@@ -28,6 +28,25 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() {
+    // Warm-up: the first MediaCodec created in a process races the codec
+    // service's startup on the emulator and wedges; open and close a
+    // decoder once so the real probes see a warm service.
+    if let Some(c) = ndk::media::media_codec::MediaCodec::from_codec_name(
+        "c2.android.avc.decoder",
+    ) {
+        let mut f = ndk::media::media_format::MediaFormat::new();
+        f.set_str("mime", "video/avc");
+        f.set_i32("width", 16);
+        f.set_i32("height", 16);
+        if c.configure(&f, None, ndk::media::media_codec::MediaCodecDirection::Decoder)
+            .is_ok()
+        {
+            let _ = c.start();
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        drop(c);
+ std::thread::sleep(Duration::from_millis(300));
+    }
     // The two deliverable probes. The experiment probes (`sw_first_probe`,
     // `nosurface_probe`) stay for debugging behind `--all`.
     let mut code = video_probe();
@@ -103,123 +122,45 @@ fn video_probe() -> i32 {
     let frames_c_slot: Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>> =
         Arc::new(parking_lot::Mutex::new(None));
 
-    let push = {
-        let sink = sink_video.clone();
-        let packets = packets.clone();
-        let swap_state = swap_state.clone();
-        let backend = backend.clone();
-            let frames_b_slot = frames_b_slot.clone();
-        let frames_c_slot = frames_c_slot.clone();
-        std::thread::spawn(move || -> Result<(), SinkError> {
-            let mut pushed = 0usize;
-            for pkt in packets.iter() {
-                if pushed == swap_at {
-                    println!(
-                        "[video] swap: set_video_window(None) at packet {pushed}/{}",
-                        packets.len()
-                    );
-                    let t0 = Instant::now();
-                    backend.set_video_window(None);
-                    println!(
-                        "[video] set_video_window(None) blocked for {:?}",
-                        t0.elapsed()
-                    );
-                    *swap_state.lock() = Swap::WindowCleared;
-                }
-                let pts = packet_media_time(pkt, time_base);
-                let r = {
-                    let mut sink = sink.lock();
-                    if pushed == 0 {
-                        if !sink.open_compressed(&params) {
-                            return Err(SinkError::Fatal(
-                                "open_compressed declined".into(),
-                            ));
-                        }
-                        println!("[video] open_compressed accepted");
-                    }
-                    sink.push_packet(pkt, pts)
-                };
-                match r {
-                    Ok(()) => {}
-                    // Unavailable right after the None: expected between
-                    // clearing and restoring; set the new window first
-                    // (it re-opens the codec via on_window_available), then
-                    // retry the packet. Never hold the sink lock across
-                    // set_video_window: the backend takes it.
-                    Err(SinkError::Unavailable) if pushed >= swap_at => {
-                        if matches!(*swap_state.lock(), Swap::WindowCleared) {
-                            let (reader, counter) = make_reader();
-                            frames_b_slot.lock().replace(counter);
-                            let w = reader
-                                .window()
-                                .map_err(|e| SinkError::Fatal(format!("reader B window: {e:?}")))?;
-                            std::mem::forget(reader); // live until process exit
-                            backend.set_video_window(Some(w));
-                            *swap_state.lock() = Swap::NewWindowSet;
-                            println!("[video] swap: new window set at packet {pushed}");
-                            let mut sink = sink.lock();
-                            sink.push_packet(pkt, pts)?;
-                        } else {
-                            return Err(SinkError::Unavailable);
-                        }
-                    }
-                    // The type-derived decoder stalled and the in-place
-                    // software retry could not take the old window (the
-                    // dead codec still holds it). Move to a fresh reader:
-                    // clear, attach reader C's window, re-open. The sink
-                    // then prefers its software decoder for this stream.
-                    Err(SinkError::Fallback(e)) => {
-                        println!("[video] fallback at packet {pushed}: {e}");
-                        backend.set_video_window(None);
-                        let (reader, counter) = make_reader();
-                        frames_c_slot.lock().replace(counter);
-                        let w = reader
-                            .window()
-                            .map_err(|e| SinkError::Fatal(format!("reader C window: {e:?}")))?;
-                        std::mem::forget(reader); // live until process exit
-                        backend.set_video_window(Some(w));
-                        println!("[video] moved to fresh window (reader C)");
-                        let mut sink = sink.lock();
-                        if !sink.open_compressed(&params) {
-                            return Err(SinkError::Fatal(
-                                "re-open on fresh window declined".into(),
-                            ));
-                        }
-                        sink.push_packet(pkt, pts)?;
-                    }
-                    Err(e) => return Err(e),
-                }
-                pushed += 1;
+    // Push inline (single thread): the sink's output thread handles
+    // presentation; the swap is driven from this thread between packets.
+    // The emulator's codec service wedges non-deterministically on newly
+    // created decoders (its AIDL transport drops work-done notifications);
+    // a fresh decoder after a settle delay recovers, so retry the stream
+    // run up to three times before reporting failure.
+    let mut swap_result: Result<(), SinkError> = Err(SinkError::Fatal("not run".into()));
+    for attempt in 1..=3 {
+        println!("[video] attempt {attempt}");
+        swap_result = run_stream(
+            &backend,
+            &sink_video,
+            &params,
+            packets.as_ref(),
+            time_base,
+            swap_at,
+            &swap_state,
+            &frames_b_slot,
+            &frames_c_slot,
+        );
+        match &swap_result {
+            Ok(()) => break,
+            Err(SinkError::Fatal(e)) if e.contains("declined") => break,
+            Err(_) => {
+                backend.suspend();
+                std::thread::sleep(Duration::from_secs(30));
+                // Fresh reader for the next attempt.
+                let (reader, counter) = make_reader();
+                frames_a.store(counter.load(Ordering::SeqCst), Ordering::SeqCst);
+                let w = reader
+                    .window()
+                    .map_err(|e| format!("reader window: {e:?}"))
+                    .unwrap();
+                std::mem::forget(reader);
+                backend.set_video_window(Some(w));
             }
-            // Let the decoder drain what it has queued.
-            std::thread::sleep(Duration::from_millis(1500));
-            let mut sink = sink.lock();
-            sink.flush();
-            Ok(())
-        })
-    };
-
-    let started = Instant::now();
-    let mut result: Result<(), String> = Ok(());
-    let mut joined = false;
-    while started.elapsed() < Duration::from_secs(150) {
-        if push.is_finished() {
-            result = match push.join() {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(format!("push failed: {e}")),
-                Err(_) => Err("push thread panicked".into()),
-            };
-            joined = true;
-            break;
         }
-        std::thread::sleep(Duration::from_millis(50));
     }
-    if !joined {
-        println!("[video] FAIL: push thread still running after 40 s");
-        backend.suspend();
-        return 1;
-    }
-    if let Err(e) = &result {
+    if let Err(e) = &swap_result {
         println!("[video] push error: {e}");
         backend.suspend();
         return 1;
@@ -268,9 +209,113 @@ enum Swap {
 
 /// One AImageReader (720x480 RGBA, 8 slots) with a counting, draining
 /// listener: `(reader, frames-received)`.
+
+/// One full stream run: open the codec on the current window, push every
+/// packet, exercise the window swap at `swap_at`, and drain. Errors leave
+/// the sink torn down so the caller can retry.
+#[allow(clippy::too_many_arguments)]
+fn run_stream(
+    backend: &Arc<AndroidBackend>,
+    sink_video: &Arc<parking_lot::Mutex<player::android::AndroidVideoSink>>,
+    params: &oxideav_core::CodecParameters,
+    packets: &[Packet],
+    time_base: TimeBase,
+    swap_at: usize,
+    swap_state: &Arc<parking_lot::Mutex<Swap>>,
+    frames_b_slot: &Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>>,
+    frames_c_slot: &Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>>,
+) -> Result<(), SinkError> {
+    {
+        let mut sink = sink_video.lock();
+        sink.prefer_software_decoder(true);
+        if !sink.open_compressed(params) {
+            return Err(SinkError::Fatal("open_compressed declined".into()));
+        }
+    }
+    println!("[video] open_compressed accepted");
+    let mut pushed = 0usize;
+    for pkt in packets.iter() {
+        if pushed == swap_at {
+            println!(
+                "[video] swap: set_video_window(None) at packet {pushed}/{}",
+                packets.len()
+            );
+            let t0 = Instant::now();
+            backend.set_video_window(None);
+            println!(
+                "[video] set_video_window(None) blocked for {:?}",
+                t0.elapsed()
+            );
+            *swap_state.lock() = Swap::WindowCleared;
+        }
+        let pts = packet_media_time(pkt, time_base);
+        let r = {
+            let mut sink = sink_video.lock();
+            sink.push_packet(pkt, pts)
+        };
+        match r {
+            Ok(()) => {}
+            // Unavailable right after the None: set the new window (it
+            // re-opens the codec via on_window_available), then retry.
+            Err(SinkError::Unavailable) if pushed >= swap_at => {
+                if matches!(*swap_state.lock(), Swap::WindowCleared) {
+                    let (reader, counter) = make_reader();
+                    frames_b_slot.lock().replace(counter);
+                    let w = reader
+                        .window()
+                        .map_err(|e| SinkError::Fatal(format!("reader B window: {e:?}")))?;
+                    std::mem::forget(reader); // live until process exit
+                    backend.set_video_window(Some(w));
+                    *swap_state.lock() = Swap::NewWindowSet;
+                    println!("[video] swap: new window set at packet {pushed}");
+                    let mut sink = sink_video.lock();
+                    sink.push_packet(pkt, pts)?;
+                } else {
+                    return Err(SinkError::Unavailable);
+                }
+            }
+            // The decoder wedged (no output): settle, then move to a fresh
+            // reader and re-open.
+            Err(SinkError::Fallback(e)) => {
+                println!("[video] fallback at packet {pushed}: {e}");
+                std::thread::sleep(Duration::from_secs(20));
+                backend.set_video_window(None);
+                let (reader, counter) = make_reader();
+                frames_c_slot.lock().replace(counter);
+                let w = reader
+                    .window()
+                    .map_err(|e| SinkError::Fatal(format!("reader C window: {e:?}")))?;
+                std::mem::forget(reader); // live until process exit
+                backend.set_video_window(Some(w));
+                println!("[video] moved to fresh window (reader C)");
+                let mut sink = sink_video.lock();
+                if !sink.open_compressed(params) {
+                    return Err(SinkError::Fatal("re-open on fresh window declined".into()));
+                }
+                sink.push_packet(pkt, pts)?;
+            }
+            Err(e) => return Err(e),
+        }
+        pushed += 1;
+    }
+    // Let the decoder drain what it has queued.
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut sink = sink_video.lock();
+    sink.flush();
+    Ok(())
+}
+
 fn make_reader() -> (ndk::media::image_reader::ImageReader, Arc<AtomicUsize>) {
+    use ndk::hardware_buffer::HardwareBufferUsage;
     use ndk::media::image_reader::{ImageFormat, ImageReader};
-    let mut reader = ImageReader::new(720, 480, ImageFormat::YUV_420_888, 8)
+    // Usage flags matching a video decoder's output buffers; the plain
+    // `new` allocation path trips the emulator's AIDL c2 transport bug
+    // (work-done items with graphic blocks fail to marshal).
+    let usage = HardwareBufferUsage::GPU_COLOR_OUTPUT
+        | HardwareBufferUsage::GPU_SAMPLED_IMAGE
+        | HardwareBufferUsage::VIDEO_ENCODE;
+    let mut reader = ImageReader::new_with_usage(720, 480, ImageFormat::YUV_420_888, usage, 8)
+        .or_else(|_| ImageReader::new(720, 480, ImageFormat::YUV_420_888, 8))
         .expect("ImageReader::new");
     let frames = Arc::new(AtomicUsize::new(0));
     let counter = frames.clone();
