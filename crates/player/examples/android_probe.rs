@@ -28,11 +28,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() {
-    let mut code = 0;
-    code |= sw_first_probe();
-    code |= video_probe();
+    // The two deliverable probes. The experiment probes (`sw_first_probe`,
+    // `nosurface_probe`) stay for debugging behind `--all`.
+    let mut code = video_probe();
     code |= audio_probe();
-    code |= nosurface_probe();
+    if std::env::args().any(|a| a == "--all") {
+        code |= sw_first_probe();
+        code |= nosurface_probe();
+    }
     std::process::exit(code);
 }
 
@@ -267,7 +270,7 @@ enum Swap {
 /// listener: `(reader, frames-received)`.
 fn make_reader() -> (ndk::media::image_reader::ImageReader, Arc<AtomicUsize>) {
     use ndk::media::image_reader::{ImageFormat, ImageReader};
-    let mut reader = ImageReader::new(720, 480, ImageFormat::RGBA_8888, 8)
+    let mut reader = ImageReader::new(720, 480, ImageFormat::YUV_420_888, 8)
         .expect("ImageReader::new");
     let frames = Arc::new(AtomicUsize::new(0));
     let counter = frames.clone();
@@ -418,7 +421,7 @@ fn sw_first_probe() -> i32 {
     let mut reader = match ndk::media::image_reader::ImageReader::new(
         720,
         480,
-        ndk::media::image_reader::ImageFormat::RGBA_8888,
+        ndk::media::image_reader::ImageFormat::YUV_420_888,
         8,
     ) {
         Ok(r) => r,

@@ -286,7 +286,7 @@ impl AndroidVideoSink {
 
                 match thread_codec
                     .0
-                    .dequeue_output_buffer(Duration::from_millis(10))
+                    .dequeue_output_buffer(Duration::from_millis(50))
                 {
                     Ok(DequeuedOutputBufferInfoResult::Buffer(out_buf)) => {
                         let pts_us = out_buf.info().presentation_time_us();
@@ -547,14 +547,16 @@ impl VideoSink for AndroidVideoSink {
             packet.data.clone()
         };
 
-        // Dequeue input buffer. A working decoder can legitimately block
-        // for seconds when it is still busy with previous input, so wait
-        // up to 5 s before declaring the stream unplayable on hardware.
-        let start_dequeue = std::time::Instant::now();
-        let timeout = Duration::from_secs(5);
-        let mut input_buf = None;
-
-        while start_dequeue.elapsed() < timeout {
+        // Dequeue an input buffer. A healthy decoder runs out of input
+        // buffers while it holds frames for B-frame reordering
+        // (output.delay up to 8): no output is released yet, so the output
+        // thread cannot return input buffers either. That state is normal —
+        // wait for the output thread to make progress rather than failing;
+        // only give up (and allow the software-decoder retry) when NO output
+        // was ever dequeued and the wait exceeds the stall budget.
+        let start_dequeue = Instant::now();
+        let stall_budget = Duration::from_secs(30);
+        let mut buf = loop {
             let err_opt = self.midstream_error.lock().take();
             if let Some(err) = err_opt {
                 self.teardown_codec();
@@ -562,13 +564,12 @@ impl VideoSink for AndroidVideoSink {
                 return Err(SinkError::Fallback(err));
             }
 
-            match codec.0.dequeue_input_buffer(Duration::from_millis(10)) {
+            match codec.0.dequeue_input_buffer(Duration::from_millis(20)) {
                 Ok(DequeuedInputBufferResult::Buffer(buf)) => {
-                    input_buf = Some(buf);
-                    break;
+                    break buf;
                 }
                 Ok(DequeuedInputBufferResult::TryAgainLater) => {
-                    std::thread::yield_now();
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => {
                     self.teardown_codec();
@@ -578,37 +579,23 @@ impl VideoSink for AndroidVideoSink {
                     )));
                 }
             }
-        }
 
-        let mut buf = match input_buf {
-            Some(b) => b,
-            None => {
-                let err_opt = self.midstream_error.lock().take();
-                if let Some(err) = err_opt {
-                    self.teardown_codec();
-                    self.awaiting_keyframe = self.is_compressed;
-                    return Err(SinkError::Fallback(err));
-                }
-                self.teardown_codec();
-                self.awaiting_keyframe = self.is_compressed;
-                // The highest-ranked decoder for the type never accepted
-                // input (the emulator's vendor decoders can do this). Retry
-                // once on the platform's software decoder before reporting
-                // the stream unplayable on hardware; later re-opens keep
-                // using it for this stream.
-                if !self.tried_software_decoder {
-                    self.tried_software_decoder = true;
-                    self.prefer_software = true;
-                    if let Some(params) = self.last_compressed_params.clone() {
-                        if self.open_compressed_inner(&params, true) {
-                            return self.push_packet(packet, pts);
-                        }
+            if start_dequeue.elapsed() < stall_budget {
+                continue;
+            }
+            // Stalled past the budget: give up on this decoder.
+            self.teardown_codec();
+            self.awaiting_keyframe = self.is_compressed;
+            if !self.tried_software_decoder {
+                self.tried_software_decoder = true;
+                self.prefer_software = true;
+                if let Some(params) = self.last_compressed_params.clone() {
+                    if self.open_compressed_inner(&params, true) {
+                        return self.push_packet(packet, pts);
                     }
                 }
-                return Err(SinkError::Fallback(
-                    "input buffer dequeue timed out".into(),
-                ));
             }
+            return Err(SinkError::Fallback("input buffer dequeue timed out".into()));
         };
 
         let raw_dest = buf.buffer_mut();
