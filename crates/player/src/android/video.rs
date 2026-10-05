@@ -87,14 +87,22 @@ impl AndroidVideoSink {
                 match self
                     .output_done
                     .as_ref()
-                    .and_then(|rx| rx.recv_timeout(Duration::from_millis(20)).ok())
+                    .expect("output thread implies a done channel")
+                    .recv_timeout(Duration::from_millis(20))
                 {
-                    Some(()) => {
+                    Ok(()) => {
                         let _ = handle.join();
                         break;
                     }
-                    None if Instant::now() < deadline => continue,
-                    None => break,
+                    // Sender dropped: the output thread exited.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = handle.join();
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if Instant::now() >= deadline {
+                    break;
                 }
             }
             self.output_done = None;

@@ -207,7 +207,7 @@ enum Swap {
 }
 
 
-/// One AImageReader (720x480 RGBA, 8 slots) with a counting, draining
+/// One AImageReader (352x288 YUV, 8 slots) with a counting, draining
 /// listener: `(reader, frames-received)`.
 
 /// One full stream run: open the codec on the current window, push every
@@ -314,8 +314,8 @@ fn make_reader() -> (ndk::media::image_reader::ImageReader, Arc<AtomicUsize>) {
     let usage = HardwareBufferUsage::GPU_COLOR_OUTPUT
         | HardwareBufferUsage::GPU_SAMPLED_IMAGE
         | HardwareBufferUsage::VIDEO_ENCODE;
-    let mut reader = ImageReader::new_with_usage(720, 480, ImageFormat::YUV_420_888, usage, 8)
-        .or_else(|_| ImageReader::new(720, 480, ImageFormat::YUV_420_888, 8))
+    let mut reader = ImageReader::new_with_usage(352, 288, ImageFormat::YUV_420_888, usage, 8)
+        .or_else(|_| ImageReader::new(352, 288, ImageFormat::YUV_420_888, 8))
         .expect("ImageReader::new");
     let frames = Arc::new(AtomicUsize::new(0));
     let counter = frames.clone();
@@ -466,8 +466,8 @@ fn sw_first_probe() -> i32 {
         }
     };
     let mut reader = match ndk::media::image_reader::ImageReader::new(
-        720,
-        480,
+        352,
+        288,
         ndk::media::image_reader::ImageFormat::YUV_420_888,
         8,
     ) {
