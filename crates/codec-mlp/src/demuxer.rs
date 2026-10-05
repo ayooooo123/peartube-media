@@ -22,91 +22,65 @@ use crate::bitreader::BitReader;
 use crate::common::{mlp_samplerate, truehd_channels, SYNC_MLP, SYNC_TRUEHD};
 use crate::tables::{MLP_CHANNELS, MLP_QUANTS, THD_CHANCOUNT};
 
-/// How much head the probe reads.
-const PROBE_BYTES: usize = 256 * 1024;
-
-/// One access unit: file offset, byte length, sample position.
-struct AuEntry {
-    offset: u64,
-    len: u32,
-    pts: u64,
-}
+/// How much head open() reads: enough for the resync scan and the first
+/// major sync.
+const HEAD_BYTES: usize = 256 * 1024;
 
 pub struct RawMlpDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     format_name: &'static str,
-    aus: Vec<AuEntry>,
-    next: usize,
+    /// Read cursor: file offset of the next access unit header.
+    next_offset: u64,
+    /// Sample position of that AU's first frame (packet pts).
+    next_pts: u64,
+    /// Samples per access unit: 40 << (ratebits & 7).
+    au_size: u32,
+    /// File offset where the AU chain starts (for seek walks).
+    start_offset: u64,
 }
 
 impl RawMlpDemuxer {
     fn open(mut input: Box<dyn ReadSeek>, is_mlp: bool) -> Result<Box<dyn Demuxer>> {
         let format_name = if is_mlp { "mlp" } else { "truehd" };
+        let sync_byte = if is_mlp { SYNC_MLP } else { SYNC_TRUEHD };
 
-        // Read the whole file index up front: AUs are cut by walking the
-        // length fields, which needs random access anyway.
-        let mut head = vec![0u8; PROBE_BYTES];
-        let total = {
-            let n = read_up_to(&mut input, &mut head)?;
-            // Continue to EOF in 1 MiB steps to learn the file size.
-            let mut total = n as u64;
-            let mut step = [0u8; 1024 * 1024];
-            loop {
-                let m = read_up_to(&mut input, &mut step)?;
-                if m == 0 {
-                    break;
-                }
-                total += m as u64;
-            }
-            total
-        };
-
-        // Scan from the start for the first major sync whose AU length
-        // lands inside the file (FFmpeg's parser resyncs the same way).
+        // Read a bounded head: enough for the resync scan and the first
+        // major sync. Nothing past that is touched until next_packet asks
+        // for it, so opening an HTTP source does not wait for the whole
+        // file (FFmpeg's raw demuxers read the head only).
         input.seek(SeekFrom::Start(0))?;
-        let mut buf = vec![0u8; PROBE_BYTES];
+        let mut buf = vec![0u8; HEAD_BYTES];
         let n = read_up_to(&mut input, &mut buf)?;
         buf.truncate(n);
 
-        let sync_byte = if is_mlp { SYNC_MLP } else { SYNC_TRUEHD };
+        // Scan for the first major sync that starts a length-consistent AU
+        // chain (the resync walk FFmpeg's mlp_parser performs). The chain is
+        // verified a few units deep from the head; after that next_packet
+        // simply follows the 12-bit length fields.
+        let sync_head = [0xf8, 0x72, 0x6f, sync_byte];
         let mut base_offset = None;
-        let mut au_lens: Vec<(u64, u32)> = Vec::new();
-        for off in 0..buf.len().saturating_sub(8) {
-            if buf[off + 4..off + 8] != [0xf8, 0x72, 0x6f, sync_byte] {
+        for off in 0..buf.len().saturating_sub(12) {
+            if buf[off + 4..off + 8] != sync_head {
                 continue;
             }
-            // Walk the AU length chain from this candidate via seeks — the
-            // file can be far larger than any sensible preload.
-            let mut pos = off as u64;
-            let mut lens: Vec<(u64, u32)> = Vec::new();
+            // Walk a few AUs inside the buffered head to confirm the length
+            // fields chain cleanly (>= 8 units, like the old full walk's
+            // acceptance, but bounded).
+            let mut pos = off;
+            let mut units = 0usize;
             let mut ok = true;
-            while pos + 4 <= total {
-                let mut hdr = [0u8; 2];
-                input.seek(SeekFrom::Start(pos))?;
-                if read_up_to(&mut input, &mut hdr)? < 2 {
-                    ok = false;
+            while pos + 4 <= buf.len() {
+                let l = (u16::from_be_bytes([buf[pos], buf[pos + 1]]) & 0xfff) as usize * 2;
+                if l < 4 || pos + l > buf.len() {
+                    ok = units >= 8;
                     break;
                 }
-                let l = (u16::from_be_bytes(hdr) & 0xfff) as usize * 2;
-                if l < 4 {
-                    ok = false;
-                    break;
-                }
-                if pos + l as u64 > total {
-                    // A truncated final AU (FFmpeg's luckynight sample ends
-                    // mid-frame): accept the chain if it is long enough.
-                    break;
-                }
-                lens.push((pos, l as u32));
-                pos += l as u64;
+                units += 1;
+                pos += l;
             }
-            // Accept the chain when it reaches the end of the file (a short
-            // partial tail is fine, as in FFmpeg's luckynight sample) and
-            // yields several units.
-            if ok && lens.len() >= 8 {
+            if ok && units >= 8 {
                 base_offset = Some(off as u64);
-                au_lens = lens;
                 break;
             }
         }
@@ -120,17 +94,10 @@ impl RawMlpDemuxer {
         // Sample rate from the first major sync (mlp_read_header):
         // TrueHD ratebits at major-sync byte 4, MLP at byte 5.
         let sync_at = base_offset as usize + 4;
-        let sample_rate = if sync_at + 10 <= buf.len() {
-            let b = &buf[sync_at..];
-            let ratebits = if is_mlp { b[5] >> 4 } else { b[4] >> 4 };
-            let r = mlp_samplerate(u32::from(ratebits));
-            if r != 0 {
-                r
-            } else {
-                48_000
-            }
-        } else {
-            48_000
+        let ratebits = ratebits_of(&buf, sync_at, is_mlp);
+        let sample_rate = match mlp_samplerate(ratebits) {
+            0 => 48_000,
+            r => r,
         };
 
         let codec_id = CodecId::new(if is_mlp { "mlp" } else { "truehd" });
@@ -186,51 +153,17 @@ impl RawMlpDemuxer {
         }
 
         let time_base = TimeBase::new(1, i64::from(sample_rate));
-        // Duration: sample count across the chain (access_unit_size unknown
-        // until decode; derive from the last AU's pts progression using the
-        // per-AU sample counts parsed from the decoder — for the stream
-        // info we store bytes*8/bits estimate? Keep None: packets carry
-        // exact pts as sample indices, accumulated in next_packet by
-        // decoding each AU's frame count lazily? FFmpeg computes pts from
-        // the frame size (40 << ratebits & 7) once it parses a major sync;
-        // do the same here from the first AU's major sync bits.
-        let au_size = {
-            // access_unit_size = 40 << (ratebits & 7) — same ratebits.
-            let ratebits = if sync_at + 10 <= buf.len() {
-                let b = &buf[sync_at..];
-                if is_mlp {
-                    b[5] >> 4
-                } else {
-                    b[4] >> 4
-                }
-            } else {
-                0
-            };
-            40usize << (ratebits & 7)
-        };
-
-        let aus: Vec<AuEntry> = au_lens
-            .iter()
-            .scan(0u64, |pts, (off, len)| {
-                let e = AuEntry {
-                    offset: *off,
-                    len: *len,
-                    pts: *pts,
-                };
-                *pts += au_size as u64;
-                Some(e)
-            })
-            .collect();
-
-        let duration = aus.last().map(|e| e.pts as i64).unwrap_or(0);
-        params.bit_rate = Some(
-            (total - base_offset) * 8 * u64::from(sample_rate) / duration.max(1) as u64,
-        );
+        // access_unit_size = 40 << (ratebits & 7), from the same ratebits
+        // that gave the sample rate (FFmpeg's read_major_sync / parser set
+        // pts progression with it).
+        let au_size = 40u32 << (ratebits_of(&buf, sync_at, is_mlp) & 7);
 
         let stream = StreamInfo {
             index: 0,
             time_base,
-            duration: Some(duration),
+            // Unknown until the last AU is decoded; FFmpeg's raw demuxers
+            // with AVFMT_NOTIMESTAMPS declare none either.
+            duration: None,
             start_time: Some(0),
             params,
         };
@@ -239,9 +172,51 @@ impl RawMlpDemuxer {
             input,
             streams: vec![stream],
             format_name,
-            aus,
-            next: 0,
+            next_offset: base_offset,
+            next_pts: 0,
+            au_size,
+            start_offset: base_offset,
         }))
+    }
+}
+
+/// The `ratebits` nibble of the first major sync (TrueHD: byte 4 high
+/// nibble, MLP: byte 5), 0 when the head does not reach it.
+fn ratebits_of(buf: &[u8], sync_at: usize, is_mlp: bool) -> u32 {
+    if sync_at + 10 <= buf.len() {
+        let b = &buf[sync_at..];
+        u32::from(if is_mlp { b[5] >> 4 } else { b[4] >> 4 })
+    } else {
+        0
+    }
+}
+
+impl RawMlpDemuxer {
+    /// Scan forward from just past the cursor for the next major sync and
+    /// resume there (mlp_parser's lost_sync path).
+    fn resync(&mut self) -> Result<Packet> {
+        const WINDOW: usize = 64 * 1024;
+        let sync_byte = if self.format_name == "mlp" {
+            SYNC_MLP
+        } else {
+            SYNC_TRUEHD
+        };
+        let mut from = self.next_offset + 1;
+        loop {
+            self.input.seek(SeekFrom::Start(from))?;
+            let mut buf = vec![0u8; WINDOW];
+            let n = read_up_to(&mut self.input, &mut buf)?;
+            if n < 8 {
+                return Err(Error::Eof);
+            }
+            for off in 0..=n - 8 {
+                if buf[off + 4..off + 8] == [0xf8, 0x72, 0x6f, sync_byte] {
+                    self.next_offset = from + off as u64;
+                    return self.next_packet();
+                }
+            }
+            from += (n - 7) as u64;
+        }
     }
 }
 
@@ -270,42 +245,71 @@ impl Demuxer for RawMlpDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        while self.next < self.aus.len() {
-            let au = &self.aus[self.next];
-            self.next += 1;
-            let mut data = vec![0u8; au.len as usize];
-            self.input.seek(SeekFrom::Start(au.offset))?;
-            self.input.read_exact(&mut data)?;
-
-            // Parity nibble check (read_access_unit): XOR of the 4-byte AU
-            // header and the substream headers must have (hi^lo nibble)=0xF.
-            // The substream header count is inside the packet; FFmpeg's
-            // parser-level parity check covers AU header + substream
-            // headers, but read_access_unit already verifies with the full
-            // structure known. The demuxer keeps corrupted data: the
-            // decoder rejects it (matching FFmpeg, where the parser only
-            // checks when not in sync).
-
-            let tb = self.streams[0].time_base;
-            return Ok(Packet::new(0, tb, data)
-                .with_pts(au.pts as i64)
-                .with_dts(au.pts as i64)
-                .with_keyframe(true));
+        // Read the 2-byte AU header at the cursor (ff_raw_read_partial_packet
+        // is unstructured; the AU framing comes from the parser, which reads
+        // the length field wherever the cursor sits).
+        let mut hdr = [0u8; 2];
+        self.input.seek(SeekFrom::Start(self.next_offset))?;
+        let got = read_up_to(&mut self.input, &mut hdr)?;
+        if got < 2 {
+            return Err(Error::Eof);
         }
-        Err(Error::Eof)
+        let len = (u16::from_be_bytes(hdr) & 0xfff) as usize * 2;
+        if len < 4 {
+            // Broken length chain mid-stream: FFmpeg's parser resyncs by
+            // scanning for the next sync word. Do the same from the cursor.
+            return self.resync();
+        }
+
+        let mut data = vec![0u8; len];
+        self.input.seek(SeekFrom::Start(self.next_offset))?;
+        if self.input.read_exact(&mut data).is_err() {
+            // Truncated final AU (luckynight ends mid-frame): FFmpeg's raw
+            // demuxer emits the short read, but the decoder needs a whole
+            // AU header at minimum; a partial frame errors inside it. Drop
+            // the tail like the parse loop does.
+            return Err(Error::Eof);
+        }
+
+        let pts = self.next_pts;
+        self.next_pts += u64::from(self.au_size);
+        self.next_offset += len as u64;
+
+        let tb = self.streams[0].time_base;
+        Ok(Packet::new(0, tb, data)
+            .with_pts(pts as i64)
+            .with_dts(pts as i64)
+            .with_keyframe(true))
     }
 
+
     fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
-        // Last AU starting at or before pts.
-        let idx = self
-            .aus
-            .partition_point(|a| (a.pts as i64) <= pts)
-            .saturating_sub(1);
-        if self.aus.is_empty() {
+        // AU boundaries are only known by walking; jump to the sample
+        // position at the AU grid (the raw stream has no seek index).
+        if self.au_size == 0 {
             return Err(Error::unsupported("empty stream"));
         }
-        self.next = idx;
-        Ok(self.aus[idx].pts as i64)
+        let au_index = (pts.max(0) as u64 / u64::from(self.au_size)) * u64::from(self.au_size);
+        self.next_pts = au_index;
+        // Offset unknown without walking from the start; walk now, bounded
+        // by the AU grid.
+        let mut offset = self.start_offset;
+        let mut walk_pts = 0u64;
+        while walk_pts < au_index {
+            self.input.seek(SeekFrom::Start(offset))?;
+            let mut hdr = [0u8; 2];
+            if read_up_to(&mut self.input, &mut hdr)? < 2 {
+                return Err(Error::unsupported("seek past end of stream"));
+            }
+            let len = (u16::from_be_bytes(hdr) & 0xfff) as usize * 2;
+            if len < 4 {
+                return Err(Error::unsupported("seek into a broken length chain"));
+            }
+            offset += len as u64;
+            walk_pts += u64::from(self.au_size);
+        }
+        self.next_offset = offset;
+        Ok(au_index as i64)
     }
 }
 

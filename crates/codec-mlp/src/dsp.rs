@@ -128,10 +128,10 @@ pub fn pack_output(
     is32: bool,
 ) -> i32 {
     let mut w = 0usize;
-    for i in 0..blockpos {
-        for out_ch in 0..=max_matrix_channel {
-            let mat_ch = ch_assign[out_ch] as usize;
-            let sample = sample_buffer[i][mat_ch]
+    for sample in sample_buffer.iter().take(blockpos) {
+        for &mat_ch in ch_assign.iter().take(max_matrix_channel + 1) {
+            let mat_ch = mat_ch as usize;
+            let sample = sample[mat_ch]
                 .wrapping_mul(1u32.wrapping_shl(output_shift[mat_ch] as u32) as i32);
             lossless_check_data ^= (sample & 0xff_ffff).wrapping_shl(mat_ch as u32);
             if is32 {

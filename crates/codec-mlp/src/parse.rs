@@ -98,9 +98,12 @@ pub fn read_major_sync(buf: &[u8], gb: &mut BitReader) -> oxideav_core::Result<M
         return Err(Error::InvalidData("mlp: bad sync word".into()));
     }
 
-    let mut mh = MlpHeaderInfo::default();
-    mh.stream_type = gb.get_bits(8) as u8;
-    mh.header_size = header_size;
+    let stream_type = gb.get_bits(8) as u8;
+    let mut mh = MlpHeaderInfo {
+        stream_type,
+        header_size,
+        ..MlpHeaderInfo::default()
+    };
 
     if mh.stream_type == 0xbb {
         mh.group1_bits = u32::from(MLP_QUANTS[gb.get_bits(4) as usize]);
@@ -149,7 +152,11 @@ pub fn read_major_sync(buf: &[u8], gb: &mut BitReader) -> oxideav_core::Result<M
     gb.skip(48);
 
     mh.is_vbr = gb.get_bits(1) != 0;
-    mh.peak_bitrate = (gb.get_bits(15) * mh.group1_samplerate + 8) >> 4;
+    // FFmpeg computes `(bits15 * samplerate + 8) >> 4` in 32-bit int, which
+    // overflows for CRC-valid headers (32767 × 192 kHz). Compute in u64 and
+    // truncate to the same 32-bit result on wrap.
+    let product = u64::from(gb.get_bits(15)) * u64::from(mh.group1_samplerate) + 8;
+    mh.peak_bitrate = ((product >> 4) & 0xFFFF_FFFF) as u32;
     mh.num_substreams = gb.get_bits(4);
 
     gb.skip(2);
