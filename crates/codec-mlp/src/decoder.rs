@@ -469,7 +469,7 @@ impl MlpDecoder {
 
     /// `ff_mlp_restart_checksum` over a bit range that may start mid-byte.
     fn restart_checksum_at(&self, buf: &[u8], bit_offset: usize, bit_size: usize) -> u8 {
-        if bit_offset % 8 == 0 {
+        if bit_offset.is_multiple_of(8) {
             return mlp_restart_checksum(&buf[bit_offset / 8..], bit_size);
         }
         // The restart header is only ever read from the first block, which
@@ -510,7 +510,7 @@ impl MlpDecoder {
 
             let coeff_bits = gbp.get_bits(5);
             let coeff_shift = gbp.get_bits(3);
-            if coeff_bits < 1 || coeff_bits > 16 {
+            if !(1..=16).contains(&coeff_bits) {
                 return Err(invalid(format!(
                     "{}IR filter coeff_bits must be between 1 and 16.",
                     if filter != FIR { 'I' } else { 'F' }
@@ -693,10 +693,8 @@ impl MlpDecoder {
             self.substream[substr].blocksize = blocksize;
         }
 
-        if pflags & PARAM_MATRIX != 0 && gbp.get_bits(1) != 0 {
-            if let Err(e) = self.read_matrix_params(substr, gbp) {
-                ret = Err(e);
-            }
+        if pflags & PARAM_MATRIX != 0 && gbp.get_bits(1) != 0 && ret.is_ok() {
+            ret = self.read_matrix_params(substr, gbp);
         }
 
         if ret.is_ok() && pflags & PARAM_OUTSHIFT != 0 && gbp.get_bits(1) != 0 {
@@ -962,13 +960,11 @@ impl MlpDecoder {
         };
         let mut seed = self.substream[substr].noisegen_seed;
 
-        for i in 0..blockpos {
+        for row in self.sample_buffer.iter_mut().take(blockpos) {
             // FFmpeg: uint16_t seed_shr7 = seed >> 7 (truncated to 16 bits).
             let seed_shr7 = (seed >> 7) as u16;
-            self.sample_buffer[i][maxchan + 1] =
-                (((seed >> 15) as u8) as i8 as i32) * (1 << noise_shift);
-            self.sample_buffer[i][maxchan + 2] =
-                ((seed_shr7 as u8) as i8 as i32) * (1 << noise_shift);
+            row[maxchan + 1] = (((seed >> 15) as u8) as i8 as i32) * (1 << noise_shift);
+            row[maxchan + 2] = ((seed_shr7 as u8) as i8 as i32) * (1 << noise_shift);
 
             let s32 = u32::from(seed_shr7);
             seed = (seed << 16) ^ s32 ^ (s32 << 5);
@@ -1012,14 +1008,13 @@ impl MlpDecoder {
             return Err(invalid("No samples to output."));
         }
 
-        let maxchan;
-        if noise_type == 0 {
+        let maxchan = if noise_type == 0 {
             self.generate_2_noise_channels(substr);
-            maxchan = max_matrix_channel + 2;
+            max_matrix_channel + 2
         } else {
             self.fill_noise_buffer(substr);
-            maxchan = max_matrix_channel;
-        }
+            max_matrix_channel
+        };
 
         // Apply the channel matrices in turn.
         let (num_primitive_matrices, blockpos, access_unit_size_pow2) = (
@@ -1087,12 +1082,13 @@ impl MlpDecoder {
         let mut gb = BitReader::new(&buf[4..length]);
         self.is_major_sync_unit = false;
         if gb.show_bits(31) == 0xf8726fba >> 1 {
-            let mh = self
-                .apply_major_sync(&buf[4..length], &mut gb)
-                .map_err(|e| {
+            let mh = match self.apply_major_sync(&buf[4..length], &mut gb) {
+                Ok(mh) => mh,
+                Err(e) => {
                     self.params_valid = false;
-                    e
-                })?;
+                    return Err(e);
+                }
+            };
             let _ = mh;
             self.is_major_sync_unit = true;
         }
@@ -1247,10 +1243,8 @@ impl MlpDecoder {
                     break;
                 }
 
-                if let Err(e) = self.read_block_data(&mut gb, substr) {
-                    // FFmpeg returns the error straight out of the decoder.
-                    return Err(e);
-                }
+                // FFmpeg returns the error straight out of the decoder.
+                self.read_block_data(&mut gb, substr)?;
 
                 if gb.bits_read() >= sub_len * 8 {
                     outcome = BlockOutcome::LengthMismatch;

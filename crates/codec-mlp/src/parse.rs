@@ -98,9 +98,12 @@ pub fn read_major_sync(buf: &[u8], gb: &mut BitReader) -> oxideav_core::Result<M
         return Err(Error::InvalidData("mlp: bad sync word".into()));
     }
 
-    let mut mh = MlpHeaderInfo::default();
-    mh.stream_type = gb.get_bits(8) as u8;
-    mh.header_size = header_size;
+    let stream_type = gb.get_bits(8) as u8;
+    let mut mh = MlpHeaderInfo {
+        stream_type,
+        header_size,
+        ..MlpHeaderInfo::default()
+    };
 
     if mh.stream_type == 0xbb {
         mh.group1_bits = u32::from(MLP_QUANTS[gb.get_bits(4) as usize]);
