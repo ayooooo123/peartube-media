@@ -54,6 +54,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-mlp"
+version = "0.1.0"
+dependencies = [
+ "md5",
+ "oxideav-core",
+ "oxideav-mkv",
+ "refcheck",
+]
+
+[[package]]
 name = "codecs"
 version = "0.1.0"
 dependencies = [
