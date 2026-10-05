@@ -1894,6 +1894,7 @@ fn fallback_fourcc_codec_id(fcc: &[u8; 4]) -> CodecId {
         b"MP41" | b"mp41" | b"MPG4" | b"mpg4" => CodecId::new("msmpeg4v1"),
         b"MSS1" | b"mss1" => CodecId::new("mss1"),
         b"MSS2" | b"mss2" => CodecId::new("mss2"),
+        b"MTS2" | b"mts2" => CodecId::new("mts2"),
         b"G2M2" | b"G2M3" | b"G2M4" | b"g2m2" | b"g2m3" | b"g2m4" => CodecId::new("g2m"),
         b"TDSC" | b"tdsc" => CodecId::new("tdsc"),
         b"H264" | b"h264" | b"X264" | b"x264" | b"AVC1" | b"avc1" => CodecId::new("h264"),
