@@ -67,6 +67,7 @@ dependencies = [
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "codec-mlp",
  "demux-asf",
  "oxideav-aac",
  "oxideav-ac3",
