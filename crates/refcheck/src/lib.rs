@@ -147,11 +147,21 @@ pub fn pack(frame: &VideoFrame, plane_dims: &[(usize, usize)]) -> Vec<u8> {
 /// does not, because the player applies that at presentation. `-fps_mode
 /// passthrough` keeps FFmpeg from duplicating or dropping frames.
 pub fn ffmpeg_video_md5s(path: &Path, nth: usize, pix_fmt: &str) -> Vec<String> {
-    let out = ffmpeg(&[
-        "-apply_cropping", "codec", "-i", path.to_str().unwrap(), "-map", &format!("0:v:{nth}"),
-        "-fps_mode", "passthrough", "-pix_fmt", pix_fmt, "-f", "framemd5", "-",
+    ffmpeg_video_md5s_with(path, nth, pix_fmt, &[])
+}
+
+/// [`ffmpeg_video_md5s`] with extra decoder options placed before `-i`, e.g.
+/// `&["-idct", "simple"]` to pin FFmpeg's C IDCT: on arm64 its default picks
+/// NEON assembly whose rounding differs from the C reference.
+pub fn ffmpeg_video_md5s_with(path: &Path, nth: usize, pix_fmt: &str, input_args: &[&str]) -> Vec<String> {
+    let map = format!("0:v:{nth}");
+    let mut args = vec!["-apply_cropping", "codec"];
+    args.extend_from_slice(input_args);
+    args.extend_from_slice(&[
+        "-i", path.to_str().unwrap(), "-map", &map, "-fps_mode", "passthrough", "-pix_fmt", pix_fmt, "-f",
+        "framemd5", "-",
     ]);
-    String::from_utf8(out)
+    String::from_utf8(ffmpeg(&args))
         .unwrap()
         .lines()
         .filter(|l| !l.starts_with('#'))
