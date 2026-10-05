@@ -1,99 +1,130 @@
 //! Reference tests: decode every FATE TrueHD / MLP sample through this
 //! crate's decoders and the raw `truehd` / `mlp` demuxers, and compare
-//! against FFmpeg bit-for-bit. FFmpeg's own FATE tests hash the decoded
-//! PCM (`fate/truehd.mak`, `fate/lossless-audio.mak`), so the comparison
-//! here is the interleaved s32 (TrueHD) / s16 (MLP) stream MD5.
+//! against FFmpeg. The decoders are integer ports of FFmpeg's, so the
+//! comparison is byte-exact: the interleaved PCM stream MD5 must equal
+//! FFmpeg's `-f s32le` / `-f s16le` md5 (the same hash FFmpeg's own FATE
+//! tests use for these samples).
 
 use oxideav_core::{Frame, MediaType};
-use refcheck::{decode, fate, interleaved_f32, snr_db};
+use refcheck::{decode, fate};
 
 fn registrars() -> Vec<refcheck::Registrar> {
     vec![codec_mlp::register]
 }
 
+/// Interleaved PCM bytes of every decoded audio frame (one `data[0]` plane;
+/// our decoder always outputs interleaved).
+fn pcm_bytes(decoded: &refcheck::Decoded) -> Vec<u8> {
+    let mut out = Vec::new();
+    for frame in &decoded.frames {
+        if let Frame::Audio(a) = frame {
+            out.extend_from_slice(&a.data[0]);
+        }
+    }
+    out
+}
+
+/// FFmpeg's md5 of stream `0:a:nth` as interleaved little-endian PCM
+/// (`-f s32le` when `bytes` is 4, `-f s16le` when 2).
+fn ffmpeg_pcm_md5(path: &std::path::Path, bytes: usize) -> String {
+    let fmt = if bytes == 4 { "s32le" } else { "s16le" };
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
+        .output()
+        .expect("ffmpeg must be on PATH");
+    assert!(
+        out.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    refcheck::md5_hex(&out.stdout)
+}
+
+/// FFmpeg's decoded PCM byte count for stream `0:a:0`.
+fn ffmpeg_pcm_len(path: &std::path::Path, bytes: usize) -> usize {
+    let fmt = if bytes == 4 { "s32le" } else { "s16le" };
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
+        .output()
+        .expect("ffmpeg must be on PATH");
+    out.stdout.len()
+}
+
 /// FFmpeg's `fate-truehd-5.1`:
-/// `md5pipe -f truehd -i truehd_5.1.raw -f s32le` (6 ch, s32).
+/// `md5pipe -f truehd -i truehd_5.1.raw -f s32le` (6 ch, s32,
+/// ref 95d8aac39dd9f0d7fb83dc7b6f88df35).
 #[test]
 fn truehd_5_1_bit_exact() {
     let path = fate("lossless-audio/truehd_5.1.raw");
     let decoded = decode(&path, &registrars(), MediaType::Audio, 0);
     assert_eq!(decoded.params.channels, Some(6), "channel count");
     assert_eq!(decoded.params.sample_rate, Some(48_000), "sample rate");
-
-    let total: usize = decoded
-        .frames
-        .iter()
-        .map(|f| match f {
-            Frame::Audio(a) => a.samples as usize,
-            _ => 0,
-        })
-        .sum();
-    // FFmpeg decodes 3410 AUs of 40 samples = 136400 samples per channel.
-    assert_eq!(total, 136400, "sample count per channel");
-
-    // Interleaved f32 vs FFmpeg: bit-exact lossless → infinite SNR.
-    let ff = refcheck::ffmpeg_audio_f32(&path, 0);
-    let ours = interleaved_f32(&decoded);
-    let snr = snr_db(&ff, &ours, 0);
-    assert!(snr >= 190.0, "SNR {snr} dB — not bit-exact (max finite ~192 dB for s32)");
+    let ours = pcm_bytes(&decoded);
+    assert_eq!(ours.len(), ffmpeg_pcm_len(&path, 4), "pcm byte count");
+    assert_eq!(
+        refcheck::md5_hex(&ours),
+        ffmpeg_pcm_md5(&path, 4),
+        "pcm md5 differs from FFmpeg"
+    );
 }
 
-/// FFmpeg's `fate-truehd-5.1-downmix-2.0` covers the `-downmix` option; our
-/// decoder always outputs the full presentation, so only the sample-count
-/// and 6-channel decode above apply. Instead verify the Atmos sample:
-/// `spdif-truehd`'s input, 4 substreams, 8-channel presentation
-/// (FFmpeg outputs the 8ch presentation by default for Atmos streams).
+/// `spdif-truehd`'s input: 4 substreams, 8-channel presentation (Atmos; the
+/// 4th substream carries non-audio data and is skipped, like FFmpeg).
 #[test]
 fn truehd_atmos_8ch_bit_exact() {
     let path = fate("truehd/atmos.thd");
     let decoded = decode(&path, &registrars(), MediaType::Audio, 0);
     assert_eq!(decoded.params.channels, Some(8), "channel count");
     assert_eq!(decoded.params.sample_rate, Some(48_000), "sample rate");
-
-    let total: usize = decoded
-        .frames
-        .iter()
-        .map(|f| match f {
-            Frame::Audio(a) => a.samples as usize,
-            _ => 0,
-        })
-        .sum();
-    // 128 AUs × 40 samples.
-    assert_eq!(total, 5120, "sample count per channel");
-
-    let ff = refcheck::ffmpeg_audio_f32(&path, 0);
-    let ours = interleaved_f32(&decoded);
-    let snr = snr_db(&ff, &ours, 0);
-    assert!(snr >= 190.0, "SNR {snr} dB — not bit-exact");
+    let ours = pcm_bytes(&decoded);
+    assert_eq!(ours.len(), ffmpeg_pcm_len(&path, 4), "pcm byte count");
+    assert_eq!(
+        refcheck::md5_hex(&ours),
+        ffmpeg_pcm_md5(&path, 4),
+        "pcm md5 differs from FFmpeg"
+    );
 }
 
 /// FFmpeg's `fate-truehd-mono1726`:
-/// `md5pipe -f truehd -i ticket-1726-monocut.thd -f s32le` (1 ch).
-/// The sample exercises the max_channel + 1 < min_channel quirk in the
-/// restart header range check (two substreams, second substream carries the
-/// mono presentation with max_channel == min_channel - 1).
+/// `md5pipe -f truehd -i ticket-1726-monocut.thd -f s32le` (1 ch,
+/// ref 9be9551fac418440bb02101bfdb11df9). The sample exercises the
+/// `max_channel + 1 < min_channel` quirk in the restart header range check
+/// (two substreams; the second carries the mono presentation with
+/// `max_channel == min_channel - 1`).
 #[test]
 fn truehd_mono_1726_bit_exact() {
     let path = fate("truehd/ticket-1726-monocut.thd");
     let decoded = decode(&path, &registrars(), MediaType::Audio, 0);
     assert_eq!(decoded.params.channels, Some(1), "channel count");
     assert_eq!(decoded.params.sample_rate, Some(48_000), "sample rate");
+    let ours = pcm_bytes(&decoded);
+    assert_eq!(ours.len(), ffmpeg_pcm_len(&path, 4), "pcm byte count");
+    assert_eq!(
+        refcheck::md5_hex(&ours),
+        ffmpeg_pcm_md5(&path, 4),
+        "pcm md5 differs from FFmpeg"
+    );
+}
 
-    let total: usize = decoded
-        .frames
-        .iter()
-        .map(|f| match f {
-            Frame::Audio(a) => a.samples as usize,
-            _ => 0,
-        })
-        .sum();
-    // 805 AUs × 40 samples.
-    assert_eq!(total, 32200, "sample count per channel");
-
-    let ff = refcheck::ffmpeg_audio_f32(&path, 0);
-    let ours = interleaved_f32(&decoded);
-    let snr = snr_db(&ff, &ours, 0);
-    assert!(snr >= 190.0, "SNR {snr} dB — not bit-exact");
+/// `spdif-truehd-branch-padding`'s input (tests/fate/spdif.mak:43–44):
+/// 2 ch, 40 AUs with branch padding the decoder must shorten correctly.
+#[test]
+fn truehd_branch_padding_bit_exact() {
+    let path = fate("truehd/spdifenc-branch-padding.thd");
+    let decoded = decode(&path, &registrars(), MediaType::Audio, 0);
+    assert_eq!(decoded.params.channels, Some(2), "channel count");
+    assert_eq!(decoded.params.sample_rate, Some(48_000), "sample rate");
+    let ours = pcm_bytes(&decoded);
+    assert_eq!(ours.len(), ffmpeg_pcm_len(&path, 4), "pcm byte count");
+    assert_eq!(
+        refcheck::md5_hex(&ours),
+        ffmpeg_pcm_md5(&path, 4),
+        "pcm md5 differs from FFmpeg"
+    );
 }
 
 /// FFmpeg's `fate-lossless-meridianaudio`:
@@ -104,52 +135,51 @@ fn mlp_meridian_bit_exact() {
     let decoded = decode(&path, &registrars(), MediaType::Audio, 0);
     assert_eq!(decoded.params.channels, Some(2), "channel count");
     assert_eq!(decoded.params.sample_rate, Some(44_100), "sample rate");
-
-    let total: usize = decoded
-        .frames
-        .iter()
-        .map(|f| match f {
-            Frame::Audio(a) => a.samples as usize,
-            _ => 0,
-        })
-        .sum();
-    // 8967 AUs × 40 samples (the file ends with an 80-byte partial AU the
-    // demuxer drops, same as FFmpeg's parser).
-    assert_eq!(total, 358680, "sample count per channel");
-
-    let ff = refcheck::ffmpeg_audio_f32(&path, 0);
-    let ours = interleaved_f32(&decoded);
-    let snr = snr_db(&ff, &ours, 0);
-    // s16 source: the finite-SNR ceiling is ~98 dB; bit-exactness shows as
-    // SNR far above the lossy threshold.
-    assert!(snr >= 95.0, "SNR {snr} dB — not bit-exact for s16 output");
+    let ours = pcm_bytes(&decoded);
+    assert_eq!(ours.len(), ffmpeg_pcm_len(&path, 2), "pcm byte count");
+    assert_eq!(
+        refcheck::md5_hex(&ours),
+        ffmpeg_pcm_md5(&path, 2),
+        "pcm md5 differs from FFmpeg"
+    );
 }
 
-/// The demuxers must cut the same packets ffprobe reports: packet count and
-/// timestamps (fsprobe: atmos.thd = 128 packets, pts 0..5080 step 40;
-/// luckynight-partial.mlp = 8967 packets, last pts 358640).
+/// The demuxers must cut the same packets ffprobe reports: packet count,
+/// every pts, and the time base (ffprobe: both files demux at 1/48000
+/// with pts stepping by the 40-sample access unit; luckynight at 1/44100
+/// likewise stepping 40 — ffprobe's per-packet time_base for raw MLP/TrueHD
+/// is the source rate set by mlp_read_header).
 #[test]
 fn raw_demuxer_packet_metadata() {
-    for (rel, packets, last_pts) in [
-        ("truehd/atmos.thd", 128usize, 5080i64),
-        ("lossless-audio/luckynight-partial.mlp", 8967, 358640),
+    for (rel, packets, last_pts, rate) in [
+        ("truehd/atmos.thd", 128usize, 5080i64, 48_000u32),
+        ("truehd/spdifenc-branch-padding.thd", 40, 1560, 48_000),
+        ("lossless-audio/luckynight-partial.mlp", 8967, 358640, 44_100),
     ] {
         let path = fate(rel);
-        let decoded_probe = open_first_stream(&path);
+        let (count, pts_list, time_base) = demux_packets(&path);
+        assert_eq!(count, packets, "{rel}: packet count differs from ffprobe");
         assert_eq!(
-            decoded_probe.0, packets,
-            "{rel}: packet count differs from ffprobe"
-        );
-        assert_eq!(
-            decoded_probe.1, last_pts,
+            pts_list.last().copied().unwrap_or(0),
+            last_pts,
             "{rel}: last packet pts differs from ffprobe"
         );
+        // ffprobe reports pts as sample indices at the source rate.
+        assert_eq!(
+            (time_base.0.num, time_base.0.den),
+            (1, i64::from(rate)),
+            "{rel}: time base differs from ffprobe"
+        );
+        // Every packet steps by exactly 40 samples, like ffprobe shows.
+        for pair in pts_list.windows(2) {
+            assert_eq!(pair[1] - pair[0], 40, "{rel}: pts step differs from ffprobe");
+        }
     }
 }
 
-/// Demux `path` with only this crate registered and return
-/// (packet count, last pts) of the first audio stream.
-fn open_first_stream(path: &std::path::Path) -> (usize, i64) {
+/// Demux `path` with only this crate registered; return the packet count,
+/// every pts, and the stream time base.
+fn demux_packets(path: &std::path::Path) -> (usize, Vec<i64>, oxideav_core::TimeBase) {
     use oxideav_core::{ProbeData, RuntimeContext};
     use std::fs::File;
     use std::io::Read;
@@ -184,11 +214,12 @@ fn open_first_stream(path: &std::path::Path) -> (usize, i64) {
         .containers
         .open_demuxer(&format, Box::new(file), &ctx.codecs)
         .unwrap_or_else(|e| panic!("open {format}: {e}"));
+    let time_base = demuxer.streams()[0].time_base;
     let mut count = 0usize;
-    let mut last_pts = 0i64;
+    let mut pts = Vec::new();
     while let Ok(packet) = demuxer.next_packet() {
-        last_pts = packet.pts.unwrap_or(0);
+        pts.push(packet.pts.unwrap_or(0));
         count += 1;
     }
-    (count, last_pts)
+    (count, pts, time_base)
 }
