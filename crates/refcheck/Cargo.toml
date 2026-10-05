@@ -1,0 +1,11 @@
+[package]
+name = "refcheck"
+description = "Test helper: decodes a FATE sample through OxideAV and through FFmpeg, and compares"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+md5 = "0.7"
