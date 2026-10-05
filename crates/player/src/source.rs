@@ -132,7 +132,15 @@ impl Read for ReadAheadSource {
                 return Ok(0);
             }
 
-            self.shared.consumer_cv.wait(&mut state);
+            // Stop: a dropped player must not leave a demuxer blocked here.
+            if state.stop {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "source stopped",
+                ));
+            }
+
+            self.shared.consumer_cv.wait_for(&mut state, Duration::from_millis(100));
         }
     }
 }
@@ -187,12 +195,12 @@ fn worker_loop(mut reader: Box<dyn ReadSeekSend>, shared: Arc<SharedRing>) {
     let mut backoff = Duration::from_millis(50);
     let mut temp_buf = vec![0u8; CHUNK_SIZE];
 
-    loop {
+    'outer: loop {
         let (read_amount, ring_write_offset) = {
             let mut state = shared.state.lock();
 
             if state.stop {
-                break;
+                break 'outer;
             }
 
             if let Some(seek_from) = state.seek_req.take() {
@@ -222,20 +230,25 @@ fn worker_loop(mut reader: Box<dyn ReadSeekSend>, shared: Arc<SharedRing>) {
                 continue;
             }
 
-            if state.eof {
-                shared.worker_cv.wait(&mut state);
-                continue;
-            }
-
             let ahead = (state.head_pos - state.cur_pos) as usize;
-            if ahead >= state.capacity {
-                shared.worker_cv.wait(&mut state);
+            let total_buffered = (state.head_pos - state.tail_pos) as usize;
+            if state.eof {
+                // EOF stands until a seek or a reset; nothing to read.
+                shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
                 continue;
             }
 
-            let total_buffered = (state.head_pos - state.tail_pos) as usize;
-            let available_space = state.capacity - total_buffered;
-            if available_space == 0 && state.cur_pos > state.tail_pos {
+            // Window full and the consumer has not advanced: park on the
+            // worker condvar (the consumer's read/seek notifies it) instead
+            // of spinning through this loop.
+            if ahead >= state.capacity
+                || (state.capacity == total_buffered && state.cur_pos > state.tail_pos)
+            {
+                shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
+                continue;
+            }
+
+            if state.capacity - total_buffered == 0 && state.cur_pos > state.tail_pos {
                 let evict = (state.cur_pos - state.tail_pos) as usize;
                 state.tail_pos += evict as u64;
                 state.ring_start = (state.ring_start + evict) % state.capacity;

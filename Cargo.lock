@@ -82,9 +82,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-mpeg4-idct"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "oxideav-mpeg4video",
+]
+
+[[package]]
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "codec-mpeg4-idct",
  "oxideav-aac",
  "oxideav-ac3",
  "oxideav-adpcm",

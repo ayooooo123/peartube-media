@@ -1,0 +1,13 @@
+[package]
+name = "codec-mpeg4-idct"
+description = "FFmpeg's integer simple IDCT (8-bit MPEG-4/H.263), bit-exact with ff_simple_idct_put_int16_8bit, plus the mpeg4video registry wrapper"
+version.workspace = true
+edition.workspace = true
+# Ports FFmpeg libavcodec/simple_idct.c + simple_idct_template.c
+# (LGPL-2.1-or-later); see src/lib.rs for the provenance header.
+license = "LGPL-2.1-or-later"
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+oxideav-mpeg4video.workspace = true

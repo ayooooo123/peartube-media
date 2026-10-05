@@ -1,41 +1,18 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+//! Subtitle pipeline: packets → cue images → `SubtitleSink::show` at cue
+//! start/end on the clock. Text/ASS cues render through the oxideav-subtitle
+//! compositor; bitmap cues (PGS/VobSub) convert their plane to RGBA.
+
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
-
-use oxideav_core::{Decoder, Frame, Packet, TimeBase};
+use oxideav_core::{Decoder, Frame};
 
 use crate::backend::{Clock, SubtitleImage, SubtitleSink};
+use crate::engine::Lane;
 
-pub struct SubtitleCueEvent {
-    pub start: Duration,
-    pub end: Duration,
-    pub image: SubtitleImage,
-}
-
-pub struct SubtitlePipeline {
-    stopped: Arc<AtomicBool>,
-}
-
-impl SubtitlePipeline {
-    pub fn new() -> Self {
-        Self {
-            stopped: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn stop(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
-    }
-}
-
-impl Default for SubtitlePipeline {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+/// Renders one text/ASS cue onto a video-sized RGBA canvas.
 pub fn render_text_cue(
     cue: &oxideav_core::SubtitleCue,
     video_width: u32,
@@ -54,6 +31,8 @@ pub fn render_text_cue(
     }
 }
 
+/// Converts one bitmap cue (an RGBA/Indexed `VideoFrame`) to a positioned
+/// overlay image.
 pub fn extract_bitmap_cue(
     frame: &oxideav_core::VideoFrame,
     video_width: u32,
@@ -85,67 +64,92 @@ pub fn extract_bitmap_cue(
     }
 }
 
-pub fn run_subtitle_loop(
+/// The subtitle lane's consumer: pulls packets, decodes under `catch_unwind`
+/// (a panicking subtitle decoder drops the cue, never the playback), and
+/// shows/hides cues on the clock. In `realtime == false` every cue is shown
+/// and cleared immediately so captures see the exact cue sequence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_subtitle_loop(
     mut decoder: Box<dyn Decoder>,
     mut sink: Box<dyn SubtitleSink>,
     clock: Arc<dyn Clock>,
-    time_base: TimeBase,
+    time_base: oxideav_core::TimeBase,
     video_width: u32,
     video_height: u32,
     realtime: bool,
-    queue: Arc<Mutex<Vec<Option<Packet>>>>,
-    condvar: Arc<Condvar>,
-    stopped: Arc<AtomicBool>,
+    lane: Arc<Lane>,
+    demux_cv: Arc<parking_lot::Condvar>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let w = video_width.max(320);
     let h = video_height.max(240);
 
     while !stopped.load(Ordering::SeqCst) {
         let packet = {
-            let mut q = queue.lock();
-            while q.is_empty() && !stopped.load(Ordering::SeqCst) {
-                condvar.wait(&mut q);
+            let mut q = lane.queue.lock();
+            loop {
+                match q.first() {
+                    Some(p) if p.stream_index == u32::MAX => {
+                        q.remove(0);
+                        break None;
+                    }
+                    Some(_) => break Some(q.remove(0)),
+                    None => {
+                        if stopped.load(Ordering::SeqCst) {
+                            break None;
+                        }
+                        demux_cv.notify_one();
+                        lane.cv.wait_for(&mut q, Duration::from_millis(100));
+                    }
+                }
             }
-            if stopped.load(Ordering::SeqCst) {
-                break;
-            }
-            if q.is_empty() {
-                continue;
-            }
-            q.remove(0)
         };
-
-        let Some(packet) = packet else {
-            // EOF
-            break;
-        };
+        let Some(packet) = packet else { break };
+        demux_cv.notify_one();
 
         if decoder.send_packet(&packet).is_err() {
             continue;
         }
 
-        while let Ok(frame) = decoder.receive_frame() {
+        loop {
             if stopped.load(Ordering::SeqCst) {
-                break;
+                return;
             }
+            let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
+            let frame = match recv {
+                Ok(Ok(f)) => f,
+                Ok(Err(oxideav_core::Error::NeedMore))
+                | Ok(Err(oxideav_core::Error::Eof)) => break,
+                Ok(Err(_)) | Err(_) => break,
+            };
 
             let (start_pts, end_pts, image) = match frame {
                 Frame::Subtitle(cue) => {
                     let start = Duration::from_micros(cue.start_us.max(0) as u64);
                     let end = Duration::from_micros(cue.end_us.max(cue.start_us) as u64);
-                    let img = render_text_cue(&cue, w, h);
+                    let img = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        render_text_cue(&cue, w, h)
+                    })) {
+                        Ok(img) => img,
+                        Err(_) => continue,
+                    };
                     (start, end, img)
                 }
                 Frame::Video(vf) => {
                     let ticks = vf.pts.or(packet.pts).unwrap_or(0).max(0);
-                    let secs = time_base.seconds_of(ticks);
-                    let start = Duration::from_secs_f64(secs.max(0.0));
+                    let secs = time_base.seconds_of(ticks).max(0.0);
+                    let start = Duration::from_secs_f64(secs);
                     let dur_secs = packet
                         .duration
                         .map(|d| time_base.seconds_of(d.max(0)))
                         .unwrap_or(2.0);
                     let end = start + Duration::from_secs_f64(dur_secs.max(0.5));
-                    let img = extract_bitmap_cue(&vf, w, h);
+                    let img = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        extract_bitmap_cue(&vf, w, h)
+                    })) {
+                        Ok(img) => img,
+                        Err(_) => continue,
+                    };
                     (start, end, img)
                 }
                 _ => continue,
@@ -155,40 +159,36 @@ pub fn run_subtitle_loop(
                 sink.show(&[image], w, h);
                 sink.show(&[], w, h);
             } else {
-                while !stopped.load(Ordering::SeqCst) {
-                    if let Some(now) = clock.now() {
-                        if now >= start_pts {
-                            break;
-                        }
-                        let sleep_dur = (start_pts - now).min(Duration::from_millis(50));
-                        std::thread::sleep(sleep_dur);
-                    } else {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-
-                if stopped.load(Ordering::SeqCst) {
-                    break;
+                // Show at cue start on the clock.
+                if !wait_for(&clock, start_pts, &stopped) {
+                    return;
                 }
                 sink.show(&[image], w, h);
-
-                while !stopped.load(Ordering::SeqCst) {
-                    if let Some(now) = clock.now() {
-                        if now >= end_pts {
-                            break;
-                        }
-                        let sleep_dur = (end_pts - now).min(Duration::from_millis(50));
-                        std::thread::sleep(sleep_dur);
-                    } else {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-
-                if stopped.load(Ordering::SeqCst) {
-                    break;
+                // Hide at cue end.
+                if !wait_for(&clock, end_pts, &stopped) {
+                    return;
                 }
                 sink.show(&[], w, h);
             }
         }
+    }
+}
+
+/// Sleeps until the clock reaches `at`. False when the playback stopped
+/// or rewound before `at` (a seek): the caller re-checks its loop.
+fn wait_for(clock: &Arc<dyn Clock>, at: Duration, stopped: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+    loop {
+        if stopped.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Some(now) = clock.now() else {
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        if now >= at {
+            return true;
+        }
+        let sleep = (at - now).min(Duration::from_millis(50));
+        std::thread::sleep(sleep);
     }
 }

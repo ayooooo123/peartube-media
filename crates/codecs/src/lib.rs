@@ -70,6 +70,9 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_ass::__oxideav_entry,
         oxideav_sub_image::__oxideav_entry,
         oxideav_subtitle::__oxideav_entry,
+        // This workspace's codec-* crates: registered last, so their higher
+        // resolution priority (50 < OxideAV's 100+) wins where both exist.
+        codec_mpeg4_idct::__oxideav_entry,
     ] {
         register(ctx);
     }
