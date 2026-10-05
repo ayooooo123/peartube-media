@@ -1,0 +1,322 @@
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use parking_lot::{Condvar, Mutex};
+
+pub const RING_CAPACITY: usize = 32 * 1024 * 1024; // 32 MiB
+const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB per read
+
+pub trait ReadSeekSend: Read + Seek + Send + 'static {}
+impl<T: Read + Seek + Send + 'static> ReadSeekSend for T {}
+
+struct RingState {
+    buffer: Vec<u8>,
+    capacity: usize,
+    tail_pos: u64,
+    head_pos: u64,
+    cur_pos: u64,
+    ring_start: usize,
+    eof: bool,
+    fatal_error: Option<String>,
+    seek_req: Option<SeekFrom>,
+    seek_res: Option<std::io::Result<u64>>,
+    suspended: bool,
+    stop: bool,
+}
+
+struct SharedRing {
+    state: Mutex<RingState>,
+    consumer_cv: Condvar,
+    worker_cv: Condvar,
+}
+
+pub struct ReadAheadSource {
+    shared: Arc<SharedRing>,
+    worker_thread: Option<JoinHandle<()>>,
+}
+
+impl ReadAheadSource {
+    pub fn new(reader: Box<dyn ReadSeekSend>) -> Self {
+        let shared = Arc::new(SharedRing {
+            state: Mutex::new(RingState {
+                buffer: vec![0u8; RING_CAPACITY],
+                capacity: RING_CAPACITY,
+                tail_pos: 0,
+                head_pos: 0,
+                cur_pos: 0,
+                ring_start: 0,
+                eof: false,
+                fatal_error: None,
+                seek_req: None,
+                seek_res: None,
+                suspended: false,
+                stop: false,
+            }),
+            consumer_cv: Condvar::new(),
+            worker_cv: Condvar::new(),
+        });
+
+        let shared_clone = Arc::clone(&shared);
+        let worker_thread = std::thread::Builder::new()
+            .name("peartube-source-readahead".into())
+            .spawn(move || {
+                worker_loop(reader, shared_clone);
+            })
+            .expect("failed to spawn source read-ahead thread");
+
+        Self {
+            shared,
+            worker_thread: Some(worker_thread),
+        }
+    }
+
+    pub fn suspend(&self) {
+        let mut state = self.shared.state.lock();
+        state.suspended = true;
+        self.shared.worker_cv.notify_all();
+    }
+
+    pub fn resume(&self) {
+        let mut state = self.shared.state.lock();
+        state.suspended = false;
+        self.shared.worker_cv.notify_all();
+    }
+}
+
+impl Drop for ReadAheadSource {
+    fn drop(&mut self) {
+        {
+            let mut state = self.shared.state.lock();
+            state.stop = true;
+            self.shared.worker_cv.notify_all();
+            self.shared.consumer_cv.notify_all();
+        }
+        if let Some(thread) = self.worker_thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Read for ReadAheadSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut state = self.shared.state.lock();
+        loop {
+            if state.cur_pos < state.head_pos {
+                let available = (state.head_pos - state.cur_pos) as usize;
+                let to_read = buf.len().min(available);
+                let offset = ((state.ring_start as u64 + (state.cur_pos - state.tail_pos))
+                    % state.capacity as u64) as usize;
+
+                let first_chunk = to_read.min(state.capacity - offset);
+                buf[..first_chunk].copy_from_slice(&state.buffer[offset..offset + first_chunk]);
+                if to_read > first_chunk {
+                    let second_chunk = to_read - first_chunk;
+                    buf[first_chunk..to_read].copy_from_slice(&state.buffer[..second_chunk]);
+                }
+                state.cur_pos += to_read as u64;
+                self.shared.worker_cv.notify_one();
+                return Ok(to_read);
+            }
+
+            if let Some(err) = &state.fatal_error {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, err.clone()));
+            }
+
+            if state.eof {
+                return Ok(0);
+            }
+
+            self.shared.consumer_cv.wait(&mut state);
+        }
+    }
+}
+
+impl Seek for ReadAheadSource {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let mut state = self.shared.state.lock();
+
+        let target = match pos {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::Current(d) => {
+                if d >= 0 {
+                    Some(state.cur_pos.saturating_add(d as u64))
+                } else {
+                    state.cur_pos.checked_sub((-d) as u64)
+                }
+            }
+            SeekFrom::End(_) => None,
+        };
+
+        if let Some(target_pos) = target {
+            if target_pos >= state.tail_pos && target_pos <= state.head_pos {
+                // Free in-buffer seek!
+                state.cur_pos = target_pos;
+                self.shared.worker_cv.notify_one();
+                return Ok(target_pos);
+            }
+        }
+
+        // Out-of-window or SeekFrom::End seek: request underlying seek
+        state.seek_req = Some(pos);
+        state.seek_res = None;
+        self.shared.worker_cv.notify_one();
+
+        while state.seek_req.is_some() && !state.stop {
+            self.shared.consumer_cv.wait(&mut state);
+        }
+
+        match state.seek_res.take() {
+            Some(Ok(new_pos)) => Ok(new_pos),
+            Some(Err(e)) => Err(e),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "seek interrupted",
+            )),
+        }
+    }
+}
+
+fn worker_loop(mut reader: Box<dyn ReadSeekSend>, shared: Arc<SharedRing>) {
+    let mut failure_start: Option<std::time::Instant> = None;
+    let mut backoff = Duration::from_millis(50);
+    let mut temp_buf = vec![0u8; CHUNK_SIZE];
+
+    loop {
+        let (read_amount, ring_write_offset) = {
+            let mut state = shared.state.lock();
+
+            if state.stop {
+                break;
+            }
+
+            if let Some(seek_from) = state.seek_req.take() {
+                let res = reader.seek(seek_from);
+                match res {
+                    Ok(new_pos) => {
+                        state.tail_pos = new_pos;
+                        state.head_pos = new_pos;
+                        state.cur_pos = new_pos;
+                        state.ring_start = 0;
+                        state.eof = false;
+                        state.fatal_error = None;
+                        failure_start = None;
+                        backoff = Duration::from_millis(50);
+                        state.seek_res = Some(Ok(new_pos));
+                    }
+                    Err(e) => {
+                        state.seek_res = Some(Err(e));
+                    }
+                }
+                shared.consumer_cv.notify_all();
+                continue;
+            }
+
+            if state.suspended {
+                shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
+                continue;
+            }
+
+            if state.eof {
+                shared.worker_cv.wait(&mut state);
+                continue;
+            }
+
+            let ahead = (state.head_pos - state.cur_pos) as usize;
+            if ahead >= state.capacity {
+                shared.worker_cv.wait(&mut state);
+                continue;
+            }
+
+            let total_buffered = (state.head_pos - state.tail_pos) as usize;
+            let available_space = state.capacity - total_buffered;
+            if available_space == 0 && state.cur_pos > state.tail_pos {
+                let evict = (state.cur_pos - state.tail_pos) as usize;
+                state.tail_pos += evict as u64;
+                state.ring_start = (state.ring_start + evict) % state.capacity;
+            }
+
+            let write_room = state.capacity - ((state.head_pos - state.tail_pos) as usize);
+            let to_read = temp_buf.len().min(write_room);
+            let write_offset = ((state.ring_start as u64 + (state.head_pos - state.tail_pos))
+                % state.capacity as u64) as usize;
+            (to_read, write_offset)
+        };
+
+        if read_amount == 0 {
+            continue;
+        }
+
+        let read_result = reader.read(&mut temp_buf[..read_amount]);
+
+        let mut state = shared.state.lock();
+        if state.stop {
+            break;
+        }
+        if state.seek_req.is_some() {
+            continue;
+        }
+
+        match read_result {
+            Ok(0) => {
+                state.eof = true;
+                failure_start = None;
+                shared.consumer_cv.notify_all();
+            }
+            Ok(n) => {
+                let first_chunk = n.min(state.capacity - ring_write_offset);
+                state.buffer[ring_write_offset..ring_write_offset + first_chunk]
+                    .copy_from_slice(&temp_buf[..first_chunk]);
+                if n > first_chunk {
+                    let second_chunk = n - first_chunk;
+                    state.buffer[..second_chunk].copy_from_slice(&temp_buf[first_chunk..n]);
+                }
+                state.head_pos += n as u64;
+                failure_start = None;
+                backoff = Duration::from_millis(50);
+                shared.consumer_cv.notify_all();
+            }
+            Err(e) => {
+                let is_suspended = state.suspended;
+                if failure_start.is_none() {
+                    failure_start = Some(std::time::Instant::now());
+                }
+                let elapsed = failure_start.unwrap().elapsed();
+                if !is_suspended && elapsed > Duration::from_secs(30) {
+                    state.fatal_error = Some(e.to_string());
+                    shared.consumer_cv.notify_all();
+                } else {
+                    let sleep_dur = backoff;
+                    backoff = (backoff * 2).min(Duration::from_millis(1000));
+                    let resume_pos = state.head_pos;
+                    drop(state);
+                    std::thread::sleep(sleep_dur);
+                    let _ = reader.seek(SeekFrom::Start(resume_pos));
+                }
+            }
+        }
+    }
+}
+
+/// Opens a URL (http(s) or file) with read-ahead ring buffering.
+pub fn open_source(url: &str) -> std::io::Result<ReadAheadSource> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let cfg = oxideav_http::HttpConfig::builder()
+            .range_probe(true)
+            .build();
+        let http = oxideav_http::HttpSource::open_with_config(url, &cfg)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        Ok(ReadAheadSource::new(Box::new(http)))
+    } else if let Some(path) = url.strip_prefix("file://") {
+        let file = std::fs::File::open(path)?;
+        Ok(ReadAheadSource::new(Box::new(file)))
+    } else {
+        let file = std::fs::File::open(url)?;
+        Ok(ReadAheadSource::new(Box::new(file)))
+    }
+}
