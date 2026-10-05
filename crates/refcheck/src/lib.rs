@@ -142,11 +142,14 @@ pub fn pack(frame: &VideoFrame, plane_dims: &[(usize, usize)]) -> Vec<u8> {
 }
 
 /// MD5 of every video frame FFmpeg decodes from stream `0:v:nth`, in the
-/// given pixel format, in output order.
+/// given pixel format, in output order. Cropping the bitstream signals (SPS
+/// cropping) applies, as decoders output it; container cropping (MOV `clap`)
+/// does not, because the player applies that at presentation. `-fps_mode
+/// passthrough` keeps FFmpeg from duplicating or dropping frames.
 pub fn ffmpeg_video_md5s(path: &Path, nth: usize, pix_fmt: &str) -> Vec<String> {
     let out = ffmpeg(&[
-        "-i", path.to_str().unwrap(), "-map", &format!("0:v:{nth}"), "-pix_fmt", pix_fmt,
-        "-f", "framemd5", "-",
+        "-apply_cropping", "codec", "-i", path.to_str().unwrap(), "-map", &format!("0:v:{nth}"),
+        "-fps_mode", "passthrough", "-pix_fmt", pix_fmt, "-f", "framemd5", "-",
     ]);
     String::from_utf8(out)
         .unwrap()
