@@ -415,7 +415,9 @@ fn audio_probe() -> i32 {
         }
     }
     let t0 = Instant::now();
-    std::thread::sleep(Duration::from_millis(400));
+    // Give a loaded machine time to drain the queued audio before reading
+    // the clock again.
+    std::thread::sleep(Duration::from_millis(1200));
     let clock_after = clock.now();
     audio.pause();
 

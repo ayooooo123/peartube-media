@@ -45,13 +45,22 @@ impl AndroidBackend {
     }
 
     /// Sets or clears the video window. When clearing, this blocks until
-    /// nothing touches the old window any more: the codec is released or
-    /// reconfigured away from it, any software-path lock/post finished, and
-    /// the backend's own reference is dropped. Android invalidates the
-    /// surface as soon as `SurfaceHolder.Callback.surfaceDestroyed` returns,
-    /// so the caller is safe to release it right after this call returns.
-    /// A later `set_video_window(Some(new))` reconfigures a compressed stream
-    /// on the new window and resumes from the next keyframe.
+    /// nothing touches the old window any more: the codec is stopped and
+    /// released, any software-path lock/post finished (those run under the
+    /// sink's mutex, which this call takes), and the backend's own
+    /// reference is dropped. Android invalidates the surface as soon as
+    /// `SurfaceHolder.Callback.surfaceDestroyed` returns, so the caller is
+    /// safe to release it right after this call returns.
+    ///
+    /// A wedged decoder (a codec whose binder calls never return — vendor
+    /// emulator decoders can do this) is the one exception: the output
+    /// thread is abandoned after a 500 ms wait instead of hanging the
+    /// caller, and the pending binder call aborts when the codec is
+    /// dropped. On healthy hardware the codec is always released before
+    /// this returns.
+    ///
+    /// A later `set_video_window(Some(new))` reconfigures a compressed
+    /// stream on the new window and resumes from the next keyframe.
     pub fn set_video_window(&self, window: Option<NativeWindow>) {
         if window.is_some() {
             *self.shared.video_window.write() = window;
