@@ -80,6 +80,13 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Tests decode real samples; unoptimized codecs make them crawl.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
 # BEGIN pin-oxideav
 [patch.crates-io]
 oxideav-aac = { git = "https://github.com/OxideAV/oxideav-aac", rev = "fe8e4986fc748004d14e634428a9b2495ce6ed26" }
