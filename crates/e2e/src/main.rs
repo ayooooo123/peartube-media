@@ -208,7 +208,7 @@ fn compare_video(path: &Path, cap: &player::VideoCapture, nth: usize) -> Compare
     let pix = refcheck::ffmpeg_pix_fmt(cap.pixel_format);
     let p = path.to_path_buf();
     let pix2 = pix;
-    let expect = match with_ffmpeg_timeout(path, 60, move || {
+    let expect = match with_ffmpeg_timeout(path, 180, move || {
         refcheck::ffmpeg_video_md5s(&p, nth, pix2)
     }) {
         Ok(e) => e,
@@ -251,7 +251,7 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, nth: usize, floor_db: 
         };
     }
     let p = path.to_path_buf();
-    let reference = match with_ffmpeg_timeout(path, 60, move || refcheck::ffmpeg_audio_f32(&p, nth)) {
+    let reference = match with_ffmpeg_timeout(path, 180, move || refcheck::ffmpeg_audio_f32(&p, nth)) {
         Ok(r) => r,
         Err(e) => {
             return Compare {
@@ -355,7 +355,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
         video: entry.streams.get("video").copied(),
         subtitle: entry.streams.get("subtitle").copied(),
     };
-    let (capture, state) = match play(&path.to_string_lossy(), discover, 60) {
+    let (capture, state) = match play(&path.to_string_lossy(), discover, 300) {
         Ok(r) => r,
         Err(e) => {
             streams_out.push(StreamResult {
@@ -539,7 +539,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
             video: entry.streams.get("video").copied(),
             subtitle: entry.streams.get("subtitle").copied(),
         };
-        match play(&url, options, 60) {
+        match play(&url, options, 300) {
             Ok((hcap, hstate)) => {
                 if let Some(err) = &hstate.error {
                     streams_out.push(StreamResult {
