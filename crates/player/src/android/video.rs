@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct SendMediaCodec(pub MediaCodec);
 unsafe impl Send for SendMediaCodec {}
@@ -24,6 +24,10 @@ pub struct AndroidVideoSink {
     clock: Arc<dyn Clock>,
     codec: Option<Arc<SendMediaCodec>>,
     output_thread: Option<JoinHandle<()>>,
+    /// The output thread's completion receiver; teardown waits on it
+    /// briefly instead of hanging on `join` for a wedged codec. The
+    /// thread sends on drop via `DoneSignal`.
+    output_done: Option<std::sync::mpsc::Receiver<()>>,
     stop_output_signal: Arc<AtomicBool>,
     midstream_error: Arc<Mutex<Option<String>>>,
     is_playing: Arc<AtomicBool>,
@@ -35,6 +39,11 @@ pub struct AndroidVideoSink {
     /// holds packets until the next keyframe instead of erroring, so the
     /// rebuilt codec starts from a clean point.
     awaiting_keyframe: bool,
+    /// The type-derived decoder stalled and we retried on the software one.
+    tried_software_decoder: bool,
+    /// The type-derived decoder for this stream proved unusable (stalled);
+    /// later re-opens (new window, resume) go straight to the software one.
+    prefer_software: bool,
 }
 
 impl AndroidVideoSink {
@@ -44,6 +53,7 @@ impl AndroidVideoSink {
             clock,
             codec: None,
             output_thread: None,
+            output_done: None,
             stop_output_signal: Arc::new(AtomicBool::new(false)),
             midstream_error: Arc::new(Mutex::new(None)),
             is_playing: Arc::new(AtomicBool::new(true)),
@@ -52,17 +62,42 @@ impl AndroidVideoSink {
             last_compressed_params: None,
             is_compressed: false,
             awaiting_keyframe: false,
+            tried_software_decoder: false,
+            prefer_software: false,
         }
     }
 
     pub fn teardown_codec(&mut self) {
         self.stop_output_signal.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.output_thread.take() {
-            let _ = handle.join();
-        }
         if let Some(codec) = self.codec.take() {
             let _ = codec.0.stop();
-            // Dropping codec releases AMediaCodec
+            // Dropping codec releases AMediaCodec (aborts a wedged
+            // dequeue call in the output thread).
+        }
+        if let Some(handle) = self.output_thread.take() {
+            // Wait briefly for the output thread: on a healthy codec it
+            // exits within one 10 ms dequeue timeout. A wedged codec can
+            // block its dequeue in binder forever; waiting would hang
+            // `set_video_window(None)`, which must return so the app can
+            // release the surface. Abandon the thread in that case — it
+            // ends on its own once its `Arc<SendMediaCodec>` is gone and
+            // the pending binder call aborts.
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                match self
+                    .output_done
+                    .as_ref()
+                    .and_then(|rx| rx.recv_timeout(Duration::from_millis(20)).ok())
+                {
+                    Some(()) => {
+                        let _ = handle.join();
+                        break;
+                    }
+                    None if Instant::now() < deadline => continue,
+                    None => break,
+                }
+            }
+            self.output_done = None;
         }
     }
 
@@ -102,14 +137,222 @@ impl AndroidVideoSink {
         }
     }
 
+    /// Test hook: prefer the platform's software decoder for this stream
+    /// (`c2.android.*`) instead of the highest-ranked decoder for the type.
+    /// The emulator's vendor decoders can wedge; a real device never needs
+    /// this.
+    pub fn prefer_software_decoder(&mut self, prefer: bool) {
+        self.prefer_software = prefer;
+    }
+
     fn current_window(&self) -> Option<NativeWindow> {
         self.backend.video_window.read().clone()
+    }
+
+    /// Builds and starts the codec. `force_software` uses the platform's
+    /// software decoder ("c2.android.*") instead of the highest-ranked
+    /// decoder for the type — the retry path when that one never accepts
+    /// input (the emulator's vendor decoders can do this).
+    fn open_compressed_inner(&mut self, params: &CodecParameters, force_software: bool) -> bool {
+        self.teardown_codec();
+        self.is_compressed = true;
+        self.last_compressed_params = Some(params.clone());
+
+        if self.backend.is_suspended.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let window = match self.current_window() {
+            Some(w) => w,
+            None => return false,
+        };
+
+        let mime = match codec_id_to_mime(&params.codec_id.0) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        let mut csd0 = Vec::new();
+        let mut csd1 = Vec::new();
+        let mut nal_len_size = 4;
+
+        if mime == "video/avc" {
+            if !params.extradata.is_empty() {
+                if let Some((s0, s1, nls)) = parse_avcc_to_annex_b(&params.extradata) {
+                    csd0 = s0;
+                    csd1 = s1;
+                    nal_len_size = nls;
+                }
+            }
+        } else if mime == "video/hevc" {
+            if !params.extradata.is_empty() {
+                if let Some((s0, nls)) = parse_hvcc_to_annex_b(&params.extradata) {
+                    csd0 = s0;
+                    nal_len_size = nls;
+                }
+            }
+        } else if !params.extradata.is_empty() {
+            csd0 = params.extradata.clone();
+        }
+        self.nal_length_size = nal_len_size;
+
+        let codec = if force_software {
+            match software_decoder_name(mime).and_then(MediaCodec::from_codec_name) {
+                Some(c) => c,
+                None => return false,
+            }
+        } else {
+            match MediaCodec::from_decoder_type(mime) {
+                Some(c) => c,
+                None => return false,
+            }
+        };
+
+        let mut format = MediaFormat::new();
+        format.set_str("mime", mime);
+        if let Some(w) = params.width {
+            format.set_i32("width", w as i32);
+        }
+        if let Some(h) = params.height {
+            format.set_i32("height", h as i32);
+        }
+        if !csd0.is_empty() {
+            format.set_buffer("csd-0", &csd0);
+        }
+        if !csd1.is_empty() {
+            format.set_buffer("csd-1", &csd1);
+        }
+
+        // A codec we just tore down releases the surface asynchronously
+        // (`stop` can take seconds); configuring the next decoder on the
+        // same window then fails with EINVAL ("already connected"). Retry
+        // on a fresh codec for up to ~3 s.
+        let mut configured = false;
+        let mut codec_opt = Some(codec);
+        for attempt in 0..6u32 {
+            let codec = codec_opt.as_ref().unwrap();
+            match codec.configure(&format, Some(&window), MediaCodecDirection::Decoder) {
+                Ok(()) => {
+                    configured = true;
+                    break;
+                }
+                Err(_) if attempt < 5 => {
+                    // Recreate: a failed configure leaves the codec unusable.
+                    let mime_s = mime;
+                    codec_opt = if force_software {
+                        software_decoder_name(mime_s).and_then(MediaCodec::from_codec_name)
+                    } else {
+                        MediaCodec::from_decoder_type(mime_s)
+                    };
+                    if codec_opt.is_none() {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                Err(_) => return false,
+            }
+        }
+        if !configured {
+            return false;
+        }
+        let codec = codec_opt.unwrap();
+
+        if codec.start().is_err() {
+            return false;
+        }
+
+        let codec_arc = Arc::new(SendMediaCodec(codec));
+        self.codec = Some(codec_arc.clone());
+        self.stop_output_signal.store(false, Ordering::SeqCst);
+        *self.midstream_error.lock() = None;
+        self.awaiting_keyframe = false;
+
+        // Output thread
+        let thread_codec = codec_arc;
+        let thread_clock = self.clock.clone();
+        let thread_stop = self.stop_output_signal.clone();
+        let thread_err = self.midstream_error.clone();
+        let thread_playing = self.is_playing.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        self.output_done = Some(done_rx);
+
+        let handle = std::thread::spawn(move || {
+            let _done = DoneSignal(done_tx);
+            while !thread_stop.load(Ordering::Relaxed) {
+                if !thread_playing.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+
+                match thread_codec
+                    .0
+                    .dequeue_output_buffer(Duration::from_millis(10))
+                {
+                    Ok(DequeuedOutputBufferInfoResult::Buffer(out_buf)) => {
+                        let pts_us = out_buf.info().presentation_time_us();
+                        let pts = Duration::from_micros(pts_us.max(0) as u64);
+                        let target_mono_ns = thread_clock.monotonic_ns_at(pts);
+                        let now_mono_ns = monotonic_now_ns();
+
+                        if let Some(target_ns) = target_mono_ns {
+                            if target_ns < now_mono_ns - 30_000_000 {
+                                // Drop late buffer
+                                let _ = thread_codec.0.release_output_buffer(out_buf, false);
+                            } else {
+                                let _ = thread_codec
+                                    .0
+                                    .release_output_buffer_at_time(out_buf, target_ns);
+                            }
+                        } else {
+                            let _ = thread_codec.0.release_output_buffer(out_buf, true);
+                        }
+                    }
+                    Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {}
+                    Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {}
+                    Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged) => {}
+                    Err(e) => {
+                        *thread_err.lock() =
+                            Some(format!("MediaCodec dequeue_output_buffer error: {e:?}"));
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.output_thread = Some(handle);
+        true
+    }
+}
+
+/// Sends on the done channel when dropped, i.e. when the output thread's
+/// loop exits (normally, on error, or after its pending binder call
+/// finally aborts). The teardown half is the `Receiver`.
+struct DoneSignal(std::sync::mpsc::Sender<()>);
+impl Drop for DoneSignal {
+    fn drop(&mut self) {
+        // The receiver half may already be gone (teardown gave up); ignore.
+        let _ = self.0.send(());
     }
 }
 
 impl Drop for AndroidVideoSink {
     fn drop(&mut self) {
         self.teardown_codec();
+    }
+}
+
+/// Well-known names of Android's software (c2.android.*) decoders, used as
+/// a fallback when the type-derived (highest-ranked) decoder is unusable.
+fn software_decoder_name(mime: &str) -> Option<&'static str> {
+    match mime {
+        "video/avc" => Some("c2.android.avc.decoder"),
+        "video/hevc" => Some("c2.android.hevc.decoder"),
+        "video/x-vnd.on2.vp8" => Some("c2.android.vp8.decoder"),
+        "video/x-vnd.on2.vp9" => Some("c2.android.vp9.decoder"),
+        "video/av01" => Some("c2.android.av1.decoder"),
+        "video/mp4v-es" => Some("c2.android.mpeg4.decoder"),
+        "video/3gpp" => Some("c2.android.h263.decoder"),
+        _ => None,
     }
 }
 
@@ -260,136 +503,11 @@ fn convert_packet_to_annex_b(data: &[u8], nal_length_size: usize) -> Vec<u8> {
 
 impl VideoSink for AndroidVideoSink {
     fn open_compressed(&mut self, params: &CodecParameters) -> bool {
-        self.teardown_codec();
-        self.is_compressed = true;
-        self.last_compressed_params = Some(params.clone());
-
-        if self.backend.is_suspended.load(Ordering::SeqCst) {
-            return false;
+        let force = self.prefer_software;
+        if !force {
+            self.tried_software_decoder = false;
         }
-
-        let window = match self.current_window() {
-            Some(w) => w,
-            None => return false,
-        };
-
-        let mime = match codec_id_to_mime(&params.codec_id.0) {
-            Some(m) => m,
-            None => return false,
-        };
-
-        let mut csd0 = Vec::new();
-        let mut csd1 = Vec::new();
-        let mut nal_len_size = 4;
-
-        if mime == "video/avc" {
-            if !params.extradata.is_empty() {
-                if let Some((s0, s1, nls)) = parse_avcc_to_annex_b(&params.extradata) {
-                    csd0 = s0;
-                    csd1 = s1;
-                    nal_len_size = nls;
-                }
-            }
-        } else if mime == "video/hevc" {
-            if !params.extradata.is_empty() {
-                if let Some((s0, nls)) = parse_hvcc_to_annex_b(&params.extradata) {
-                    csd0 = s0;
-                    nal_len_size = nls;
-                }
-            }
-        } else if !params.extradata.is_empty() {
-            csd0 = params.extradata.clone();
-        }
-        self.nal_length_size = nal_len_size;
-
-        let codec = match MediaCodec::from_decoder_type(mime) {
-            Some(c) => c,
-            None => return false,
-        };
-
-        let mut format = MediaFormat::new();
-        format.set_str("mime", mime);
-        if let Some(w) = params.width {
-            format.set_i32("width", w as i32);
-        }
-        if let Some(h) = params.height {
-            format.set_i32("height", h as i32);
-        }
-        if !csd0.is_empty() {
-            format.set_buffer("csd-0", &csd0);
-        }
-        if !csd1.is_empty() {
-            format.set_buffer("csd-1", &csd1);
-        }
-
-        if codec
-            .configure(&format, Some(&window), MediaCodecDirection::Decoder)
-            .is_err()
-        {
-            return false;
-        }
-
-        if codec.start().is_err() {
-            return false;
-        }
-
-        let codec_arc = Arc::new(SendMediaCodec(codec));
-        self.codec = Some(codec_arc.clone());
-        self.stop_output_signal.store(false, Ordering::SeqCst);
-        *self.midstream_error.lock() = None;
-        self.awaiting_keyframe = false;
-
-        // Output thread
-        let thread_codec = codec_arc;
-        let thread_clock = self.clock.clone();
-        let thread_stop = self.stop_output_signal.clone();
-        let thread_err = self.midstream_error.clone();
-        let thread_playing = self.is_playing.clone();
-
-        let handle = std::thread::spawn(move || {
-            while !thread_stop.load(Ordering::Relaxed) {
-                if !thread_playing.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-
-                match thread_codec
-                    .0
-                    .dequeue_output_buffer(Duration::from_millis(10))
-                {
-                    Ok(DequeuedOutputBufferInfoResult::Buffer(out_buf)) => {
-                        let pts_us = out_buf.info().presentation_time_us();
-                        let pts = Duration::from_micros(pts_us.max(0) as u64);
-                        let target_mono_ns = thread_clock.monotonic_ns_at(pts);
-                        let now_mono_ns = monotonic_now_ns();
-
-                        if let Some(target_ns) = target_mono_ns {
-                            if target_ns < now_mono_ns - 30_000_000 {
-                                // Drop late buffer
-                                let _ = thread_codec.0.release_output_buffer(out_buf, false);
-                            } else {
-                                let _ = thread_codec
-                                    .0
-                                    .release_output_buffer_at_time(out_buf, target_ns);
-                            }
-                        } else {
-                            let _ = thread_codec.0.release_output_buffer(out_buf, true);
-                        }
-                    }
-                    Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {}
-                    Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {}
-                    Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged) => {}
-                    Err(e) => {
-                        *thread_err.lock() =
-                            Some(format!("MediaCodec dequeue_output_buffer error: {e:?}"));
-                        break;
-                    }
-                }
-            }
-        });
-
-        self.output_thread = Some(handle);
-        true
+        self.open_compressed_inner(params, force)
     }
 
     fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError> {
@@ -429,9 +547,11 @@ impl VideoSink for AndroidVideoSink {
             packet.data.clone()
         };
 
-        // Dequeue input buffer with timeout
+        // Dequeue input buffer. A working decoder can legitimately block
+        // for seconds when it is still busy with previous input, so wait
+        // up to 5 s before declaring the stream unplayable on hardware.
         let start_dequeue = std::time::Instant::now();
-        let timeout = Duration::from_millis(500);
+        let timeout = Duration::from_secs(5);
         let mut input_buf = None;
 
         while start_dequeue.elapsed() < timeout {
@@ -471,6 +591,20 @@ impl VideoSink for AndroidVideoSink {
                 }
                 self.teardown_codec();
                 self.awaiting_keyframe = self.is_compressed;
+                // The highest-ranked decoder for the type never accepted
+                // input (the emulator's vendor decoders can do this). Retry
+                // once on the platform's software decoder before reporting
+                // the stream unplayable on hardware; later re-opens keep
+                // using it for this stream.
+                if !self.tried_software_decoder {
+                    self.tried_software_decoder = true;
+                    self.prefer_software = true;
+                    if let Some(params) = self.last_compressed_params.clone() {
+                        if self.open_compressed_inner(&params, true) {
+                            return self.push_packet(packet, pts);
+                        }
+                    }
+                }
                 return Err(SinkError::Fallback(
                     "input buffer dequeue timed out".into(),
                 ));

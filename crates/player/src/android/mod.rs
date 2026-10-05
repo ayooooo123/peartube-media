@@ -9,3 +9,4 @@ pub mod subtitle;
 pub mod video;
 
 pub use backend::AndroidBackend;
+pub use video::AndroidVideoSink;

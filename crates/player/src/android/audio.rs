@@ -130,7 +130,9 @@ impl AudioSink for AndroidAudioSink {
             }
         }
 
-        // Blocking write
+        // Blocking write. ndk 0.9 maps any non-zero AAudio result to an
+        // error, but `AAudioStream_write` returns the positive frame count
+        // on success; treat positive results as success.
         let mut total_written = 0usize;
         let timeout_ns = 1_000_000_000i64; // 1 second timeout per chunk
 
@@ -140,8 +142,12 @@ impl AudioSink for AndroidAudioSink {
             let slice_offset = offset_frames * channels;
             let ptr = unsafe { pcm.as_ptr().add(slice_offset) };
 
-            let written = unsafe { stream.0.write(ptr.cast(), remaining_frames, timeout_ns) }
-                .map_err(|e| SinkError::Fatal(format!("AAudioStream write error: {e:?}")))?;
+            let written = unsafe { stream.0.write(ptr.cast(), remaining_frames, timeout_ns) };
+            let written = match written {
+                Ok(n) => n as usize,
+                Err(ndk::audio::AudioError::__Unknown(code)) if code > 0 => code as usize,
+                Err(e) => return Err(SinkError::Fatal(format!("AAudioStream write error: {e:?}"))),
+            };
 
             if written == 0 {
                 break;
