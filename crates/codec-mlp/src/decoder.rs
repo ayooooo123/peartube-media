@@ -292,6 +292,7 @@ impl MlpDecoder {
     }
 
     /// `read_restart_header`.
+    #[allow(clippy::too_many_arguments)]
     fn read_restart_header(
         &mut self,
         gbp: &mut BitReader,
@@ -1347,6 +1348,7 @@ enum BlockOutcome {
 
 /// `thd_channel_layout_extract_channel`: the `index`-th channel of `mask`
 /// in `thd_channel_order`.
+#[allow(clippy::manual_is_multiple_of)]
 fn thd_channel_layout_extract_channel(mask: u64, mut index: usize) -> Option<u8> {
     if u64::from(mask_popcount(mask)) <= index as u64 {
         return None;

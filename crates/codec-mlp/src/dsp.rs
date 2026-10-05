@@ -20,6 +20,7 @@ pub fn msb_mask(bits: u32) -> i32 {
 /// `MAX_BLOCKSIZE + MAX_FIR_ORDER` entries (FFmpeg splits one
 /// `[2][MAX_BLOCKSIZE + MAX_FIR_ORDER]` buffer). `samples` is the
 /// block-strided column of the sample buffer for this channel.
+#[allow(clippy::too_many_arguments)]
 pub fn mlp_filter_channel(
     firbuf: &mut [i32],
     iirbuf: &mut [i32],
@@ -79,6 +80,7 @@ pub fn mlp_filter_channel(
 /// `bypassed_lsbs` likewise (LSBs for matrix `mat` are at index `mat`).
 /// `index` is FFmpeg's `num_primitive_matrices - mat` (drives the noise
 /// stepping).
+#[allow(clippy::too_many_arguments)]
 pub fn mlp_rematrix_channel(
     samples: &mut [[i32; MAX_CHANNELS]],
     coeffs: &[i32; MAX_CHANNELS],
@@ -114,6 +116,7 @@ pub fn mlp_rematrix_channel(
 /// `ff_mlp_pack_output`: interleave the sample buffer into `data` with the
 /// `ch_assign` channel permutation, applying output shifts, and update the
 /// running lossless check data.
+#[allow(clippy::too_many_arguments)]
 pub fn pack_output(
     mut lossless_check_data: i32,
     blockpos: usize,

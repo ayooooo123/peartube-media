@@ -138,36 +138,32 @@ pub fn mlp_samplerate(ratebits: u32) -> u32 {
 /// `truehd_channels`: sum of `thd_chancount[i] * ((chanmap >> i) & 1)`.
 #[inline]
 pub fn truehd_channels(chanmap: u32) -> u32 {
-    let mut channels = 0;
-    for i in 0..13 {
-        channels += u32::from(THD_CHANCOUNT[i]) * ((chanmap >> i) & 1);
-    }
-    channels
+    THD_CHANCOUNT
+        .iter()
+        .enumerate()
+        .map(|(i, &count)| u32::from(count) * ((chanmap >> i) & 1))
+        .sum()
 }
 
 /// `truehd_layout`: OR of `thd_layout[i]` for every set bit of `chanmap`.
 #[inline]
 pub fn truehd_layout(chanmap: u32) -> u64 {
-    let mut layout = 0u64;
-    for i in 0..13 {
-        if (chanmap >> i) & 1 != 0 {
-            layout |= THD_LAYOUT[i];
-        }
-    }
-    layout
+    THD_LAYOUT
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| (chanmap >> i) & 1 != 0)
+        .fold(0u64, |layout, (_, &bits)| layout | bits)
 }
 
 /// `layout_truehd`: inverse of [`truehd_layout`] (used by parsers/muxers).
 #[inline]
 #[allow(dead_code)]
 pub fn layout_truehd(layout: u64) -> u32 {
-    let mut chanmap = 0;
-    for i in 0..13 {
-        if layout & THD_LAYOUT[i] == THD_LAYOUT[i] {
-            chanmap |= 1 << i;
-        }
-    }
-    chanmap
+    THD_LAYOUT
+        .iter()
+        .enumerate()
+        .filter(|&(_, &bits)| layout & bits == bits)
+        .fold(0u32, |chanmap, (i, _)| chanmap | (1 << i))
 }
 
 #[cfg(test)]

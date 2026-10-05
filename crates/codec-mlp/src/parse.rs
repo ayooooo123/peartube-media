@@ -94,7 +94,7 @@ pub fn read_major_sync(buf: &[u8], gb: &mut BitReader) -> oxideav_core::Result<M
         ));
     }
 
-    if gb.get_bits(24) != 0xf872_6f {
+    if gb.get_bits(24) != 0x00f8_726f {
         return Err(Error::InvalidData("mlp: bad sync word".into()));
     }
 
