@@ -24,6 +24,10 @@ struct RingState {
     seek_res: Option<std::io::Result<u64>>,
     suspended: bool,
     stop: bool,
+    /// The worker is inside a read or seek of the underlying source, with
+    /// the ring unlocked. Over a stalled network that call blocks for as long
+    /// as the peer withholds bytes.
+    io: bool,
     /// The consumer is blocked in `read` or `seek` waiting for bytes that
     /// have not arrived: the ring is empty and the source is not at its end.
     starved: bool,
@@ -51,10 +55,26 @@ impl SharedRing {
             MutexGuard::unlocked(state, || hook(starved));
         }
     }
+
+    /// Ends the read-ahead for good: the worker exits at its next look at
+    /// the ring, and reads and seeks fail instead of waiting for bytes.
+    fn stop(&self) -> MutexGuard<'_, RingState> {
+        let mut state = self.state.lock();
+        state.stop = true;
+        self.worker_cv.notify_all();
+        self.consumer_cv.notify_all();
+        state
+    }
+}
+
+/// What reads and seeks return once the ring is stopped. Not `Interrupted`:
+/// `read_exact` and the demuxers' read loops retry that kind, and would spin.
+fn stopped_error() -> std::io::Error {
+    std::io::Error::other("source stopped")
 }
 
 /// The engine's handle on a source it handed to a demuxer: starvation
-/// reports and suspend/resume of the read-ahead.
+/// reports, suspend/resume of the read-ahead, and stopping it.
 #[derive(Clone)]
 pub struct SourceMonitor {
     shared: Arc<SharedRing>,
@@ -79,6 +99,13 @@ impl SourceMonitor {
         state.suspended = false;
         self.shared.worker_cv.notify_all();
     }
+
+    /// Stops the source (the player is going away): a demuxer blocked in a
+    /// read or seek gets an error instead of waiting for bytes that may never
+    /// come, and every later read or seek fails.
+    pub fn stop(&self) {
+        drop(self.shared.stop());
+    }
 }
 
 pub struct ReadAheadSource {
@@ -102,6 +129,7 @@ impl ReadAheadSource {
                 seek_res: None,
                 suspended: false,
                 stop: false,
+                io: false,
                 starved: false,
             }),
             consumer_cv: Condvar::new(),
@@ -134,14 +162,22 @@ impl ReadAheadSource {
 
 impl Drop for ReadAheadSource {
     fn drop(&mut self) {
-        {
-            let mut state = self.shared.state.lock();
-            state.stop = true;
-            self.shared.worker_cv.notify_all();
-            self.shared.consumer_cv.notify_all();
-        }
+        let in_io = {
+            let mut state = self.shared.stop();
+            if state.io {
+                // The worker sits in a read or seek of the underlying source,
+                // which over a stalled network returns only when the peer
+                // sends or gives up: leave it (it exits as soon as the call
+                // returns, without touching the ring) and free the ring now.
+                state.buffer = Vec::new();
+            }
+            state.io
+        };
         if let Some(thread) = self.worker_thread.take() {
-            let _ = thread.join();
+            if !in_io {
+                // Parked on the ring: it sees the stop right away.
+                let _ = thread.join();
+            }
         }
     }
 }
@@ -154,6 +190,11 @@ impl Read for ReadAheadSource {
 
         let mut state = self.shared.state.lock();
         let result = loop {
+            // Stopped: a dropped player must not leave a demuxer blocked here.
+            if state.stop {
+                break Err(stopped_error());
+            }
+
             if state.cur_pos < state.head_pos {
                 let available = (state.head_pos - state.cur_pos) as usize;
                 let to_read = buf.len().min(available);
@@ -179,14 +220,6 @@ impl Read for ReadAheadSource {
                 break Ok(0);
             }
 
-            // Stop: a dropped player must not leave a demuxer blocked here.
-            if state.stop {
-                break Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "source stopped",
-                ));
-            }
-
             // Nothing buffered and more to come: the reader is starved. The
             // hook runs unlocked, so look again before waiting.
             if !state.starved {
@@ -203,6 +236,9 @@ impl Read for ReadAheadSource {
 impl Seek for ReadAheadSource {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let mut state = self.shared.state.lock();
+        if state.stop {
+            return Err(stopped_error());
+        }
 
         let target = match pos {
             SeekFrom::Start(n) => Some(n),
@@ -225,7 +261,8 @@ impl Seek for ReadAheadSource {
             }
         }
 
-        // Out-of-window or SeekFrom::End seek: request underlying seek
+        // Out-of-window or SeekFrom::End seek: request underlying seek. The
+        // worker clears the request once the result is in.
         state.seek_req = Some(pos);
         state.seek_res = None;
         self.shared.worker_cv.notify_one();
@@ -244,10 +281,8 @@ impl Seek for ReadAheadSource {
         match state.seek_res.take() {
             Some(Ok(new_pos)) => Ok(new_pos),
             Some(Err(e)) => Err(e),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "seek interrupted",
-            )),
+            // Stopped before the worker got to it.
+            None => Err(stopped_error()),
         }
     }
 }
@@ -257,79 +292,80 @@ fn worker_loop(mut reader: Box<dyn ReadSeekSend>, shared: Arc<SharedRing>) {
     let mut backoff = Duration::from_millis(50);
     let mut temp_buf = vec![0u8; CHUNK_SIZE];
 
-    'outer: loop {
-        let (read_amount, ring_write_offset) = {
-            let mut state = shared.state.lock();
+    let mut state = shared.state.lock();
+    loop {
+        if state.stop {
+            break;
+        }
 
+        if let Some(seek_from) = state.seek_req {
+            // An HTTP source drains a short forward hop from its open
+            // response, which blocks while the peer withholds bytes: seek
+            // with the ring unlocked so a stop never waits behind it. The
+            // request stays posted until its result is in.
+            let res = source_io(&mut state, || reader.seek(seek_from));
             if state.stop {
-                break 'outer;
+                break;
             }
-
-            if let Some(seek_from) = state.seek_req.take() {
-                let res = reader.seek(seek_from);
-                match res {
-                    Ok(new_pos) => {
-                        state.tail_pos = new_pos;
-                        state.head_pos = new_pos;
-                        state.cur_pos = new_pos;
-                        state.ring_start = 0;
-                        state.eof = false;
-                        state.fatal_error = None;
-                        failure_start = None;
-                        backoff = Duration::from_millis(50);
-                        state.seek_res = Some(Ok(new_pos));
-                    }
-                    Err(e) => {
-                        state.seek_res = Some(Err(e));
-                    }
+            match res {
+                Ok(new_pos) => {
+                    state.tail_pos = new_pos;
+                    state.head_pos = new_pos;
+                    state.cur_pos = new_pos;
+                    state.ring_start = 0;
+                    state.eof = false;
+                    state.fatal_error = None;
+                    failure_start = None;
+                    backoff = Duration::from_millis(50);
+                    state.seek_res = Some(Ok(new_pos));
                 }
-                shared.consumer_cv.notify_all();
-                continue;
+                Err(e) => {
+                    state.seek_res = Some(Err(e));
+                }
             }
+            state.seek_req = None;
+            shared.consumer_cv.notify_all();
+            continue;
+        }
 
-            if state.suspended {
-                shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
-                continue;
-            }
+        if state.suspended {
+            shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
+            continue;
+        }
 
-            let ahead = (state.head_pos - state.cur_pos) as usize;
-            let total_buffered = (state.head_pos - state.tail_pos) as usize;
-            if state.eof {
-                // EOF stands until a seek or a reset; nothing to read.
-                shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
-                continue;
-            }
+        let ahead = (state.head_pos - state.cur_pos) as usize;
+        let total_buffered = (state.head_pos - state.tail_pos) as usize;
+        if state.eof {
+            // EOF stands until a seek or a reset; nothing to read.
+            shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
+            continue;
+        }
 
-            // Window full and the consumer has not advanced: park on the
-            // worker condvar (the consumer's read/seek notifies it) instead
-            // of spinning through this loop.
-            if ahead >= state.capacity
-                || (state.capacity == total_buffered && state.cur_pos > state.tail_pos)
-            {
-                shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
-                continue;
-            }
+        // Window full and the consumer has not advanced: park on the
+        // worker condvar (the consumer's read/seek notifies it) instead
+        // of spinning through this loop.
+        if ahead >= state.capacity
+            || (state.capacity == total_buffered && state.cur_pos > state.tail_pos)
+        {
+            shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
+            continue;
+        }
 
-            if state.capacity - total_buffered == 0 && state.cur_pos > state.tail_pos {
-                let evict = (state.cur_pos - state.tail_pos) as usize;
-                state.tail_pos += evict as u64;
-                state.ring_start = (state.ring_start + evict) % state.capacity;
-            }
+        if state.capacity - total_buffered == 0 && state.cur_pos > state.tail_pos {
+            let evict = (state.cur_pos - state.tail_pos) as usize;
+            state.tail_pos += evict as u64;
+            state.ring_start = (state.ring_start + evict) % state.capacity;
+        }
 
-            let write_room = state.capacity - ((state.head_pos - state.tail_pos) as usize);
-            let to_read = temp_buf.len().min(write_room);
-            let write_offset = ((state.ring_start as u64 + (state.head_pos - state.tail_pos))
-                % state.capacity as u64) as usize;
-            (to_read, write_offset)
-        };
-
+        let write_room = state.capacity - ((state.head_pos - state.tail_pos) as usize);
+        let read_amount = temp_buf.len().min(write_room);
+        let ring_write_offset = ((state.ring_start as u64 + (state.head_pos - state.tail_pos))
+            % state.capacity as u64) as usize;
         if read_amount == 0 {
             continue;
         }
 
-        let read_result = reader.read(&mut temp_buf[..read_amount]);
-
-        let mut state = shared.state.lock();
+        let read_result = source_io(&mut state, || reader.read(&mut temp_buf[..read_amount]));
         if state.stop {
             break;
         }
@@ -366,16 +402,31 @@ fn worker_loop(mut reader: Box<dyn ReadSeekSend>, shared: Arc<SharedRing>) {
                     state.fatal_error = Some(e.to_string());
                     shared.consumer_cv.notify_all();
                 } else {
-                    let sleep_dur = backoff;
+                    let retry_in = backoff;
                     backoff = (backoff * 2).min(Duration::from_millis(1000));
                     let resume_pos = state.head_pos;
-                    drop(state);
-                    std::thread::sleep(sleep_dur);
-                    let _ = reader.seek(SeekFrom::Start(resume_pos));
+                    // Back off before reconnecting; a stop or a seek ends the
+                    // wait early.
+                    shared.worker_cv.wait_for(&mut state, retry_in);
+                    if state.stop {
+                        break;
+                    }
+                    if state.seek_req.is_none() {
+                        let _ = source_io(&mut state, || reader.seek(SeekFrom::Start(resume_pos)));
+                    }
                 }
             }
         }
     }
+}
+
+/// Runs `call` on the underlying source with the ring unlocked, flagged as
+/// in I/O so a dropping source knows not to wait for it.
+fn source_io<T>(state: &mut MutexGuard<'_, RingState>, call: impl FnOnce() -> T) -> T {
+    state.io = true;
+    let out = MutexGuard::unlocked(state, call);
+    state.io = false;
+    out
 }
 
 /// Opens a URL (http(s) or file) with read-ahead ring buffering.

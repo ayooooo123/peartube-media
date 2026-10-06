@@ -1,12 +1,13 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use oxideav_core::{
-    Decoder, Demuxer, Frame, MediaType, Packet, ProbeData, RuntimeContext,
+    CodecParameters, Decoder, Demuxer, Frame, MediaType, Packet, ProbeData, RuntimeContext,
     SampleFormat, StreamInfo, TimeBase, PROBE_SCORE_EXTENSION,
 };
 
@@ -105,6 +106,10 @@ pub(crate) struct Lane {
     /// Seek generation the queued packets belong to; changed only with
     /// `queue` locked, when the demuxer empties the lane for a seek.
     seek_gen: AtomicU64,
+    /// A pipeline thread drains the lane (see `Consumer`); changed only with
+    /// `queue` locked. Without one, packets for the lane are dropped:
+    /// queued, they would fill it and park the demuxer for good.
+    consumed: AtomicBool,
 }
 
 /// What a pipeline got from its lane.
@@ -123,21 +128,28 @@ impl Lane {
             queue: Mutex::new(Vec::new()),
             cv: Condvar::new(),
             seek_gen: AtomicU64::new(0),
+            consumed: AtomicBool::new(false),
         })
     }
 
     fn push(&self, packet: Packet) {
-        self.queue.lock().push(packet);
+        let mut q = self.queue.lock();
+        if !self.consumed.load(Ordering::SeqCst) {
+            return;
+        }
+        q.push(packet);
+        drop(q);
         self.cv.notify_one();
     }
 
     fn push_eof(&self) {
-        self.queue.lock().push_eof_marker();
+        let mut q = self.queue.lock();
+        if !self.consumed.load(Ordering::SeqCst) {
+            return;
+        }
+        q.push_eof_marker();
+        drop(q);
         self.cv.notify_all();
-    }
-
-    fn clear(&self) {
-        self.queue.lock().clear();
     }
 
     /// Empties the lane for the demuxer's seek `generation`: what it queues
@@ -220,6 +232,75 @@ impl Lane {
     }
 }
 
+/// Marks a lane as drained by one pipeline thread, from spawn until that
+/// thread ends, however it ends: its stream has no decoder, the decoder gave
+/// up, a selection switch retired it, it panicked, or it played to the end.
+/// The lane then empties and queues nothing more, so the demuxer never waits
+/// on a lane that nobody drains.
+struct Consumer {
+    lane: Arc<Lane>,
+    demux_cv: Arc<Condvar>,
+}
+
+impl Consumer {
+    fn new(lane: &Arc<Lane>, demux_cv: &Arc<Condvar>) -> Consumer {
+        let q = lane.queue.lock();
+        lane.consumed.store(true, Ordering::SeqCst);
+        drop(q);
+        Consumer {
+            lane: Arc::clone(lane),
+            demux_cv: Arc::clone(demux_cv),
+        }
+    }
+}
+
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        let mut q = self.lane.queue.lock();
+        self.lane.consumed.store(false, Ordering::SeqCst);
+        q.clear();
+        drop(q);
+        // The demuxer may be waiting for this lane to make room or drain.
+        self.demux_cv.notify_all();
+    }
+}
+
+/// A running pipeline thread and the flag that retires it. A selection
+/// switch retires the old thread, and waits for it, before the new one
+/// starts: a lane has one consumer at a time, and nothing the old thread
+/// still had in hand reaches a sink after the switch.
+struct PipelineThread {
+    handle: JoinHandle<()>,
+    retired: Arc<AtomicBool>,
+}
+
+impl PipelineThread {
+    /// Runs `body` on a new thread called `name`, handing it its retire flag.
+    fn spawn(name: &str, body: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> PipelineThread {
+        let retired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&retired);
+        let handle = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || body(flag))
+            .unwrap_or_else(|e| panic!("failed to spawn {name} thread: {e}"));
+        PipelineThread { handle, retired }
+    }
+
+    /// Stops the thread without stopping the player, and waits for it.
+    fn retire(self, shared: &SharedState, lane: &Lane) {
+        self.retired.store(true, Ordering::SeqCst);
+        // Wake it wherever it waits: on its lane or on the clock.
+        drop(lane.queue.lock());
+        lane.cv.notify_all();
+        shared.wake_clock_waiters();
+        self.join();
+    }
+
+    fn join(self) {
+        let _ = self.handle.join();
+    }
+}
+
 trait PushEof {
     fn push_eof_marker(&mut self);
 }
@@ -251,6 +332,9 @@ fn packet_end_secs(p: &Packet) -> Option<f64> {
 struct SharedState {
     state: Mutex<State>,
     stopped: Arc<AtomicBool>,
+    /// The playback failed (`set_error`); set with `state` locked. A stream
+    /// error that leaves the rest playing does not count.
+    failed: AtomicBool,
     /// Paired with `state` for `Player::wait`.
     condvar: Condvar,
     on_event: Arc<dyn Fn(Event) + Send + Sync>,
@@ -304,11 +388,23 @@ impl SharedState {
     fn sink_clock(&self) -> Arc<dyn Clock> {
         self.free_clock.clone()
     }
+
+    /// Moves playback to `to`: the demux loop applies the newest request,
+    /// and each pipeline starts over when it sees the generation change.
+    fn request_seek(&self, to: Duration) {
+        *self.seek_target.lock() = Some(to);
+        self.seek_gen.fetch_add(1, Ordering::SeqCst);
+        self.seek_clock(to);
+        self.state.lock().position = to;
+        notify_changed(self);
+    }
 }
 
 pub struct Player {
     shared: Arc<SharedState>,
-    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// Runs the playback: opens the source, owns the demuxer, and spawns and
+    /// joins the pipeline threads.
+    pipeline: Option<JoinHandle<()>>,
 }
 
 impl Player {
@@ -336,6 +432,7 @@ impl Player {
         let shared = Arc::new(SharedState {
             state: Mutex::new(initial_state),
             stopped,
+            failed: AtomicBool::new(false),
             condvar: Condvar::new(),
             on_event: on_event_arc,
             last_changed: Mutex::new(Instant::now() - Duration::from_secs(1)),
@@ -368,7 +465,7 @@ impl Player {
 
         Player {
             shared,
-            threads: Mutex::new(vec![init_thread]),
+            pipeline: Some(init_thread),
         }
     }
 
@@ -387,17 +484,7 @@ impl Player {
     }
 
     pub fn seek(&self, to: Duration) {
-        {
-            let mut target = self.shared.seek_target.lock();
-            *target = Some(to);
-        }
-        self.shared.seek_gen.fetch_add(1, Ordering::SeqCst);
-        self.shared.seek_clock(to);
-        {
-            let mut st = self.shared.state.lock();
-            st.position = to;
-        }
-        notify_changed(&self.shared);
+        self.shared.request_seek(to);
     }
 
     pub fn select_audio(&self, stream: Option<u32>) {
@@ -437,9 +524,14 @@ impl Player {
         st.clone()
     }
 
+    /// Blocks until the playback ended or failed (a stream error that leaves
+    /// the rest playing does not end the wait), or the player is dropped.
     pub fn wait(&self) -> State {
         let mut st = self.shared.state.lock();
-        while !st.ended && st.error.is_none() && !self.shared.stopped.load(Ordering::SeqCst) {
+        while !st.ended
+            && !self.shared.failed.load(Ordering::SeqCst)
+            && !self.shared.stopped.load(Ordering::SeqCst)
+        {
             self.shared.condvar.wait(&mut st);
         }
         st.position = self.shared.free_clock.now().unwrap_or(st.position);
@@ -451,10 +543,24 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.shared.stopped.store(true, Ordering::SeqCst);
         self.shared.stop();
+        // A demuxer waiting on a stalled source gets an error instead of
+        // the bytes, and the playback winds down without them.
+        let opened = match &*self.shared.source.lock() {
+            Some(source) => {
+                source.stop();
+                true
+            }
+            None => false,
+        };
         self.shared.condvar.notify_all();
-        let threads = self.threads.lock().drain(..).collect::<Vec<_>>();
-        for t in threads {
-            let _ = t.join();
+        if let Some(pipeline) = self.pipeline.take() {
+            // Until the source exists the pipeline thread may sit in the
+            // request that opens it, which a stalled peer can hold for as
+            // long as it likes: leave it then (it ends as soon as that
+            // returns, see `run_player_pipeline`).
+            if opened {
+                let _ = pipeline.join();
+            }
         }
     }
 }
@@ -482,6 +588,7 @@ fn set_error(shared: &SharedState, err: String) {
             st.error = Some(err.clone());
             st.playing = false;
         }
+        shared.failed.store(true, Ordering::SeqCst);
     }
     shared.finish();
     (shared.on_event)(Event::Error(err));
@@ -511,7 +618,9 @@ fn run_player_pipeline(
     let mut source = match open_source(&url) {
         Ok(s) => s,
         Err(e) => {
-            set_error(&shared, format!("failed to open source: {e}"));
+            if !shared.stopped.load(Ordering::SeqCst) {
+                set_error(&shared, format!("failed to open source: {e}"));
+            }
             return;
         }
     };
@@ -523,6 +632,11 @@ fn run_player_pipeline(
         }
     });
     *shared.source.lock() = Some(monitor);
+    if shared.stopped.load(Ordering::SeqCst) {
+        // Dropped while the source opened: `Player::drop` neither waited for
+        // this thread nor could stop a source that did not exist yet.
+        return;
+    }
 
     // 2. Probe (rule from engine-api.md, same as refcheck), then rewind.
     let container = match probe_container(&url, &mut source, &shared) {
@@ -544,7 +658,9 @@ fn run_player_pipeline(
     {
         Ok(d) => d,
         Err(e) => {
-            set_error(&shared, format!("failed to open demuxer: {e}"));
+            if !shared.stopped.load(Ordering::SeqCst) {
+                set_error(&shared, format!("failed to open demuxer: {e}"));
+            }
             return;
         }
     };
@@ -616,11 +732,14 @@ fn run_player_pipeline(
         });
 
     // 5. Selection. The pipeline thread owns `current_*`; `select_*` writes
-    // `wanted_*` and bumps `select_gen` so this loop applies switches.
+    // `wanted_*` and bumps `select_gen` so the demux loop applies switches.
+    // Read the generation first: a switch made while this reads `wanted_*`
+    // then still counts as new.
+    let select_gen = shared.select_gen.load(Ordering::SeqCst);
     let options_video = *shared.wanted_video.lock();
-    let mut current_video = options_video.or(first_video);
-    let mut current_audio = (*shared.wanted_audio.lock()).or(first_audio);
-    let mut current_subtitle = *shared.wanted_subtitle.lock();
+    let current_video = options_video.or(first_video);
+    let current_audio = (*shared.wanted_audio.lock()).or(first_audio);
+    let current_subtitle = *shared.wanted_subtitle.lock();
 
     {
         let mut st = shared.state.lock();
@@ -686,87 +805,11 @@ fn run_player_pipeline(
         .map(|s| s.time_base)
         .unwrap_or_else(|| TimeBase::new(1, 1000));
 
-    let threads: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
-
-    // 7. Initial pipeline threads. The demux loop re-spawns the audio and
-    // subtitle threads on a selection switch; the video pipeline stays fixed
-    // (the public API cannot switch it mid-playback).
-    if let Some(stream) = current_video.and_then(|i| streams.iter().find(|s| s.index == i).cloned())
-    {
-        let lane = Arc::clone(&video_lane);
-        let demux_cv2 = Arc::clone(&demux_cv);
-        let shared2 = Arc::clone(&shared);
-        let sink = shared.backend.video(shared.sink_clock());
-        let ctx_video = Arc::clone(&shared.ctx);
-        let realtime = options.realtime;
-        let live = Live::new(&shared, Pipe::Video);
-        let handle = std::thread::Builder::new()
-            .name("peartube-video".into())
-            .spawn(move || {
-                let _live = live;
-                run_video_thread(stream, sink, lane, demux_cv2, shared2, ctx_video, realtime);
-            })
-            .expect("failed to spawn video thread");
-        threads.lock().push(handle);
-    }
-    if let Some(stream) = current_audio.and_then(|i| streams.iter().find(|s| s.index == i).cloned())
-    {
-        let lane = Arc::clone(&audio_lane);
-        let demux_cv2 = Arc::clone(&demux_cv);
-        let shared2 = Arc::clone(&shared);
-        let sink = shared.backend.audio();
-        let ctx_audio = Arc::clone(&shared.ctx);
-        let realtime = options.realtime;
-        let live = Live::new(&shared, Pipe::Audio);
-        let handle = std::thread::Builder::new()
-            .name("peartube-audio".into())
-            .spawn(move || {
-                let _live = live;
-                run_audio_thread(stream, sink, lane, demux_cv2, shared2, ctx_audio, realtime);
-            })
-            .expect("failed to spawn audio thread");
-        threads.lock().push(handle);
-    }
-    if let Some(stream) =
-        current_subtitle.and_then(|i| streams.iter().find(|s| s.index == i).cloned())
-    {
-        let lane = Arc::clone(&sub_lane);
-        let demux_cv2 = Arc::clone(&demux_cv);
-        let shared2 = Arc::clone(&shared);
-        let ctx_sub = Arc::clone(&shared.ctx);
-        let clock = shared.sink_clock();
-        let sink = shared.backend.subtitles();
-        let realtime = options.realtime;
-        let (w, h) = shared.state.lock().video_size.unwrap_or((320, 240));
-        let handle = std::thread::Builder::new()
-            .name("peartube-subtitles".into())
-            .spawn(move || {
-                let decoder = match ctx_sub.codecs.first_decoder(&stream.params) {
-                    Ok(d) => d,
-                    Err(_) => return,
-                };
-                run_subtitle_loop(
-                    decoder,
-                    sink,
-                    clock,
-                    stream.time_base,
-                    w,
-                    h,
-                    realtime,
-                    lane,
-                    demux_cv2,
-                    shared2.stopped.clone(),
-                );
-            })
-            .expect("failed to spawn subtitle thread");
-        threads.lock().push(handle);
-    }
-
-    // 8. Demux loop owns spawn/join so a selection switch can drain lanes and
-    // respawn the affected pipeline thread without ending playback. From
-    // here the buffering hold follows the pipelines' data.
-    shared.pipelines_started();
-    run_demux_loop(&mut Run {
+    // 7. Pipeline threads. The demux loop replaces the audio and subtitle
+    // pipelines on a selection switch; the video pipeline stays fixed (the
+    // public API cannot switch it mid-playback).
+    let realtime = options.realtime;
+    let mut run = Run {
         shared: &shared,
         demuxer: &mut *demuxer,
         streams: &streams,
@@ -778,19 +821,146 @@ fn run_player_pipeline(
         video_tb,
         audio_tb,
         sub_tb,
-        threads: &threads,
-        current_video: &mut current_video,
-        current_audio: &mut current_audio,
-        current_subtitle: &mut current_subtitle,
-    });
+        select_gen,
+        current_video,
+        current_audio,
+        current_subtitle,
+        video_thread: None,
+        audio_thread: None,
+        sub_thread: None,
+    };
+    run.video_thread = find_stream(&streams, current_video)
+        .map(|stream| spawn_video(&shared, stream, &video_lane, &demux_cv, realtime));
+    run.audio_thread = find_stream(&streams, current_audio)
+        .map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
+    run.sub_thread = find_stream(&streams, current_subtitle)
+        .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime));
 
-    for t in threads.lock().drain(..) {
-        let _ = t.join();
+    // 8. From here the buffering hold follows the pipelines' data.
+    shared.pipelines_started();
+    run_demux_loop(&mut run);
+
+    for thread in [run.video_thread.take(), run.audio_thread.take(), run.sub_thread.take()]
+        .into_iter()
+        .flatten()
+    {
+        thread.join();
     }
 
-    if !shared.stopped.load(Ordering::SeqCst) && shared.state.lock().error.is_none() {
+    // A stream that lost its decoder leaves an error in `State` while the
+    // rest plays on; the playback still ends. Only a failure (`set_error`)
+    // or a drop ends it otherwise.
+    if !shared.stopped.load(Ordering::SeqCst) && !shared.finished() {
         set_ended(&shared);
     }
+}
+
+fn find_stream(streams: &[StreamInfo], index: Option<u32>) -> Option<StreamInfo> {
+    let index = index?;
+    streams.iter().find(|s| s.index == index).cloned()
+}
+
+/// The stream's decoder, built from the registry. Seeks build a fresh one
+/// rather than calling `Decoder::reset`, which may drop state the codec
+/// parameters set up: oxideav-h264's reset forgets the avcC SPS/PPS, after
+/// which every slice fails. H.264 whose extradata is Annex B (NUT, AVI, or
+/// any stream muxed with global headers outside MP4/Matroska) reaches the
+/// decoder in-band, as a packet of its own ahead of the stream: that decoder
+/// reads only avcC extradata, while FFmpeg's accepts both forms.
+fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
+    let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if params.codec_id.as_str() != "h264" || !is_annex_b(&params.extradata) {
+            return ctx.codecs.first_decoder(params);
+        }
+        let mut bare = params.clone();
+        let parameter_sets = std::mem::take(&mut bare.extradata);
+        let mut decoder = ctx.codecs.first_decoder(&bare)?;
+        decoder.send_packet(&Packet {
+            stream_index: 0,
+            time_base: TimeBase::new(1, 1000),
+            pts: None,
+            dts: None,
+            duration: None,
+            flags: Default::default(),
+            data: parameter_sets,
+        })?;
+        Ok(decoder)
+    }));
+    built.unwrap_or_else(|_| Err(oxideav_core::Error::Other("decoder panicked while opening".into())))
+}
+
+/// Annex B framing: the bytes start with a start code. (An avcC record
+/// starts with its version, 1.)
+fn is_annex_b(data: &[u8]) -> bool {
+    data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
+}
+
+fn spawn_video(
+    shared: &Arc<SharedState>,
+    stream: StreamInfo,
+    lane: &Arc<Lane>,
+    demux_cv: &Arc<Condvar>,
+    realtime: bool,
+) -> PipelineThread {
+    let consumer = Consumer::new(lane, demux_cv);
+    let live = Live::new(shared, Pipe::Video);
+    let sink = shared.backend.video(shared.sink_clock());
+    let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
+    PipelineThread::spawn("peartube-video", move |retired| {
+        let _guards = (live, consumer);
+        run_video_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
+    })
+}
+
+fn spawn_audio(
+    shared: &Arc<SharedState>,
+    stream: StreamInfo,
+    lane: &Arc<Lane>,
+    demux_cv: &Arc<Condvar>,
+    realtime: bool,
+) -> PipelineThread {
+    let consumer = Consumer::new(lane, demux_cv);
+    let live = Live::new(shared, Pipe::Audio);
+    let sink = shared.backend.audio();
+    let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
+    PipelineThread::spawn("peartube-audio", move |retired| {
+        let _guards = (live, consumer);
+        run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
+    })
+}
+
+fn spawn_subtitles(
+    shared: &Arc<SharedState>,
+    stream: StreamInfo,
+    lane: &Arc<Lane>,
+    demux_cv: &Arc<Condvar>,
+    realtime: bool,
+) -> PipelineThread {
+    let consumer = Consumer::new(lane, demux_cv);
+    let sink = shared.backend.subtitles();
+    let clock = shared.sink_clock();
+    let (w, h) = shared.state.lock().video_size.unwrap_or((320, 240));
+    let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
+    PipelineThread::spawn("peartube-subtitles", move |retired| {
+        let _consumer = consumer;
+        let decoder = match shared.ctx.codecs.first_decoder(&stream.params) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        run_subtitle_loop(
+            decoder,
+            sink,
+            clock,
+            stream.time_base,
+            w,
+            h,
+            realtime,
+            lane,
+            demux_cv,
+            shared.stopped.clone(),
+            retired,
+        );
+    })
 }
 
 /// Probes the first 256 KiB of `source` and rewinds it to the start (the
@@ -841,7 +1011,8 @@ fn probe_container(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// What the demux loop works with: the demuxer, the lanes, the selection and
+/// the pipeline threads it replaces on a selection switch.
 struct Run<'a> {
     shared: &'a Arc<SharedState>,
     demuxer: &'a mut dyn Demuxer,
@@ -854,32 +1025,31 @@ struct Run<'a> {
     video_tb: TimeBase,
     audio_tb: TimeBase,
     sub_tb: TimeBase,
-    threads: &'a Mutex<Vec<std::thread::JoinHandle<()>>>,
-    current_video: &'a mut Option<u32>,
-    current_audio: &'a mut Option<u32>,
-    current_subtitle: &'a mut Option<u32>,
+    /// The `SharedState::select_gen` the `current_*` selection reflects.
+    select_gen: u64,
+    current_video: Option<u32>,
+    current_audio: Option<u32>,
+    current_subtitle: Option<u32>,
+    video_thread: Option<PipelineThread>,
+    audio_thread: Option<PipelineThread>,
+    sub_thread: Option<PipelineThread>,
 }
 
 fn run_demux_loop(run: &mut Run<'_>) {
     let shared = run.shared;
-    let mut active: Vec<u32> = [
-        *run.current_video,
-        *run.current_audio,
-        *run.current_subtitle,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let mut active: Vec<u32> = [run.current_video, run.current_audio, run.current_subtitle]
+        .into_iter()
+        .flatten()
+        .collect();
     let _ = run.demuxer.set_active_streams(&active);
-    let mut select_gen_seen = shared.select_gen.load(Ordering::SeqCst);
     let mut eof = false;
     let mut full = false;
 
     while !shared.stopped.load(Ordering::SeqCst) {
-        // Selection switch: flush lanes, respawn changed pipelines.
+        // Selection switch: replace the changed pipelines.
         let gen_now = shared.select_gen.load(Ordering::SeqCst);
-        if gen_now != select_gen_seen {
-            select_gen_seen = gen_now;
+        if gen_now != run.select_gen {
+            run.select_gen = gen_now;
             apply_selection_switch(run, &mut active);
             if eof {
                 eof = false;
@@ -915,24 +1085,15 @@ fn run_demux_loop(run: &mut Run<'_>) {
         }
 
         if eof {
-            // Wait until the lanes with consumers drained their tail (the
-            // EOF marker) so a trailing packet is never dropped, then leave.
-            // A lane without a pipeline thread (no such stream, or the stream
-            // was disabled) has no consumer, so only lanes whose stream is
-            // currently selected are waited on. Leaving ends
-            // `run_player_pipeline`, which joins the pipelines and sets
-            // Ended. A seek or a selection switch clears lanes and reopens
-            // `eof` at the top of this loop.
-            let tail = |lane: &Arc<Lane>, selected: bool| {
-                if !selected {
-                    return 0;
-                }
-                lane.queue.lock().len()
-            };
-            let drained = tail(&run.video_lane, run.current_video.is_some())
-                + tail(&run.audio_lane, run.current_audio.is_some())
-                + tail(&run.sub_lane, run.current_subtitle.is_some())
-                == 0;
+            // Wait until the pipelines drained their lanes, end markers
+            // included, so a trailing packet is never cut off, then leave. A
+            // lane without a consumer is always empty (see `Consumer`).
+            // Leaving ends `run_player_pipeline`, which joins the pipelines
+            // and sets Ended. A seek or a selection switch clears lanes and
+            // reopens `eof` at the top of this loop.
+            let drained = [run.video_lane, run.audio_lane, run.sub_lane]
+                .iter()
+                .all(|lane| lane.queue.lock().is_empty());
             if drained {
                 return;
             }
@@ -948,9 +1109,9 @@ fn run_demux_loop(run: &mut Run<'_>) {
         match packet_res {
             Ok(Ok(packet)) => {
                 let stream_id = packet.stream_index;
-                let pipe = if Some(stream_id) == *run.current_video {
+                let pipe = if Some(stream_id) == run.current_video {
                     Some(Pipe::Video)
-                } else if Some(stream_id) == *run.current_audio {
+                } else if Some(stream_id) == run.current_audio {
                     Some(Pipe::Audio)
                 } else {
                     None
@@ -959,7 +1120,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
                 match pipe {
                     Some(Pipe::Video) => run.video_lane.push(packet),
                     Some(Pipe::Audio) => run.audio_lane.push(packet),
-                    None if Some(stream_id) == *run.current_subtitle => run.sub_lane.push(packet),
+                    None if Some(stream_id) == run.current_subtitle => run.sub_lane.push(packet),
                     // Inactive streams' packets are dropped.
                     None => {}
                 }
@@ -975,10 +1136,11 @@ fn run_demux_loop(run: &mut Run<'_>) {
                 shared.demux_eof(true);
             }
             Ok(Err(e)) => {
-                // Transient demux errors are retried; a demuxer that keeps
-                // failing still ends playback through the 30 s read timeout
-                // upstream, so surface immediately otherwise.
-                set_error(shared, format!("demux error: {e}"));
+                // A source stopped by `Player::drop` fails the read: that
+                // ends the loop, it is not a playback error.
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(shared, format!("demux error: {e}"));
+                }
                 return;
             }
             Err(_) => {
@@ -1003,7 +1165,7 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
     let shared = run.shared;
     // Convert to the seek stream's time base. The demuxer seeks the video
     // stream when present, else audio, else stream 0.
-    let seek_stream = (*run.current_video).or(*run.current_audio).unwrap_or(0);
+    let seek_stream = run.current_video.or(run.current_audio).unwrap_or(0);
     let tb = run
         .streams
         .iter()
@@ -1035,43 +1197,48 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
     }
 }
 
-/// `select_audio` / `select_subtitle` took effect: flush the affected lane,
-/// respawn its thread (a switch = flush that pipeline and resume at the
-/// current position), and refresh the headless registry entry.
+/// `select_audio` / `select_subtitle` took effect: retire the replaced
+/// pipeline, start the new one, and refresh the headless registry entry. A
+/// new audio track resumes where playback is: the demuxer re-reads from the
+/// clock's position (a refresh seek) instead of starting the track wherever
+/// it has read ahead to.
 fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let shared = run.shared;
 
     let wanted_audio = *shared.wanted_audio.lock();
     let wanted_subtitle = *shared.wanted_subtitle.lock();
-    let audio_changed = wanted_audio != *run.current_audio;
-    let sub_changed = wanted_subtitle != *run.current_subtitle;
+    let audio_changed = wanted_audio != run.current_audio;
+    let sub_changed = wanted_subtitle != run.current_subtitle;
 
+    // The old thread goes first: a lane has one consumer, and nothing the
+    // old pipeline still holds may reach a sink once the new stream is the
+    // selected one.
     if audio_changed {
-        run.audio_lane.clear();
+        if let Some(old) = run.audio_thread.take() {
+            old.retire(shared, run.audio_lane);
+        }
     }
     if sub_changed {
-        run.sub_lane.clear();
+        if let Some(old) = run.sub_thread.take() {
+            old.retire(shared, run.sub_lane);
+        }
     }
 
-    // Video selection is not switchable through the public API (options only),
-    // but keep the state consistent.
-    let wanted_video = *shared.wanted_video.lock();
-
-    *run.current_audio = wanted_audio;
-    *run.current_subtitle = wanted_subtitle;
-    *run.current_video = wanted_video;
+    // The video stream stays as opened: the public API cannot switch it.
+    run.current_audio = wanted_audio;
+    run.current_subtitle = wanted_subtitle;
+    let time_base = |index: Option<u32>| {
+        find_stream(run.streams, index)
+            .map(|s| s.time_base)
+            .unwrap_or_else(|| TimeBase::new(1, 1000))
+    };
+    run.audio_tb = time_base(wanted_audio);
+    run.sub_tb = time_base(wanted_subtitle);
 
     {
         let mut st = shared.state.lock();
         st.audio = wanted_audio;
         st.subtitle = wanted_subtitle;
-        st.video = wanted_video;
-        st.video_size = wanted_video.and_then(|idx| {
-            run.streams.iter().find(|s| s.index == idx).and_then(|s| {
-                let (w, h) = (s.params.width?, s.params.height?);
-                (w > 0 && h > 0).then_some((w, h))
-            })
-        });
     }
     notify_changed(shared);
 
@@ -1085,99 +1252,52 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
             })
         };
         headless.set_active_streams(
-            info(*run.current_video, MediaType::Video),
-            info(*run.current_audio, MediaType::Audio),
-            info(*run.current_subtitle, MediaType::Subtitle),
+            info(run.current_video, MediaType::Video),
+            info(run.current_audio, MediaType::Audio),
+            info(run.current_subtitle, MediaType::Subtitle),
             run.options.realtime,
         );
     }
 
-    // Respawn the audio pipeline if the selection changed. The old thread
-    // exits on its own: its lane was cleared and never refilled for the old
-    // stream, and the demux loop now feeds the new one.
+    let realtime = run.options.realtime;
     if audio_changed {
-        let audio_idx = *run.current_audio;
-        let stream = audio_idx.and_then(|i| run.streams.iter().find(|s| s.index == i).cloned());
+        let stream = find_stream(run.streams, run.current_audio)
+            .filter(|s| s.params.media_type == MediaType::Audio);
         if let Some(stream) = stream {
-            let lane = Arc::clone(run.audio_lane);
-            let demux_cv = Arc::clone(run.demux_cv);
-            let shared2 = Arc::clone(shared);
-            let ctx_audio = Arc::clone(&shared.ctx);
-            let realtime = run.options.realtime;
-            let sink = shared.backend.audio();
-            let live = Live::new(shared, Pipe::Audio);
-            let handle = std::thread::Builder::new()
-                .name("peartube-audio".into())
-                .spawn(move || {
-                    let _live = live;
-                    run_audio_thread(stream, sink, lane, demux_cv, shared2, ctx_audio, realtime);
-                })
-                .expect("failed to spawn audio thread");
-            run.threads.lock().push(handle);
+            shared.request_seek(shared.free_clock.now().unwrap_or_default());
+            run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
         }
     }
     if sub_changed {
-        let sub_idx = *run.current_subtitle;
-        let stream = sub_idx.and_then(|i| run.streams.iter().find(|s| s.index == i).cloned());
+        let stream = find_stream(run.streams, run.current_subtitle)
+            .filter(|s| s.params.media_type == MediaType::Subtitle);
         if let Some(stream) = stream {
-            let lane = Arc::clone(run.sub_lane);
-            let demux_cv = Arc::clone(run.demux_cv);
-            let shared2 = Arc::clone(shared);
-            let ctx_sub = Arc::clone(&shared.ctx);
-            let realtime = run.options.realtime;
-            let sink = shared.backend.subtitles();
-            let clock = shared.sink_clock();
-            let (w, h) = shared.state.lock().video_size.unwrap_or((320, 240));
-            let handle = std::thread::Builder::new()
-                .name("peartube-subtitles".into())
-                .spawn(move || {
-                    let decoder = match ctx_sub.codecs.first_decoder(&stream.params) {
-                        Ok(d) => d,
-                        Err(_) => return,
-                    };
-                    run_subtitle_loop(
-                        decoder,
-                        sink,
-                        clock,
-                        stream.time_base,
-                        w,
-                        h,
-                        realtime,
-                        lane,
-                        demux_cv,
-                        shared2.stopped.clone(),
-                    );
-                })
-                .expect("failed to spawn subtitle thread");
-            run.threads.lock().push(handle);
+            run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime));
         }
     }
 
-    *active = [
-        *run.current_video,
-        *run.current_audio,
-        *run.current_subtitle,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    *active = [run.current_video, run.current_audio, run.current_subtitle]
+        .into_iter()
+        .flatten()
+        .collect();
     let _ = run.demuxer.set_active_streams(active);
 }
 
 /// Packet lanes → decoder → sink, for one audio stream. The sink follows the
 /// clock's run state (`play`/`pause`); while the clock stands still, PCM goes
 /// out only up to `PREROLL` past it. Reaches Ended with the rest of the
-/// pipeline at EOF.
+/// pipeline at EOF; ends early when the player stops or a selection switch
+/// sets `retired`.
 fn run_audio_thread(
     stream: StreamInfo,
     mut sink: Box<dyn AudioSink>,
     lane: Arc<Lane>,
     demux_cv: Arc<Condvar>,
     shared: Arc<SharedState>,
-    ctx: Arc<RuntimeContext>,
     realtime: bool,
+    retired: Arc<AtomicBool>,
 ) {
-    let mut decoder = match ctx.codecs.first_decoder(&stream.params) {
+    let mut decoder = match make_decoder(&shared.ctx, &stream.params) {
         Ok(d) => d,
         Err(e) => {
             // No decoder: the stream stays silent, playback continues.
@@ -1199,29 +1319,40 @@ fn run_audio_thread(
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
     let mut seen_seek_target: u64 = 0;
     let mut primed: Option<u64> = None;
+    let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
-    while !shared.stopped.load(Ordering::SeqCst) {
+    while !quit() {
         if !realtime {
             // Nothing waits on the clock: park while paused instead.
-            shared.wait_while_paused();
-            if shared.stopped.load(Ordering::SeqCst) {
+            shared.wait_while_paused(&retired);
+            if quit() {
                 break;
             }
         }
         sync_audio_sink(&mut *sink, &shared, &mut sink_running);
 
-        // Seek generation: always reset the decoder and the sink, drop
+        // Seek generation: start the decoder and the sink over, drop
         // pre-target output after the demuxer's seek lands.
         let gen_now = shared.seek_gen.load(Ordering::SeqCst);
         if gen_now != seen_seek {
             seen_seek = gen_now;
             let _ = sink.flush();
-            let _ = decoder.reset();
+            decoder = match make_decoder(&shared.ctx, &stream.params) {
+                Ok(d) => d,
+                Err(e) => {
+                    let mut st = shared.state.lock();
+                    st.error.get_or_insert_with(|| format!("audio decoder failed to restart: {e}"));
+                    st.audio = None;
+                    drop(st);
+                    notify_changed(&shared);
+                    return;
+                }
+            };
             consecutive_errors = 0;
         }
 
         // Pull a packet; the EOF marker ends this pipeline.
-        let woken = || shared.stopped.load(Ordering::SeqCst) || Some(shared.running()) != sink_running;
+        let woken = || quit() || Some(shared.running()) != sink_running;
         let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
         let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
@@ -1229,7 +1360,7 @@ fn run_audio_thread(
             Pop::Eof => {
                 // Drain the decoder's tail into the sink.
                 let _ = decoder.flush();
-                while !shared.stopped.load(Ordering::SeqCst) {
+                while !quit() {
                     let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
                     match recv {
                         Ok(Ok(Frame::Audio(af))) => {
@@ -1244,7 +1375,7 @@ fn run_audio_thread(
                             let pts = Duration::from_secs_f64(secs);
                             if !write_pcm(
                                 &mut *sink, &shared, &pcm, channels as usize, rate, pts,
-                                seen_seek, realtime, &mut sink_running,
+                                seen_seek, realtime, &mut sink_running, &retired,
                             ) {
                                 break;
                             }
@@ -1282,7 +1413,7 @@ fn run_audio_thread(
         }
 
         loop {
-            if shared.stopped.load(Ordering::SeqCst) {
+            if quit() {
                 return;
             }
             let recv_res =
@@ -1359,9 +1490,9 @@ fn run_audio_thread(
             let pts = Duration::from_secs_f64(pts_secs);
             if !write_pcm(
                 &mut *sink, &shared, &pcm, channels, sample_rate, pts, seen_seek, realtime,
-                &mut sink_running,
+                &mut sink_running, &retired,
             ) {
-                // Stopped, or a seek: the rest of this packet is stale.
+                // Stopped, retired or a seek: the rest of this packet is stale.
                 break;
             }
         }
@@ -1385,8 +1516,8 @@ fn sync_audio_sink(sink: &mut dyn AudioSink, shared: &SharedState, applied: &mut
 /// While the clock stands still (buffering or paused), audio goes out only up
 /// to `PREROLL` past it, so a paused output never fills up and blocks; what a
 /// paused sink did not take is written again once the clock runs, so no
-/// audio is skipped across a hold. False when the player stopped or a seek
-/// superseded this audio.
+/// audio is skipped across a hold. False when the player stopped, the
+/// pipeline was retired, or a seek superseded this audio.
 #[allow(clippy::too_many_arguments)]
 fn write_pcm(
     sink: &mut dyn AudioSink,
@@ -1398,13 +1529,14 @@ fn write_pcm(
     seen_seek: u64,
     realtime: bool,
     sink_running: &mut Option<bool>,
+    retired: &AtomicBool,
 ) -> bool {
     let channels = channels.max(1);
     let frames = pcm.len() / channels;
     let mut done = 0;
     while done < frames {
         let at = pts + Duration::from_secs_f64(done as f64 / f64::from(rate.max(1)));
-        if realtime && !shared.preroll(at, seen_seek) {
+        if realtime && !shared.preroll(at, seen_seek, retired) {
             return false;
         }
         sync_audio_sink(sink, shared, sink_running);
@@ -1416,7 +1548,7 @@ fn write_pcm(
                 if shared.running() {
                     return true;
                 }
-                if !shared.wait_running(seen_seek) {
+                if !shared.wait_running(seen_seek, retired) {
                     return false;
                 }
             }
@@ -1545,22 +1677,23 @@ fn run_video_thread(
     lane: Arc<Lane>,
     demux_cv: Arc<Condvar>,
     shared: Arc<SharedState>,
-    ctx: Arc<RuntimeContext>,
     realtime: bool,
+    retired: Arc<AtomicBool>,
 ) {
     let mut compressed = sink.open_compressed(&stream.params);
     let mut sw_decoder: Option<Box<dyn Decoder>> = None;
     let mut need_keyframe = !compressed;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
-    let mut seen_seek_target: u64 = 0;
+    let mut shown_seek: u64 = 0;
     // The clock run state last applied to the sink (`set_playing`).
     let mut sink_running: Option<bool> = None;
     let mut starved = false;
     let mut primed: Option<u64> = None;
+    let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
     if !compressed {
-        match ctx.codecs.first_decoder(&stream.params) {
+        match make_decoder(&shared.ctx, &stream.params) {
             Ok(d) => {
                 let _ = sink.open_frames(&stream.params);
                 sw_decoder = Some(d);
@@ -1579,30 +1712,42 @@ fn run_video_thread(
         }
     }
 
-    while !shared.stopped.load(Ordering::SeqCst) {
+    while !quit() {
         if !realtime {
             // Nothing waits on the clock: park while paused instead.
-            shared.wait_while_paused();
-            if shared.stopped.load(Ordering::SeqCst) {
+            shared.wait_while_paused(&retired);
+            if quit() {
                 break;
             }
         }
         sync_video_sink(&mut *sink, &shared, &mut sink_running);
 
-        // Seek generation: always reset decoder state; drop pre-target
-        // frames; resume from the next keyframe.
+        // Seek generation: start the decoder over; drop pre-target frames;
+        // resume from the next keyframe.
         let gen_now = shared.seek_gen.load(Ordering::SeqCst);
         if gen_now != seen_seek {
             seen_seek = gen_now;
             sink.flush();
-            if let Some(dec) = sw_decoder.as_mut() {
-                let _ = dec.reset();
+            if sw_decoder.is_some() {
+                match make_decoder(&shared.ctx, &stream.params) {
+                    Ok(d) => sw_decoder = Some(d),
+                    Err(e) => {
+                        let mut st = shared.state.lock();
+                        let _ = st
+                            .error
+                            .get_or_insert_with(|| format!("video decoder failed to restart: {e}"));
+                        st.video = None;
+                        drop(st);
+                        notify_changed(&shared);
+                        return;
+                    }
+                }
             }
             need_keyframe = true;
             consecutive_errors = 0;
         }
 
-        let woken = || shared.stopped.load(Ordering::SeqCst) || Some(shared.running()) != sink_running;
+        let woken = || quit() || Some(shared.running()) != sink_running;
         let report = |dry| shared.pipe_starved(Pipe::Video, dry);
         let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
@@ -1612,15 +1757,18 @@ fn run_video_thread(
                 // rest.
                 if let Some(dec) = sw_decoder.as_mut() {
                     let _ = dec.flush();
-                    while !shared.stopped.load(Ordering::SeqCst) {
+                    while !quit() {
                         let recv = std::panic::catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
                         match recv {
                             Ok(Ok(Frame::Video(vf))) => {
                                 let ticks = vf.pts.unwrap_or(0).max(0);
                                 let secs = stream.time_base.seconds_of(ticks).max(0.0);
+                                if before_seek_target(&shared, secs, seen_seek, &mut shown_seek) {
+                                    continue;
+                                }
                                 let shown = present_frame(
                                     &mut *sink, &shared, &vf, Duration::from_secs_f64(secs),
-                                    seen_seek, realtime, &mut sink_running, &mut primed,
+                                    seen_seek, realtime, &mut sink_running, &mut primed, &retired,
                                 );
                                 if !shown {
                                     break;
@@ -1646,7 +1794,7 @@ fn run_video_thread(
             // While the clock stands still the platform decoder cannot
             // present anything: feed it only up to `PREROLL` past the clock,
             // so its input queue never fills and blocks `push_packet`.
-            if realtime && !shared.preroll(pts, seen_seek) {
+            if realtime && !shared.preroll(pts, seen_seek, &retired) {
                 continue;
             }
             sync_video_sink(&mut *sink, &shared, &mut sink_running);
@@ -1663,7 +1811,7 @@ fn run_video_thread(
                     // next keyframe.
                     compressed = false;
                     need_keyframe = true;
-                    match ctx.codecs.first_decoder(&stream.params) {
+                    match make_decoder(&shared.ctx, &stream.params) {
                         Ok(d) => {
                             let _ = sink.open_frames(&stream.params);
                             sw_decoder = Some(d);
@@ -1721,7 +1869,7 @@ fn run_video_thread(
             }
 
             loop {
-                if shared.stopped.load(Ordering::SeqCst) {
+                if quit() {
                     return;
                 }
                 let recv_res =
@@ -1757,26 +1905,37 @@ fn run_video_thread(
                 let frame_pts_secs = stream.time_base.seconds_of(frame_ticks).max(0.0);
 
                 // Drop everything before the seek target, for seeks this
-                // thread has not yet consumed. The first frame at or after
-                // the target clears the window.
-                if let Some(seek) = *shared.active_seek.lock() {
-                    if seek.generation > seen_seek_target && frame_pts_secs < seek.target {
-                        continue;
-                    }
-                    seen_seek_target = seen_seek;
+                // thread has not shown a frame for yet.
+                if before_seek_target(&shared, frame_pts_secs, seen_seek, &mut shown_seek) {
+                    continue;
                 }
 
                 let shown = present_frame(
                     &mut *sink, &shared, &vf, Duration::from_secs_f64(frame_pts_secs),
-                    seen_seek, realtime, &mut sink_running, &mut primed,
+                    seen_seek, realtime, &mut sink_running, &mut primed, &retired,
                 );
                 if !shown {
-                    // Stopped, or a seek: the decoder's output is stale.
+                    // Stopped, retired or a seek: the decoder's output is stale.
                     break;
                 }
             }
         }
     }
+}
+
+/// Whether a frame at `pts_secs` precedes the target of the latest seek
+/// while this pipeline has shown nothing since it (`shown_seek` is the
+/// newest seek generation it has shown a frame for). Such frames are
+/// dropped; the first frame at or after the target closes the window.
+fn before_seek_target(shared: &SharedState, pts_secs: f64, seen_seek: u64, shown_seek: &mut u64) -> bool {
+    let Some(seek) = *shared.active_seek.lock() else {
+        return false;
+    };
+    if seek.generation > *shown_seek && pts_secs < seek.target {
+        return true;
+    }
+    *shown_seek = seen_seek;
+    false
 }
 
 /// Applies the clock's run state to a video sink when it changed.
@@ -1791,8 +1950,8 @@ fn sync_video_sink(sink: &mut dyn VideoSink, shared: &SharedState, applied: &mut
 /// Hands one decoded frame to the sink: in realtime once it is due on the
 /// clock (pushed up to 100 ms early; more than 100 ms late it is dropped and
 /// counted), immediately otherwise. A frame waiting for its time counts as
-/// output ready for the buffering hold. False when the player stopped or a
-/// seek superseded the frame.
+/// output ready for the buffering hold. False when the player stopped, the
+/// pipeline was retired, or a seek superseded the frame.
 #[allow(clippy::too_many_arguments)]
 fn present_frame(
     sink: &mut dyn VideoSink,
@@ -1803,13 +1962,14 @@ fn present_frame(
     realtime: bool,
     sink_running: &mut Option<bool>,
     primed: &mut Option<u64>,
+    retired: &AtomicBool,
 ) -> bool {
     if *primed != Some(seen_seek) {
         *primed = Some(seen_seek);
         shared.pipe_primed(Pipe::Video, seen_seek);
     }
     if realtime {
-        match shared.wait_due(pts, seen_seek) {
+        match shared.wait_due(pts, seen_seek, retired) {
             Due::Now => {}
             Due::Late => {
                 shared.state.lock().dropped_frames += 1;
