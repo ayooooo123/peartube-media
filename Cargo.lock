@@ -72,6 +72,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "check-mpeg4"
+version = "0.1.0"
+dependencies = [
+ "oxideav-avi",
+ "oxideav-core",
+ "oxideav-mkv",
+ "oxideav-mp4",
+ "oxideav-mpeg4video",
+ "oxideav-mpegts",
+ "refcheck",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -616,7 +629,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg4video"
 version = "0.1.8"
-source = "git+https://github.com/OxideAV/oxideav-mpeg4video?rev=bd44688135e9894e8b58b8fca1c0a286406ab1af#bd44688135e9894e8b58b8fca1c0a286406ab1af"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=a0dc44f1533444dc216f6ec7dfd1b9601177c5cb#a0dc44f1533444dc216f6ec7dfd1b9601177c5cb"
 dependencies = [
  "oxideav-core",
 ]

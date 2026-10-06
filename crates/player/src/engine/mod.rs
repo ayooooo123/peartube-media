@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex};
 
 use oxideav_core::{
-    CodecId, CodecResolver, Decoder, Demuxer, Frame, MediaType, Packet, ProbeContext, ProbeData,
-    RuntimeContext, SampleFormat, StreamInfo, TimeBase, PROBE_SCORE_EXTENSION,
+    Decoder, Demuxer, Frame, MediaType, Packet, ProbeData, RuntimeContext,
+    SampleFormat, StreamInfo, TimeBase, PROBE_SCORE_EXTENSION,
 };
 
 use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
@@ -15,28 +15,6 @@ use crate::clock::FreeRunningClock;
 use crate::headless::find_headless;
 use crate::source::{open_source, ReadAheadSource};
 use crate::subs::run_subtitle_loop;
-
-/// Resolves container codec tags with one compat alias on top of the
-/// registry: Matroska's MPEG-4 Part 2 CodecID strings → `mpeg4video`.
-struct AliasResolver<'a> {
-    inner: &'a dyn CodecResolver,
-}
-
-impl CodecResolver for AliasResolver<'_> {
-    fn resolve_tag(&self, ctx: &ProbeContext) -> Option<CodecId> {
-        if let oxideav_core::CodecTag::Matroska(s) = ctx.tag {
-            // Only the MPEG-4 Part 2 profiles; AVC/HEVC stay with their own
-            // decoders ("V_MPEG4/ISO/AVC" → h264, "V_MPEGH/ISO/HEVC" → h265).
-            match s.as_str() {
-                "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/AP" => {
-                    return Some(CodecId::new("mpeg4video"));
-                }
-                _ => {}
-            }
-        }
-        self.inner.resolve_tag(ctx)
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
@@ -503,19 +481,14 @@ fn run_player_pipeline(
         }
     };
 
-    // 3. Demuxer. The demuxer resolves container tags through an alias
-    // resolver: Matroska's legacy MPEG-4 Part 2 CodecIDs (V_MPEG4/ISO/ASP,
-    // //SP, //AP — what every ordinary FFmpeg/AVI-sourced file carries)
-    // resolve to the `mpeg4video` decoder even though no registry crate
-    // claims the raw Matroska string yet.
+    // 3. Demuxer. Container codec tags resolve through the registry — the
+    //    mpeg4video fork claims Matroska's MPEG-4 Part 2 CodecIDs
+    //    (V_MPEG4/ISO/ASP, //SP, //AP) directly.
     let demuxer_source = SourceHandle::new(&url);
-    let alias = AliasResolver {
-        inner: &ctx.codecs as &dyn CodecResolver,
-    };
     let mut demuxer = match demuxer_source {
         Ok(src) => match ctx
             .containers
-            .open_demuxer(&container, Box::new(src), &alias)
+            .open_demuxer(&container, Box::new(src), &ctx.codecs)
         {
             Ok(d) => d,
             Err(e) => {

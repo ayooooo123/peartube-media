@@ -1,0 +1,21 @@
+[package]
+name = "check-mpeg4"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-avi.workspace = true
+oxideav-mkv.workspace = true
+oxideav-mp4.workspace = true
+oxideav-mpegts.workspace = true
+# The fork under test (pinned in the workspace [patch.crates-io]).
+oxideav-mpeg4video = "*"
