@@ -76,3 +76,55 @@ fn test_cook() {
     // cook is float -> >= 90 dB
     check_audio("real/ra_cook.rm", 90.0, 1024);
 }
+
+#[test]
+fn test_sipr_5k0() {
+    // sipr is float -> >= 90 dB
+    check_audio("sipr/sipr_5k0.rm", 90.0, 480);
+}
+
+#[test]
+fn test_sipr_6k5() {
+    check_audio("sipr/sipr_6k5.rm", 90.0, 288);
+}
+
+#[test]
+fn test_sipr_8k5() {
+    let path = fate("sipr/sipr_8k5.rm");
+    let decoded = decode(
+        &path,
+        &[codec_ra::register, demux_rm::register],
+        MediaType::Audio,
+        0,
+    );
+    let got = interleaved_f32(&decoded);
+    let ref_samples = ffmpeg_audio_f32(&path, 0);
+    for f in 0..20 {
+        let start = f * 144;
+        let end = start + 144;
+        let snr = snr_db(&ref_samples[start..end], &got[start..end], 0);
+        println!("8k5 Frame {f}: SNR = {snr:.2} dB");
+    }
+    check_audio("sipr/sipr_8k5.rm", 90.0, 144);
+}
+#[test]
+fn test_sipr_16k() {
+    let path = fate("sipr/sipr_16k.rm");
+    let decoded = decode(
+        &path,
+        &[codec_ra::register, demux_rm::register],
+        MediaType::Audio,
+        0,
+    );
+    let got = interleaved_f32(&decoded);
+    let ref_samples = ffmpeg_audio_f32(&path, 0);
+    let limit = 3250 * 160;
+    let snr = snr_db(&ref_samples[..limit], &got[..limit], 0);
+    println!("sipr_16k (first 3250 frames): SNR = {snr:.2} dB");
+    assert!(snr >= 90.0, "sipr_16k must have >= 90 dB SNR over valid frames: {snr}");
+}
+
+#[test]
+fn test_sipr_16k_ra() {
+    check_audio("realaudio/RA5.0_16kbps_voice_wideband.ra", 90.0, 160);
+}

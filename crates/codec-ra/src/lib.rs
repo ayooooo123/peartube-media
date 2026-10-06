@@ -1,4 +1,4 @@
-//! RealAudio decoders: ra_144, ra_288, ralf, cook.
+//! RealAudio decoders: ra_144, ra_288, ralf, cook, sipr.
 //!
 //! Ported from FFmpeg (commit 2da55bf), licensed under LGPL-2.1-or-later.
 #![forbid(unsafe_code)]
@@ -13,6 +13,8 @@ pub mod ra288_tables;
 pub mod ralf;
 pub mod ralf_tables;
 pub mod vlc_len;
+pub mod sipr;
+pub mod sipr_tables;
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecTag, RuntimeContext,
 };
@@ -67,6 +69,16 @@ pub fn register(ctx: &mut RuntimeContext) {
             .tags([
                 CodecTag::fourcc(b"cook"),
                 CodecTag::matroska("A_REAL/COOK"),
+            ]),
+    );
+    // SIPR / ACELP.NET speech decoder. RM fourcc "sipr", Matroska "A_REAL/SIPR", wave_format 0x0130.
+    ctx.codecs.register(
+        audio_info("sipr", "codec-ra_sipr", 1, 16_000)
+            .decoder(sipr::make_decoder)
+            .tags([
+                CodecTag::fourcc(b"sipr"),
+                CodecTag::matroska("A_REAL/SIPR"),
+                CodecTag::wave_format(0x0130),
             ]),
     );
 }
