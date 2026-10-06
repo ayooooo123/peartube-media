@@ -297,6 +297,19 @@ mod tests {
     }
 
     #[test]
+    fn the_video_oracle_pins_the_c_idct_for_idct_codecs_only() {
+        // MPEG-2 builds its IDCT through ff_idctdsp_init(avctx->idct_algo).
+        let mpeg2 = refcheck::fate("mpeg2/matrixbench_mpeg2.lq1.mpg");
+        let pinned = video_md5s(&mpeg2, "0:0", "yuv420p").unwrap();
+        assert_eq!(pinned, refcheck::ffmpeg_video_md5s_with(&mpeg2, 0, "yuv420p", &["-idct", "simple"]));
+        #[cfg(target_arch = "aarch64")]
+        assert_ne!(pinned, refcheck::ffmpeg_video_md5s(&mpeg2, 0, "yuv420p"), "arm64's default NEON IDCT rounds differently");
+        // H.264 has no IDCT option: the pin changes nothing.
+        let h264 = refcheck::fate("mkv/1242-small.mkv");
+        assert_eq!(video_md5s(&h264, "0:1", "yuv420p").unwrap(), refcheck::ffmpeg_video_md5s(&h264, 0, "yuv420p"));
+    }
+
+    #[test]
     fn subtitle_srt_reads_ffmpegs_decoded_cues() {
         let cues = subtitle_srt(&refcheck::fate("sub/SubRip_capability_tester.srt"), "0:0").unwrap();
         assert!(cues.len() > 10, "{}", cues.len());
