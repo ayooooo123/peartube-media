@@ -1,11 +1,12 @@
 //! What a platform gives the engine: somewhere to send audio, video and
 //! subtitles, and the clock that ties them together.
 //!
-//! The engine decodes audio itself and hands PCM to an [`AudioSink`], which
-//! owns the master [`Clock`]. Video goes to a [`VideoSink`], which first gets
-//! a chance to take the stream compressed (a platform decoder); if it
-//! declines, or fails later, the engine decodes in software and hands it
-//! frames. Subtitles arrive as positioned RGBA images.
+//! The engine decodes audio itself and hands PCM to an [`AudioSink`], whose
+//! [`Clock`] is the playback's master clock while audio plays. Video goes to
+//! a [`VideoSink`], which first gets a chance to take the stream compressed
+//! (a platform decoder); if it declines, or fails later, the engine decodes
+//! in software and hands it frames. Either way the video is presented on
+//! the master clock. Subtitles arrive as positioned RGBA images.
 
 use oxideav_core::{CodecParameters, Packet, VideoFrame};
 use std::sync::Arc;
@@ -13,10 +14,13 @@ use std::time::Duration;
 
 /// A platform: Android, Apple, or headless for tests.
 pub trait Backend: Send + Sync {
-    /// The audio output for one playback.
+    /// The audio output for one playback. The engine creates it before the
+    /// video output and keeps it for the whole playback, across audio track
+    /// switches.
     fn audio(&self) -> Box<dyn AudioSink>;
-    /// The video output for one playback. `clock` is the audio sink's clock
-    /// (or a free-running one when there is no audio).
+    /// The video output for one playback. `clock` is the playback's clock:
+    /// the audio output's clock while audio plays, a free-running one
+    /// otherwise (no audio track, or after the audio ended).
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink>;
     /// The subtitle overlay for one playback.
     fn subtitles(&self) -> Box<dyn SubtitleSink>;
@@ -32,14 +36,21 @@ pub trait Clock: Send + Sync {
     /// Current media position, or `None` before the first audio is heard.
     fn now(&self) -> Option<Duration>;
     /// CLOCK_MONOTONIC nanoseconds at which media time `at` will be (or was)
-    /// presented, or `None` while unknown. Android uses it for
-    /// `AMediaCodec_releaseOutputBufferAtTime`.
+    /// presented, or `None` while that is unknown: before the output
+    /// started, and whenever the clock stands still (paused, holding), since
+    /// then nothing says when it will move again. Android uses it for
+    /// `AMediaCodec_releaseOutputBufferAtTime`; the engine to wake for a
+    /// frame's time.
     fn monotonic_ns_at(&self, at: Duration) -> Option<i64>;
 }
 
 /// Why a sink refused a packet or frame.
 #[derive(Debug, thiserror::Error)]
 pub enum SinkError {
+    /// A bounded enqueue made no room. Retry the same packet after applying
+    /// transport changes; it has not been consumed.
+    #[error("output buffer full")]
+    WouldBlock,
     /// The platform decoder cannot continue with this stream; the engine
     /// switches to software decoding at the next keyframe.
     #[error("platform decoder failed: {0}")]
@@ -59,14 +70,19 @@ pub trait AudioSink: Send {
     /// the format changes.
     fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), SinkError>;
     /// Queues PCM whose first sample plays at media time `pts`. Blocks while
-    /// the output's buffer is full; returns how many frames it took.
+    /// a playing output's buffer is full; a paused output that is full takes
+    /// nothing (0). Returns how many frames it took.
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError>;
+    /// Starts the output: queued audio plays and the clock runs.
     fn play(&mut self);
+    /// Stops the output where it is: the clock stands still, nothing queued
+    /// is lost.
     fn pause(&mut self);
     /// Drops everything queued (seek). The clock restarts at the next
     /// `write`'s `pts`.
     fn flush(&mut self);
-    /// The master clock for this playback.
+    /// The output's clock: the media time of the sample being heard. The
+    /// playback's master clock while audio plays.
     fn clock(&self) -> Arc<dyn Clock>;
 }
 
@@ -82,8 +98,18 @@ pub trait VideoSink: Send {
     /// Prepares for software frames of this stream.
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError>;
     /// One decoded frame, in presentation order, to show at media time `pts`.
-    /// The engine calls it shortly before `pts`; the sink shows it at `pts`.
+    /// The engine calls it `frame_lead` before `pts` on the playback's clock;
+    /// the sink shows it at `pts`.
     fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError>;
+    /// How long before its `pts` a decoded frame should reach `push_frame`.
+    /// A sink that presents frames by their timestamps (a layer timed by
+    /// the audio clock) takes them early; one that shows a frame as soon as
+    /// it has it takes it on time, early by only the work it does before
+    /// the frame is on screen.
+    fn frame_lead(&self) -> Duration;
+    /// Signals end of compressed input so a platform decoder releases its
+    /// reordered tail. Frame-only outputs have no decoder to drain.
+    fn finish(&mut self) -> Result<(), SinkError> { Ok(()) }
     /// Drops everything queued and decoder state (seek).
     fn flush(&mut self);
     /// Pause/resume presentation (the clock stops with the audio).

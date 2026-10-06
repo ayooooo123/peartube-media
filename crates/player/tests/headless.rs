@@ -1559,3 +1559,120 @@ fn track_without_decoder_is_skipped() {
     let end = samples.last().unwrap().position;
     assert!(end + Duration::from_millis(200) >= last, "the clock stopped at {end:?}, last frame {last:?}");
 }
+
+/// One white frame and a 40 ms, 1 kHz beep at each integer second. PCM and
+/// short indexed clusters keep HTTP read-ahead from swallowing the stall.
+fn sync_clip(seconds: u32) -> Vec<u8> {
+    ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i",
+        "color=black:size=160x96:rate=25,drawbox=color=white:t=fill:enable='lt(mod(t,1),0.039)',geq=lum='if(lt(Y,8)*lt(X,128),if(bitand(N,pow(2,floor(X/16))),220,32),lum(X,Y))':cb='cb(X,Y)':cr='cr(X,Y)'",
+        "-f", "lavfi", "-i",
+        "aevalsrc=if(lt(mod(t\\,1)\\,0.04)\\,0.5*sin(2*PI*1000*t)\\,0):s=48000",
+        "-t", &seconds.to_string(), "-c:v", "libx264", "-preset", "ultrafast",
+        "-g", "25", "-bf", "0", "-pix_fmt", "yuv420p",
+        "-c:a", "pcm_s16le", "-ac", "2", "-reserve_index_space", "4096",
+        "-cluster_size_limit", "100000", "-cluster_time_limit", "200",
+    ])
+}
+
+/// Compare independent output records, not video PTS against the clock the
+/// scheduler just read. Locate the actual beep samples in captured PCM and
+/// interpolate their device presentation times in recorded playback runs.
+fn assert_flash_beeps(capture: &Capture, bytes: &[u8], expected: &[Vec<u32>], name: &str) {
+    let video = &capture.video[0];
+    let audio = &capture.audio[0];
+    let reference = ffmpeg_video_frames(bytes);
+    let mut bounds = vec![0];
+    bounds.extend_from_slice(&video.flushes);
+    bounds.push(video.pts.len());
+    assert_eq!(bounds.len() - 1, expected.len(), "seek generations");
+    let mut offsets = Vec::new();
+    let mut csv = String::from("generation,pts_s,video_mono_ns,beep_mono_ns,offset_ms\n");
+    for (generation, (range, seconds)) in bounds.windows(2).zip(expected).enumerate() {
+        for &second in seconds {
+            let pts = Duration::from_secs(u64::from(second));
+            let frame = (range[0]..range[1]).find(|&i| video.pts[i] == pts)
+                .unwrap_or_else(|| panic!("missing flash at {pts:?}, generation {generation}"));
+            let expected_frame = &reference.iter().find(|(p, _)| *p == pts).expect("reference flash").1;
+            assert_eq!(&video.frame_md5[frame], expected_frame, "flash/frame identifier differs from FFmpeg");
+            let shown = video.shown_at[frame];
+            let channels = usize::from(audio.channels);
+            let mut heard = Vec::new();
+            for (i, &(start_pts, from)) in audio.writes.iter().enumerate() {
+                let to = audio.writes.get(i + 1).map_or(audio.pcm.len(), |w| w.1);
+                let span = Duration::from_secs_f64((to - from) as f64 / channels as f64 / audio.sample_rate as f64);
+                if pts < start_pts || pts >= start_pts + span {
+                    continue;
+                }
+                let offset = ((pts - start_pts).as_secs_f64() * audio.sample_rate as f64).round() as usize;
+                let estimated = from / channels + offset;
+                // Matroska packet stamps round to milliseconds. Find the
+                // waveform's actual onset near that estimate, after silence,
+                // rather than assigning a rounded stamp to a silent sample.
+                let radius = audio.sample_rate as usize / 500;
+                let sample_frame = (estimated.saturating_sub(radius)..=(estimated + radius).min(audio.pcm.len() / channels - 1))
+                    .find(|&n| audio.pcm[n * channels].abs() > 0.01
+                        && (n.saturating_sub(16)..n).all(|k| audio.pcm[k * channels].abs() <= 0.01))
+                    .unwrap_or_else(|| panic!("no beep onset near {pts:?}"));
+                let sample = sample_frame * channels;
+                for &(begin, end, at) in &audio.played {
+                    if (begin..end).contains(&sample) {
+                        heard.push(at + ((sample - begin) as f64 / channels as f64 / audio.device_rate * 1e9).round() as i64);
+                    }
+                }
+            }
+            let beep = heard.into_iter().min_by_key(|at| shown.abs_diff(*at))
+                .unwrap_or_else(|| panic!("beep at {pts:?} was never played"));
+            let offset = (shown - beep) as f64 / 1e6;
+            csv.push_str(&format!("{generation},{second},{shown},{beep},{offset:.6}\n"));
+            offsets.push(offset);
+        }
+    }
+    let root = std::env::var_os("CARGO_TARGET_DIR").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("../../target"));
+    let dir = root.join("engine-sync");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.csv")), csv).unwrap();
+    eprintln!("{name}: offsets_ms={offsets:?}");
+    assert!(offsets.iter().all(|v| v.abs() <= 40.0), "A/V offsets exceed 40 ms: {offsets:?}");
+}
+
+#[test]
+fn audio_master_follows_two_percent_slow_device_for_thirty_seconds() {
+    let _cpu = realtime_test();
+    let bytes = sync_clip(32);
+    let path = tempfile("mkv");
+    std::fs::write(&path, &bytes).unwrap();
+    let backend = Headless::new();
+    backend.set_audio_speed(0.98);
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(50), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    assert_flash_beeps(&backend.capture(), &bytes, &[(0..32).collect()], "headless-drift");
+}
+
+#[test]
+fn flash_beeps_remain_synchronized_after_stall_pause_and_seek() {
+    let _cpu = realtime_test();
+    let bytes = Arc::new(sync_clip(8));
+    let server = HttpServer::start_with(bytes.clone(), Delivery {
+        mid_stall: Some(Duration::from_secs(6)),
+        ..Delivery::default()
+    });
+    let (player, backend, _) = open_realtime(&server.url());
+    let (samples, state) = sample_until(&player, Duration::from_secs(25), |s| finished(s) || s.position >= Duration::from_millis(6200));
+    assert!(!finished(&state), "{state:?}");
+    assert!(samples.windows(2).any(|w| !w[0].buffering && w[1].buffering), "no mid-stream hold");
+    player.pause();
+    let held = player.state().position;
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(player.state().position, held, "paused master moved");
+    player.seek(Duration::from_millis(2100));
+    player.play();
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    assert_flash_beeps(&backend.capture(), &bytes, &[(0..7).collect(), (3..8).collect()], "headless-stall-seek");
+}

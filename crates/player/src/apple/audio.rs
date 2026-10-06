@@ -40,6 +40,7 @@ pub struct AppleAudioSink {
     /// or flush); `play`/`pause` before that only record the intent.
     anchored: bool,
     playing: bool,
+    playback: super::PlaybackSlot,
 }
 
 // SAFETY: AVSampleBufferAudioRenderer is documented thread-safe (enqueue
@@ -53,6 +54,7 @@ impl AppleAudioSink {
         synchronizer: Retained<AVSampleBufferRenderSynchronizer>,
         audio_renderer: Retained<AVSampleBufferAudioRenderer>,
         clock: Arc<AppleClock>,
+        playback: super::PlaybackSlot,
     ) -> Self {
         Self {
             synchronizer: SendSync(synchronizer),
@@ -65,17 +67,21 @@ impl AppleAudioSink {
             requesting: std::cell::Cell::new(false),
             anchored: false,
             playing: false,
+            playback,
         }
     }
 
-    fn wait_ready(&self) {
+    fn wait_ready(&self) -> bool {
         // Fast path: renderer is accepting data right now.
         let ready_now = unsafe {
             let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
             objc2::msg_send![renderer, isReadyForMoreMediaData]
         };
         if ready_now {
-            return;
+            return true;
+        }
+        if !self.playing {
+            return false;
         }
         // Register the pull callback once; it fires on `queue` whenever the
         // renderer becomes ready again.
@@ -95,24 +101,16 @@ impl AppleAudioSink {
             }
             self.requesting.set(true);
         }
-        // Block `write` (the contract: "Blocks while the output's buffer is
-        // full") until ready. The condition is re-checked against the
-        // renderer after every wake: requestMediaDataWhenReady fires the
-        // block repeatedly while ready, so a stale flag cannot hang us.
-        loop {
-            let ready_now = unsafe {
+        // A bounded wait returns control to the engine so it can pause,
+        // seek or stop even when the renderer stops requesting data.
+        let (lock, cvar) = &*self.ready;
+        let guard = lock.lock().expect("ready lock");
+        let (guard, _) = cvar.wait_timeout(guard, Duration::from_millis(20))
+            .expect("ready condvar");
+        drop(guard);
+        unsafe {
             let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
             objc2::msg_send![renderer, isReadyForMoreMediaData]
-        };
-            if ready_now {
-                return;
-            }
-            let (lock, cvar) = &*self.ready;
-            let guard = lock.lock().expect("ready lock");
-            let (guard, _timeout) = cvar
-                .wait_timeout(guard, Duration::from_millis(20))
-                .expect("ready condvar");
-            drop(guard);
         }
     }
 }
@@ -158,6 +156,7 @@ impl AudioSink for AppleAudioSink {
         }
         // SAFETY: Create-rule function returned +1.
         self.format_desc = Some(unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw as *mut _)) });
+        self.flush();
         Ok(())
     }
 
@@ -175,7 +174,9 @@ impl AudioSink for AppleAudioSink {
             return Ok(0);
         }
 
-        self.wait_ready();
+        if !self.wait_ready() {
+            return Ok(0);
+        }
 
         let pcm_bytes =
             unsafe { std::slice::from_raw_parts(pcm.as_ptr().cast::<u8>(), pcm.len() * 4) };
@@ -257,6 +258,7 @@ impl AudioSink for AppleAudioSink {
     }
 
     fn flush(&mut self) {
+        unsafe { self.synchronizer.setRate(0.0); }
         // The plain `-flush` lives on the AVQueuedSampleBufferRendering
         // protocol; the renderer also inherits it via that conformance.
         unsafe {
@@ -276,6 +278,10 @@ impl AudioSink for AppleAudioSink {
 
 impl Drop for AppleAudioSink {
     fn drop(&mut self) {
+        let mut slot = self.playback.lock().expect("playback lock");
+        if slot.as_ref().is_some_and(|s| std::ptr::eq(&*s.0, &*self.synchronizer.0)) {
+            *slot = None;
+        }
         if self.requesting.get() {
             unsafe {
                 let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;

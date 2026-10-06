@@ -4,24 +4,40 @@
 //! the source has no bytes to give, until about a second of media is
 //! buffered past it (or the input ends). Play/pause stay the user's intent:
 //! the hold never changes them.
+//!
+//! The clock itself is the playback's `MasterClock`: the audio output's
+//! clock while audio plays (the audio pipeline pauses its output while the
+//! clock is held), the free-running clock otherwise. Everything that waits
+//! for a media time here re-reads it on every wake, so it follows an audio
+//! output that runs fast or slow, and stops with it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{notify_changed_now, SharedState};
 use crate::backend::Clock;
+use crate::clock::current_monotonic_ns;
 
 /// Media demuxed past the clock before a hold lets go.
 const BUFFER_AHEAD_SECS: f64 = 1.0;
-/// Video frames go to the sink this long before they are due; frames later
-/// than this past due are dropped (CPU starvation, never data starvation:
-/// the clock holds before it passes media that has not arrived).
+/// The most a decoded video frame goes to its sink before it is due (see
+/// `VideoSink::frame_lead`); frames later than this past due are dropped
+/// (CPU starvation, never data starvation: the clock holds before it passes
+/// media that has not arrived).
 const VIDEO_LEAD: Duration = Duration::from_millis(100);
 /// While the clock stands still, audio and compressed video are handed to
 /// their sinks at most this far past it: enough to have the output primed,
 /// short of filling a paused output so far that `write`/`push_packet` block.
 const PREROLL: Duration = Duration::from_millis(100);
+/// The longest timed wait for a media time: it is re-evaluated at least
+/// this often, whatever the clock's mapping said.
+const MAX_WAIT: Duration = Duration::from_millis(100);
+/// The audio's end counts as heard this close to it (the stamps are
+/// rounded to the container's time base, the clock counts samples).
+const END_SLACK: Duration = Duration::from_millis(5);
+/// A running clock that stands still this long has played all its output.
+const DRAINED: Duration = Duration::from_millis(100);
 
 /// The pipelines whose data the clock waits for (subtitles never hold it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +71,8 @@ pub(super) struct Transport {
     started: bool,
     /// Playback ended or failed: the clock stops for good.
     done: bool,
-    /// The free clock is running (not paused, not buffering, not done).
+    /// The clock runs (not paused, not buffering, not done): the free clock
+    /// plays, and the audio pipeline plays its output.
     running: bool,
     /// Latest seek generation, and the one the demuxer has applied.
     seek_gen: u64,
@@ -97,6 +114,16 @@ pub(super) enum Due {
     /// More than `VIDEO_LEAD` past due: drop it.
     Late,
     /// The player stopped or a seek superseded the frame.
+    Abort,
+}
+
+/// Whether media may go to a sink while the clock stands still.
+pub(super) enum Preroll {
+    Go,
+    /// The clock's run state changed: apply it to the sink, then ask again.
+    Resync,
+    /// The player stopped, the pipeline was retired, or a seek superseded
+    /// the media.
     Abort,
 }
 
@@ -149,11 +176,7 @@ impl SharedState {
             let run_changed = run != t.running;
             if run_changed {
                 t.running = run;
-                if run {
-                    self.free_clock.play();
-                } else {
-                    self.free_clock.pause();
-                }
+                self.master.set_running(run);
                 self.running.store(run, Ordering::SeqCst);
             }
             let buffering_changed = before.1 != t.buffering;
@@ -218,7 +241,7 @@ impl SharedState {
             }
             return;
         }
-        let now = self.free_clock.now().unwrap_or_default().as_secs_f64();
+        let now = self.master.now().unwrap_or_default().as_secs_f64();
         let primed = t.pipes.iter().filter(live).all(|p| ready(&p));
         let enough = t.demux_eof
             || t.pipes
@@ -236,11 +259,12 @@ impl SharedState {
     }
 
     /// `seek()`: the clock jumps to `to` and holds until the pipelines have
-    /// output from there and enough is buffered.
+    /// output from there and enough is buffered. The free clock leads until
+    /// the audio plays from `to`.
     pub(super) fn seek_clock(&self, to: Duration) {
         self.update(|t| {
-            self.free_clock.set_position(to);
             t.seek_gen = self.seek_gen.load(Ordering::SeqCst);
+            self.master.seek(to, t.seek_gen);
             for p in &mut t.pipes {
                 p.horizon = None;
             }
@@ -320,61 +344,138 @@ impl SharedState {
         self.update(|t| t.demux_full = full);
     }
 
-    /// Waits until a video frame at `pts` is due (realtime pacing): up to
-    /// `VIDEO_LEAD` before `pts` on the clock. Wakes on every clock change.
-    pub(super) fn wait_due(&self, pts: Duration, seen_seek: u64, retired: &AtomicBool) -> Due {
+    /// Waits until a decoded video frame at `pts` should go to its sink:
+    /// `lead` before `pts` on the clock (at most `VIDEO_LEAD`); more than
+    /// `VIDEO_LEAD` past `pts` it is late. Re-reads the clock on every wake:
+    /// its run state changing, or the time its mapping gives for the frame.
+    pub(super) fn wait_due(
+        &self,
+        pts: Duration,
+        lead: Duration,
+        seen_seek: u64,
+        retired: &AtomicBool,
+    ) -> Due {
+        #[cfg(target_os = "macos")]
+        let _timing = crate::clock::timing::Guard::enter();
+        let due = pts.saturating_sub(lead.min(VIDEO_LEAD));
         let mut t = self.transport.lock();
         loop {
             if self.superseded(seen_seek, retired) {
                 return Due::Abort;
             }
-            let now = self.free_clock.now().unwrap_or_default();
+            let now = self.master.now().unwrap_or_default();
             if now > pts + VIDEO_LEAD {
                 return Due::Late;
             }
-            if pts <= now + VIDEO_LEAD {
+            if due <= now {
                 return Due::Now;
             }
             if t.running {
-                let until_due = pts - VIDEO_LEAD - now;
-                self.transport_cv.wait_for(&mut t, until_due);
+                let wait = self.until(due, now);
+                self.transport_cv.wait_for(&mut t, wait);
             } else {
                 self.transport_cv.wait(&mut t);
             }
         }
     }
 
+    /// How long until the clock reaches `at` (it reads `now`), for a timed
+    /// wait: from the clock's own mapping when it has one (an audio output's
+    /// timestamps follow a device that runs fast or slow), else the media
+    /// time between. Between 1 ms and `MAX_WAIT`: the caller re-reads the
+    /// clock when it wakes.
+    fn until(&self, at: Duration, now: Duration) -> Duration {
+        let wait = match self.master.monotonic_ns_at(at) {
+            Some(ns) => Duration::from_nanos((ns - current_monotonic_ns()).max(0) as u64),
+            None => at.saturating_sub(now),
+        };
+        wait.clamp(Duration::from_millis(1), MAX_WAIT)
+    }
+
     /// While the clock stands still, waits until media at `pts` is within
-    /// `PREROLL` of it. False when stopped, retired or superseded by a seek.
-    pub(super) fn preroll(&self, pts: Duration, seen_seek: u64, retired: &AtomicBool) -> bool {
+    /// `PREROLL` of it. `Resync` as soon as the clock's run state differs
+    /// from `applied`, the one the caller's sink follows: an audio output
+    /// left playing while the clock is held would run the clock on.
+    pub(super) fn preroll(
+        &self,
+        pts: Duration,
+        applied: Option<bool>,
+        ahead: Option<Duration>,
+        seen_seek: u64,
+        retired: &AtomicBool,
+    ) -> Preroll {
         let mut t = self.transport.lock();
         loop {
             if self.superseded(seen_seek, retired) {
-                return false;
+                return Preroll::Abort;
             }
+            if applied != Some(t.running) {
+                return Preroll::Resync;
+            }
+            let now = self.master.now().unwrap_or_default();
             if t.running {
-                return true;
+                if let Some(ahead) = ahead {
+                    if pts > now + ahead {
+                        let wait = self.until(pts - ahead, now);
+                        self.transport_cv.wait_for(&mut t, wait);
+                        continue;
+                    }
+                }
+                return Preroll::Go;
             }
-            let now = self.free_clock.now().unwrap_or_default();
             if pts <= now + PREROLL {
-                return true;
+                return Preroll::Go;
             }
             self.transport_cv.wait(&mut t);
         }
     }
 
-    /// Waits until the clock runs. False when stopped, retired or superseded.
-    pub(super) fn wait_running(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
+    /// Waits until the clock reaches `at`, the end of the audio written: its
+    /// last samples have been heard. False when stopped, retired or
+    /// superseded by a seek. A clock that stands still while running has
+    /// played everything it was given, which ends the wait too (its sample
+    /// count falls short of the stamps where they have a gap).
+    pub(super) fn wait_heard(
+        &self, at: Duration, seen_seek: u64, retired: &AtomicBool,
+        mut apply_running: impl FnMut(bool),
+    ) -> bool {
+        #[cfg(target_os = "macos")]
+        let _timing = crate::clock::timing::Guard::enter();
         let mut t = self.transport.lock();
+        let mut still: Option<(Duration, Instant)> = None;
         loop {
             if self.superseded(seen_seek, retired) {
                 return false;
             }
-            if t.running {
+            apply_running(t.running);
+            let now = self.master.now().unwrap_or_default();
+            if now + END_SLACK >= at {
                 return true;
             }
-            self.transport_cv.wait(&mut t);
+            if !t.running {
+                still = None;
+                self.transport_cv.wait(&mut t);
+                continue;
+            }
+            match still {
+                Some((position, since)) if position == now => {
+                    if since.elapsed() >= DRAINED {
+                        return true;
+                    }
+                }
+                _ => still = Some((now, Instant::now())),
+            }
+            let wait = self.until(at, now).min(DRAINED);
+            self.transport_cv.wait_for(&mut t, wait);
         }
+    }
+
+
+    /// A sink made no room in its bounded write. Yield on the transport's
+    /// condvar, so pause/seek/drop interrupts the retry without losing PCM.
+    pub(super) fn wait_output(&self) {
+        let mut t = self.transport.lock();
+        self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
     }
 
     /// Without realtime pacing nothing waits on the clock: a paused player

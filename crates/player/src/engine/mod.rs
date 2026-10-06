@@ -12,13 +12,13 @@ use oxideav_core::{
 };
 
 use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
-use crate::clock::FreeRunningClock;
+use crate::clock::MasterClock;
 use crate::headless::find_headless;
 use crate::source::{open_source, ReadAheadSource, SourceMonitor};
 use crate::subs::run_subtitle_loop;
 
 mod transport;
-use transport::{Due, Live, Pipe, Transport};
+use transport::{Due, Live, Pipe, Preroll, Transport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
@@ -359,8 +359,15 @@ struct SharedState {
     /// Bumped on every selection change; the demux loop compares to detect it.
     select_gen: AtomicU64,
     backend: Arc<dyn Backend>,
-    free_clock: Arc<FreeRunningClock>,
-    /// Play/pause intent and the buffering hold; decides when `free_clock`
+    /// The playback's clock (see `MasterClock`); `transport` decides when
+    /// it runs.
+    master: Arc<MasterClock>,
+    /// The playback's audio output while no audio pipeline holds it: made
+    /// before the video output (an Apple video layer joins the audio
+    /// output's synchronizer) and kept across audio track switches, so the
+    /// playback has one audio clock throughout.
+    audio_sink: Mutex<Option<Box<dyn AudioSink>>>,
+    /// Play/pause intent and the buffering hold; decides when the clock
     /// runs (see `transport`).
     transport: Mutex<Transport>,
     /// Paired with `transport`: notified whenever the clock's run state,
@@ -382,11 +389,11 @@ struct Seek {
 }
 
 impl SharedState {
-    /// The clock every sink of this playback follows: the free-running
-    /// clock, held while buffering (the audio sinks follow it through
-    /// `AudioSink::play`/`pause`).
+    /// The clock every sink of this playback follows: the audio output's
+    /// clock while audio plays, else the free-running clock; either stands
+    /// still while buffering or paused.
     fn sink_clock(&self) -> Arc<dyn Clock> {
-        self.free_clock.clone()
+        self.master.clone()
     }
 
     /// Moves playback to `to`: the demux loop applies the newest request,
@@ -425,9 +432,6 @@ impl Player {
             ..State::default()
         };
 
-        let free = Arc::new(FreeRunningClock::new());
-        free.set_position(Duration::ZERO);
-
         let stopped = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(SharedState {
             state: Mutex::new(initial_state),
@@ -445,7 +449,8 @@ impl Player {
             wanted_subtitle: Mutex::new(options.subtitle),
             select_gen: AtomicU64::new(1),
             backend,
-            free_clock: Arc::clone(&free),
+            master: Arc::new(MasterClock::new()),
+            audio_sink: Mutex::new(None),
             transport: Mutex::new(Transport::new()),
             transport_cv: Condvar::new(),
             running: AtomicBool::new(false),
@@ -520,7 +525,7 @@ impl Player {
 
     pub fn state(&self) -> State {
         let mut st = self.shared.state.lock();
-        st.position = self.shared.free_clock.now().unwrap_or(st.position);
+        st.position = self.shared.master.now().unwrap_or(st.position);
         st.clone()
     }
 
@@ -534,7 +539,7 @@ impl Player {
         {
             self.shared.condvar.wait(&mut st);
         }
-        st.position = self.shared.free_clock.now().unwrap_or(st.position);
+        st.position = self.shared.master.now().unwrap_or(st.position);
         st.clone()
     }
 }
@@ -780,6 +785,7 @@ fn run_player_pipeline(
             info(current_subtitle, MediaType::Subtitle),
             options.realtime,
         );
+        headless.set_clock(shared.sink_clock());
     }
 
     // 6. Lanes + sinks.
@@ -829,10 +835,17 @@ fn run_player_pipeline(
         audio_thread: None,
         sub_thread: None,
     };
-    run.video_thread = find_stream(&streams, current_video)
-        .map(|stream| spawn_video(&shared, stream, &video_lane, &demux_cv, realtime));
-    run.audio_thread = find_stream(&streams, current_audio)
-        .map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
+    let video_stream = find_stream(&streams, current_video);
+    let audio_stream = find_stream(&streams, current_audio);
+    // The audio output comes first: the video output may join its clock
+    // (an Apple video layer joins the audio's synchronizer).
+    if audio_stream.is_some() {
+        *shared.audio_sink.lock() = Some(shared.backend.audio());
+    }
+    run.video_thread =
+        video_stream.map(|stream| spawn_video(&shared, stream, &video_lane, &demux_cv, realtime));
+    run.audio_thread =
+        audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
     run.sub_thread = find_stream(&streams, current_subtitle)
         .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime));
 
@@ -845,6 +858,10 @@ fn run_player_pipeline(
         .flatten()
     {
         thread.join();
+    }
+    // Everything has played: the idle audio output stops with the clock.
+    if let Some(sink) = shared.audio_sink.lock().as_mut() {
+        sink.pause();
     }
 
     // A stream that lost its decoder leaves an error in `State` while the
@@ -908,6 +925,12 @@ fn spawn_video(
     let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
     PipelineThread::spawn("peartube-video", move |retired| {
         let _guards = (live, consumer);
+        #[cfg(target_os = "macos")]
+        if realtime {
+            if let Err(error) = crate::clock::timing::initialize_worker() {
+                eprintln!("macOS video worker scheduling setup failed: {error}");
+            }
+        }
         run_video_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
     })
 }
@@ -921,12 +944,41 @@ fn spawn_audio(
 ) -> PipelineThread {
     let consumer = Consumer::new(lane, demux_cv);
     let live = Live::new(shared, Pipe::Audio);
-    let sink = shared.backend.audio();
+    let held = shared.audio_sink.lock().take();
+    let sink = held.unwrap_or_else(|| shared.backend.audio());
     let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
     PipelineThread::spawn("peartube-audio", move |retired| {
         let _guards = (live, consumer);
-        run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
+        #[cfg(target_os = "macos")]
+        if realtime {
+            if let Err(error) = crate::clock::timing::initialize_worker() {
+                eprintln!("macOS audio worker scheduling setup failed: {error}");
+            }
+        }
+        let mut output = AudioOutput {
+            shared: Arc::clone(&shared),
+            sink: Some(sink),
+        };
+        if let Some(sink) = output.sink.as_deref_mut() {
+            run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
+        }
     })
+}
+
+/// The playback's audio output while an audio pipeline holds it. However
+/// the pipeline ends, the output's clock stops leading (the free clock
+/// carries on from where it was) and the output goes back to
+/// `SharedState::audio_sink` for the next audio pipeline.
+struct AudioOutput {
+    shared: Arc<SharedState>,
+    sink: Option<Box<dyn AudioSink>>,
+}
+
+impl Drop for AudioOutput {
+    fn drop(&mut self) {
+        self.shared.master.release_audio();
+        *self.shared.audio_sink.lock() = self.sink.take();
+    }
 }
 
 fn spawn_subtitles(
@@ -1091,9 +1143,8 @@ fn run_demux_loop(run: &mut Run<'_>) {
             // Leaving ends `run_player_pipeline`, which joins the pipelines
             // and sets Ended. A seek or a selection switch clears lanes and
             // reopens `eof` at the top of this loop.
-            let drained = [run.video_lane, run.audio_lane, run.sub_lane]
-                .iter()
-                .all(|lane| lane.queue.lock().is_empty());
+            let drained = [run.video_thread.as_ref(), run.audio_thread.as_ref(), run.sub_thread.as_ref()]
+                .into_iter().flatten().all(|thread| thread.handle.is_finished());
             if drained {
                 return;
             }
@@ -1264,7 +1315,7 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
         let stream = find_stream(run.streams, run.current_audio)
             .filter(|s| s.params.media_type == MediaType::Audio);
         if let Some(stream) = stream {
-            shared.request_seek(shared.free_clock.now().unwrap_or_default());
+            shared.request_seek(shared.master.now().unwrap_or_default());
             run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
         }
     }
@@ -1285,12 +1336,13 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
 
 /// Packet lanes → decoder → sink, for one audio stream. The sink follows the
 /// clock's run state (`play`/`pause`); while the clock stands still, PCM goes
-/// out only up to `PREROLL` past it. Reaches Ended with the rest of the
-/// pipeline at EOF; ends early when the player stops or a selection switch
-/// sets `retired`.
+/// out only up to `PREROLL` past it. From its first samples of each seek the
+/// output's clock leads the playback. At EOF the pipeline ends once its last
+/// samples are heard; it ends early when the player stops or a selection
+/// switch sets `retired`.
 fn run_audio_thread(
     stream: StreamInfo,
-    mut sink: Box<dyn AudioSink>,
+    sink: &mut dyn AudioSink,
     lane: Arc<Lane>,
     demux_cv: Arc<Condvar>,
     shared: Arc<SharedState>,
@@ -1313,9 +1365,10 @@ fn run_audio_thread(
 
     let mut current_rate = stream.params.sample_rate.unwrap_or(48000);
     let mut current_channels = stream.params.channels.unwrap_or(2);
+    // The output may come from the previous track: none of that plays on.
+    sink.flush();
     let mut sink_open = sink.open(current_rate, current_channels).is_ok();
-    // The clock run state last applied to the sink (`play`/`pause`).
-    let mut sink_running: Option<bool> = None;
+    let mut written = Written::default();
     let mut starved = false;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
@@ -1331,14 +1384,16 @@ fn run_audio_thread(
                 break;
             }
         }
-        sync_audio_sink(&mut *sink, &shared, &mut sink_running);
+        sync_audio_sink(sink, &shared, &mut written.running);
 
         // Seek generation: start the decoder and the sink over, drop
         // pre-target output after the demuxer's seek lands.
         let gen_now = shared.seek_gen.load(Ordering::SeqCst);
         if gen_now != seen_seek {
             seen_seek = gen_now;
-            let _ = sink.flush();
+            sink.flush();
+            written.running = None;
+            written.end = None;
             decoder = match make_decoder(&shared.ctx, &stream.params) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1354,7 +1409,8 @@ fn run_audio_thread(
         }
 
         // Pull a packet; the EOF marker ends this pipeline.
-        let woken = || quit() || Some(shared.running()) != sink_running;
+        let applied = written.running;
+        let woken = || quit() || Some(shared.running()) != applied;
         let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
         let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
@@ -1376,8 +1432,8 @@ fn run_audio_thread(
                             let secs = stream.time_base.seconds_of(ticks).max(0.0);
                             let pts = Duration::from_secs_f64(secs);
                             if !write_pcm(
-                                &mut *sink, &shared, &pcm, channels as usize, rate, pts,
-                                seen_seek, realtime, &mut sink_running, &retired,
+                                sink, &shared, &pcm, channels as usize, rate, pts, seen_seek,
+                                realtime, &mut written, &retired,
                             ) {
                                 break;
                             }
@@ -1386,6 +1442,20 @@ fn run_audio_thread(
                         _ => break,
                     }
                 }
+                // The output plays what it holds before the pipeline ends:
+                // the audio leads the clock up to its last sample, and the
+                // playback ends after that sample is heard.
+                if let (true, Some(end), Some(leads)) = (realtime, written.end, written.leads) {
+                    if leads == seen_seek {
+                        shared.wait_heard(end, seen_seek, &retired, |running| {
+                            if written.running != Some(running) {
+                                if running { sink.play(); } else { sink.pause(); }
+                                written.running = Some(running);
+                            }
+                        });
+                    }
+                }
+                if shared.seek_gen.load(Ordering::SeqCst) != seen_seek { continue; }
                 break;
             }
         };
@@ -1450,8 +1520,8 @@ fn run_audio_thread(
             if !sink_open || sample_rate != current_rate || (channels as u16) != current_channels {
                 current_rate = sample_rate;
                 current_channels = channels as u16;
+                written.reopen(&shared);
                 sink_open = sink.open(current_rate, current_channels).is_ok();
-                sink_running = None;
             }
             let sink_failed = !sink_open;
 
@@ -1459,14 +1529,16 @@ fn run_audio_thread(
             let ticks = af.pts.or(packet.pts).unwrap_or(0).max(0);
             let mut pts_secs = stream.time_base.seconds_of(ticks).max(0.0);
 
-            // Drop pre-target output after a seek: anything that still
-            // decodes before the target never reaches the sink. The first
-            // frame at/after the target is clamped to it so the clock
-            // restarts exactly at the seek point.
+            // Drop pre-target output after a seek: audio before the target
+            // never reaches the sink. The frame that holds the target loses
+            // its samples before it, so the clock restarts at the target with
+            // the target's own sample.
             if let Some(seek) = *shared.active_seek.lock() {
                 if seek.generation > seen_seek_target && pts_secs < seek.target {
-                    let frame_dur = af.samples as f64 / sample_rate as f64;
-                    if seek.target - pts_secs <= frame_dur {
+                    let frames = pcm.len() / channels.max(1);
+                    let before = ((seek.target - pts_secs) * f64::from(sample_rate)).round() as usize;
+                    if before < frames {
+                        pcm.drain(..before * channels);
                         pts_secs = seek.target;
                     } else {
                         pcm.clear();
@@ -1480,24 +1552,48 @@ fn run_audio_thread(
                 continue;
             }
 
-            // Decoded audio counts as ready even when the output refused to
-            // open: the clock must not wait for a sink that drops it.
-            if primed != Some(seen_seek) {
-                primed = Some(seen_seek);
-                shared.pipe_primed(Pipe::Audio, seen_seek);
-            }
+            // A failed output cannot prime; let the remaining streams run.
+            // A working output primes only after it has actually taken PCM.
             if sink_failed {
+                if primed != Some(seen_seek) {
+                    primed = Some(seen_seek);
+                    shared.pipe_primed(Pipe::Audio, seen_seek);
+                }
                 continue;
             }
             let pts = Duration::from_secs_f64(pts_secs);
             if !write_pcm(
-                &mut *sink, &shared, &pcm, channels, sample_rate, pts, seen_seek, realtime,
-                &mut sink_running, &retired,
+                sink, &shared, &pcm, channels, sample_rate, pts, seen_seek, realtime,
+                &mut written, &retired,
             ) {
                 // Stopped, retired or a seek: the rest of this packet is stale.
                 break;
             }
         }
+    }
+}
+
+/// What an audio pipeline knows about its output across writes.
+#[derive(Default)]
+struct Written {
+    /// The clock run state last applied to the sink (`play`/`pause`).
+    running: Option<bool>,
+    /// The seek generation whose audio the output has taken: from its first
+    /// samples on, the output's clock leads the playback.
+    leads: Option<u64>,
+    /// Where the audio written since the last flush ends.
+    end: Option<Duration>,
+}
+
+impl Written {
+    /// The sink is about to be (re)opened, which restarts its clock: the
+    /// free clock carries on from where the output was until it plays the
+    /// next write.
+    fn reopen(&mut self, shared: &SharedState) {
+        shared.master.release_audio();
+        self.leads = None;
+        self.end = None;
+        self.running = None;
     }
 }
 
@@ -1514,12 +1610,15 @@ fn sync_audio_sink(sink: &mut dyn AudioSink, shared: &SharedState, applied: &mut
     }
 }
 
-/// Hands interleaved `pcm`, whose first frame plays at `pts`, to the sink.
-/// While the clock stands still (buffering or paused), audio goes out only up
-/// to `PREROLL` past it, so a paused output never fills up and blocks; what a
-/// paused sink did not take is written again once the clock runs, so no
-/// audio is skipped across a hold. False when the player stopped, the
-/// pipeline was retired, or a seek superseded this audio.
+/// Hands interleaved `pcm`, whose first frame plays at `pts`, to the sink,
+/// in writes of at most 20 ms so the output follows a change of the clock's
+/// run state within one of them. While the clock stands still (buffering or
+/// paused), audio goes out only up to `PREROLL` past it, so a paused output
+/// never fills up and blocks; what a paused sink did not take is written
+/// again once the clock runs, so no audio is skipped across a hold. The
+/// first samples the output takes after a seek put its clock in the lead.
+/// False when the player stopped, the pipeline was retired, or a seek
+/// superseded this audio.
 #[allow(clippy::too_many_arguments)]
 fn write_pcm(
     sink: &mut dyn AudioSink,
@@ -1530,36 +1629,47 @@ fn write_pcm(
     pts: Duration,
     seen_seek: u64,
     realtime: bool,
-    sink_running: &mut Option<bool>,
+    written: &mut Written,
     retired: &AtomicBool,
 ) -> bool {
+    #[cfg(target_os = "macos")]
+    let _timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
     let channels = channels.max(1);
+    let rate = rate.max(1);
     let frames = pcm.len() / channels;
+    let chunk = (rate as usize / 50).max(1);
     let mut done = 0;
     while done < frames {
-        let at = pts + Duration::from_secs_f64(done as f64 / f64::from(rate.max(1)));
-        if realtime && !shared.preroll(at, seen_seek, retired) {
-            return false;
+        let at = pts + Duration::from_secs_f64(done as f64 / f64::from(rate));
+        sync_audio_sink(sink, shared, &mut written.running);
+        if realtime {
+            match shared.preroll(at, written.running, None, seen_seek, retired) {
+                Preroll::Go => {}
+                Preroll::Resync => continue,
+                Preroll::Abort => return false,
+            }
         }
-        sync_audio_sink(sink, shared, sink_running);
-        match sink.write(&pcm[done * channels..frames * channels], at) {
+        let until = frames.min(done + chunk);
+        match sink.write(&pcm[done * channels..until * channels], at) {
             Ok(0) => {
-                // A paused output that is full: write the rest once the clock
-                // runs. A playing output that takes nothing has nowhere to
-                // put it.
-                if shared.running() {
-                    return true;
-                }
-                if !shared.wait_running(seen_seek, retired) {
-                    return false;
+                // Timeout or paused/full: retain these samples and retry.
+                // A bounded wait keeps transport changes interruptible.
+                shared.wait_output();
+            }
+            Ok(n) => {
+                done += n.min(until - done);
+                written.end = Some(pts + Duration::from_secs_f64(done as f64 / f64::from(rate)));
+                if written.leads != Some(seen_seek) {
+                    written.leads = Some(seen_seek);
+                    shared.master.follow_audio(sink.clock(), seen_seek);
+                    shared.pipe_primed(Pipe::Audio, seen_seek);
                 }
             }
-            Ok(n) => done += n,
             Err(_) => {
                 // Sink refused (device lost): keep the engine alive; the
                 // platform resume path reopens it.
+                written.reopen(shared);
                 let _ = sink.open(rate, channels as u16);
-                *sink_running = None;
                 return true;
             }
         }
@@ -1692,6 +1802,7 @@ fn run_video_thread(
     let mut sink_running: Option<bool> = None;
     let mut starved = false;
     let mut primed: Option<u64> = None;
+    let mut last_end = Duration::ZERO;
     let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
     if !compressed {
@@ -1732,6 +1843,7 @@ fn run_video_thread(
         if gen_now != seen_seek {
             seen_seek = gen_now;
             sink.flush();
+            last_end = Duration::ZERO;
             if sw_decoder.is_some() {
                 match make_decoder(&shared.ctx, &stream.params) {
                     Ok(d) => sw_decoder = Some(d),
@@ -1783,9 +1895,31 @@ fn run_video_thread(
                         }
                     }
                 }
+                if compressed {
+                    while !quit() && shared.seek_gen.load(Ordering::SeqCst) == seen_seek {
+                        sync_video_sink(&mut *sink, &shared, &mut sink_running);
+                        if !matches!(sink.finish(), Err(SinkError::WouldBlock)) { break; }
+                        shared.wait_output();
+                    }
+                }
+                if realtime {
+                    // Timestamped renderers still own queued frames at EOF.
+                    // Keep the sink alive through the final presentation.
+                    loop {
+                        sync_video_sink(&mut *sink, &shared, &mut sink_running);
+                        match shared.preroll(last_end, sink_running, Some(Duration::ZERO), seen_seek, &retired) {
+                            Preroll::Resync => continue,
+                            Preroll::Go | Preroll::Abort => break,
+                        }
+                    }
+                }
+                if shared.seek_gen.load(Ordering::SeqCst) != seen_seek { continue; }
                 break;
             }
         };
+        if let Some(end) = packet_end_secs(&packet) {
+            last_end = last_end.max(Duration::from_secs_f64(end.max(0.0)));
+        }
 
         if need_keyframe && !packet.flags.keyframe {
             continue;
@@ -1795,18 +1929,26 @@ fn run_video_thread(
         if compressed {
             let ticks = packet.pts.unwrap_or(0).max(0);
             let pts = Duration::from_secs_f64(stream.time_base.seconds_of(ticks).max(0.0));
-            // While the clock stands still the platform decoder cannot
-            // present anything: feed it only up to `PREROLL` past the clock,
-            // so its input queue never fills and blocks `push_packet`.
-            if realtime && !shared.preroll(pts, seen_seek, &retired) {
-                continue;
-            }
-            sync_video_sink(&mut *sink, &shared, &mut sink_running);
             if primed != Some(seen_seek) {
                 primed = Some(seen_seek);
                 shared.pipe_primed(Pipe::Video, seen_seek);
             }
-            match sink.push_packet(&packet, pts) {
+            // While the clock stands still the platform decoder cannot
+            // present anything: feed it only up to `PREROLL` past the clock,
+            // so its input queue never fills and blocks `push_packet`.
+            if realtime && !preroll_video(&mut *sink, &shared, pts, &mut sink_running, seen_seek, &retired) {
+                continue;
+            }
+            sync_video_sink(&mut *sink, &shared, &mut sink_running);
+            let result = loop {
+                if quit() || shared.seek_gen.load(Ordering::SeqCst) != seen_seek { break Ok(()); }
+                sync_video_sink(&mut *sink, &shared, &mut sink_running);
+                match sink.push_packet(&packet, pts) {
+                    Err(SinkError::WouldBlock) => shared.wait_output(),
+                    result => break result,
+                }
+            };
+            match result {
                 Ok(()) => {
                     consecutive_errors = 0;
                 }
@@ -1951,11 +2093,34 @@ fn sync_video_sink(sink: &mut dyn VideoSink, shared: &SharedState, applied: &mut
     }
 }
 
+/// `SharedState::preroll` for a video sink: applies the clock's run state
+/// to the sink whenever it changes while waiting. False when the player
+/// stopped, the pipeline was retired, or a seek superseded the packet.
+fn preroll_video(
+    sink: &mut dyn VideoSink,
+    shared: &SharedState,
+    pts: Duration,
+    applied: &mut Option<bool>,
+    seen_seek: u64,
+    retired: &AtomicBool,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    let _timing = crate::clock::timing::Guard::enter();
+    loop {
+        sync_video_sink(sink, shared, applied);
+        match shared.preroll(pts, *applied, Some(Duration::from_millis(500)), seen_seek, retired) {
+            Preroll::Go => return true,
+            Preroll::Resync => {}
+            Preroll::Abort => return false,
+        }
+    }
+}
+
 /// Hands one decoded frame to the sink: in realtime once it is due on the
-/// clock (pushed up to 100 ms early; more than 100 ms late it is dropped and
-/// counted), immediately otherwise. A frame waiting for its time counts as
-/// output ready for the buffering hold. False when the player stopped, the
-/// pipeline was retired, or a seek superseded the frame.
+/// clock, `VideoSink::frame_lead` before its `pts` (more than 100 ms late it
+/// is dropped and counted), immediately otherwise. A frame waiting for its
+/// time counts as output ready for the buffering hold. False when the player
+/// stopped, the pipeline was retired, or a seek superseded the frame.
 #[allow(clippy::too_many_arguments)]
 fn present_frame(
     sink: &mut dyn VideoSink,
@@ -1973,7 +2138,7 @@ fn present_frame(
         shared.pipe_primed(Pipe::Video, seen_seek);
     }
     if realtime {
-        match shared.wait_due(pts, seen_seek, retired) {
+        match shared.wait_due(pts, sink.frame_lead(), seen_seek, retired) {
             Due::Now => {}
             Due::Late => {
                 shared.state.lock().dropped_frames += 1;

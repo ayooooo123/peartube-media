@@ -103,7 +103,7 @@ fn video_probe(mode: Mode) -> i32 {
     // `set_video_window(None)` able to detach the codec. The typed Arc is
     // recovered from the registration so the probe can call sink methods
     // directly while the backend still tracks it.
-    let clock = Arc::new(NullClock);
+    let clock = probe_clock();
     let _box_sink = backend.video(clock);
     let sink_video: Arc<parking_lot::Mutex<player::android::AndroidVideoSink>> = backend
         .shared()
@@ -325,7 +325,7 @@ fn run_stream(
             decode_and_push_frame(sink_video, &mut sw_decoder, params, pkt, pts)
         } else {
             let mut sink = sink_video.lock();
-            sink.push_packet(pkt, pts)
+            push_packet(&mut *sink, pkt, pts)
         };
         match r {
             Ok(()) => {}
@@ -344,7 +344,7 @@ fn run_stream(
                     println!("[video] swap: new window set at packet {pushed}");
                     let mut sink = sink_video.lock();
                     reopen_mode(&mut sink, mode, params)?;
-                    sink.push_packet(pkt, pts)?;
+                    push_packet(&mut *sink, pkt, pts)?;
                 } else {
                     return Err(SinkError::Unavailable);
                 }
@@ -371,7 +371,7 @@ fn run_stream(
                 println!("[video] moved to fresh window (reader C)");
                 let mut sink = sink_video.lock();
                 reopen_mode(&mut sink, mode, params)?;
-                sink.push_packet(pkt, pts)?;
+                push_packet(&mut *sink, pkt, pts)?;
             }
             Err(e) => return Err(e),
         }
@@ -533,15 +533,19 @@ fn audio_probe() -> i32 {
     }
 }
 
-/// Placeholder clock for the video probe; real sync comes from the audio
-/// clock in the engine. Frames are presented immediately.
-struct NullClock;
-impl Clock for NullClock {
-    fn now(&self) -> Option<Duration> {
-        None
-    }
-    fn monotonic_ns_at(&self, _at: Duration) -> Option<i64> {
-        None
+/// The video-only probe uses the same free clock as audio-less playback.
+fn probe_clock() -> Arc<dyn Clock> {
+    let clock = player::clock::FreeRunningClock::new();
+    clock.play();
+    Arc::new(clock)
+}
+
+fn push_packet(sink: &mut dyn VideoSink, packet: &Packet, pts: Duration) -> Result<(), SinkError> {
+    loop {
+        match sink.push_packet(packet, pts) {
+            Err(SinkError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+            result => return result,
+        }
     }
 }
 
@@ -584,7 +588,7 @@ fn sw_first_probe() -> i32 {
     let window = reader.window().unwrap();
     let backend = AndroidBackend::new();
     backend.set_video_window(Some(window));
-    let _box_sink = backend.video(Arc::new(NullClock));
+    let _box_sink = backend.video(probe_clock());
     let sink_video: Arc<parking_lot::Mutex<player::android::AndroidVideoSink>> = backend
         .shared()
         .active_video
@@ -609,7 +613,7 @@ fn sw_first_probe() -> i32 {
         let pts = packet_media_time(pkt, time_base);
         let r = {
             let mut sink = sink_video.lock();
-            sink.push_packet(pkt, pts)
+            push_packet(&mut *sink, pkt, pts)
         };
         match r {
             Ok(()) => pushed += 1,

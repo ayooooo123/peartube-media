@@ -20,9 +20,10 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 - **Source**: `oxideav-http`'s `HttpSource` (HTTP/1.1 Range, `Read + Seek`) behind a bounded read-ahead ring. Reads have a deadline, so a suspended worklet fails reads instead of hanging them; resume reopens at the last offset.
 - **Demux**: `ContainerRegistry::probe_input` (rewinds after reading up to 256 KiB), then `open_demuxer(name, input, &codecs)`. One demux thread fills per-stream packet queues bounded in both duration and bytes.
 - **Buffering**: the read-ahead ring reports when a read waits for bytes that have not arrived. The clock holds at the start until the first audio and video are decoded and about a second is queued (or the input ends), likewise after a seek, and mid-stream whenever a pipeline runs dry while the source is starved, until a second is queued past the clock again. `buffering` in the state follows the hold; `play`/`pause` stay the user's intent, so a pause during buffering stays paused when the data arrives.
-- **Audio**: always decoded in software (OxideAV or `codec-*`) to PCM. Android plays it through AAudio, Apple through `AVSampleBufferAudioRenderer`. Audio is the master clock. On Android the clock comes from `AAudioStream_getTimestamp` once it is valid and from frames written before that.
+- **Audio**: always decoded in software (OxideAV or `codec-*`) to PCM. Android plays it through AAudio, Apple through `AVSampleBufferAudioRenderer`. The sink's presented position is the master clock; Android maps AAudio frame/time pairs onto `CLOCK_MONOTONIC`, clamped to the audio actually queued. Pause and buffering stop the audio output, including while its final queued samples drain. After a seek, only audio from the new seek generation may lead; without audio, or after it ends, the free clock continues from the current position.
 - **Video**: the platform decoder first, chosen by trying it: Android `MediaCodec::from_decoder_type` + `configure` on the slot's `ANativeWindow` (the NDK has no codec-list API below API 36); Apple enqueues compressed `CMSampleBuffer`s on `AVSampleBufferDisplayLayer`. Any failure, at open or mid-stream, tears the platform decoder down and continues in software from the next keyframe. Software frames go to Android as RGBA_8888 through `ANativeWindow_lock` (after `oxideav-pixfmt` conversion), and to Apple as `CVPixelBuffer` sample buffers on the same layer.
-- **Apple**: one `AVSampleBufferRenderSynchronizer` drives the display layer and the audio renderer. Layer work stays on the main thread, and a failed layer (`requiresFlushToResumeDecoding`) is flushed and re-fed from a keyframe.
+- **Native packet framing**: AVC/HEVC packet framing comes from the stream's configuration, not a per-packet start-code guess. A valid AVCC length of 256–511 starts with `00 00 01`; misreading it as Annex B corrupts the native decoder's input.
+- **Presentation**: software frames wait against the live master clock, with a sink-specific enqueue lead. Android recomputes each MediaCodec release target from the clock rather than committing a distant, uninterruptible deadline. Apple attaches the video renderer to the audio's `AVSampleBufferRenderSynchronizer`; video-only playback uses its own timebase anchored to the engine clock. Neither Apple path uses `DisplayImmediately`. Layer work stays on the main thread, and a failed layer (`requiresFlushToResumeDecoding`) is flushed and re-fed from a keyframe.
 - **Lifecycle**: `open` takes no surface; `set_surface` attaches or detaches one (Android `SurfaceView` callbacks, macOS/iOS view moves). `suspend` / `resume` follow the activity: stop audio, release the platform decoder and surface, resume at the last position.
 - **Subtitles**: text, ASS and bitmap subtitles render to RGBA on an overlay above the video (a second `SurfaceView` on Android, a `CALayer` on Apple).
 - **Untrusted input**: every stream comes from untrusted peers. Frame dimensions, stream count and queue bytes are capped, demux and decode run under `catch_unwind`, and the corpus includes truncated and mutated files.
@@ -49,3 +50,82 @@ Code in this repository is MIT unless a crate says otherwise. Decoders with no p
 ## Verification
 
 `cargo run -p e2e --release` plays the corpus (FFmpeg's FATE samples plus generated files) through the headless backend and compares every stream with FFmpeg: `framemd5` for bit-exact codecs, PSNR/SNR thresholds for the rest. Every format on the list needs a passing file. The result is `target/e2e/codecs.json`.
+
+### Audio-master timing
+
+`cargo test -q -p player` includes two strict realtime flash/beep scenarios:
+a 32-second run with the audio device 2% slow, and HTTP starvation followed
+by pause and seek. The headless backend records independent frame-arrival
+times and PCM playback runs; every expected flash must be within 40 ms of
+its actual beep samples. CSV artifacts go in
+`$CARGO_TARGET_DIR/engine-sync/` (otherwise `target/engine-sync/`). Run the
+suite three times for acceptance. Do not overlap realtime measurements with
+builds or throughput benchmarks. Dropped flashes or late host timer wakeups
+are failures, not permission to loosen the bound.
+
+On macOS, the dedicated realtime audio/video workers use a scoped Mach
+time-constraint policy for paced waits and audio device writes: 20 ms
+period, 1 ms computation budget, 2 ms constraint. Codec decoding remains
+under ordinary scheduling. Mach policy changes permanently opt a pthread
+out of QoS, so only these owned workers opt out at creation; a guard refuses
+to modify a borrowed QoS-managed thread. Each timed scope restores the
+previous Mach mode/precedence on exit or unwind and releases its Mach send
+right. Non-realtime decoding, subtitle workers and application threads are
+not changed. Native tests check the budget and restoration, not just the
+configuration constants.
+
+Native harnesses use an eight-second H.264/PCM clip with a per-frame binary
+identifier in its top eight pixel rows. Generate it with FFmpeg:
+
+```sh
+ffmpeg -v error -nostdin -y \
+  -f lavfi -i "color=black:size=160x96:rate=25,drawbox=color=white:t=fill:enable='lt(mod(t,1),0.039)',geq=lum='if(lt(Y,8)*lt(X,128),if(bitand(N,pow(2,floor(X/16))),220,32),lum(X,Y))':cb='cb(X,Y)':cr='cr(X,Y)'" \
+  -f lavfi -i 'aevalsrc=if(lt(mod(t\,1)\,0.04)\,0.5*sin(2*PI*1000*t)\,0):s=48000' \
+  -t 8 -c:v libx264 -preset ultrafast -g 25 -bf 0 -pix_fmt yuv420p \
+  -c:a pcm_s16le -ac 2 -reserve_index_space 4096 \
+  -cluster_size_limit 100000 -cluster_time_limit 200 flash-beep.mkv
+```
+
+On macOS, `cargo run -p player --example apple_play -- flash-beep.mkv`
+runs the real Player and AppleBackend. Add `--software` to force engine
+decoding or `--transport` for pause/seek. The harness pauses at sample points
+and reads the renderer's displayed pixel buffer, comparing its identifier
+with the audio timebase while inside the media duration. Hardware-compressed
+readback formats (such as Apple's `&8v0`) are converted by VideoToolbox into
+reused linear NV12 storage before CPU inspection; the source is still the
+displayed buffer, not a decoder input frame. No screen capture is used.
+Nil/unreadable readback is a hard failure; renderer queue counts and zero
+accumulated-delay counters alone are not timing proof. These are sampled
+displayed-frame offsets, not a continuous presentation-time distribution.
+
+For Android, use the NDK compiler and a 16 KiB-compatible executable link:
+
+```sh
+NDK="$HOME/Library/Android/sdk/ndk/27.1.12297006/toolchains/llvm/prebuilt/darwin-x86_64"
+CC_aarch64_linux_android="$NDK/bin/aarch64-linux-android29-clang" \
+AR_aarch64_linux_android="$NDK/bin/llvm-ar" \
+CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK/bin/aarch64-linux-android29-clang" \
+cargo rustc -q -p player --target aarch64-linux-android --features probe \
+  --example android_sync -- -C link-arg=-Wl,-z,max-page-size=16384
+adb -s emulator-5554 push "$CARGO_TARGET_DIR/aarch64-linux-android/debug/examples/android_sync" /data/local/tmp/engine_sync
+adb -s emulator-5554 push flash-beep.mkv /data/local/tmp/engine_sync.mkv
+adb -s emulator-5554 shell 'chmod 755 /data/local/tmp/engine_sync && PEARTUBE_SYNC_TRACE=1 /data/local/tmp/engine_sync /data/local/tmp/engine_sync.mkv'
+```
+
+The debug-only trace records native AAudio frame/time pairs and video
+release targets. Software traces also record entry, conversion, window-lock
+and post times, separating a late engine wake from rendering or callback
+delay. ImageReader callbacks read each frame's identifier, so
+arrival can be compared independently with the corresponding audio sample
+time. This measures a native surface consumer, not physical display
+scanout. The compressed harness uses the emulator's `c2.android` MediaCodec;
+`--software` exercises engine decode plus `ANativeWindow`, and `--transport`
+exercises pause/seek. Report offsets after the initial second, including
+outliers; reaching `Ended` alone does not pass sync acceptance.
+
+On a 16 KiB-page emulator, inspect executable `LOAD` alignment with
+`llvm-readelf -l`. An incompatible executable can fail in the loader before
+`main`; that is not an engine crash. Successful probe launch does not prove
+the app's native libraries are compatible: integration must check every
+linked native library and the final app separately.
+

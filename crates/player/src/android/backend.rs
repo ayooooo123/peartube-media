@@ -151,6 +151,10 @@ impl VideoSink for VideoSinkWrapper {
         self.inner.lock().push_frame(frame, pts)
     }
 
+    fn frame_lead(&self) -> Duration { self.inner.lock().frame_lead() }
+
+    fn finish(&mut self) -> Result<(), SinkError> { self.inner.lock().finish() }
+
     fn flush(&mut self) {
         self.inner.lock().flush()
     }
