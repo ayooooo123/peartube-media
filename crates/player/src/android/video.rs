@@ -29,7 +29,10 @@ pub struct AndroidVideoSink {
     /// briefly instead of hanging on `join` for a wedged codec. The
     /// thread sends on drop via `DoneSignal`.
     output_done: Option<std::sync::mpsc::Receiver<()>>,
-    stop_output_signal: Arc<AtomicBool>,
+    /// Stop flags of live output-thread generations. Teardown sets every
+    /// flag; each reopen creates a fresh one so an abandoned older thread
+    /// can never be resurrected by a later reopen resetting its flag.
+    stop_output_signal: Mutex<Vec<Arc<AtomicBool>>>,
     midstream_error: Arc<Mutex<Option<String>>>,
     is_playing: Arc<AtomicBool>,
     /// Length-prefix size taken from avcC/hvcC.
@@ -62,7 +65,7 @@ impl AndroidVideoSink {
             codec: None,
             output_thread: None,
             output_done: None,
-            stop_output_signal: Arc::new(AtomicBool::new(false)),
+            stop_output_signal: Mutex::new(Vec::new()),
             midstream_error: Arc::new(Mutex::new(None)),
             is_playing: Arc::new(AtomicBool::new(true)),
             nal_length_size: 4,
@@ -77,20 +80,24 @@ impl AndroidVideoSink {
     }
 
     pub fn teardown_codec(&mut self) {
-        self.stop_output_signal.store(true, Ordering::SeqCst);
+        // Stop every live output-thread generation. Reopens push a fresh
+        // flag per generation and never reset an old one, so a thread that
+        // unblocks after teardown always sees `true` and exits instead of
+        // resuming on its retired codec.
+        for flag in self.stop_output_signal.lock().iter() {
+            flag.store(true, Ordering::SeqCst);
+        }
         if let Some(codec) = self.codec.take() {
             let _ = codec.0.stop();
             // Dropping codec releases AMediaCodec (aborts a wedged
             // dequeue call in the output thread).
         }
         if let Some(handle) = self.output_thread.take() {
-            // Wait briefly for the output thread: on a healthy codec it
-            // exits within one 10 ms dequeue timeout. A wedged codec can
-            // block its dequeue in binder forever; waiting would hang
-            // `set_video_window(None)`, which must return so the app can
-            // release the surface. Abandon the thread in that case — it
-            // ends on its own once its `Arc<SendMediaCodec>` is gone and
-            // the pending binder call aborts.
+            // Wait for the output thread: on a healthy codec it exits
+            // within one dequeue timeout. A wedged codec can block its
+            // dequeue in binder; the wait below still applies so this call
+            // returns, but the thread's generation flag stays `true` and it
+            // exits as soon as its pending call aborts.
             let deadline = Instant::now() + Duration::from_millis(500);
             while Instant::now() < deadline {
                 match self
@@ -115,6 +122,12 @@ impl AndroidVideoSink {
                 }
             }
             self.output_done = None;
+            // Every generation is now stopped (or wedged with a `true` flag
+            // it holds a private Arc of — it exits when its binder call
+            // aborts). Drop our Arcs so the list doesn't grow across
+            // reopens; a wedged thread is unaffected because it holds its
+            // own clone, and that clone reads `true`.
+            self.stop_output_signal.lock().clear();
         }
     }
 
@@ -289,7 +302,8 @@ impl AndroidVideoSink {
 
         let codec_arc = Arc::new(SendMediaCodec(codec));
         self.codec = Some(codec_arc.clone());
-        self.stop_output_signal.store(false, Ordering::SeqCst);
+        // No flag reset: the new generation registered its own fresh flag
+        // below; older generations keep their `true` flags.
         *self.midstream_error.lock() = None;
         // NOTE: `awaiting_keyframe` is deliberately NOT cleared here. When
         // the codec was rebuilt after a window loss, the next packet pushed
@@ -297,10 +311,13 @@ impl AndroidVideoSink {
         // when a keyframe arrives. A fresh-open (no loss) enters with the
         // gate already false.
 
-        // Output thread
+        // Output thread. Each generation gets its own stop flag: a reopen
+        // must never reset the flag an abandoned (wedged) older thread is
+        // watching — that would resurrect it on its retired codec.
         let thread_codec = codec_arc;
         let thread_clock = self.clock.clone();
-        let thread_stop = self.stop_output_signal.clone();
+        let thread_stop = Arc::new(AtomicBool::new(false));
+        self.stop_output_signal.lock().push(thread_stop.clone());
         let thread_err = self.midstream_error.clone();
         let thread_playing = self.is_playing.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
