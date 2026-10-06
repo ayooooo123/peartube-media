@@ -109,11 +109,22 @@ fn mutations_do_not_panic() {
             continue;
         }
         let mut data = packet.clone();
-        // Flip 1-8 bit positions picked from the stream state.
-        let flips = 1 + (xorshift(&mut state) as usize) % 8;
-        for _ in 0..flips {
-            let bit = (xorshift(&mut state) as usize) % (data.len() * 8);
-            data[bit / 8] ^= 1 << (bit % 8);
+        // Every odd run truncates: cut 1-64 bytes off the tail (packet
+        // and header boundaries land inside the cut at random). Every
+        // even run flips 1-8 bit positions.
+        if run % 2 == 0 {
+            let cut = 1 + (xorshift(&mut state) as usize) % 64;
+            let cut = cut.min(data.len());
+            data.truncate(data.len() - cut);
+        } else {
+            let flips = 1 + (xorshift(&mut state) as usize) % 8;
+            for _ in 0..flips {
+                let bit = (xorshift(&mut state) as usize) % (data.len() * 8);
+                data[bit / 8] ^= 1 << (bit % 8);
+            }
+        }
+        if data.is_empty() {
+            continue;
         }
 
         let seed_for_report = state;
