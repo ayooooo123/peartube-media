@@ -1,0 +1,11 @@
+Generated reference fixtures (deterministic `testsrc2`, ffmpeg 9.0.1):
+
+    ffmpeg -f lavfi -i testsrc2=size=64x64:rate=25 -t 2 -c:v mpeg4 -bf 2 -g 6 -f m4v ipb_bf2_64x64.m4v
+    ffmpeg -f lavfi -i testsrc2=size=64x64:rate=25 -t 2 -c:v mpeg4 -flags +qpel -g 6 -f m4v qpel_64x64.m4v
+    ffmpeg -f lavfi -i testsrc2=size=64x64:rate=25 -t 2 -c:v mpeg4 -mbd rd -mpv_flags +qp_rd -g 6 -f m4v qp_rd_64x64.m4v
+    ffmpeg -f lavfi -i testsrc2=size=64x64:rate=25 -t 2 -c:v mpeg4 -flags +ildct+ilme -g 6 -f m4v ilaced_64x64.m4v
+    ffmpeg -f lavfi -i testsrc2=size=64x64:rate=25 -t 2 -c:v mpeg4 -bf 2 -flags +aic+qpel -g 6 -f m4v ipb_aic_qpel_64x64.m4v
+
+Reference decodes (the C integer simple IDCT — see tests/reference.rs):
+
+    ffmpeg -idct simple -i <name>.m4v -f rawvideo -pix_fmt yuv420p <name>.yuv
