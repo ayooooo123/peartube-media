@@ -745,9 +745,18 @@ fn probe_container(url: &str, ctx: &RuntimeContext) -> Result<String, String> {
     // The probe re-opens the URL through its own read-ahead source; the
     // demuxer's read position is untouched.
     let mut probe_reader = SourceHandle::new(url).map_err(|e| format!("failed to open source: {e}"))?;
+    // One read returns what has arrived so far, which over a P2P stream can
+    // be a few bytes: fill the buffer (or reach the end) before probing.
     let mut probe_buf = vec![0u8; 256 * 1024];
-    let n = std::io::Read::read(&mut probe_reader, &mut probe_buf)
-        .map_err(|e| format!("failed to read for probe: {e}"))?;
+    let mut n = 0;
+    while n < probe_buf.len() {
+        match std::io::Read::read(&mut probe_reader, &mut probe_buf[n..]) {
+            Ok(0) => break,
+            Ok(read) => n += read,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("failed to read for probe: {e}")),
+        }
+    }
     let _ = std::io::Seek::seek(&mut probe_reader, std::io::SeekFrom::Start(0));
     probe_buf.truncate(n);
 
