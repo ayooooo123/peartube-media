@@ -45,6 +45,7 @@ const CASES: &[(&str, &str)] = &[
     ("hevc-conformance/WPP_A_ericsson_MAIN_2.bit", "hevc"),
     ("mpegps/pcm_aud.mpg", "mpeg"),
     ("mpeg2/dvd_single_frame.vob", "mpeg"),
+    ("sub/vobsub.sub", "mpeg"),
     ("pva/PVA_test-partial.pva", "pva"),
     ("creative/BBC_2BIT.VOC", "voc"),
     ("caf/caf-pcm16.caf", "caf"),

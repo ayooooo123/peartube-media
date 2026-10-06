@@ -372,76 +372,8 @@ fn hevc_wpp_a_main10() {
     });
 }
 
-// ─── MPEG-PS (container timestamps; ffprobe sequence must match 1:1) ───
-
-#[test]
-fn mpegps_pcm_aud() {
-    check(&{
-        let mut c = Case::new("mpegps/pcm_aud.mpg", "mpeg", &[("audio", "pcm_dvd")], Some(44));
-        c.sizes_exact = true;
-        c.ffprobe_sequence = true;
-        c
-    });
-}
-
-#[test]
-fn mpegps_dvd_single_frame() {
-    // ffprobe emits 3 packets because FFmpeg's video parser merges the 49
-    // video PES packets of the still frame into one AU; the container has
-    // 49 video PES + 2 subpicture PES + padding. Our demuxer emits the
-    // container's PES packets.
-    check(&{
-        let mut c = Case::new(
-            "mpeg2/dvd_single_frame.vob",
-            "mpeg",
-            &[
-                ("video", "mpeg2video"),
-                ("subtitle", "dvdsub"),
-                ("subtitle", "dvdsub"),
-            ],
-            Some(60),
-        );
-        c.ffprobe_sequence = false;
-        c
-    });
-}
-
-#[test]
-fn mpegps_dvd_still_frame() {
-    // Container: 58 video PES + 7 subpicture PES + 364 AC-3 PES = 429.
-    // ffprobe: 957 (AC-3 re-framed into syncframes by the audio parser).
-    check(&{
-        let mut c = Case::new(
-            "mpeg2/dvd_still_frame.vob",
-            "mpeg",
-            &[
-                ("video", "mpeg2video"),
-                ("subtitle", "dvdsub"),
-                ("subtitle", "dvdsub"),
-                ("audio", "ac3"),
-            ],
-            Some(429),
-        );
-        c.ffprobe_sequence = false;
-        c
-    });
-}
-
-#[test]
-fn mpegps_t_mpg() {
-    // ffprobe: 877 (354 video + 523 audio after mp2 parsing). Container:
-    // count PES packets — the mp2 parser splits multi-frame PES payloads.
-    check(&{
-        let mut c = Case::new(
-            "mpeg2/t.mpg",
-            "mpeg",
-            &[("video", "mpeg2video"), ("audio", "mp2"), ("audio", "mp2")],
-            None,
-        );
-        c.ffprobe_sequence = false;
-        c
-    });
-}
+// MPEG-PS: tests/mpegps.rs compares every FATE program stream in full.
+// (mpeg2/t.mpg is a transport stream: FFmpeg demuxes it with mpegts.)
 
 // ─── PVA (PES-carried PTS on every audio packet and some video packets;
 // payloads are re-framed by FFmpeg's parsers, so compare PTS + counts) ───

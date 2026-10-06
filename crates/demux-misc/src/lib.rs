@@ -13,6 +13,7 @@ mod ivf;
 mod mpegps;
 mod mpegvideo;
 mod nut;
+mod parser;
 mod pva;
 mod smf;
 mod voc;
