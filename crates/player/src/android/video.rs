@@ -8,6 +8,7 @@ use ndk::media::media_codec::{
 use ndk::media::media_format::MediaFormat;
 use ndk::native_window::NativeWindow;
 use oxideav_core::{CodecParameters, Packet, PixelFormat, VideoFrame};
+use crate::annexb::convert_packet_to_annex_b;
 use oxideav_pixfmt::FrameInfo;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -485,49 +486,6 @@ fn parse_hvcc_to_annex_b(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     }
 
     Some((csd0, nal_length_size))
-}
-
-fn convert_packet_to_annex_b(data: &[u8], nal_length_size: usize) -> Vec<u8> {
-    if is_annex_b(data) {
-        return data.to_vec();
-    }
-    let len_size = if nal_length_size == 0 {
-        4
-    } else {
-        nal_length_size
-    };
-    let mut out = Vec::with_capacity(data.len() + 32);
-    let mut offset = 0;
-
-    while offset + len_size <= data.len() {
-        let nal_len = match len_size {
-            4 => u32::from_be_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]) as usize,
-            2 => u16::from_be_bytes([data[offset], data[offset + 1]]) as usize,
-            1 => data[offset] as usize,
-            3 => {
-                let b0 = data[offset] as usize;
-                let b1 = data[offset + 1] as usize;
-                let b2 = data[offset + 2] as usize;
-                (b0 << 16) | (b1 << 8) | b2
-            }
-            _ => 0,
-        };
-        offset += len_size;
-        if offset + nal_len > data.len() {
-            out.extend_from_slice(&[0, 0, 0, 1]);
-            out.extend_from_slice(&data[offset..]);
-            break;
-        }
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&data[offset..offset + nal_len]);
-        offset += nal_len;
-    }
-    out
 }
 
 impl VideoSink for AndroidVideoSink {
