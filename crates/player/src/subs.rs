@@ -67,7 +67,9 @@ pub fn extract_bitmap_cue(
 /// The subtitle lane's consumer: pulls packets, decodes under `catch_unwind`
 /// (a panicking subtitle decoder drops the cue, never the playback), and
 /// shows/hides cues on the clock. In `realtime == false` every cue is shown
-/// and cleared immediately so captures see the exact cue sequence.
+/// and cleared immediately so captures see the exact cue sequence. Ends at
+/// the lane's end, when the player stops, or when a selection switch sets
+/// `retired`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_subtitle_loop(
     mut decoder: Box<dyn Decoder>,
@@ -80,11 +82,13 @@ pub(crate) fn run_subtitle_loop(
     lane: Arc<Lane>,
     demux_cv: Arc<parking_lot::Condvar>,
     stopped: Arc<std::sync::atomic::AtomicBool>,
+    retired: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let w = video_width.max(320);
     let h = video_height.max(240);
+    let quit = || stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
-    while !stopped.load(Ordering::SeqCst) {
+    while !quit() {
         let packet = {
             let mut q = lane.queue.lock();
             loop {
@@ -95,7 +99,7 @@ pub(crate) fn run_subtitle_loop(
                     }
                     Some(_) => break Some(q.remove(0)),
                     None => {
-                        if stopped.load(Ordering::SeqCst) {
+                        if quit() {
                             break None;
                         }
                         demux_cv.notify_one();
@@ -112,7 +116,7 @@ pub(crate) fn run_subtitle_loop(
         }
 
         loop {
-            if stopped.load(Ordering::SeqCst) {
+            if quit() {
                 return;
             }
             let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
@@ -160,12 +164,14 @@ pub(crate) fn run_subtitle_loop(
                 sink.show(&[], w, h);
             } else {
                 // Show at cue start on the clock.
-                if !wait_for(&clock, start_pts, &stopped) {
+                if !wait_for(&clock, start_pts, &quit) {
                     return;
                 }
                 sink.show(&[image], w, h);
                 // Hide at cue end.
-                if !wait_for(&clock, end_pts, &stopped) {
+                if !wait_for(&clock, end_pts, &quit) {
+                    // Stopped or retired with the cue up: take it down.
+                    sink.show(&[], w, h);
                     return;
                 }
                 sink.show(&[], w, h);
@@ -174,11 +180,11 @@ pub(crate) fn run_subtitle_loop(
     }
 }
 
-/// Sleeps until the clock reaches `at`. False when the playback stopped
-/// or rewound before `at` (a seek): the caller re-checks its loop.
-fn wait_for(clock: &Arc<dyn Clock>, at: Duration, stopped: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+/// Sleeps until the clock reaches `at`. False when the pipeline should quit
+/// (the player stopped or a selection switch retired it).
+fn wait_for(clock: &Arc<dyn Clock>, at: Duration, quit: &impl Fn() -> bool) -> bool {
     loop {
-        if stopped.load(Ordering::SeqCst) {
+        if quit() {
             return false;
         }
         let Some(now) = clock.now() else {

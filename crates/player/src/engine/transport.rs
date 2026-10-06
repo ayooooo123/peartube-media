@@ -5,7 +5,7 @@
 //! buffered past it (or the input ends). Play/pause stay the user's intent:
 //! the hold never changes them.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +32,8 @@ pub(super) enum Pipe {
 
 #[derive(Debug, Default)]
 struct PipeState {
-    /// Running pipeline threads (a selection switch can briefly run two).
+    /// Running pipeline threads (at most one: a selection switch retires
+    /// the old thread before it starts the new one).
     live: u32,
     /// Waiting on an empty lane that has not reached its end.
     starved: bool,
@@ -259,12 +260,22 @@ impl SharedState {
         self.update(|t| t.done = true);
     }
 
+    /// `finish` ran: the playback ended or failed.
+    pub(super) fn finished(&self) -> bool {
+        self.transport.lock().done
+    }
+
     /// The player is being dropped (`stopped` is set): wake every waiter.
     pub(super) fn stop(&self) {
         self.update(|_| {});
+        self.wake_clock_waiters();
+        self.wake_lanes();
+    }
+
+    /// Wakes every thread waiting on the clock, e.g. a retired pipeline.
+    pub(super) fn wake_clock_waiters(&self) {
         drop(self.transport.lock());
         self.transport_cv.notify_all();
-        self.wake_lanes();
     }
 
     pub(super) fn pipe_starved(&self, pipe: Pipe, starved: bool) {
@@ -311,10 +322,10 @@ impl SharedState {
 
     /// Waits until a video frame at `pts` is due (realtime pacing): up to
     /// `VIDEO_LEAD` before `pts` on the clock. Wakes on every clock change.
-    pub(super) fn wait_due(&self, pts: Duration, seen_seek: u64) -> Due {
+    pub(super) fn wait_due(&self, pts: Duration, seen_seek: u64, retired: &AtomicBool) -> Due {
         let mut t = self.transport.lock();
         loop {
-            if self.superseded(seen_seek) {
+            if self.superseded(seen_seek, retired) {
                 return Due::Abort;
             }
             let now = self.free_clock.now().unwrap_or_default();
@@ -334,11 +345,11 @@ impl SharedState {
     }
 
     /// While the clock stands still, waits until media at `pts` is within
-    /// `PREROLL` of it. False when stopped or superseded by a seek.
-    pub(super) fn preroll(&self, pts: Duration, seen_seek: u64) -> bool {
+    /// `PREROLL` of it. False when stopped, retired or superseded by a seek.
+    pub(super) fn preroll(&self, pts: Duration, seen_seek: u64, retired: &AtomicBool) -> bool {
         let mut t = self.transport.lock();
         loop {
-            if self.superseded(seen_seek) {
+            if self.superseded(seen_seek, retired) {
                 return false;
             }
             if t.running {
@@ -352,11 +363,11 @@ impl SharedState {
         }
     }
 
-    /// Waits until the clock runs. False when stopped or superseded.
-    pub(super) fn wait_running(&self, seen_seek: u64) -> bool {
+    /// Waits until the clock runs. False when stopped, retired or superseded.
+    pub(super) fn wait_running(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
         let mut t = self.transport.lock();
         loop {
-            if self.superseded(seen_seek) {
+            if self.superseded(seen_seek, retired) {
                 return false;
             }
             if t.running {
@@ -368,14 +379,18 @@ impl SharedState {
 
     /// Without realtime pacing nothing waits on the clock: a paused player
     /// parks its pipelines here instead.
-    pub(super) fn wait_while_paused(&self) {
+    pub(super) fn wait_while_paused(&self, retired: &AtomicBool) {
         let mut t = self.transport.lock();
-        while t.paused && !self.stopped.load(Ordering::SeqCst) {
+        while t.paused && !self.stopped.load(Ordering::SeqCst) && !retired.load(Ordering::SeqCst) {
             self.transport_cv.wait(&mut t);
         }
     }
 
-    fn superseded(&self, seen_seek: u64) -> bool {
-        self.stopped.load(Ordering::SeqCst) || self.seek_gen.load(Ordering::SeqCst) != seen_seek
+    /// The caller's work is stale: the player stopped, a selection switch
+    /// retired the caller's pipeline thread, or a newer seek arrived.
+    fn superseded(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+            || retired.load(Ordering::SeqCst)
+            || self.seek_gen.load(Ordering::SeqCst) != seen_seek
     }
 }

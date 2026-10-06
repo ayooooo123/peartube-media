@@ -1,0 +1,16 @@
+[package]
+name = "codec-wma"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+repository.workspace = true
+description = "Windows Media Audio decoders: wmav1, wmav2, wmapro, wmalossless, wmavoice"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-wma = "*"
+demux-asf = { path = "../demux-asf" }
