@@ -806,7 +806,10 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
             Kind::Audio => state.audio,
             Kind::Subtitle => state.subtitle,
         };
-        if current != Some(sel.track.stream) {
+        // A stream the player dropped (no decoder) fails on its own as never
+        // captured; playing another stream than selected discredits the
+        // mapping of every comparison.
+        if current.is_some_and(|c| c != sel.track.stream) {
             result.streams.push(StreamResult::entry_level(
                 "selection",
                 sel.track.stream,
