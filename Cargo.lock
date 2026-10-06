@@ -93,6 +93,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-mkv"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "oxideav-mkv",
+ "parking_lot",
+ "refcheck",
+]
+
+[[package]]
 name = "check-mpeg4"
 version = "0.1.0"
 dependencies = [
@@ -184,6 +194,7 @@ dependencies = [
  "codec-mlp",
  "codec-ra",
  "codec-rv",
+ "codec-wma",
  "codec-wmv",
  "demux-asf",
  "demux-misc",
@@ -1090,7 +1101,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/OxideAV/oxideav-mkv?rev=c0966a663803e7e3506f4e6330f6d89fa2410966#c0966a663803e7e3506f4e6330f6d89fa2410966"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=f07b1a79317f53d31385715e6969b479219d10a1#f07b1a79317f53d31385715e6969b479219d10a1"
 dependencies = [
  "oxideav-core",
 ]
