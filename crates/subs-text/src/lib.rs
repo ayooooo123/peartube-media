@@ -20,9 +20,12 @@ pub mod bitpack;
 pub mod cmml;
 pub mod kate;
 pub mod mov_text;
+pub mod sami;
+pub mod subviewer1;
+pub mod text_common;
 pub mod usf;
+pub mod vplayer;
 pub mod xml;
-
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, MediaType};
 
 /// Codec id for 3GPP Timed Text / QuickTime text (MP4 `tx3g` / `text`).
@@ -35,6 +38,12 @@ pub const USF_CODEC_ID: &str = "usf";
 pub const CMML_CODEC_ID: &str = "cmml";
 /// Codec id for Kate (Ogg `\x80kate\0\0\0` ident; Matroska `S_KATE`).
 pub const KATE_CODEC_ID: &str = "kate";
+/// Codec id for SAMI (Microsoft Synchronized Accessible Media Interchange).
+pub const SAMI_CODEC_ID: &str = "sami";
+/// Codec id for SubViewer 1.
+pub const SUBVIEWER1_CODEC_ID: &str = "subviewer1";
+/// Codec id for VPlayer.
+pub const VPLAYER_CODEC_ID: &str = "vplayer";
 
 /// Ogg BOS-packet magic of a Kate logical bitstream (packet type 0x80 +
 /// `kate\0\0\0`).
@@ -106,11 +115,48 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .decoder(cmml::make_decoder)
             .payload_magic(CMML_OGG_MAGIC),
     );
+    // SAMI
+    reg.register(
+        CodecInfo::new(CodecId::new(SAMI_CODEC_ID))
+            .capabilities(subtitle_caps("sami_sw"))
+            .decoder(sami::make_decoder),
+    );
+    // SubViewer 1
+    reg.register(
+        CodecInfo::new(CodecId::new(SUBVIEWER1_CODEC_ID))
+            .capabilities(subtitle_caps("subviewer1_sw"))
+            .decoder(subviewer1::make_decoder),
+    );
+    // VPlayer
+    reg.register(
+        CodecInfo::new(CodecId::new(VPLAYER_CODEC_ID))
+            .capabilities(subtitle_caps("vplayer_sw"))
+            .decoder(vplayer::make_decoder),
+    );
+}
+
+/// Register standalone subtitle containers (demuxers + probes) provided by this crate.
+pub fn register_containers(reg: &mut oxideav_core::ContainerRegistry) {
+    // SAMI
+    reg.register_demuxer(sami::CONTAINER_NAME, sami::open_demuxer);
+    reg.register_probe_with_priority(sami::CONTAINER_NAME, sami::probe, 50);
+    reg.register_extension_with_priority("smi", sami::CONTAINER_NAME, 50);
+    reg.register_extension_with_priority("sami", sami::CONTAINER_NAME, 50);
+
+    // SubViewer 1
+    reg.register_demuxer(subviewer1::CONTAINER_NAME, subviewer1::open_demuxer);
+    reg.register_probe_with_priority(subviewer1::CONTAINER_NAME, subviewer1::probe, 50);
+
+    // VPlayer
+    reg.register_demuxer(vplayer::CONTAINER_NAME, vplayer::open_demuxer);
+    reg.register_probe_with_priority(vplayer::CONTAINER_NAME, vplayer::probe, 50);
+    reg.register_extension_with_priority("vpl", vplayer::CONTAINER_NAME, 50);
 }
 
 /// Unified registration entry point.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
 }
 
 oxideav_core::register!("subs-text", register);

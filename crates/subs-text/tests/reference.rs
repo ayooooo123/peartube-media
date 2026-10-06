@@ -35,15 +35,39 @@ fn ffmpeg_srt_cues(path: &Path) -> Vec<(String, String)> {
         .expect("run ffmpeg");
     assert!(output.status.success(), "ffmpeg failed: {:?}", output);
     let text = String::from_utf8_lossy(&output.stdout);
+    parse_srt_text(&text)
+}
 
+fn parse_srt_text(text: &str) -> Vec<(String, String)> {
     let mut cues = Vec::new();
-    let blocks: Vec<&str> = text.split("\n\n").collect();
-    for block in blocks {
-        let lines: Vec<&str> = block.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-        if lines.len() >= 2 && lines[1].contains("-->") {
-            let timing = lines[1].to_string();
-            let body = lines[2..].join("\n");
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if !line.is_empty()
+            && line.chars().all(|c| c.is_ascii_digit())
+            && i + 1 < lines.len()
+            && lines[i + 1].contains("-->")
+        {
+            let timing = lines[i + 1].trim().to_string();
+            i += 2;
+            let mut body_lines = Vec::new();
+            while i < lines.len() {
+                let cur = lines[i].trim();
+                if !cur.is_empty()
+                    && cur.chars().all(|c| c.is_ascii_digit())
+                    && i + 1 < lines.len()
+                    && lines[i + 1].contains("-->")
+                {
+                    break;
+                }
+                body_lines.push(lines[i]);
+                i += 1;
+            }
+            let body = body_lines.join("\n").trim().to_string();
             cues.push((timing, body));
+        } else {
+            i += 1;
         }
     }
     cues
@@ -227,6 +251,102 @@ fn test_cmml_decode_sample() {
 }
 
 #[test]
+fn test_sami_reference() {
+    let fate_samples = [
+        "sub/SAMI_capability_tester.smi",
+        "sub/SAMI_multilang_tweak_tester.smi",
+    ];
+
+    for sample_rel in fate_samples {
+        let sample = fate(sample_rel);
+        let ffmpeg_cues = ffmpeg_srt_cues(&sample);
+
+        let decoded = refcheck::decode(
+            &sample,
+            &[subs_text::register],
+            MediaType::Subtitle,
+            0,
+        );
+
+        assert_eq!(
+            decoded.frames.len(),
+            ffmpeg_cues.len(),
+            "[{}] cue count mismatch: decoded {} vs ffmpeg {}",
+            sample_rel,
+            decoded.frames.len(),
+            ffmpeg_cues.len()
+        );
+
+        for (i, frame) in decoded.frames.iter().enumerate() {
+            if let Frame::Subtitle(cue) = frame {
+                let timing = format!(
+                    "{} --> {}",
+                    format_srt_time(cue.start_us),
+                    format_srt_time(cue.end_us)
+                );
+                assert_eq!(
+                    timing, ffmpeg_cues[i].0,
+                    "[{}] cue {} timing mismatch: {} vs {}",
+                    sample_rel,
+                    i + 1,
+                    timing,
+                    ffmpeg_cues[i].0
+                );
+
+                let body = subs_text::sami::render_srt_body(&cue.segments).trim().to_string();
+                assert_eq!(
+                    body, ffmpeg_cues[i].1,
+                    "[{}] cue {} body mismatch:\n  Act: {:?}\n  Exp: {:?}",
+                    sample_rel,
+                    i + 1,
+                    body,
+                    ffmpeg_cues[i].1
+                );
+            } else {
+                panic!("expected Subtitle frame, got {:?}", frame);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_subviewer1_reference() {
+    let sample = fate("sub/SubViewer1_capability_tester.sub");
+    let decoded = refcheck::decode(
+        &sample,
+        &[subs_text::register],
+        MediaType::Subtitle,
+        0,
+    );
+    assert_eq!(decoded.frames.len(), 10, "expected 10 decoded cues");
+    let (first_pts, last_pts) = match (&decoded.frames[0], &decoded.frames[9]) {
+        (Frame::Subtitle(c1), Frame::Subtitle(c10)) => (c1.start_us, c10.start_us),
+        _ => panic!("expected subtitle frames"),
+    };
+    assert_eq!(first_pts, 225_000_000); // 00:03:45
+    assert_eq!(last_pts, 7_218_000_000); // 02:00:18
+}
+
+#[test]
+fn test_vplayer_reference() {
+    let sample = fate("sub/VPlayer_capability_tester.txt");
+    let decoded = refcheck::decode(
+        &sample,
+        &[subs_text::register],
+        MediaType::Subtitle,
+        0,
+    );
+    assert_eq!(decoded.frames.len(), 3, "expected 3 decoded cues");
+    let (c1, c2, c3) = match (&decoded.frames[0], &decoded.frames[1], &decoded.frames[2]) {
+        (Frame::Subtitle(c1), Frame::Subtitle(c2), Frame::Subtitle(c3)) => (c1, c2, c3),
+        _ => panic!("expected subtitle frames"),
+    };
+    assert_eq!(c1.start_us, 120_000); // 00:00:00,120
+    assert_eq!(c2.start_us, 23_510_000); // 00:00:23,510
+    assert_eq!(c3.start_us, 62_050_000); // 00:01:02,050
+}
+
+#[test]
 fn test_untrusted_input_robustness() {
     struct Rng(u64);
     impl Rng {
@@ -252,8 +372,10 @@ fn test_untrusted_input_robustness() {
         ("usf", b"<USFSubtitles><subtitles><subtitle start=\"1.0\" stop=\"2.0\"><text><b>Test</b></text></subtitle></subtitles></USFSubtitles>"),
         ("cmml", b"<cmml><clip start=\"1.0\" end=\"2.0\"><title>T</title><desc>D</desc></clip></cmml>"),
         ("kate", b"\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00Kate\x00"),
+        ("sami", b"<SAMI><BODY><SYNC Start=100><P Class=ENUSCC ID=Source>Speaker<P Class=ENUSCC>Hello <B>World</B></BODY></SAMI>"),
+        ("subviewer1", b"[DELAY]\n4\n[00:03:41]\nFirst line|second line\n"),
+        ("vplayer", b"0:00:01.50:Hello|world\n"),
     ];
-
     for &(codec, seed_data) in test_seeds {
         for _ in 0..2500 {
             let mut mutated = seed_data.to_vec();
@@ -312,6 +434,21 @@ fn test_untrusted_input_robustness() {
                     }
                     "kate" => {
                         let mut dec = subs_text::kate::make_decoder(&params).unwrap();
+                        let _ = dec.send_packet(&packet);
+                        let _ = dec.receive_frame();
+                    }
+                    "sami" => {
+                        let mut dec = subs_text::sami::make_decoder(&params).unwrap();
+                        let _ = dec.send_packet(&packet);
+                        let _ = dec.receive_frame();
+                    }
+                    "subviewer1" => {
+                        let mut dec = subs_text::subviewer1::make_decoder(&params).unwrap();
+                        let _ = dec.send_packet(&packet);
+                        let _ = dec.receive_frame();
+                    }
+                    "vplayer" => {
+                        let mut dec = subs_text::vplayer::make_decoder(&params).unwrap();
                         let _ = dec.send_packet(&packet);
                         let _ = dec.receive_frame();
                     }
