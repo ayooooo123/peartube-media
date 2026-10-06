@@ -38,8 +38,45 @@ pub fn fate(relative: &str) -> PathBuf {
 /// layout (when it gives one), and every frame, in output order.
 pub struct Decoded {
     pub params: CodecParameters,
+    /// `Decoder::output_audio_format` after the last frame.
     pub audio_format: Option<AudioFormat>,
+    /// `Decoder::output_audio_format` as reported right after each frame of
+    /// `frames` was received: one entry per frame, in the same order. A
+    /// stream can change layout mid-way (LATM stereo to 5.1, HE-AAC mono
+    /// until parametric stereo starts), so each frame is read in its own.
+    pub frame_formats: Vec<Option<AudioFormat>>,
     pub frames: Vec<Frame>,
+}
+
+/// The container the player's probe rule picks for `path` (engine-api.md):
+/// the best content probe when it scores at least an extension match,
+/// else the container registered for the file extension. Reads the first
+/// 256 KiB, as the engine does.
+pub fn probe_container(ctx: &RuntimeContext, path: &Path) -> Result<String, String> {
+    let mut head = vec![0; 256 * 1024];
+    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut n = 0;
+    while n < head.len() {
+        match file.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(read) => n += read,
+            Err(e) => return Err(format!("read {}: {e}", path.display())),
+        }
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let probe = ProbeData { buf: &head[..n], ext: ext.as_deref() };
+    let candidates = ctx.containers.probe_candidates(&probe);
+    // Below an extension match a probe is guessing (EBU STL scores 5 on any
+    // input); the player rejects those too.
+    let by_extension = ext.as_deref().and_then(|e| ctx.containers.container_for_extension(e));
+    match (candidates.first(), by_extension) {
+        (Some(c), _) if c.score >= PROBE_SCORE_EXTENSION => Ok(c.name.to_string()),
+        (_, Some(name)) => Ok(name.to_string()),
+        _ => Err(format!(
+            "no container claims this input (candidates: {:?})",
+            candidates.iter().map(|c| (c.name, c.score)).collect::<Vec<_>>()
+        )),
+    }
 }
 
 /// Opens `path` with the containers and codecs that `registrars` install,
@@ -49,23 +86,7 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
     for register in registrars {
         register(&mut ctx);
     }
-    let mut head = vec![0; 256 * 1024];
-    let n = File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
-    let probe = ProbeData { buf: &head[..n], ext: ext.as_deref() };
-    let candidates = ctx.containers.probe_candidates(&probe);
-    // Below an extension match a probe is guessing (EBU STL scores 5 on any
-    // input); the player rejects those too.
-    let by_extension = ext.as_deref().and_then(|e| ctx.containers.container_for_extension(e));
-    let format = match (candidates.first(), by_extension) {
-        (Some(c), _) if c.score >= PROBE_SCORE_EXTENSION => c.name.to_string(),
-        (_, Some(name)) => name.to_string(),
-        _ => panic!(
-            "{}: no container claims it (candidates: {:?})",
-            path.display(),
-            candidates.iter().map(|c| (c.name, c.score)).collect::<Vec<_>>()
-        ),
-    };
+    let format = probe_container(&ctx, path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let mut demuxer = ctx
         .containers
@@ -83,9 +104,15 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
         .first_decoder(&stream.params)
         .unwrap_or_else(|e| panic!("no decoder for {:?}: {e}", stream.params.codec_id));
     let mut frames = Vec::new();
-    let drain = |decoder: &mut Box<dyn oxideav_core::Decoder>, frames: &mut Vec<Frame>| loop {
+    let mut frame_formats = Vec::new();
+    let drain = |decoder: &mut Box<dyn oxideav_core::Decoder>,
+                 frames: &mut Vec<Frame>,
+                 frame_formats: &mut Vec<Option<AudioFormat>>| loop {
         match decoder.receive_frame() {
-            Ok(frame) => frames.push(frame),
+            Ok(frame) => {
+                frames.push(frame);
+                frame_formats.push(decoder.output_audio_format());
+            }
             Err(Error::NeedMore) | Err(Error::Eof) => break,
             Err(e) => panic!("decode: {e}"),
         }
@@ -94,7 +121,7 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
         match demuxer.next_packet() {
             Ok(packet) if packet.stream_index == stream.index => {
                 decoder.send_packet(&packet).unwrap_or_else(|e| panic!("send_packet: {e}"));
-                drain(&mut decoder, &mut frames);
+                drain(&mut decoder, &mut frames, &mut frame_formats);
             }
             Ok(_) => {}
             Err(Error::Eof) => break,
@@ -102,29 +129,63 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
         }
     }
     decoder.flush().unwrap_or_else(|e| panic!("flush: {e}"));
-    drain(&mut decoder, &mut frames);
-    Decoded { params: stream.params, audio_format: decoder.output_audio_format(), frames }
+    drain(&mut decoder, &mut frames, &mut frame_formats);
+    Decoded { params: stream.params, audio_format: decoder.output_audio_format(), frame_formats, frames }
 }
 
-/// FFmpeg's name for a pixel format, for `-pix_fmt`.
-pub fn ffmpeg_pix_fmt(format: PixelFormat) -> &'static str {
-    match format {
+/// FFmpeg's name for a pixel format, for `-pix_fmt`, or `None` when FFmpeg
+/// has no equivalent.
+pub fn ffmpeg_pix_fmt_name(format: PixelFormat) -> Option<&'static str> {
+    Some(match format {
         PixelFormat::Yuv420P => "yuv420p",
         PixelFormat::Yuv422P => "yuv422p",
         PixelFormat::Yuv444P => "yuv444p",
         PixelFormat::Yuv440P => "yuv440p",
         PixelFormat::Yuv411P => "yuv411p",
+        PixelFormat::YuvJ420P => "yuvj420p",
+        PixelFormat::YuvJ422P => "yuvj422p",
+        PixelFormat::YuvJ444P => "yuvj444p",
         PixelFormat::Yuv420P10Le => "yuv420p10le",
         PixelFormat::Yuv422P10Le => "yuv422p10le",
         PixelFormat::Yuv444P10Le => "yuv444p10le",
+        PixelFormat::Yuv420P12Le => "yuv420p12le",
+        PixelFormat::Yuv422P12Le => "yuv422p12le",
+        PixelFormat::Yuv444P12Le => "yuv444p12le",
+        PixelFormat::Yuv420P16Le => "yuv420p16le",
+        PixelFormat::Yuv422P16Le => "yuv422p16le",
+        PixelFormat::Yuv444P16Le => "yuv444p16le",
+        PixelFormat::Yuva420P => "yuva420p",
+        PixelFormat::Yuva422P => "yuva422p",
+        PixelFormat::Yuva444P => "yuva444p",
         PixelFormat::Gray8 => "gray",
+        PixelFormat::Gray10Le => "gray10le",
+        PixelFormat::Gray12Le => "gray12le",
+        PixelFormat::Gray16Le => "gray16le",
+        PixelFormat::Ya8 => "ya8",
         PixelFormat::Rgb24 => "rgb24",
         PixelFormat::Bgr24 => "bgr24",
         PixelFormat::Rgba => "rgba",
+        PixelFormat::Bgra => "bgra",
+        PixelFormat::Argb => "argb",
+        PixelFormat::Abgr => "abgr",
+        PixelFormat::Rgb48Le => "rgb48le",
+        PixelFormat::Rgba64Le => "rgba64le",
+        PixelFormat::Gbrp8 => "gbrp",
+        PixelFormat::Gbrap8 => "gbrap",
         PixelFormat::Pal8 => "pal8",
         PixelFormat::Nv12 => "nv12",
-        other => panic!("refcheck: add FFmpeg's name for {other:?}"),
-    }
+        PixelFormat::Nv21 => "nv21",
+        PixelFormat::Yuyv422 => "yuyv422",
+        PixelFormat::Uyvy422 => "uyvy422",
+        PixelFormat::MonoBlack => "monob",
+        PixelFormat::MonoWhite => "monow",
+        _ => return None,
+    })
+}
+
+/// FFmpeg's name for a pixel format, for `-pix_fmt`.
+pub fn ffmpeg_pix_fmt(format: PixelFormat) -> &'static str {
+    ffmpeg_pix_fmt_name(format).unwrap_or_else(|| panic!("refcheck: add FFmpeg's name for {format:?}"))
 }
 
 /// The frame's image planes packed row by row without stride padding, the
@@ -156,17 +217,39 @@ pub fn ffmpeg_video_md5s(path: &Path, nth: usize, pix_fmt: &str) -> Vec<String> 
 /// `&["-idct", "simple"]` to pin FFmpeg's C IDCT: on arm64 its default picks
 /// NEON assembly whose rounding differs from the C reference.
 pub fn ffmpeg_video_md5s_with(path: &Path, nth: usize, pix_fmt: &str, input_args: &[&str]) -> Vec<String> {
-    let map = format!("0:v:{nth}");
-    let mut args = vec!["-apply_cropping", "codec"];
-    args.extend_from_slice(input_args);
-    args.extend_from_slice(&[
-        "-i", path.to_str().unwrap(), "-map", &map, "-fps_mode", "passthrough", "-pix_fmt", pix_fmt, "-f",
-        "framemd5", "-",
-    ]);
-    String::from_utf8(ffmpeg(&args))
-        .unwrap()
-        .lines()
-        .filter(|l| !l.starts_with('#'))
+    let args = ffmpeg_video_md5_args(path, &format!("0:v:{nth}"), pix_fmt, input_args);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    parse_framemd5(&String::from_utf8(ffmpeg(&args)).unwrap())
+}
+
+/// The arguments (after FFmpeg's global `-v error -nostdin`) of the video
+/// oracle behind [`ffmpeg_video_md5s_with`], for the stream `map` (an
+/// `-map` specifier such as `0:v:1` or `0:3`).
+pub fn ffmpeg_video_md5_args(path: &Path, map: &str, pix_fmt: &str, input_args: &[&str]) -> Vec<String> {
+    let mut args = vec!["-apply_cropping".to_string(), "codec".to_string()];
+    args.extend(input_args.iter().map(|a| a.to_string()));
+    for a in [
+        "-i",
+        path.to_str().unwrap(),
+        "-map",
+        map,
+        "-fps_mode",
+        "passthrough",
+        "-pix_fmt",
+        pix_fmt,
+        "-f",
+        "framemd5",
+        "-",
+    ] {
+        args.push(a.to_string());
+    }
+    args
+}
+
+/// The per-frame hashes of FFmpeg's `framemd5` output, in order.
+pub fn parse_framemd5(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
         .map(|l| l.rsplit(',').next().unwrap().trim().to_string())
         .collect()
 }
@@ -185,21 +268,34 @@ pub fn ffmpeg_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
     out.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
-/// Every audio frame converted to interleaved f32 in [-1, 1], read in the
-/// layout the decoder reports through `Decoder::output_audio_format`, else
-/// in the container's declared one.
+/// Every audio frame converted to interleaved f32 in [-1, 1]. Each frame is
+/// read in the layout the decoder reported for it through
+/// `Decoder::output_audio_format` (see [`Decoded::frame_formats`]), else in
+/// the container's declared one. Panics when a frame's buffers are shorter
+/// than its sample count in that layout.
 pub fn interleaved_f32(decoded: &Decoded) -> Vec<f32> {
-    let (format, channels) = match decoded.audio_format {
-        Some(f) => (f.sample_format, f.channels as usize),
-        None => (
+    let declared = || {
+        (
             decoded.params.sample_format.expect("audio stream without sample_format"),
             decoded.params.channels.unwrap_or(1) as usize,
-        ),
+        )
     };
     let mut out = Vec::new();
-    for frame in &decoded.frames {
+    for (index, frame) in decoded.frames.iter().enumerate() {
         let Frame::Audio(a) = frame else { continue };
+        let (format, channels) = match decoded.frame_formats.get(index).copied().flatten() {
+            Some(f) => (f.sample_format, f.channels as usize),
+            None => declared(),
+        };
         let n = a.samples as usize;
+        let w = format.bytes_per_sample();
+        let (planes, per_plane) = if format.is_planar() { (channels, n * w) } else { (1, n * channels * w) };
+        assert!(
+            a.data.len() >= planes && a.data[..planes].iter().all(|p| p.len() >= per_plane),
+            "frame {index}: {n} samples x {channels} channels of {format:?} need {planes} plane(s) of {per_plane} bytes, \
+             the frame has {:?}",
+            a.data.iter().map(Vec::len).collect::<Vec<_>>()
+        );
         for i in 0..n {
             for c in 0..channels {
                 out.push(sample_f32(format, &a.data, channels, c, i));
@@ -224,15 +320,28 @@ fn sample_f32(format: SampleFormat, data: &[Vec<u8>], channels: usize, c: usize,
     }
 }
 
-/// Signal-to-noise ratio of `test` against `reference`, in dB, over the
-/// common length. Lengths must agree within `slack` samples.
-pub fn snr_db(reference: &[f32], test: &[f32], slack: usize) -> f64 {
-    assert!(
-        reference.len().abs_diff(test.len()) <= slack,
-        "length {} vs FFmpeg {} (slack {slack})",
-        test.len(),
-        reference.len()
-    );
+/// Signal-to-noise ratio of `test` against `reference`, in dB, over their
+/// common length, or why it cannot be scored: an empty reference, an empty
+/// comparison interval, a non-finite sample on either side, or lengths
+/// that differ by more than `slack` samples. A silent reference scores
+/// +infinity against silence and -infinity against anything else, so the
+/// only acceptance test is `snr >= floor`.
+pub fn try_snr_db(reference: &[f32], test: &[f32], slack: usize) -> Result<f64, String> {
+    if reference.is_empty() {
+        return Err("the reference is empty".into());
+    }
+    if test.is_empty() {
+        return Err("nothing to compare: the decode is empty".into());
+    }
+    if reference.len().abs_diff(test.len()) > slack {
+        return Err(format!("length {} vs FFmpeg {} (slack {slack})", test.len(), reference.len()));
+    }
+    if let Some(i) = reference.iter().position(|x| !x.is_finite()) {
+        return Err(format!("reference sample {i} is {}", reference[i]));
+    }
+    if let Some(i) = test.iter().position(|x| !x.is_finite()) {
+        return Err(format!("decoded sample {i} is {}", test[i]));
+    }
     let n = reference.len().min(test.len());
     let (mut signal, mut noise) = (0f64, 0f64);
     for i in 0..n {
@@ -240,7 +349,12 @@ pub fn snr_db(reference: &[f32], test: &[f32], slack: usize) -> f64 {
         signal += r * r;
         noise += (r - test[i] as f64).powi(2);
     }
-    if noise == 0.0 { f64::INFINITY } else { 10.0 * (signal / noise).log10() }
+    Ok(if noise == 0.0 { f64::INFINITY } else { 10.0 * (signal / noise).log10() })
+}
+
+/// [`try_snr_db`], panicking when the inputs cannot be scored.
+pub fn snr_db(reference: &[f32], test: &[f32], slack: usize) -> f64 {
+    try_snr_db(reference, test, slack).unwrap_or_else(|e| panic!("snr_db: {e}"))
 }
 
 fn ffmpeg(args: &[&str]) -> Vec<u8> {
@@ -251,4 +365,200 @@ fn ffmpeg(args: &[&str]) -> Vec<u8> {
         .expect("ffmpeg must be on PATH");
     assert!(out.status.success(), "ffmpeg {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     out.stdout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_core::{
+        AudioFrame, CodecId, CodecInfo, CodecResolver, Decoder, Demuxer, Packet, ReadSeek, StreamInfo, TimeBase,
+    };
+
+    #[test]
+    fn snr_rejects_an_empty_reference() {
+        assert!(try_snr_db(&[], &[], 0).is_err(), "empty/empty");
+        assert!(try_snr_db(&[], &[0.25, -0.25], 2).is_err(), "empty reference / nonempty decode");
+    }
+
+    #[test]
+    fn snr_rejects_an_empty_comparison_interval() {
+        assert!(try_snr_db(&[0.25, -0.25], &[], 2).is_err(), "nonempty reference / empty decode");
+    }
+
+    #[test]
+    fn snr_of_silence_against_noise_is_minus_infinity_and_fails_any_floor() {
+        let snr = try_snr_db(&[0.0; 4], &[0.1, -0.1, 0.1, -0.1], 0).unwrap();
+        assert_eq!(snr, f64::NEG_INFINITY);
+        assert!(snr < 90.0, "-infinity must fail the acceptance test snr >= floor");
+        let exact = try_snr_db(&[0.0; 4], &[0.0; 4], 0).unwrap();
+        assert_eq!(exact, f64::INFINITY);
+        assert!(exact >= 90.0);
+    }
+
+    #[test]
+    fn snr_bounds_the_length_difference_by_the_slack() {
+        let reference = [0.5f32; 10];
+        assert!(try_snr_db(&reference, &reference[..7], 2).is_err(), "3 missing samples, slack 2");
+        assert_eq!(try_snr_db(&reference, &reference[..7], 3), Ok(f64::INFINITY));
+        let mut longer = reference.to_vec();
+        longer.extend([0.5; 3]);
+        assert!(try_snr_db(&reference, &longer, 2).is_err(), "3 extra samples, slack 2");
+    }
+
+    #[test]
+    fn snr_rejects_non_finite_samples_on_either_side() {
+        assert!(try_snr_db(&[0.5, f32::NAN], &[0.5, 0.5], 0).is_err());
+        assert!(try_snr_db(&[0.5, 0.5], &[0.5, f32::INFINITY], 0).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "the reference is empty")]
+    fn snr_db_panics_where_try_snr_db_errs() {
+        snr_db(&[], &[0.1], 1);
+    }
+
+    fn s16_plane(samples: &[i16]) -> Vec<u8> {
+        samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    fn format(sample_format: SampleFormat, channels: u16) -> AudioFormat {
+        AudioFormat { sample_format, sample_rate: 48000, channels }
+    }
+
+    fn audio(samples: u32, data: Vec<Vec<u8>>) -> Frame {
+        Frame::Audio(AudioFrame { samples, pts: None, data })
+    }
+
+    #[test]
+    fn interleaved_f32_reads_each_frame_in_its_own_layout() {
+        let mut params = CodecParameters::audio(CodecId::new("test"));
+        params.sample_format = Some(SampleFormat::S16);
+        params.channels = Some(1);
+        // Mono S16 until the stream switches to stereo planar float, as
+        // LATM stereo-to-5.1 or HE-AAC mono-until-PS streams do.
+        let decoded = Decoded {
+            params,
+            audio_format: Some(format(SampleFormat::F32P, 2)),
+            frame_formats: vec![Some(format(SampleFormat::S16, 1)), Some(format(SampleFormat::F32P, 2))],
+            frames: vec![
+                audio(2, vec![s16_plane(&[16384, -16384])]),
+                audio(
+                    2,
+                    vec![
+                        [0.5f32, 0.25].iter().flat_map(|x| x.to_le_bytes()).collect(),
+                        [-0.5f32, -0.25].iter().flat_map(|x| x.to_le_bytes()).collect(),
+                    ],
+                ),
+            ],
+        };
+        assert_eq!(interleaved_f32(&decoded), vec![0.5, -0.5, 0.5, -0.5, 0.25, -0.25]);
+    }
+
+    #[test]
+    #[should_panic(expected = "need 2 plane(s)")]
+    fn interleaved_f32_refuses_a_frame_shorter_than_its_layout() {
+        let mut params = CodecParameters::audio(CodecId::new("test"));
+        params.sample_format = Some(SampleFormat::S16P);
+        params.channels = Some(2);
+        let decoded = Decoded {
+            params,
+            audio_format: None,
+            frame_formats: vec![None],
+            frames: vec![audio(2, vec![s16_plane(&[1, 2])])],
+        };
+        interleaved_f32(&decoded);
+    }
+
+    // A container and decoder whose output layout changes mid-stream: the
+    // first two packets decode to mono S16, the rest to stereo S16.
+
+    const LAYOUT_CODEC: &str = "refcheck_layout_switch";
+
+    struct SwitchingDemuxer {
+        streams: Vec<StreamInfo>,
+        next: u8,
+    }
+
+    impl Demuxer for SwitchingDemuxer {
+        fn format_name(&self) -> &str {
+            "refcheck_layout"
+        }
+        fn streams(&self) -> &[StreamInfo] {
+            &self.streams
+        }
+        fn next_packet(&mut self) -> oxideav_core::Result<Packet> {
+            if self.next == 4 {
+                return Err(Error::Eof);
+            }
+            let packet = Packet::new(0, TimeBase::new(1, 48000), vec![self.next]);
+            self.next += 1;
+            Ok(packet)
+        }
+    }
+
+    fn open_switching(_input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> oxideav_core::Result<Box<dyn Demuxer>> {
+        let mut params = CodecParameters::audio(CodecId::new(LAYOUT_CODEC));
+        params.sample_format = Some(SampleFormat::S16);
+        params.channels = Some(2);
+        params.sample_rate = Some(48000);
+        let stream = StreamInfo { index: 0, time_base: TimeBase::new(1, 48000), duration: None, start_time: None, params };
+        Ok(Box::new(SwitchingDemuxer { streams: vec![stream], next: 0 }))
+    }
+
+    struct SwitchingDecoder {
+        id: CodecId,
+        channels: u16,
+        pending: Option<Frame>,
+    }
+
+    impl Decoder for SwitchingDecoder {
+        fn codec_id(&self) -> &CodecId {
+            &self.id
+        }
+        fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
+            let k = packet.data[0] as i16;
+            self.channels = if k < 2 { 1 } else { 2 };
+            // Two samples per channel, value 1000 * packet + channel.
+            let samples: Vec<i16> = (0..2).flat_map(|_| (0..self.channels as i16).map(move |c| 1000 * k + c)).collect();
+            self.pending = Some(audio(2, vec![s16_plane(&samples)]));
+            Ok(())
+        }
+        fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
+            self.pending.take().ok_or(Error::NeedMore)
+        }
+        fn flush(&mut self) -> oxideav_core::Result<()> {
+            Ok(())
+        }
+        fn output_audio_format(&self) -> Option<AudioFormat> {
+            Some(format(SampleFormat::S16, self.channels))
+        }
+    }
+
+    fn make_switching(_params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
+        Ok(Box::new(SwitchingDecoder { id: CodecId::new(LAYOUT_CODEC), channels: 0, pending: None }))
+    }
+
+    fn register_switching(ctx: &mut RuntimeContext) {
+        ctx.containers.register_demuxer("refcheck_layout", open_switching);
+        ctx.containers.register_extension("rclayout", "refcheck_layout");
+        ctx.codecs.register(CodecInfo::new(CodecId::new(LAYOUT_CODEC)).decoder(make_switching));
+    }
+
+    #[test]
+    fn decode_snapshots_the_layout_of_every_frame() {
+        let path = std::env::temp_dir().join(format!("refcheck-layout-{}.rclayout", std::process::id()));
+        std::fs::write(&path, b"layout switch").unwrap();
+        let decoded = decode(&path, &[register_switching], MediaType::Audio, 0);
+        let _ = std::fs::remove_file(&path);
+
+        let channels: Vec<u16> = decoded.frame_formats.iter().map(|f| f.unwrap().channels).collect();
+        assert_eq!(channels, [1, 1, 2, 2], "per-frame layouts");
+        assert_eq!(decoded.audio_format.unwrap().channels, 2, "final layout");
+        let scale = |v: i16| v as f32 / 32768.0;
+        let expected: Vec<f32> = [0, 0, 1000, 1000, 2000, 2001, 2000, 2001, 3000, 3001, 3000, 3001]
+            .into_iter()
+            .map(scale)
+            .collect();
+        assert_eq!(interleaved_f32(&decoded), expected);
+    }
 }
