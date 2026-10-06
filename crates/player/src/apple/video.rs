@@ -78,6 +78,9 @@ pub struct AppleVideoSink {
     /// Set to `true` once `failed` has been observed; further software
     /// frames then flow normally.
     fallback_reported: std::cell::Cell<bool>,
+    /// Software frames display as decoded instead of at `pts` (video-only
+    /// playback without an audio clock anchor).
+    display_immediately: bool,
     observers: Vec<SendSync<Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>>,
     _screenshot_probe: (),
 }
@@ -97,6 +100,8 @@ struct SoftwarePath {
     pool: SendSync<CFRetained<CVPixelBufferPool>>,
 }
 
+
+
 // SAFETY: the layer is only touched on the main queue (all uses wrap in
 // exec_async / run-on-main); the other fields are Send/Sync by type.
 unsafe impl Send for AppleVideoSink {}
@@ -107,6 +112,58 @@ unsafe impl Sync for AppleVideoSink {}
 struct SendPtr<T>(*mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
+
+/// Which enqueue path the display layer supports. `sampleBufferRenderer`
+/// is macOS 14+/iOS 17+ only; the layer's own (deprecated) rendering
+/// methods exist since 10.8/8.0 and are used below that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendererPath {
+    /// `layer.sampleBufferRenderer` + `AVSampleBufferVideoRenderer`.
+    Modern,
+    /// The layer's own `AVQueuedSampleBufferRendering` conformance.
+    LegacyLayer,
+}
+
+fn renderer_path(layer: &AVSampleBufferDisplayLayer) -> RendererPath {
+    static PATH: std::sync::OnceLock<RendererPath> = std::sync::OnceLock::new();
+    *PATH.get_or_init(|| {
+        // SAFETY: objc runtime queries on a live object.
+        unsafe {
+            let responds: bool = objc2::msg_send![
+                layer,
+                respondsToSelector: objc2::sel!(sampleBufferRenderer)
+            ];
+            if responds {
+                RendererPath::Modern
+            } else {
+                RendererPath::LegacyLayer
+            }
+        }
+    })
+}
+
+/// Runs `f` with the rendering target for `layer`: either the modern
+/// `AVSampleBufferVideoRenderer` or the layer itself on older systems.
+fn with_renderer<R>(
+    layer: &AVSampleBufferDisplayLayer,
+    f: impl FnOnce(&objc2::runtime::ProtocolObject<dyn objc2_av_foundation::AVQueuedSampleBufferRendering>) -> R,
+) -> R {
+    match renderer_path(layer) {
+        RendererPath::Modern => {
+            let renderer: Retained<AVSampleBufferVideoRenderer> = unsafe {
+                layer.sampleBufferRenderer()
+            };
+            let proto: Retained<objc2::runtime::ProtocolObject<
+                dyn objc2_av_foundation::AVQueuedSampleBufferRendering,
+            >> = objc2::runtime::ProtocolObject::from_retained(renderer);
+            f(&proto)
+        }
+        RendererPath::LegacyLayer => {
+            let proto = objc2::runtime::ProtocolObject::from_ref(layer);
+            f(proto)
+        }
+    }
+}
 
 /// A main-thread handle to the display layer, clonable across threads; the
 /// layer is only dereferenced on the main queue.
@@ -126,7 +183,7 @@ impl AppleVideoSink {
         SinkHandle(SendSync(self.layer.0.clone()))
     }
 
-    pub fn new(layer: Retained<AVSampleBufferDisplayLayer>) -> Self {
+    pub fn new(layer: Retained<AVSampleBufferDisplayLayer>, display_immediately: bool) -> Self {
         let main = unsafe { dispatch2::DispatchRetained::retain(std::ptr::NonNull::from(DispatchQueue::main())) };
         let failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let failed_for_obs = failed.clone();
@@ -173,6 +230,7 @@ impl AppleVideoSink {
             failed,
             frames_enqueued,
             fallback_reported: std::cell::Cell::new(false),
+            display_immediately,
             observers: vec![SendSync(observer)],
             _screenshot_probe: (),
         }
@@ -199,29 +257,37 @@ impl AppleVideoSink {
     }
 
     fn renderer_status_errors(&self) -> Option<String> {
-        // Reading status from a non-main thread is safe on
-        // AVSampleBufferVideoRenderer (documented thread-safe enqueue API).
-        let renderer: Retained<AVSampleBufferVideoRenderer> = unsafe { self.layer.sampleBufferRenderer() };
-        let status: AVQueuedSampleBufferRenderingStatus = unsafe { objc2::msg_send![&*renderer, status] };
-        if status == AVQueuedSampleBufferRenderingStatus::Failed {
-            let msg: Option<objc2::rc::Retained<objc2_foundation::NSError>> = unsafe {
-                let err: *mut objc2_foundation::NSError = objc2::msg_send![&*renderer, error];
-                if err.is_null() {
-                    None
-                } else {
-                    // -error returns an autoreleased instance per the Get
-                    // rule; retain for ownership.
-                    // -error returned a valid non-null instance; `retain`
-                    // bumps the count for ownership.
-                    Some(objc2::rc::Retained::retain(err).expect("NSError null"))
+        // Status read happens on the enqueue thread; both the modern
+        // renderer and the layer's own conformance are documented
+        // thread-safe for these queries. An NSException raised inside AVF
+        // unwinds through this Rust frame and would abort the process, so
+        // catch and surface it as a fallback trigger.
+        let read = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+            with_renderer(&self.layer, |r| {
+                let status: AVQueuedSampleBufferRenderingStatus =
+                    objc2::msg_send![r, status];
+                if status != AVQueuedSampleBufferRenderingStatus::Failed {
+                    return None;
                 }
-            };
-            Some(
-                msg.map(|e| format!("{e:?}"))
-                    .unwrap_or_else(|| "layer status failed".into()),
-            )
-        } else {
-            None
+                let msg: Option<objc2::rc::Retained<objc2_foundation::NSError>> = {
+                    let err: *mut objc2_foundation::NSError = objc2::msg_send![r, error];
+                    if err.is_null() {
+                        None
+                    } else {
+                        // -error returns an autoreleased instance per the
+                        // Get rule; retain for ownership.
+                        Some(objc2::rc::Retained::retain(err).expect("NSError null"))
+                    }
+                };
+                Some(
+                    msg.map(|e| format!("{e:?}"))
+                        .unwrap_or_else(|| "layer status failed".into()),
+                )
+            })
+        }));
+        match read {
+            Ok(v) => v,
+            Err(_) => Some("Obj-C exception reading renderer status".into()),
         }
     }
 }
@@ -433,12 +499,13 @@ impl VideoSink for AppleVideoSink {
             // An Obj-C exception here (renderer gone mid-teardown) must not
             // abort the process; the next push observes the failed status
             // and returns Fallback.
-            let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-                let sample = CFRetained::from_raw(NonNull::new_unchecked(
-                    sample_ptr.0 as *mut CMSampleBuffer,
-                ));
-                let renderer = layer.sampleBufferRenderer();
-                let _: () = objc2::msg_send![&*renderer, enqueueSampleBuffer: &*sample];
+            let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                with_renderer(layer, |r| unsafe {
+                    let sample = CFRetained::from_raw(NonNull::new_unchecked(
+                        sample_ptr.0 as *mut CMSampleBuffer,
+                    ));
+                    let _: () = objc2::msg_send![r, enqueueSampleBuffer: &*sample];
+                });
             }));
         });
         Ok(())
@@ -473,9 +540,10 @@ impl VideoSink for AppleVideoSink {
         *self.failed.lock().expect("failed lock") = None;
         self.fallback_reported.set(false);
         self.enqueue_on_main(|layer| {
-            let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-                let renderer = layer.sampleBufferRenderer();
-                let _: () = objc2::msg_send![&*renderer, flush];
+            let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                with_renderer(layer, |r| unsafe {
+                    let _: () = objc2::msg_send![r, flush];
+                });
             }));
         });
     }
@@ -610,6 +678,7 @@ impl AppleVideoSink {
         // exec_async; the video thread blocks on the result channel. Obj-C
         // exceptions convert to SinkError instead of aborting.
         let sink = self.clone_sink_handle();
+        let display_immediately = self.display_immediately;
         let enqueued = run_on_main(move |_mtm| {
             let res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
                 let pixel: CFRetained<CVPixelBuffer> = pool_pixel_buffer(&pool)?;
@@ -636,38 +705,44 @@ impl AppleVideoSink {
                 }
                 // SAFETY: Create-rule function returned +1.
                 let sample = CFRetained::from_raw(NonNull::new_unchecked(raw));
-                // Mark the frame display-immediately: with no audio stream
-                // anchoring the synchronizer timebase, timestamp-based
-                // display may never trigger, while this attachment shows
-                // the frame as soon as it is decoded.
-                unsafe extern "C-unwind" {
-                    fn CFArrayGetCount(array: &objc2_core_foundation::CFArray)
-                        -> isize;
-                    fn CFArrayGetValueAtIndex(
-                        array: &objc2_core_foundation::CFArray,
-                        index: isize,
-                    ) -> *const std::ffi::c_void;
-                }
-                let attachments =
-                    CMSampleBuffer::sample_attachments_array(&sample, true)
+                if display_immediately {
+                    // Video-only playback: no audio clock anchors the
+                    // synchronizer timebase, so timestamp-based display
+                    // never fires. Mark the frame display-immediately.
+                    unsafe extern "C-unwind" {
+                            fn CFArrayGetCount(
+                                array: &objc2_core_foundation::CFArray,
+                            ) -> isize;
+                            fn CFArrayGetValueAtIndex(
+                                array: &objc2_core_foundation::CFArray,
+                                index: isize,
+                            ) -> *const std::ffi::c_void;
+                        }
+                        let attachments = CMSampleBuffer::sample_attachments_array(
+                            &sample, true,
+                        )
                         .expect("attachments array");
-                if CFArrayGetCount(&attachments) > 0 {
-                    // SAFETY: the per-sample attachments dictionary of a
-                    // freshly created sample buffer is mutable.
-                    let dict = &*(CFArrayGetValueAtIndex(&attachments, 0)
-                        as *const objc2_core_foundation::CFMutableDictionary);
-                    objc2_core_foundation::CFMutableDictionary::set_value(
-                        Some(dict),
-                        (objc2_core_media::kCMSampleAttachmentKey_DisplayImmediately
-                            as *const objc2_core_foundation::CFString)
-                            .cast(),
-                        (objc2_core_foundation::kCFBooleanTrue.unwrap()
-                            as *const objc2_core_foundation::CFBoolean)
-                            .cast(),
-                    );
-                }
-                let renderer = sink.layer().sampleBufferRenderer();
-                let _: () = objc2::msg_send![&*renderer, enqueueSampleBuffer: &*sample];
+                        if CFArrayGetCount(&attachments) > 0 {
+                            // SAFETY: the per-sample attachments dictionary
+                            // of a fresh sample buffer is mutable.
+                            let dict = &*(CFArrayGetValueAtIndex(
+                                &attachments, 0,
+                            )
+                            as *const objc2_core_foundation::CFMutableDictionary);
+                            objc2_core_foundation::CFMutableDictionary::set_value(
+                                Some(dict),
+                                (objc2_core_media::kCMSampleAttachmentKey_DisplayImmediately
+                                    as *const objc2_core_foundation::CFString)
+                                    .cast(),
+                                (objc2_core_foundation::kCFBooleanTrue.unwrap()
+                                    as *const objc2_core_foundation::CFBoolean)
+                                    .cast(),
+                            );
+                        }
+                    }
+                with_renderer(sink.layer(), |r| {
+                    let _: () = objc2::msg_send![r, enqueueSampleBuffer: &*sample];
+                });
                 Ok(())
             }));
             // The exception value itself is !Send; replace it with a message

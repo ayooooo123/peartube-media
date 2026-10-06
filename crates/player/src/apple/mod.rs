@@ -8,6 +8,7 @@ pub mod subtitles;
 pub mod util;
 pub mod video;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -19,6 +20,7 @@ use objc2_app_kit::NSView;
 #[cfg(target_os = "ios")]
 use objc2_ui_kit::UIView;
 use objc2_av_foundation::{AVSampleBufferAudioRenderer, AVSampleBufferRenderSynchronizer};
+use std::time::{Duration, Instant};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_quartz_core::CALayer;
 
@@ -47,6 +49,9 @@ pub struct AppleBackend {
     video_layer: SendSync<Retained<objc2_av_foundation::AVSampleBufferDisplayLayer>>,
     subtitle_layer: SendSync<Retained<CALayer>>,
     frame: Mutex<[f64; 4]>,
+    /// Software frames display as decoded instead of at `pts` (video-only
+    /// playback without an audio clock anchor). See `set_display_immediately`.
+    display_immediately: AtomicBool,
 }
 
 // SAFETY: AVF/CoreMedia objects here are documented thread-safe, and all
@@ -75,6 +80,7 @@ impl AppleBackend {
             video_layer: SendSync(video_layer),
             subtitle_layer: SendSync(subtitle_layer),
             frame: Mutex::new([0.0; 4]),
+            display_immediately: AtomicBool::new(true),
         })
     }
 
@@ -215,6 +221,16 @@ fn black_background() -> Retained<objc2_core_graphics::CGColor> {
 type CFRetainedColor = objc2_core_foundation::CFRetained<objc2_core_graphics::CGColor>;
 
 impl AppleBackend {
+    /// Marks software-decoded frames `kCMSampleAttachmentKey_DisplayImmediately`
+    /// instead of presenting at `pts`. For video-only playback where no
+    /// audio stream anchors the synchronizer timebase: without it frames
+    /// never reach their presentation time and are never displayed.
+    /// Audio-anchored playback keeps timed presentation.
+    pub fn set_display_immediately(&self, on: bool) {
+        self.display_immediately
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Starts the playback clock when there is no audio stream to anchor
     /// it: sets the synchronizer's rate to 1 and its time to 0. The engine
     /// calls this for video-only files.
@@ -294,7 +310,10 @@ impl Backend for AppleBackend {
         // raw pointer for the side-thread hop and give the sink ownership.
         let ptr = SendPtr(Retained::into_raw(layer));
         let layer = unsafe { Retained::from_raw(ptr.0) }.expect("layer null");
-        Box::new(AppleVideoSink::new(layer))
+        Box::new(AppleVideoSink::new(
+            layer,
+            self.display_immediately.load(std::sync::atomic::Ordering::Relaxed),
+        ))
     }
 
     fn subtitles(&self) -> Box<dyn SubtitleSink> {
@@ -330,24 +349,26 @@ impl AppleBackend {
         &self.video_layer.0
     }
 
-    /// True once the layer reports isReadyForDisplay (first decoded frame
-    /// ready) and it is not in a failed state. Used as a fallback proof
-    /// that frames reach the layer when copyDisplayedPixelBuffer returns
-    /// nil.
-    pub fn layer_rendering(&self) -> bool {
+    /// Blocks until the video layer reports `isReadyForDisplay` or
+    /// `timeout_ms` elapses. Sequencing helper for display verification.
+    pub fn wait_layer_ready(&self, timeout_ms: u64) -> bool {
         let video_layer = std::sync::Arc::new(SendPtr(Retained::into_raw(
             self.video_layer.0.clone(),
         )));
         run_on_main(move |_mtm| {
-            // SAFETY: non-null by construction (+1 held for the hop).
+            // SAFETY: non-null by construction (+1 held for the hop); the
+            // layer is dropped here on main at the end of the hop.
             let video_layer = unsafe { Retained::from_raw(video_layer.0) }
                 .expect("video layer null");
-            // SAFETY: main-thread AVF calls.
-            unsafe {
-                video_layer.isReadyForDisplay()
-                    && video_layer.sampleBufferRenderer().status()
-                        == objc2_av_foundation::AVQueuedSampleBufferRenderingStatus::Rendering
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+            // SAFETY: main-thread AVF call.
+            while std::time::Instant::now() < deadline {
+                if unsafe { video_layer.isReadyForDisplay() } {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
+            false
         })
     }
 

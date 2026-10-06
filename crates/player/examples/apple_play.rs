@@ -185,6 +185,12 @@ fn demux_and_feed(path: &str) {
     let verifier = {
         let backend = backend.clone();
         std::thread::spawn(move || {
+            // Give the pipeline time to decode and present the first
+            // frame: wait until the layer reports isReadyForDisplay (up
+            // to 8 s) before the strict readback samples. This is
+            // sequencing, not a fallback: every verification below still
+            // requires a real copyDisplayedPixelBuffer result.
+            let _ = AppleBackend::wait_layer_ready(&backend, 8_000);
             for _ in 0..25 {
                 std::thread::sleep(Duration::from_millis(200));
                 match AppleBackend::verify_displayed(&backend, expect_w, expect_h) {
@@ -193,16 +199,8 @@ fn demux_and_feed(path: &str) {
                         return;
                     }
                     Err(e) => {
-                        // copyDisplayedPixelBuffer returns nil on some
-                        // macOS builds even when the layer is rendering
-                        // (status Rendering, isReadyForDisplay true).
-                        // Fall back to layer-readiness proof.
-                        if AppleBackend::layer_rendering(&backend) {
-                            eprintln!(
-                                "VERIFY OK (readiness): copyDisplayedPixelBuffer nil                                  ({e}), but layer is rendering decoded frames"
-                            );
-                            return;
-                        }
+                        eprintln!("VERIFY FAIL: {e}");
+                        std::process::exit(3);
                     }
                 }
             }
@@ -235,12 +233,16 @@ fn feed_loop(
     let _unused_subtitle_sink = backend.subtitles();
     eprintln!("feed: sinks ready");
 
-    // Video-only files have no audio to anchor the playback clock; start it
-    // manually so frames actually display.
+    // Video-only: no audio anchors the synchronizer timebase, so frames
+    // present as decoded (the engine keeps timed presentation when audio
+    // is playing) and the clock is started manually.
     if audio.is_none() {
-        eprintln!("feed: manual clock started (no audio)");
+        eprintln!("feed: manual clock starting (no audio)");
+        backend.set_display_immediately(true);
         backend.start_manual_clock();
+        eprintln!("feed: manual clock started (no audio)");
     }
+    eprintln!("feed: clocks configured");
     let mut audio_decoder: Option<Box<dyn oxideav_core::Decoder>> = None;
     if let (Some(a), Some(ap)) = (&audio, &audio_params) {
         let dec = ctx_decoder(ap).expect("audio decoder");
