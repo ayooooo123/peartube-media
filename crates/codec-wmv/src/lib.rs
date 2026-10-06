@@ -37,8 +37,8 @@ pub use msmpeg4::{CODEC_ID_MSMPEG4V1, CODEC_ID_MSMPEG4V2, CODEC_ID_MSMPEG4V3, CO
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, PixelFormat};
 
-/// Resolution priority for our FFmpeg-derived software decoders. Lower wins;
-/// OxideAV software implementations sit at 100+, so 50 takes precedence.
+/// Container-tag resolution priority (lower wins). Decoder selection instead
+/// follows factory registration order; production registers our factories first.
 pub const RESOLUTION_PRIORITY: i32 = 50;
 
 /// Maximum accepted frame side (untrusted input).
