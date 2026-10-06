@@ -1,0 +1,16 @@
+[package]
+name = "check-mkv"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oxideav-core.workspace = true
+# The fork under test (pinned in the workspace [patch.crates-io]).
+oxideav-mkv.workspace = true
+refcheck.workspace = true
+parking_lot = "0.12"
