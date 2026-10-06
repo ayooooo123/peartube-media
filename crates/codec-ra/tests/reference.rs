@@ -70,3 +70,9 @@ fn test_ralf() {
     // ralf is lossless -> bit exact (infinity), slack 2048 allows the final truncated frame
     check_audio("lossless-audio/luckynight-partial.rmvb", f64::INFINITY, 2048);
 }
+
+#[test]
+fn test_cook() {
+    // cook is float -> >= 90 dB
+    check_audio("real/ra_cook.rm", 90.0, 1024);
+}

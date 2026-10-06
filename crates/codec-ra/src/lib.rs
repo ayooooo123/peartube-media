@@ -1,9 +1,11 @@
-//! RealAudio decoders: ra_144, ra_288, ralf.
+//! RealAudio decoders: ra_144, ra_288, ralf, cook.
 //!
 //! Ported from FFmpeg (commit 2da55bf), licensed under LGPL-2.1-or-later.
 #![forbid(unsafe_code)]
 
 pub mod bitreader;
+pub mod cook;
+pub mod cook_tables;
 pub mod ra144;
 pub mod ra144_tables;
 pub mod ra288;
@@ -56,6 +58,16 @@ pub fn register(ctx: &mut RuntimeContext) {
         audio_info("ralf", "codec-ra_ralf", 2, 96_000)
             .decoder(ralf::make_decoder)
             .tags([CodecTag::fourcc(b"LSD:")]),
+    );
+
+    // RealAudio G2 (Cook). RM fourcc "cook", Matroska "A_REAL/COOK".
+    ctx.codecs.register(
+        audio_info("cook", "codec-ra_cook", 2, 96_000)
+            .decoder(cook::make_decoder)
+            .tags([
+                CodecTag::fourcc(b"cook"),
+                CodecTag::matroska("A_REAL/COOK"),
+            ]),
     );
 }
 

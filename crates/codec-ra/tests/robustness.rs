@@ -101,3 +101,22 @@ fn test_ralf_robustness() {
     let base = vec![0x33u8; 512];
     fuzz_decoder(decoder, &base, 0x1A1F);
 }
+
+#[test]
+fn test_cook_robustness() {
+    let mut extradata = vec![0u8; 16];
+    extradata[..4].copy_from_slice(&0x01000003u32.to_be_bytes()); // JOINT_STEREO
+    extradata[4..6].copy_from_slice(&2048u16.to_be_bytes()); // samples_per_frame = 2048
+    extradata[6..8].copy_from_slice(&37u16.to_be_bytes()); // subbands = 37
+    extradata[12..14].copy_from_slice(&6u16.to_be_bytes()); // js_subband_start = 6
+    extradata[14..16].copy_from_slice(&5u16.to_be_bytes()); // js_vlc_bits = 5
+
+    let mut params = CodecParameters::audio(CodecId::new("cook"));
+    params.channels = Some(2);
+    params.sample_rate = Some(44100);
+    params.extradata = extradata;
+    let mut decoder = codec_ra::cook::make_decoder(&params).unwrap();
+    let base = vec![0x5Au8; 240];
+    let _ = decoder.send_packet(&Packet::new(0, TimeBase::new(1, 1000), base.clone()));
+    fuzz_decoder(decoder, &base, 0xC00C);
+}

@@ -56,11 +56,11 @@ impl LengthVlc {
         for len in 1..=16usize {
             first[len] = acc;
             base[len] = sym_acc;
-            acc = (acc + cnt[len]) << 1;
-            sym_acc += cnt[len];
-            if acc > 0 && acc > (1u32 << len) && cnt[len] > 0 {
+            if acc + cnt[len] > (1u32 << len) && cnt[len] > 0 {
                 return Err(format!("vlc: overfull at length {len}"));
             }
+            acc = (acc + cnt[len]) << 1;
+            sym_acc += cnt[len];
         }
         let max_len = (1..=16).rev().find(|&l| cnt[l] > 0).unwrap_or(0);
         if first[max_len] + cnt[max_len] != (1u32 << max_len) {
@@ -97,5 +97,10 @@ impl LengthVlc {
             }
         }
         None
+    }
+    /// Decode one signed symbol reading MSB-first bits.
+    #[inline]
+    pub fn decode_signed(&self, read_bit: &mut dyn FnMut() -> Option<u32>) -> Option<i32> {
+        self.decode(read_bit).map(|v| v as i32)
     }
 }
