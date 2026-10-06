@@ -1558,6 +1558,7 @@ impl XllDecoder {
             self.fixed_lsb_width = 0;
         }
 
+
         // Filter frequency bands for active channel sets
         self.output_mask = 0;
         for i in 0..self.nactivechsets {
@@ -1616,6 +1617,18 @@ impl XllDecoder {
         if self.nfreqbands > 1 {
             for i in 0..self.nactivechsets {
                 self.chs_assemble_freq_bands(i, &mut all_bufs[i]);
+            }
+        }
+
+        // The C maps output_samples as POINTERS into the band buffers, so the
+        // hierarchical downmix undo above is visible through them. Our planes
+        // are copies — re-map them after the undo.
+        for i in 0..self.nactivechsets {
+            if self.chset[i].nfreqbands == 1 {
+                for j in 0..self.chset[i].nchannels {
+                    let spkr = self.chset[i].ch_remap[j];
+                    self.output_samples[spkr] = all_bufs[i].msb[j].clone();
+                }
             }
         }
 

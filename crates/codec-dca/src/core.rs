@@ -2111,7 +2111,6 @@ impl CoreDecoder {
 
 
         // Parse X96 unless decoding XLL
-        let x96_dbg = std::env::var("DCA_TRACE").is_ok();
         if self.packet & packet_xll(self) == 0 {
             if exss_mask & crate::dca::exss_mask::EXSS_X96 != 0 {
                 let asset = asset.unwrap();
@@ -2119,11 +2118,7 @@ impl CoreDecoder {
                 let mut gb = BitReader::new(sub);
                 match self.parse_x96_frame_exss(&mut gb) {
                     Ok(()) => self.ext_audio_mask |= crate::dca::exss_mask::EXSS_X96,
-                    Err(e) => {
-                        if x96_dbg {
-                            eprintln!("TRACE-R x96exss ERR: {e}");
-                        }
-                    }
+                    Err(_) => {}
                 }
             } else if self.x96_pos != 0 {
                 let mut gb = BitReader::new(data);
