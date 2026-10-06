@@ -67,3 +67,4 @@ demux-rm = { path = "../demux-rm" }
 codec-dca = { path = "../codec-dca" }
 subs-text = { path = "../subs-text" }
 codec-ra = { path = "../codec-ra" }
+codec-rv = { path = "../codec-rv" }
