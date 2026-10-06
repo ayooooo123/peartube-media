@@ -119,6 +119,68 @@ pub fn ffprobe_subtitles(path: &Path, nth: usize) -> Vec<FfSubtitle> {
         .collect()
 }
 
+/// One packet of a stream as FFmpeg's demuxer returns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FfPacket {
+    /// In the stream's time base; `None` for `AV_NOPTS_VALUE`.
+    pub pts: Option<i64>,
+    pub dts: Option<i64>,
+    pub duration: Option<i64>,
+    pub size: usize,
+    /// Lowercase hex MD5 of the packet data.
+    pub md5: String,
+}
+
+/// The time base of stream `s:nth`.
+pub fn ffprobe_time_base(path: &Path, nth: usize) -> TimeBase {
+    let stream = format!("s:{nth}");
+    let text = run(
+        "ffprobe",
+        &["-v", "error", "-select_streams", &stream, "-show_entries", "stream=time_base", "-of", "csv=p=0", path.to_str().unwrap()],
+    );
+    let text = String::from_utf8(text).unwrap();
+    let (num, den) = text.trim().split_once('/').expect("time_base");
+    TimeBase::new(num.parse().unwrap(), den.parse().unwrap())
+}
+
+/// Every packet of stream `s:nth`, in demux order.
+pub fn ffprobe_packets(path: &Path, nth: usize) -> Vec<FfPacket> {
+    let stream = format!("s:{nth}");
+    let text = run(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            &stream,
+            "-show_entries",
+            "packet=pts,dts,duration,size,data_hash",
+            "-show_data_hash",
+            "md5",
+            "-of",
+            "csv=p=0",
+            path.to_str().unwrap(),
+        ],
+    );
+    String::from_utf8(text)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let f: Vec<&str> = line.trim().split(',').collect();
+            assert_eq!(f.len(), 5, "ffprobe packet line {line:?}");
+            let opt = |s: &str| (s != "N/A").then(|| s.parse::<i64>().unwrap_or_else(|_| panic!("{s:?} in {line:?}")));
+            FfPacket {
+                pts: opt(f[0]),
+                dts: opt(f[1]),
+                duration: opt(f[2]),
+                size: f[3].parse().unwrap(),
+                md5: f[4].strip_prefix("MD5:").expect("md5").to_string(),
+            }
+        })
+        .collect()
+}
+
 fn sub2video_args(path: &Path, nth: usize, format: &str) -> Vec<String> {
     // sub2video's canvas is AV_PIX_FMT_RGB32 (bgra in memory on little
     // endian); asking for bgra keeps FFmpeg from converting it.
