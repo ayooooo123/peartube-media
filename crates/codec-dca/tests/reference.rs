@@ -9,8 +9,7 @@
 //! FFmpeg's own FATE lossy DCA tests use a one-off comparison with fuzz
 //! 9 on f32 for the same reason.
 
-use oxideav_core::{Frame, MediaType, ProbeData, RuntimeContext};
-use std::io::Read;
+use oxideav_core::{Frame, MediaType};
 use refcheck::{decode, fate};
 
 fn registrars() -> Vec<refcheck::Registrar> {
