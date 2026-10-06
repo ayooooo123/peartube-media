@@ -1,0 +1,12 @@
+[package]
+name = "demux-rm"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+description = "RealMedia (.rm, .rmvb, .ra) demuxer ported from FFmpeg"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
