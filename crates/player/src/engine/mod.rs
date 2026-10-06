@@ -1300,9 +1300,11 @@ fn run_audio_thread(
     let mut decoder = match make_decoder(&shared.ctx, &stream.params) {
         Ok(d) => d,
         Err(e) => {
-            // No decoder: the stream stays silent, playback continues.
+            // No decoder: the track is skipped (still listed in `tracks`)
+            // and the rest plays on.
             let mut st = shared.state.lock();
             st.error.get_or_insert_with(|| format!("no audio decoder found: {e}"));
+            st.audio = None;
             drop(st);
             notify_changed(&shared);
             return;
@@ -1699,12 +1701,14 @@ fn run_video_thread(
                 sw_decoder = Some(d);
             }
             Err(e) => {
-                // No software decoder either: no video, playback continues
-                // (audio-only file, or a codec neither backend knows).
+                // No software decoder either: the track is skipped (still
+                // listed in `tracks`) and the rest plays on (audio-only
+                // file, or a codec neither backend knows).
                 let mut st = shared.state.lock();
                 let _ = st
                     .error
                     .get_or_insert_with(|| format!("no video decoder found: {e}"));
+                st.video = None;
                 drop(st);
                 notify_changed(&shared);
                 return;

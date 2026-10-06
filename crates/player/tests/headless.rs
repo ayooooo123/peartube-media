@@ -97,12 +97,17 @@ fn make_ref_mkv() -> Vec<u8> {
 /// FFmpeg's decode of video stream 0 of `bytes`: each frame's pts and md5,
 /// in output order (`-f framemd5`).
 fn ffmpeg_video_frames(bytes: &[u8]) -> Vec<(Duration, String)> {
+    ffmpeg_video_frames_with(bytes, &[])
+}
+
+/// `ffmpeg_video_frames` with decoder options (placed before `-i`).
+fn ffmpeg_video_frames_with(bytes: &[u8], input_args: &[&str]) -> Vec<(Duration, String)> {
     let tmp = tempfile("bin");
     std::fs::write(&tmp, bytes).unwrap();
     let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-apply_cropping", "codec"])
+        .args(input_args)
         .args([
-            "-v", "error", "-nostdin",
-            "-apply_cropping", "codec",
             "-i", tmp.to_str().unwrap(),
             "-map", "0:v:0",
             "-fps_mode", "passthrough",
@@ -137,7 +142,11 @@ fn ffmpeg_video_frames(bytes: &[u8]) -> Vec<(Duration, String)> {
 }
 
 fn ffmpeg_video_md5s(bytes: &[u8]) -> Vec<String> {
-    ffmpeg_video_frames(bytes).into_iter().map(|(_, md5)| md5).collect()
+    ffmpeg_video_md5s_with(bytes, &[])
+}
+
+fn ffmpeg_video_md5s_with(bytes: &[u8], input_args: &[&str]) -> Vec<String> {
+    ffmpeg_video_frames_with(bytes, input_args).into_iter().map(|(_, md5)| md5).collect()
 }
 
 fn ffmpeg_audio_f32(bytes: &[u8]) -> Vec<f32> {
@@ -1492,4 +1501,61 @@ fn pal8_frames_hash_with_their_palette() {
     let packed = player::headless::pack_frame(&frame, oxideav_core::PixelFormat::Pal8, width as u32, height as u32);
     assert_eq!(packed, raw, "packed bytes");
     assert_eq!(format!("{:x}", md5::compute(&packed)), expected);
+}
+
+/// fate:isom/vc1-wmapro.ism: VC-1 video next to a WMA Pro track that may
+/// have no decoder (main has none yet). Its e2e run hung past the watchdog
+/// like T3/T6. The track without a decoder is skipped (listed in `tracks`,
+/// not selected, its error reported) and the video plays to its end on a
+/// running clock, FFmpeg's frames bit for bit.
+#[test]
+fn track_without_decoder_is_skipped() {
+    let _cpu = realtime_test();
+    let path = refcheck::fate("isom/vc1-wmapro.ism");
+    let bytes = std::fs::read(&path).unwrap();
+    let (p, backend, _) = open_realtime(path.to_str().unwrap());
+    p.play();
+    // The skipped track's error shows up at once; the playback goes on.
+    let (samples, state) = sample_until(&p, Duration::from_secs(60), |st| st.ended);
+    drop(p);
+    assert!(state.ended, "did not end: {state:?}");
+    assert!(
+        state.tracks.iter().any(|t| t.stream == 0 && t.kind == player::TrackKind::Audio),
+        "the WMA Pro track is not listed: {:?}",
+        state.tracks
+    );
+    let capture = backend.capture();
+    if let Some(error) = &state.error {
+        // No WMA Pro decoder: the track is skipped.
+        assert!(error.contains("no audio decoder"), "unexpected error: {error}");
+        assert_eq!(state.audio, None, "a track without a decoder stays selected");
+        assert!(capture.audio.is_empty(), "audio captured without a decoder");
+    }
+    assert_eq!(state.video, Some(1));
+
+    // FFmpeg's frames bit for bit and in order (C IDCT, as the codec crates
+    // compare), bar any dropped as late. Matched by content: the file stamps
+    // packets pts == dts, and FFmpeg's B-frame delay shifts its frames'
+    // stamps by a frame.
+    let video = &capture.video[0];
+    let ff = ffmpeg_video_md5s_with(&bytes, &["-idct", "simple"]);
+    let mut next = 0;
+    for (i, md5) in video.frame_md5.iter().enumerate() {
+        let skipped = ff[next..]
+            .iter()
+            .position(|m| m == md5)
+            .unwrap_or_else(|| panic!("frame {i} (at {:?}) is not among FFmpeg's next frames", video.pts[i]));
+        next += skipped + 1;
+    }
+    let missing = ff.len() - video.frame_md5.len();
+    assert!(
+        missing as u64 <= state.dropped_frames,
+        "{missing} of FFmpeg's {} frames missing, {} dropped as late",
+        ff.len(),
+        state.dropped_frames
+    );
+    // The clock ran up to the last frame (shown up to 100 ms early).
+    let last = *video.pts.last().expect("no video");
+    let end = samples.last().unwrap().position;
+    assert!(end + Duration::from_millis(200) >= last, "the clock stopped at {end:?}, last frame {last:?}");
 }
