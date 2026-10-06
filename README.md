@@ -11,7 +11,7 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 |Path|Purpose|
 |---|---|
 |`crates/player`|The engine: source, demux, decoder choice, clock, sync, seek, tracks, and the platform backends (Android, Apple, headless)|
-|`crates/codecs`|`register_all`: every OxideAV crate the player uses plus the `codec-*` crates here|
+|`crates/codecs`|`register_all`: local replacement decoders register before OxideAV (`first_decoder` uses registration order, not capability priority); replacement container factories register last because they replace entries by name|
 |`crates/codec-*`|Decoders and demuxers OxideAV lacks. Same shape as an OxideAV crate: implement `oxideav_core::Decoder` / `Demuxer`, export `register(&mut RuntimeContext)`|
 |`crates/e2e`|Corpus runner: plays every corpus file through the headless backend and checks it against FFmpeg; writes `target/e2e/codecs.json`|
 

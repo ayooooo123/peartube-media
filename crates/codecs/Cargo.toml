@@ -70,3 +70,6 @@ codec-ra = { path = "../codec-ra" }
 codec-rv = { path = "../codec-rv" }
 codec-wmv = { path = "../codec-wmv" }
 codec-wma = { path = "../codec-wma" }
+
+[dev-dependencies]
+refcheck = { path = "../refcheck" }
