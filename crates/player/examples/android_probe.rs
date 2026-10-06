@@ -38,8 +38,11 @@ fn main() {
     } else {
         Mode::Compressed
     };
-    let mut code = video_probe(mode);
-    code |= audio_probe();
+    // Audio first: opening the AAudio stream before the video decoder has
+    // preceded every successful decode run on the emulator (the swcodec
+    // service stalls when the video path runs first on some boots).
+    let mut code = audio_probe();
+    code |= video_probe(mode);
     if std::env::args().any(|a| a == "--all") {
         code |= sw_first_probe();
         code |= nosurface_probe();
