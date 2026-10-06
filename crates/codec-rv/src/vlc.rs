@@ -1,280 +1,203 @@
-//! VLC decoding tables, ported from FFmpeg libavcodec/vlc.c (commit 2da55bf).
-//! License: GNU Lesser General Public License, version 2.1 or later.
+//! VLC decoding tables with FFmpeg's exact layout and construction rules.
+//!
+//! Ported from FFmpeg libavcodec/vlc.c (`build_table`, `ff_vlc_init_sparse`,
+//! `ff_vlc_init_from_lengths`) at commit 2da55bf; LGPL-2.1-or-later.
+//!
+//! A table is a flat `Vec<VlcElem>`: the root level has `1 << bits` entries;
+//! an entry with `len < 0` points (`sym` = offset) to a subtable of
+//! `-len` bits. Missing codes have `len == 0, sym == -1`. Decoding is
+//! [`crate::bits::BitReader::get_vlc2`].
 
-#![forbid(unsafe_code)]
-
-use crate::bitread::GetBitContext;
-
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VlcElem {
     pub sym: i16,
     pub len: i16,
 }
 
-#[derive(Clone, Copy, Default, Debug)]
-pub struct RlVlcElem {
-    pub level: i16,
-    pub len8: i8,
-    pub run: u8,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct Vlc {
+    /// Root-level index width (`vlc->bits`).
     pub bits: u32,
     pub table: Vec<VlcElem>,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct VlcCode {
-    pub bits: u8,
-    pub symbol: i32,
-    pub code: u32, // MSB-aligned 32-bit
+struct VlcCode {
+    bits: u8,
+    symbol: i16,
+    /// Codeword with the first bit to be read in the MSB.
+    code: u32,
 }
 
-impl Vlc {
-    pub fn new() -> Self {
-        Self { bits: 0, table: Vec::new() }
+fn build_table(table: &mut Vec<VlcElem>, table_nb_bits: u32, codes: &mut [VlcCode]) -> Result<usize, &'static str> {
+    if table_nb_bits > 30 {
+        return Err("vlc: table too wide");
     }
+    let table_size = 1usize << table_nb_bits;
+    let table_index = table.len();
+    table.resize(table_index + table_size, VlcElem::default());
 
-    fn build_table(
-        vlc: &mut Vlc,
-        table_nb_bits: u32,
-        codes: &mut [VlcCode],
-    ) -> Result<usize, String> {
-        let table_size = 1usize << table_nb_bits;
-        let table_index = vlc.table.len();
-        vlc.table.resize(table_index + table_size, VlcElem::default());
-
-        let mut i = 0usize;
-        while i < codes.len() {
-            let n = codes[i].bits as u32;
-            let code = codes[i].code;
-            let symbol = codes[i].symbol;
-
-            if n <= table_nb_bits {
-                let j0 = (code >> (32 - table_nb_bits)) as usize;
-                let nb = 1usize << (table_nb_bits - n);
-                for k in 0..nb {
-                    let j = table_index + j0 + k;
-                    if (vlc.table[j].len != 0 || vlc.table[j].sym != 0)
-                        && (vlc.table[j].len != n as i16 || vlc.table[j].sym != symbol as i16)
-                    {
-                        return Err("incorrect codes".to_string());
-                    }
-                    vlc.table[j].len = n as i16;
-                    vlc.table[j].sym = symbol as i16;
+    let nb_codes = codes.len();
+    let mut i = 0;
+    while i < nb_codes {
+        let n = codes[i].bits as u32;
+        let code = codes[i].code;
+        let symbol = codes[i].symbol;
+        if n <= table_nb_bits {
+            let mut j = (code >> (32 - table_nb_bits)) as usize;
+            let nb = 1usize << (table_nb_bits - n);
+            for _ in 0..nb {
+                let e = &mut table[table_index + j];
+                if (e.len != 0 || e.sym != 0) && (e.len != n as i16 || e.sym != symbol) {
+                    return Err("vlc: incorrect codes");
                 }
-                i += 1;
-            } else {
-                let n_rem = n - table_nb_bits;
-                let code_prefix = code >> (32 - table_nb_bits);
-                let mut subtable_bits = n_rem;
-                codes[i].bits = n_rem as u8;
-                codes[i].code = code << table_nb_bits;
-
-                let mut k = i + 1;
-                while k < codes.len() {
-                    let n2 = codes[k].bits as u32;
-                    let code2 = codes[k].code;
-                    if n2 <= table_nb_bits || (code2 >> (32 - table_nb_bits)) != code_prefix {
-                        break;
-                    }
-                    let rem = n2 - table_nb_bits;
-                    codes[k].bits = rem as u8;
-                    codes[k].code = code2 << table_nb_bits;
-                    subtable_bits = subtable_bits.max(rem);
-                    k += 1;
-                }
-                let subtable_bits = subtable_bits.min(table_nb_bits);
-                let j = table_index + code_prefix as usize;
-                vlc.table[j].len = -(subtable_bits as i16);
-                let sub_index = Self::build_table(vlc, subtable_bits, &mut codes[i..k])?;
-                vlc.table[j].sym = sub_index as i16;
-                i = k;
+                e.len = n as i16;
+                e.sym = symbol;
+                j += 1;
             }
-        }
-        Ok(table_index)
-    }
-}
-
-pub fn vlc_init_from_lengths(
-    nb_bits: u32,
-    lens: &[i32],
-    symbols: Option<&[u16]>,
-) -> Result<Vlc, String> {
-    let len_max = 3 * nb_bits.min(32);
-    let mut codes = Vec::new();
-    let mut code: u64 = 0;
-    for (i, &l0) in lens.iter().enumerate() {
-        let len = if l0 > 0 {
-            l0 as u32
-        } else if l0 < 0 {
-            (-l0) as u32
         } else {
-            continue;
-        };
-        let sym = symbols.map(|s| s[i] as i32).unwrap_or(i as i32);
-        if l0 > 0 {
-            codes.push(VlcCode {
-                bits: len as u8,
-                symbol: sym,
-                code: code as u32,
-            });
+            let n = n - table_nb_bits;
+            let code_prefix = code >> (32 - table_nb_bits);
+            let mut subtable_bits = n;
+            codes[i].bits = n as u8;
+            codes[i].code = code << table_nb_bits;
+            let mut k = i + 1;
+            while k < nb_codes {
+                let nk = codes[k].bits as i32 - table_nb_bits as i32;
+                if nk <= 0 {
+                    break;
+                }
+                let ck = codes[k].code;
+                if ck >> (32 - table_nb_bits) != code_prefix {
+                    break;
+                }
+                codes[k].bits = nk as u8;
+                codes[k].code = ck << table_nb_bits;
+                subtable_bits = subtable_bits.max(nk as u32);
+                k += 1;
+            }
+            let subtable_bits = subtable_bits.min(table_nb_bits);
+            let j = code_prefix as usize;
+            table[table_index + j].len = -(subtable_bits as i16);
+            let index = build_table(table, subtable_bits, &mut codes[i..k])?;
+            let index = i16::try_from(index).map_err(|_| "vlc: strange codes")?;
+            table[table_index + j].sym = index;
+            i = k - 1;
         }
-        if len > len_max || (code & ((1u64 << (32 - len)) - 1)) != 0 {
-            return Err(format!("Invalid VLC (length {len})"));
-        }
-        code += 1u64 << (32 - len);
-        if code > u32::MAX as u64 + 1 {
-            return Err("Overdetermined VLC tree".to_string());
-        }
+        i += 1;
     }
-    finish_vlc(nb_bits, codes)
-}
-
-pub fn vlc_init_sparse(
-    nb_bits: u32,
-    raw_codes: Vec<(u32, u32, i32)>, // (code, bits, symbol)
-) -> Result<Vlc, String> {
-    let mut codes = Vec::with_capacity(raw_codes.len());
-    for (raw_code, bits, symbol) in raw_codes {
-        if bits == 0 {
-            continue;
-        }
-        if bits > 3 * nb_bits || bits > 32 {
-            return Err("Too long VLC".to_string());
-        }
-        if raw_code >= (1u64 << bits) as u32 {
-            return Err("Invalid code".to_string());
-        }
-        let code = raw_code << (32 - bits);
-        codes.push(VlcCode {
-            bits: bits as u8,
-            symbol,
-            code,
-        });
-    }
-    finish_vlc(nb_bits, codes)
-}
-fn finish_vlc(nb_bits: u32, codes: Vec<VlcCode>) -> Result<Vlc, String> {
-    let mut long_codes: Vec<VlcCode> = codes.iter().filter(|c| c.bits as u32 > nb_bits).copied().collect();
-    long_codes.sort_by_key(|c| c.code >> 1);
-    let short_codes: Vec<VlcCode> = codes.iter().filter(|c| (c.bits as u32) <= nb_bits && c.bits > 0).copied().collect();
-    let mut all_codes = long_codes;
-    all_codes.extend(short_codes);
-
-    let mut vlc = Vlc::new();
-    vlc.bits = nb_bits;
-    Vlc::build_table(&mut vlc, nb_bits, &mut all_codes)?;
-    for e in vlc.table.iter_mut() {
+    for e in &mut table[table_index..table_index + table_size] {
         if e.len == 0 {
             e.sym = -1;
         }
     }
-    Ok(vlc)
+    Ok(table_index)
 }
 
-pub fn get_vlc2(gb: &mut GetBitContext, vlc: &Vlc) -> i32 {
-    let n = vlc.bits;
-    let index = gb.show_bits(n) as usize;
-    if index >= vlc.table.len() {
-        return -1;
-    }
-    let mut elem = vlc.table[index];
-    if elem.len > 0 {
-        gb.skip_bits(elem.len as u32);
-        return elem.sym as i32;
-    }
-    if elem.len < 0 {
-        gb.skip_bits(n);
-        let sub_bits = (-elem.len) as u32;
-        let sub_index = (elem.sym as usize) + gb.show_bits(sub_bits) as usize;
-        if sub_index < vlc.table.len() {
-            elem = vlc.table[sub_index];
-            if elem.len > 0 {
-                gb.skip_bits(elem.len as u32);
-                return elem.sym as i32;
+impl Vlc {
+    /// `ff_vlc_init_sparse` with big-endian codes. `entries` holds
+    /// `(length, code, symbol)` per input code; length-0 entries are skipped.
+    pub fn init_sparse(nb_bits: u32, entries: &[(u32, u32, i16)]) -> Result<Vlc, &'static str> {
+        let mut buf: Vec<VlcCode> = Vec::with_capacity(entries.len());
+        let mut push = |len: u32, code: u32, symbol: i16| -> Result<(), &'static str> {
+            if len > 3 * nb_bits || len > 32 {
+                return Err("vlc: too long code");
+            }
+            if (code as u64) >= (1u64 << len) {
+                return Err("vlc: invalid code");
+            }
+            let code = if len == 0 { 0 } else { code << (32 - len) };
+            buf.push(VlcCode { bits: len as u8, symbol, code });
+            Ok(())
+        };
+        for &(len, code, sym) in entries {
+            if len > nb_bits {
+                push(len, code, sym)?;
             }
         }
-    }
-    -1
-}
-
-pub struct RlTable {
-    pub n: usize,
-    pub last: usize,
-    pub table_vlc: Vec<(u32, u8)>,
-    pub table_run: Vec<i8>,
-    pub table_level: Vec<i8>,
-}
-
-pub struct RlVlc {
-    pub tables: Vec<Vec<RlVlcElem>>,
-    pub bits: u32,
-}
-
-impl RlTable {
-    pub fn build_rl_vlc(&self) -> Result<RlVlc, String> {
-        let mut codes = Vec::with_capacity(self.table_vlc.len());
-        for (i, &(code, bits)) in self.table_vlc.iter().enumerate() {
-            codes.push((code, bits as u32, i as i32));
-        }
-        let base = vlc_init_sparse(9, codes)?;
-        let static_size = base.table.len();
-        let mut tables = Vec::with_capacity(32);
-        for q in (0..32).rev() {
-            let (qmul, qadd) = if q == 0 { (1, 0) } else { (q * 2, ((q - 1) | 1) as i32) };
-            let mut out = vec![RlVlcElem::default(); static_size];
-            for i in 0..static_size {
-                let idx = base.table[i].sym;
-                let len = base.table[i].len;
-                let (level, mut run, len8): (i16, u8, i8);
-                if len == 0 {
-                    run = 66;
-                    level = 64;
-                    len8 = 0;
-                } else if len < 0 {
-                    run = 0;
-                    level = idx;
-                    len8 = len as i8;
-                } else {
-                    len8 = len as i8;
-                    if idx == self.n as i16 {
-                        run = 66;
-                        level = 0;
-                    } else {
-                        let idx = idx as usize;
-                        run = (self.table_run[idx] + 1) as u8;
-                        level = (self.table_level[idx] as i32 * qmul + qadd) as i16;
-                        if idx >= self.last {
-                            run += 192;
-                        }
-                    }
-                }
-                out[i] = RlVlcElem { level, len8, run };
+        // AV_QSORT by code >> 1; the codes of a prefix-free set are distinct.
+        buf.sort_unstable_by_key(|c| c.code >> 1);
+        let mut short = Vec::new();
+        for &(len, code, sym) in entries {
+            if len != 0 && len <= nb_bits {
+                short.push((len, code, sym));
             }
-            tables.push(out);
         }
-        tables.reverse();
-        Ok(RlVlc { tables, bits: 9 })
+        let mut push = |len: u32, code: u32, symbol: i16| -> Result<(), &'static str> {
+            if (code as u64) >= (1u64 << len) {
+                return Err("vlc: invalid code");
+            }
+            buf.push(VlcCode { bits: len as u8, symbol, code: code << (32 - len) });
+            Ok(())
+        };
+        for (len, code, sym) in short {
+            push(len, code, sym)?;
+        }
+        let mut table = Vec::new();
+        build_table(&mut table, nb_bits, &mut buf)?;
+        Ok(Vlc { bits: nb_bits, table })
+    }
+
+    /// `ff_vlc_init_from_lengths`: codes are assigned in table order from
+    /// the lengths; a negative length reserves a code without an entry.
+    pub fn init_from_lengths(nb_bits: u32, lens: &[i8], symbols: &[i16], offset: i16) -> Result<Vlc, &'static str> {
+        let len_max = 32.min(3 * nb_bits);
+        let mut buf: Vec<VlcCode> = Vec::with_capacity(lens.len());
+        let mut code: u64 = 0;
+        for (i, &l) in lens.iter().enumerate() {
+            let len: u32 = if l > 0 {
+                buf.push(VlcCode { bits: l as u8, symbol: symbols[i].wrapping_add(offset), code: code as u32 });
+                l as u32
+            } else if l < 0 {
+                (-(l as i32)) as u32
+            } else {
+                continue;
+            };
+            if len > len_max || code & ((1u64 << (32 - len)) - 1) != 0 {
+                return Err("vlc: invalid length");
+            }
+            code += 1u64 << (32 - len);
+            if code > u32::MAX as u64 + 1 {
+                return Err("vlc: overdetermined tree");
+            }
+        }
+        let mut table = Vec::new();
+        build_table(&mut table, nb_bits, &mut buf)?;
+        Ok(Vlc { bits: nb_bits, table })
     }
 }
 
-pub fn get_rl_vlc(gb: &mut GetBitContext, rl: &RlVlc) -> (i32, u32) {
-    let index = gb.show_bits(rl.bits) as usize;
-    let mut elem = rl.tables[0][index];
-    if elem.len8 < 0 {
-        gb.skip_bits(rl.bits);
-        let nb_bits = (-elem.len8) as u32;
-        let sub_idx = gb.show_bits(nb_bits) as usize + elem.level as usize;
-        if sub_idx < rl.tables[0].len() {
-            elem = rl.tables[0][sub_idx];
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bits::BitReader;
+
+    #[test]
+    fn sparse_three_level_decode() {
+        // Codes: 0 (1 bit) -> 7, 10 (2) -> 8, 110 (3) -> 9, 1110000000001 (13) -> 10,
+        // 1111 (4) -> 11; a 5-bit root puts the 13-bit code three levels deep.
+        let entries = [(1, 0b0, 7), (2, 0b10, 8), (3, 0b110, 9), (13, 0b1110000000001, 10), (4, 0b1111, 11)];
+        let vlc = Vlc::init_sparse(5, &entries).unwrap();
+        // stream: 1110000000001 110 0 1111 10
+        let bits = "1110000000001110011111000000000";
+        let mut data = vec![0u8; 8];
+        for (i, c) in bits.chars().enumerate() {
+            if c == '1' {
+                data[i / 8] |= 0x80 >> (i % 8);
+            }
         }
+        let mut gb = BitReader::new(&data, data.len());
+        let got: Vec<i32> = (0..5).map(|_| gb.get_vlc2(&vlc.table, 5, 3)).collect();
+        assert_eq!(got, vec![10, 9, 7, 11, 8]);
     }
-    if elem.len8 > 0 {
-        gb.skip_bits(elem.len8 as u32);
-        (elem.level as i32, elem.run as u32)
-    } else {
-        (0, 66)
+
+    #[test]
+    fn from_lengths_assigns_in_order() {
+        let vlc = Vlc::init_from_lengths(3, &[1, 2, 3, 3], &[5, 6, 7, 8], 0).unwrap();
+        // codes: 0, 10, 110, 111
+        let data = [0b1101_1110u8, 0b0000_0000, 0, 0, 0, 0];
+        let mut gb = BitReader::new(&data, data.len());
+        let got: Vec<i32> = (0..4).map(|_| gb.get_vlc2(&vlc.table, 3, 1)).collect();
+        assert_eq!(got, vec![7, 8, 6, 5]);
     }
 }

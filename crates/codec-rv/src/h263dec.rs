@@ -15,7 +15,7 @@ use crate::h263tables::*;
 use crate::hpel::op_pixels;
 use crate::idct::{add_pixels_clamped, simple_idct_add, simple_idct_put};
 use crate::mpeg::{MotionType, MpegState, PLANE};
-use crate::vlc::{get_rl_vlc, get_vlc2, RlTable, RlVlc, Vlc};
+use crate::legacy_vlc::{get_rl_vlc, get_vlc2, RlTable, RlVlc, Vlc};
 
 pub const SLICE_OK: i32 = 0;
 pub const SLICE_END: i32 = -100; // end marker
@@ -72,7 +72,7 @@ fn build_from_pairs(bits: u32, tab: &[[u8; 2]]) -> Result<Vlc, String> {
         .enumerate()
         .map(|(i, &[code, len])| (code as u32, len as u32, i as i32))
         .collect();
-    crate::vlc::vlc_init_sparse(bits, codes)
+    crate::legacy_vlc::vlc_init_sparse(bits, codes)
 }
 
 impl H263Vlc {
@@ -108,7 +108,7 @@ impl H263Vlc {
                 .zip(H263_MB_TYPE_B_MAP.iter())
                 .map(|(&[code, len], &sym)| (code as u32, len as u32, sym))
                 .collect();
-            crate::vlc::vlc_init_sparse(H263_MBTYPE_B_VLC_BITS, codes)?
+            crate::legacy_vlc::vlc_init_sparse(H263_MBTYPE_B_VLC_BITS, codes)?
         };
         let cbpc_b = build_from_pairs(CBPC_B_VLC_BITS, &CBPC_B_TAB)?;
         let rl_inter = rl_table_inter().build_rl_vlc()?;
@@ -129,7 +129,7 @@ impl H263Vlc {
                     lens_lum.push((i + 2) as i32);
                 }
             }
-            let lum = crate::vlc::vlc_init_from_lengths(9, &lens_lum, Some(&syms_lum))?;
+            let lum = crate::legacy_vlc::vlc_init_from_lengths(9, &lens_lum, Some(&syms_lum))?;
 
             let mut syms_chrom = Vec::new();
             let mut lens_chrom = Vec::new();
@@ -145,7 +145,7 @@ impl H263Vlc {
                     lens_chrom.push((i + 2) as i32);
                 }
             }
-            let chrom = crate::vlc::vlc_init_from_lengths(9, &lens_chrom, Some(&syms_chrom))?;
+            let chrom = crate::legacy_vlc::vlc_init_from_lengths(9, &lens_chrom, Some(&syms_chrom))?;
             (lum, chrom)
         };
         Ok(Self { intra_mcbpc, inter_mcbpc, cbpy, mv, mbtype_b, cbpc_b, rl_inter, rl_intra_aic, rv_dc_lum, rv_dc_chrom })
@@ -474,9 +474,9 @@ pub fn h263_decode_block(
 /// RV10 DC VLC decode (`ff_rv_decode_dc`).
 fn rv_decode_dc(gb: &mut GetBitContext, vlcs: &H263Vlc, n: usize) -> i32 {
     if n < 4 {
-        crate::vlc::get_vlc2(gb, &vlcs.rv_dc_lum)
+        crate::legacy_vlc::get_vlc2(gb, &vlcs.rv_dc_lum)
     } else {
-        crate::vlc::get_vlc2(gb, &vlcs.rv_dc_chrom)
+        crate::legacy_vlc::get_vlc2(gb, &vlcs.rv_dc_chrom)
     }
 }
 

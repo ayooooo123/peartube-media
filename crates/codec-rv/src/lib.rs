@@ -12,19 +12,23 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code, unused_variables, unused_mut, unused_imports, unused_assignments)]
 
-pub mod bitread;
+pub mod bits;
+mod golomb_tables;
+pub mod picture;
+pub mod rv34;
 pub mod vlc;
+
+pub mod bitread;
+pub mod legacy_vlc;
 pub mod idct;
 pub mod hpel;
 pub mod h263tables;
 pub mod h263dsp_tables;
 pub mod mpegtables;
 pub mod rvdata;
-pub mod rv34vlc_tables;
 pub mod mpeg;
 pub mod h263dec;
 pub mod rv10;
-pub mod rv34;
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, PixelFormat, RuntimeContext,
