@@ -167,16 +167,22 @@ fn video_probe(mode: Mode) -> i32 {
     let total = a + b + c;
     println!("[video] total frames received: {total}");
 
-    // Both swap windows must have received frames, and the total must
-    // cover the sample (the drain sleep covers the last frames).
-    let ok = b + c > 0 && total >= EXPECTED_FRAMES * 8 / 10;
+    // Acceptance: frames decoded before the swap (A), frames decoded after
+    // the swap on the NEW window (B/C — decode resumed there), and the
+    // total covering the keyframe-aligned resume. The swap restarts B from
+    // the next keyframe after packet swap_at (keyint 30 ⇒ up to 29 packets
+    // are gate-skipped), so the total floor is 192 minus one GOP minus the
+    // reorder/ drain slack.
+    let gop_skip = 30 + 12; // one keyframe interval + reorder, decode-start and drain slack
+    let floor = EXPECTED_FRAMES.saturating_sub(gop_skip);
+    let ok = a > 0 && b + c > 0 && total >= floor;
     if ok {
         println!("[video] PASS (window swap resumed on new surface)");
         0
     } else {
         println!(
-            "[video] FAIL: expected >0 frames after the swap and >= {}",
-            EXPECTED_FRAMES * 8 / 10
+            "[video] FAIL: need frames on both windows and total >= {floor} (got A={a}, B+C={}, total={total})",
+            b + c
         );
         1
     }
