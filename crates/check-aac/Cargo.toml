@@ -13,5 +13,5 @@ oxideav-core.workspace = true
 oxideav-mov.workspace = true
 oxideav-mp4.workspace = true
 oxideav-mpegts.workspace = true
-oxideav-aac = { git = "https://github.com/ayooooo123/oxideav-aac", rev = "ffa7fa69f8619c6ade89ba48354d5284d755cd4a" }
+oxideav-aac.workspace = true
 refcheck.workspace = true
