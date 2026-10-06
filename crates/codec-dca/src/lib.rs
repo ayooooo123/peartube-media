@@ -7,6 +7,7 @@
 
 // Module wiring for the ported FFmpeg DCA files (commit 2da55bf).
 
+pub mod avtx;
 pub mod bitreader;
 pub mod bitreader_le;
 pub mod core;
@@ -27,7 +28,10 @@ mod demuxer;
 use crate::decoder::DcaDecoder;
 use oxideav_core::{AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, Decoder, Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, SampleFormat};
 
-pub const CODEC_ID_STR_DCA: &str = "dca";
+/// OxideAV's DTS codec id — every demuxer already maps DTS tags to it, so
+/// registering under the same id with a lower priority makes this decoder
+/// win resolution without touching crates/codecs (retry guidance).
+pub const CODEC_ID_STR_DCA: &str = "dts";
 
 /// Priority over OxideAV's core-only `dts` decoder (OxideAV software sits
 /// at 100+; lower wins; contract value 50).
@@ -40,12 +44,13 @@ pub fn register(ctx: &mut RuntimeContext) {
     demuxer::register_containers(&mut ctx.containers);
 }
 
-/// Register the decoder. Container tag claims:
+/// Register the decoder under FFmpeg's `dca` name with OxideAV's `dts`
+/// codec id. Container tag claims:
 /// - WAVEFORMATEX `wFormatTag` 0x2001 (DTS in RIFF/WAV, mmreg.h).
 /// - Matroska `A_DTS` (DTS-HD MA / DTS:X / core — one CodecID).
 /// - MP4/QuickTime sample entries `dtsc` (core), `dtsh` (DTS-HD HRA),
 ///   `dtsl` (DTS-HD MA), `dtse` (DTS Express; ETSI TS 102 114).
-/// - MPEG-TS stream type 0x82 is mapped to the `dts` id by oxideav-mpegts.
+/// - MPEG-TS stream types are mapped to the `dts` id by oxideav-mpegts.
 pub fn register_codecs(reg: &mut oxideav_core::CodecRegistry) {
     let id = CodecId::new(CODEC_ID_STR_DCA);
     let caps = CodecCapabilities::audio("dca_sw_dec")
@@ -75,6 +80,9 @@ fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
     // dtshd padding (see the dtshd demuxer): trim `initial_padding` leading
     // samples, keep `keep` samples total, like FFmpeg's skip-samples side
     // data.
+    // dtshd padding (see the dtshd demuxer): FFmpeg's CLI applies the
+    // skip-samples side data when decoding, so the decoder trims
+    // `initial_padding` leading samples and keeps `keep` samples total.
     let initial_padding: u64 = params
         .options
         .get("dtshd_initial_padding")
@@ -85,12 +93,7 @@ fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         .get("dtshd_keep_samples")
         .and_then(|v| v.parse().ok())
         .unwrap_or(u64::MAX);
-    Ok(Box::new(DcaDecoderImpl::new(
-        initial_padding,
-        keep,
-        params.sample_format,
-        params.channels,
-    )))
+    Ok(Box::new(DcaDecoderImpl::new(initial_padding, keep)))
 }
 
 /// OxideAV `Decoder` adapter over [`DcaDecoder`].
@@ -106,21 +109,10 @@ pub struct DcaDecoderImpl {
     emitted: u64,
     /// Absolute decoded-sample position (trim window reference).
     decoded: u64,
-    /// The stream-declared output format; frames are emitted interleaved
-    /// in this format so frame data always matches the stream parameters
-    /// (FFmpeg's decoder sets avctx->sample_fmt dynamically; OxideAV
-    /// frames must be self-describing via the stream parameters).
-    declared_format: Option<SampleFormat>,
-    declared_channels: Option<u16>,
 }
 
 impl DcaDecoderImpl {
-    fn new(
-        trim_head: u64,
-        keep: u64,
-        declared_format: Option<SampleFormat>,
-        declared_channels: Option<u16>,
-    ) -> Self {
+    fn new(trim_head: u64, keep: u64) -> Self {
         Self {
             inner: DcaDecoder::new(),
             codec_id: CodecId::new(CODEC_ID_STR_DCA),
@@ -131,9 +123,28 @@ impl DcaDecoderImpl {
             keep,
             emitted: 0,
             decoded: 0,
-            declared_format,
-            declared_channels,
         }
+    }
+
+    /// The decoder's output layout: interleaved, `bits` wide (16 for XLL
+    /// 16-bit storage, 32 otherwise — the lossy/fixed path emits 24-bit
+    /// samples in 32-bit words and the float/LBR path emits f32).
+    fn audio_format(&self) -> Option<oxideav_core::AudioFormat> {
+        if self.sample_rate == 0 || self.channels == 0 {
+            return None;
+        }
+        let sample_format = if self.bits == 0 {
+            SampleFormat::F32
+        } else if self.bits == 16 {
+            SampleFormat::S16
+        } else {
+            SampleFormat::S32
+        };
+        Some(oxideav_core::AudioFormat {
+            sample_format,
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+        })
     }
 }
 
@@ -157,40 +168,53 @@ impl Decoder for DcaDecoderImpl {
         self.sample_rate = frame.sample_rate;
         self.bits = frame.bits_per_sample;
 
-        // Normalize to f32 planes first.
-        let f32_planes: Vec<Vec<f32>> = if !frame.planes_s32.is_empty() {
-            let bits = if frame.bits_per_sample == 16 { 16 } else { 24 };
-            frame
+        // The decoder's native layout: F32 planes for the float paths, S16
+        // for XLL 16-bit storage, S32 (24-bit samples << 8) for XLL 24-bit
+        // and the fixed-point core path — FFmpeg's sample_fmt is exactly
+        // this (fltp / s16 / s32).
+        let planes_s16: Vec<Vec<i16>>;
+        let planes_s32: Vec<Vec<i32>>;
+        let planes_f32: Vec<Vec<f32>>;
+        if frame.planes_s32.is_empty() {
+            planes_s16 = Vec::new();
+            planes_s32 = Vec::new();
+            planes_f32 = frame.planes_f32;
+        } else if frame.bits_per_sample == 16 {
+            planes_f32 = Vec::new();
+            planes_s32 = Vec::new();
+            planes_s16 = frame
                 .planes_s32
                 .iter()
-                .map(|plane| {
-                    plane
-                        .iter()
-                        .map(|&v| {
-                            if bits == 16 {
-                                v as i16 as f32 / 32768.0
-                            } else {
-                                // 24-bit sample in 32 bits, like FFmpeg's
-                                // s32 output for 24-bit DTS.
-                                (v >> 8) as f32 / 8388608.0
-                            }
-                        })
-                        .collect()
-                })
-                .collect()
+                .map(|plane| plane.iter().map(|&v| v as i16).collect())
+                .collect();
         } else {
-            frame.planes_f32.clone()
-        };
-
-        let channels = f32_planes.len();
-        let samples = f32_planes.first().map_or(0, |p| p.len());
-        let mut samples = samples;
-        let decoded_samples = samples;
-        let mut f32_planes = f32_planes;
-        for plane in &f32_planes {
-            samples = samples.min(plane.len());
+            planes_f32 = Vec::new();
+            planes_s16 = Vec::new();
+            planes_s32 = frame.planes_s32;
         }
-        for plane in f32_planes.iter_mut() {
+
+        let channels = planes_f32
+            .len()
+            .max(planes_s16.len())
+            .max(planes_s32.len());
+        fn len_of<T>(p: &[Vec<T>]) -> usize {
+            p.iter().map(|v| v.len()).min().unwrap_or(0)
+        }
+        let mut samples = len_of(&planes_f32)
+            .max(len_of(&planes_s16))
+            .max(len_of(&planes_s32));
+        let decoded_samples = samples;
+        // Truncate all planes to the common length.
+        let mut planes_f32 = planes_f32;
+        let mut planes_s16 = planes_s16;
+        let mut planes_s32 = planes_s32;
+        for plane in planes_f32.iter_mut() {
+            plane.truncate(samples);
+        }
+        for plane in planes_s16.iter_mut() {
+            plane.truncate(samples);
+        }
+        for plane in planes_s32.iter_mut() {
             plane.truncate(samples);
         }
 
@@ -206,11 +230,19 @@ impl Decoder for DcaDecoderImpl {
             if cut_end > cut_start {
                 let s = (cut_start - abs_start) as usize;
                 let e = (cut_end - abs_start) as usize;
-                for plane in f32_planes.iter_mut() {
-                    plane.drain(..s);
-                    plane.truncate(e - s);
-                }
                 samples = e - s;
+                for plane in planes_f32.iter_mut() {
+                    plane.drain(..s);
+                    plane.truncate(e);
+                }
+                for plane in planes_s16.iter_mut() {
+                    plane.drain(..s);
+                    plane.truncate(e);
+                }
+                for plane in planes_s32.iter_mut() {
+                    plane.drain(..s);
+                    plane.truncate(e);
+                }
             } else {
                 samples = 0;
             }
@@ -221,31 +253,32 @@ impl Decoder for DcaDecoderImpl {
             return Err(CoreError::NeedMore);
         }
 
-        // Emit ONE interleaved plane in the stream-declared format
-        // (SampleFormat::S32 declared by the dtshd demuxer, F32 by the raw
-        // dts demuxer, S32 by default).
-        let format = self.declared_format.unwrap_or(SampleFormat::S32);
-        let interleaved: Vec<u8> = match format {
-            SampleFormat::F32 | SampleFormat::F32P => {
-                let mut out = Vec::with_capacity(samples * channels * 4);
-                for i in 0..samples {
-                    for plane in &f32_planes {
-                        out.extend_from_slice(&plane[i].to_le_bytes());
-                    }
+        // Emit ONE interleaved plane in the decoder's native format.
+        let interleaved: Vec<u8> = if !planes_f32.is_empty() {
+            let mut out = Vec::with_capacity(samples * channels * 4);
+            for i in 0..samples {
+                for plane in &planes_f32 {
+                    out.extend_from_slice(&plane[i].to_le_bytes());
                 }
-                out
             }
-            _ => {
-                // s32le interleaved (24-bit in 32, << 8 like FFmpeg).
-                let mut out = Vec::with_capacity(samples * channels * 4);
-                for i in 0..samples {
-                    for plane in &f32_planes {
-                        let v = ((plane[i].clamp(-1.0, 1.0) * 8388608.0) as i32) << 8;
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
+            out
+        } else if !planes_s16.is_empty() {
+            let mut out = Vec::with_capacity(samples * channels * 2);
+            for i in 0..samples {
+                for plane in &planes_s16 {
+                    out.extend_from_slice(&plane[i].to_le_bytes());
                 }
-                out
             }
+            out
+        } else {
+            // s32le interleaved (24-bit in 32, << 8 like FFmpeg).
+            let mut out = Vec::with_capacity(samples * channels * 4);
+            for i in 0..samples {
+                for plane in &planes_s32 {
+                    out.extend_from_slice(&plane[i].to_le_bytes());
+                }
+            }
+            out
         };
 
         let audio = AudioFrame {
@@ -254,6 +287,10 @@ impl Decoder for DcaDecoderImpl {
             data: vec![interleaved],
         };
         Ok(Frame::Audio(audio))
+    }
+
+    fn output_audio_format(&self) -> Option<oxideav_core::AudioFormat> {
+        self.audio_format()
     }
 
     fn flush(&mut self) -> CoreResult<()> {

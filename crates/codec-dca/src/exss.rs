@@ -293,6 +293,9 @@ fn parse_descriptor(gb: &mut BitReader, asset: &mut ExssAsset, parser: &ExssPars
         0 => {
             // Coding mode that may contain multiple coding components
             asset.extension_mask = gb.get_bits(12) as i32;
+            if std::env::var("DCA_TRACE").is_ok() {
+                eprintln!("TRACE-R exss asset mask={:#x}", asset.extension_mask);
+            }
 
             if asset.extension_mask & exss_mask::CORE != 0 {
                 // Size of core component in extension substream
@@ -441,6 +444,9 @@ fn set_exss_offsets(asset: &mut ExssAsset) -> ExssResult<()> {
 
 /// `ff_dca_exss_parse`. `data` starts at the EXSS sync word.
 pub fn exss_parse(parser: &mut ExssParser, data: &[u8]) -> ExssResult<()> {
+    if std::env::var("DCA_TRACE").is_ok() {
+        eprintln!("TRACE-R exss_parse enter len={}", data.len());
+    }
     let mut gb = BitReader::new(data);
 
     // Extension substream sync word
@@ -542,6 +548,10 @@ pub fn exss_parse(parser: &mut ExssParser, data: &[u8]) -> ExssResult<()> {
     for i in 0..parser.nassets as usize {
         let mut asset = std::mem::take(&mut parser.assets[i]);
         let res = parse_descriptor(&mut gb, &mut asset, parser).and_then(|()| set_exss_offsets(&mut asset));
+        if std::env::var("DCA_TRACE").is_ok() {
+            eprintln!("TRACE-R exss asset off={} size={} core_off={} xbr_off={} xbr_size={}",
+                asset.asset_offset, asset.asset_size, asset.core_offset, asset.xbr_offset, asset.xbr_size);
+        }
         parser.assets[i] = asset;
         res?;
     }

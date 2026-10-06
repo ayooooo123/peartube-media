@@ -336,7 +336,7 @@ pub fn imdct_naive_inv(input: &[f32], output: &mut [f32], scale: f32) {
 /// 32-subband input `in`.
 pub fn synth_filter_float(
     imdct: &dyn Fn(&[f32], &mut [f32]),
-    synth_buf: &mut [f32; 512],
+    synth_buf: &mut [f32; 1024],
     synth_buf_offset: &mut i32,
     synth_buf2: &mut [f32; 32],
     window: &[f32],
@@ -349,35 +349,36 @@ pub fn synth_filter_float(
     // base+offset), wrapping circularly.
     let mut tmp = [0f32; 32];
     imdct(input, &mut tmp);
-    for (k, &v) in tmp.iter().enumerate() {
-        synth_buf[(offset + k) % 512] = v;
-    }
+    // The C writes the TX output at hist1 + offset (32 floats) inside the
+    // 1024-entry history; the window sums index ABSOLUTELY from there and
+    // wrap with -512 in the second loop (synth_filter.c).
+    synth_buf[offset..offset + 32].copy_from_slice(&tmp);
 
     for i in 0..16 {
         let mut a = synth_buf2[i];
         let mut b = synth_buf2[i + 16];
         let mut c = 0.0f32;
         let mut d = 0.0f32;
-        // synth_buf here is the C `synth_buf` pointer (base + offset);
-        // indices are relative to it, like the C code.
-        // synth_buf is a 512-entry circular window whose origin sits at
-        // `offset`; C's relative indices map to absolute cells mod 512.
-        let sb = |k: isize| -> f32 { synth_buf[(((k + offset as isize) % 512 + 512) % 512) as usize] };
+        // synth_buf is the C `synth_buf` pointer (hist1 base + offset);
+        // indices are relative to it, exactly like the C code.
+        let sb = |k: isize| -> f32 { synth_buf[(offset as isize + k) as usize] };
         let mut j = 0usize;
         while j < 512 - offset {
-            a += window[i + j] * (-sb((15 - i + j) as isize));
-            b += window[i + j + 16] * sb((i + j) as isize);
-            c += window[i + j + 32] * sb((16 + i + j) as isize);
-            d += window[i + j + 48] * sb((31 - i + j) as isize);
+            // The reference build contracts each mul+add into an FMA
+            // (clang -ffp-contract=on); mul_add replicates the rounding.
+            a = (-sb((15 - i + j) as isize)).mul_add(window[i + j], a);
+            b = sb((i + j) as isize).mul_add(window[i + j + 16], b);
+            c = sb((16 + i + j) as isize).mul_add(window[i + j + 32], c);
+            d = sb((31 - i + j) as isize).mul_add(window[i + j + 48], d);
             j += 64;
         }
         while j < 512 {
             let jj = j as isize;
             let ii = i as isize;
-            a += window[i + j] * (-sb(15 - ii + jj - 512));
-            b += window[i + j + 16] * sb(ii + jj - 512);
-            c += window[i + j + 32] * sb(16 + ii + jj - 512);
-            d += window[i + j + 48] * sb(31 - ii + jj - 512);
+            a = (-sb(15 - ii + jj - 512)).mul_add(window[i + j], a);
+            b = sb(ii + jj - 512).mul_add(window[i + j + 16], b);
+            c = sb(16 + ii + jj - 512).mul_add(window[i + j + 32], c);
+            d = sb(31 - ii + jj - 512).mul_add(window[i + j + 48], d);
             j += 64;
         }
         out[i] = a * scale;
@@ -435,7 +436,7 @@ pub fn synth_filter_float_64(
 
 /// `synth_filter_fixed`: 32-subband fixed-point synthesis.
 pub fn synth_filter_fixed(
-    synth_buf: &mut [i32; 512],
+    synth_buf: &mut [i32; 1024],
     synth_buf_offset: &mut i32,
     synth_buf2: &mut [i32; 32],
     window: &[i32],
@@ -445,16 +446,14 @@ pub fn synth_filter_fixed(
     let offset = *synth_buf_offset as usize;
     let mut tmp32 = [0i32; 32];
     crate::dsp::imdct_half_32(&mut tmp32, input);
-    for (k, &v) in tmp32.iter().enumerate() {
-        synth_buf[(offset + k) % 512] = v;
-    }
+    synth_buf[offset..offset + 32].copy_from_slice(&tmp32);
 
     for i in 0..16 {
         let mut a = i64::from(synth_buf2[i]) * (1i64 << 21);
         let mut b = i64::from(synth_buf2[i + 16]) * (1i64 << 21);
         let mut c: i64 = 0;
         let mut d: i64 = 0;
-        let sb = |k: isize| -> i32 { synth_buf[(((k + offset as isize) % 512 + 512) % 512) as usize] };
+        let sb = |k: isize| -> i32 { synth_buf[(offset as isize + k) as usize] };
         let mut j = 0usize;
         while j < 512 - offset {
             a += i64::from(window[i + j]) * i64::from(sb((i + j) as isize));
@@ -492,9 +491,7 @@ pub fn synth_filter_fixed_64(
     let offset = *synth_buf_offset as usize;
     let mut tmp64 = [0i32; 64];
     crate::dsp::imdct_half_64(&mut tmp64, input);
-    for (k, &v) in tmp64.iter().enumerate() {
-        synth_buf[(offset + k) % 1024] = v;
-    }
+    synth_buf[offset..offset + 64].copy_from_slice(&tmp64);
 
     for i in 0..32 {
         let mut a = i64::from(synth_buf2[i]) * (1i64 << 20);

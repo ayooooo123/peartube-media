@@ -369,7 +369,7 @@ impl RawDtsDemuxer {
         // bitstream conversion like dts_parse_params does).
         let (sample_rate, channels, npcmblocks) = sniff_params(&head);
 
-        let codec_id = oxideav_core::CodecId::new("dca");
+        let codec_id = oxideav_core::CodecId::new(crate::CODEC_ID_STR_DCA);
         let mut params = CodecParameters::audio(codec_id);
         params.media_type = MediaType::Audio;
         if sample_rate > 0 {
@@ -630,7 +630,7 @@ impl DtshdDemuxer {
 
         input.seek(SeekFrom::Start(data_start))?;
 
-        let codec_id = oxideav_core::CodecId::new("dca");
+        let codec_id = oxideav_core::CodecId::new(crate::CODEC_ID_STR_DCA);
         let mut params = CodecParameters::audio(codec_id);
         params.media_type = MediaType::Audio;
         if sample_rate > 0 {

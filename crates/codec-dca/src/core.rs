@@ -138,15 +138,17 @@ impl SubbandBuffer {
         }
     }
 
-    /// `alloc_sample_buffer` / `alloc_x96_sample_buffer`: (re)allocate for
-    /// `npcmblocks` blocks, `nchannels * nbands` rows.
-    fn alloc(&mut self, nchsamples: usize, nchannels: usize, _nbands: usize, zero: bool) {
+    /// `alloc_sample_buffer` / `alloc_x96_sample_buffer`. Like FFmpeg's
+    /// `av_fast_mallocz`, the buffer is zeroed only when (re)allocated;
+    /// its contents persist across frames so the ADPCM predictor sees the
+    /// previous frame's tail samples (the 4-sample history region is
+    /// refreshed by `parse_frame_data`, `erase_adpcm_history` clears it
+    /// when `predictor_history` is off).
+    fn alloc(&mut self, nchsamples: usize, nchannels: usize, _nbands: usize) {
         let nframesamples = nchsamples * nchannels * self.nbands;
         if self.data.len() != nframesamples {
             self.data = vec![0i32; nframesamples];
             self.nchsamples = nchsamples;
-        } else if zero {
-            self.data.iter_mut().for_each(|v| *v = 0);
         }
     }
 
@@ -282,6 +284,11 @@ pub struct CoreDecoder {
     pub output_history_lfe_fixed: i32,
     pub output_history_lfe_float: f32,
 
+    /// FFmpeg's `s->imdct[0]` / `s->imdct[1]`: AV_TX_FLOAT_MDCT inverse,
+    /// len 32 and 64, scale 1.0 (dca_core.c ff_dca_core_init).
+    pub imdct32: crate::avtx::MdctInv,
+    pub imdct64: crate::avtx::MdctInv,
+
     pub ch_remap: [usize; dca::DCA_SPEAKER_COUNT],
     pub request_mask: u32,
     pub request_channel_layout: u32,
@@ -367,6 +374,8 @@ impl CoreDecoder {
             output_plane_len: 0,
             output_history_lfe_fixed: 0,
             output_history_lfe_float: 0.0,
+            imdct32: crate::avtx::MdctInv::new(32, 1.0),
+            imdct64: crate::avtx::MdctInv::new(64, 1.0),
             ch_remap: [0; dca::DCA_SPEAKER_COUNT],
             request_mask: 0,
             request_channel_layout: 0,
@@ -490,6 +499,9 @@ impl CoreDecoder {
                     return Err("too many XXCH channels");
                 }
                 self.nchannels = FF_DCA_CHANNELS[self.audio_mode] as usize + nchannels;
+                if self.nchannels > dca::DCA_CHANNELS {
+                    return Err("too many XXCH channels for the channel set");
+                }
 
                 // Loudspeaker layout mask
                 let m = self.xxch_mask_nbits - speaker::CS;
@@ -940,7 +952,7 @@ impl CoreDecoder {
                     for j in 0..nsamples {
                         self.subband.data[base + j] = clip23((i32::from(coeff[j]) * scale + (1 << 3)) >> 4);
                     }
-                }
+                            }
             }
         }
 
@@ -1011,7 +1023,7 @@ impl CoreDecoder {
                         scale
                     };
 
-                    // Dequantize into the subband row
+                                // Dequantize into the subband row
                     let base = self.subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS + ofs;
                     let (out, _rest) = self.subband.data[base..base + dca::DCA_SUBBAND_SAMPLES].split_at_mut(dca::DCA_SUBBAND_SAMPLES);
                     core_dequantize(out, &audio, step_size, scale, false);
@@ -1029,9 +1041,10 @@ impl CoreDecoder {
         // Inverse ADPCM
         for ch in xch_base..self.nchannels {
             self.inverse_adpcm(false, ch, 0, self.nsubbands[ch], *sub_pos, nsamples);
-        }
+                    }
 
-        // Joint subband coding
+        // Joint subband coding (reads/writes at the subframe start, like
+        // FFmpeg's decode_joint(.., *sub_pos, nsamples))
         for ch in xch_base..self.nchannels {
             let src_ch = self.joint_intensity_index[ch].wrapping_sub(1);
             if self.joint_intensity_index[ch] != 0 && src_ch < dca::DCA_CHANNELS {
@@ -1042,11 +1055,11 @@ impl CoreDecoder {
                 let end = self.nsubbands[src_ch];
                 for (bi, band) in (start..end).enumerate() {
                     for j in 0..nsamples {
-                        let sv = self.subband.data[self.subband.row_base(src_ch, band) + crate::data::DCA_ADPCM_COEFFS + ofs + j];
-                        let di = self.subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS + ofs + j;
+                        let sv = self.subband.data[self.subband.row_base(src_ch, band) + crate::data::DCA_ADPCM_COEFFS + *sub_pos + j];
+                        let di = self.subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS + *sub_pos + j;
                         self.subband.data[di] = clip23(mul17(sv, scales[bi]));
                     }
-                }
+                            }
             }
         }
 
@@ -1091,9 +1104,7 @@ impl CoreDecoder {
 
     fn alloc_sample_buffer(&mut self) {
         let nchsamples = crate::data::DCA_ADPCM_COEFFS + self.npcmblocks;
-        let nframesamples = nchsamples * dca::DCA_CHANNELS * dca::DCA_SUBBANDS;
-        self.subband.alloc(nchsamples, dca::DCA_CHANNELS, dca::DCA_SUBBANDS, true);
-        let _ = nframesamples;
+        self.subband.alloc(nchsamples, dca::DCA_CHANNELS, dca::DCA_SUBBANDS);
         if !self.predictor_history {
             self.erase_adpcm_history();
         }
@@ -1101,7 +1112,7 @@ impl CoreDecoder {
 
     fn alloc_x96_sample_buffer(&mut self) {
         let nchsamples = crate::data::DCA_ADPCM_COEFFS + self.npcmblocks;
-        self.x96_subband.alloc(nchsamples, dca::DCA_CHANNELS, dca::DCA_SUBBANDS_X96, true);
+        self.x96_subband.alloc(nchsamples, dca::DCA_CHANNELS, dca::DCA_SUBBANDS_X96);
         if !self.predictor_history {
             self.erase_x96_adpcm_history();
         }
@@ -1129,9 +1140,11 @@ impl CoreDecoder {
             for band in 0..nsubbands {
                 let base = self.subband.row_base(ch, band);
                 // AV_COPY128(samples, samples + npcmblocks): copy the last
-                // 4 samples of the frame into the 4-sample history.
+                // 4 samples of the frame (samples region ends at
+                // base + COEFFS + npcmblocks) into the 4-sample history.
                 for k in 0..crate::data::DCA_ADPCM_COEFFS {
-                    self.subband.data[base + k] = self.subband.data[base + crate::data::DCA_ADPCM_COEFFS + self.npcmblocks + k];
+                    self.subband.data[base + k] =
+                        self.subband.data[base + crate::data::DCA_ADPCM_COEFFS + self.npcmblocks - 4 + k];
                 }
             }
 
@@ -1315,7 +1328,7 @@ impl CoreDecoder {
                         0
                     };
                     let abits = xbr_bit_allocation[ch][band];
-
+            
                     // Extract bits from the bit stream
                     if abits > 7 {
                         for slot in audio.iter_mut() {
@@ -1341,7 +1354,7 @@ impl CoreDecoder {
                     let base = self.subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS + ofs;
                     let out = &mut self.subband.data[base..base + dca::DCA_SUBBAND_SAMPLES];
                     core_dequantize(out, &audio, step_size, scale, true);
-                }
+                            }
             }
 
             // DSYNC
@@ -1539,7 +1552,8 @@ impl CoreDecoder {
             self.inverse_adpcm(true, ch, self.x96_subband_start, self.nsubbands[ch], *sub_pos, nsamples);
         }
 
-        // Joint subband coding
+        // Joint subband coding (reads/writes at the subframe start, like
+        // FFmpeg's decode_joint(.., *sub_pos, nsamples))
         for ch in xch_base..self.x96_nchannels {
             let src_ch = self.joint_intensity_index[ch].wrapping_sub(1);
             if self.joint_intensity_index[ch] != 0 && src_ch < dca::DCA_CHANNELS {
@@ -1550,8 +1564,8 @@ impl CoreDecoder {
                 let end = self.nsubbands[src_ch];
                 for (bi, band) in (start..end).enumerate() {
                     for j in 0..nsamples {
-                        let sv = self.x96_subband.data[self.x96_subband.row_base(src_ch, band) + crate::data::DCA_ADPCM_COEFFS + ofs + j];
-                        let di = self.x96_subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS + ofs + j;
+                        let sv = self.x96_subband.data[self.x96_subband.row_base(src_ch, band) + crate::data::DCA_ADPCM_COEFFS + *sub_pos + j];
+                        let di = self.x96_subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS + *sub_pos + j;
                         self.x96_subband.data[di] = clip23(mul17(sv, scales[bi]));
                     }
                 }
@@ -1741,7 +1755,8 @@ impl CoreDecoder {
                 let base = self.x96_subband.row_base(ch, band);
                 if band >= self.x96_subband_start && band < nsubbands {
                     for k in 0..crate::data::DCA_ADPCM_COEFFS {
-                        self.x96_subband.data[base + k] = self.x96_subband.data[base + crate::data::DCA_ADPCM_COEFFS + self.npcmblocks + k];
+                        self.x96_subband.data[base + k] =
+                            self.x96_subband.data[base + crate::data::DCA_ADPCM_COEFFS + self.npcmblocks - 4 + k];
                     }
                 } else {
                     let n = self.x96_subband.nchsamples;
@@ -2094,6 +2109,7 @@ impl CoreDecoder {
             }
         }
 
+
         // Parse X96 unless decoding XLL
         if self.packet & packet_xll(self) == 0 {
             if exss_mask & crate::dca::exss_mask::EXSS_X96 != 0 {
@@ -2249,9 +2265,9 @@ impl CoreDecoder {
                     &self.subband.data[base..base + self.npcmblocks]
                 })
                 .collect();
-            let hi_rows: Option<Vec<&[i32]>> = if ch < x96_nchannels {
+            let hi_rows: Option<Vec<&[i32]>> = if x96 && ch < x96_nchannels {
                 Some(
-                    (0..dca::DCA_SUBBANDS)
+                    (0..dca::DCA_SUBBANDS_X96)
                         .map(|band| {
                             let base = self.x96_subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS;
                             &self.x96_subband.data[base..base + self.npcmblocks]
@@ -2376,8 +2392,8 @@ fn sub_qmf_fixed(
             let mut input32 = [0i32; 32];
             input32.copy_from_slice(&input[..32]);
             let hist2_32: &mut [i32; 32] = (&mut hist2[..32]).try_into().unwrap();
-            let hist1_512: &mut [i32; 512] = (&mut hist1[..512]).try_into().unwrap();
-            dsp::synth_filter_fixed(hist1_512, offset, hist2_32, filter_coeff, &mut pcm[pcm_pos..pcm_pos + 32], &input32);
+            let hist1_1024: &mut [i32; 1024] = (&mut hist1[..1024]).try_into().unwrap();
+            dsp::synth_filter_fixed(hist1_1024, offset, hist2_32, filter_coeff, &mut pcm[pcm_pos..pcm_pos + 32], &input32);
             pcm_pos += 32;
         }
     }
@@ -2645,17 +2661,16 @@ impl CoreDecoder {
         // Filter primary channels
         for ch in 0..self.nchannels {
             let spkr = self.map_prm_ch_to_spkr(ch)?;
-
-            // Filter bank reconstruction (sub_qmf_float[x96_synth])
+                        // Filter bank reconstruction (sub_qmf_float[x96_synth])
             let lo_rows: Vec<Vec<f32>> = (0..dca::DCA_SUBBANDS)
                 .map(|band| {
                     let base = self.subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS;
                     self.subband.data[base..base + self.npcmblocks].iter().map(|&v| v as f32).collect()
                 })
                 .collect();
-            let hi_rows: Option<Vec<Vec<f32>>> = if ch < x96_nchannels {
+            let hi_rows: Option<Vec<Vec<f32>>> = if x96 && ch < x96_nchannels {
                 Some(
-                    (0..dca::DCA_SUBBANDS)
+                    (0..dca::DCA_SUBBANDS_X96)
                         .map(|band| {
                             let base = self.x96_subband.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS;
                             self.x96_subband.data[base..base + self.npcmblocks].iter().map(|&v| v as f32).collect()
@@ -2679,6 +2694,7 @@ impl CoreDecoder {
                 self.npcmblocks,
                 x96,
                 1.0f32 / (1 << (17 - x96_synth)) as f32,
+                if x96 { &self.imdct64 } else { &self.imdct32 },
             );
         }
 
@@ -2873,15 +2889,8 @@ fn sub_qmf_float(
     npcmblocks: usize,
     x96: bool,
     scale: f32,
+    imdct: &crate::avtx::MdctInv,
 ) {
-    // The float synth filter needs a half-length IMDCT writing into the
-    // rotating history window.
-    let imdct32 = |input: &[f32], out: &mut [f32]| {
-        imdct_half_float::<32>(input, out);
-    };
-    let imdct64 = |input: &[f32], out: &mut [f32]| {
-        imdct_half_float::<64>(input, out);
-    };
 
     let mut input = [0f32; 64];
     let mut pcm_pos = 0usize;
@@ -2905,7 +2914,7 @@ fn sub_qmf_float(
             let hist2_64: &mut [f32; 64] = (&mut hist2[..64]).try_into().unwrap();
             let hist1_1024: &mut [f32; 1024] = (&mut hist1[..1024]).try_into().unwrap();
             let mut out64 = [0f32; 64];
-            dsp::synth_filter_float_64(&imdct64, hist1_1024, offset, hist2_64, filter_coeff, &mut out64, &input[..64], scale);
+            dsp::synth_filter_float_64(&|i, o| imdct.run(i, o), hist1_1024, offset, hist2_64, filter_coeff, &mut out64, &input[..64], scale);
             pcm[pcm_pos..pcm_pos + 64].copy_from_slice(&out64);
             pcm_pos += 64;
         } else {
@@ -2913,13 +2922,12 @@ fn sub_qmf_float(
             input32.copy_from_slice(&input[..32]);
             let mut out32 = [0f32; 32];
             let hist2_32: &mut [f32; 32] = (&mut hist2[..32]).try_into().unwrap();
-            let hist1_512: &mut [f32; 512] = (&mut hist1[..512]).try_into().unwrap();
-            dsp::synth_filter_float(&imdct32, hist1_512, offset, hist2_32, filter_coeff, &mut out32, &input32, scale);
+            let hist1_1024: &mut [f32; 1024] = (&mut hist1[..1024]).try_into().unwrap();
+            dsp::synth_filter_float(&|i, o| imdct.run(i, o), hist1_1024, offset, hist2_32, filter_coeff, &mut out32, &input32, scale);
             pcm[pcm_pos..pcm_pos + 32].copy_from_slice(&out32);
             pcm_pos += 32;
         }
     }
-    let _ = (imdct32, imdct64);
 }
 
 /// Generic half-IMDCT used by the float synth filter: FFmpeg's

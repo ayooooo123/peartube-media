@@ -121,6 +121,10 @@ impl DcaDecoder {
             }
         }
 
+        if std::env::var("DCA_TRACE").is_ok() {
+            eprintln!("TRACE-R dec: in={} fs={} consumed={} exss_sync={:?}", input_size, self.core.frame_size, consumed_core,
+                u32::from_be_bytes([data[consumed_core.min(data.len().saturating_sub(1))], data[consumed_core.min(data.len().saturating_sub(1)) + 1], data[consumed_core.min(data.len().saturating_sub(1)) + 2], data[consumed_core.min(data.len().saturating_sub(1)) + 3]]));
+        }
         let mut asset_index: Option<usize> = None;
         if !self.core.core_only {
             // Parse extension sub-stream (EXSS)
@@ -130,7 +134,11 @@ impl DcaDecoder {
                     == dca::DCA_SYNCWORD_SUBSTREAM
             {
                 match exss_parse(&mut self.exss, exss_data) {
-                    Err(_) => {} // conceal, like FFmpeg without EXPLODE
+                    Err(e) => {
+                        if std::env::var("DCA_TRACE").is_ok() {
+                            eprintln!("TRACE-R exssparse ERR: {e:?}");
+                        }
+                    } // conceal, like FFmpeg without EXPLODE
                     Ok(()) => {
                         self.packet |= pkt::DCA_PACKET_EXSS;
                         asset_index = Some(consumed_core);
@@ -153,8 +161,6 @@ impl DcaDecoder {
                         Ok(buffers) => {
                             self.xll_buffers = Some(buffers);
                             self.packet |= pkt::DCA_PACKET_XLL;
-                        }
-                        Err(_e) => {
                         }
                     }
                 }
