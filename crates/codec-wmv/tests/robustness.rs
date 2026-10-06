@@ -1,9 +1,20 @@
-//! Untrusted-input robustness: demuxers and decoders must never panic on
-//! mutated or truncated input.
+//! Untrusted-input robustness: every decoder and demuxer of the crate must
+//! survive truncated, bit-flipped and overwritten copies of the reference
+//! samples' packets (and files) without panicking or hanging.
+//! Deterministic: fixed seeds, at least `MUTATIONS` mutations per target.
 
-use refcheck::fate;
-use oxideav_core::RuntimeContext;
+mod common;
 
+use std::fs::File;
+use std::path::Path;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use common::encoded_sample;
+use oxideav_core::{CodecParameters, MediaType, Packet, RuntimeContext};
+use refcheck::{Registrar, fate};
+
+/// xorshift64*: a fixed seed gives the same mutations on every run.
 struct Rng(u64);
 
 impl Rng {
@@ -15,100 +26,244 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-}
 
-const MUTATIONS_PER_SAMPLE: usize = 2000;
-
-fn feed_through(data: &[u8], _ext: &str, format: &str) {
-    let mut ctx = RuntimeContext::new();
-    codec_wmv::register(&mut ctx);
-
-    let cursor = std::io::Cursor::new(data.to_vec());
-    let Ok(mut demuxer) = ctx.containers.open_demuxer(format, Box::new(cursor), &ctx.codecs) else {
-        return;
-    };
-
-    let streams = demuxer.streams().to_vec();
-    let mut decoders: Vec<_> = streams
-        .iter()
-        .map(|s| ctx.codecs.first_decoder(&s.params))
-        .collect();
-
-    let mut budget = 256;
-    while budget > 0 {
-        budget -= 1;
-        match demuxer.next_packet() {
-            Ok(packet) => {
-                if let Some(Ok(decoder)) = decoders.get_mut(packet.stream_index as usize) {
-                    let _ = decoder.send_packet(&packet);
-                    let mut guard = 0;
-                    while guard < 8 {
-                        guard += 1;
-                        if decoder.receive_frame().is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-            _ => break,
-        }
+    /// A value in `0..n` (0 when `n` is 0).
+    fn below(&mut self, n: usize) -> usize {
+        if n == 0 { 0 } else { (self.next() % n as u64) as usize }
     }
 }
 
-fn mutate(rng: &mut Rng, original: &[u8]) -> Vec<u8> {
-    let mut data = original.to_vec();
-    let mode = (rng.next() % 3) as u8;
-    match mode {
+const MUTATIONS: usize = 2000;
+
+/// No single packet or file may take this long to process: that is a hang.
+const HANG_LIMIT: Duration = Duration::from_secs(30);
+
+/// Truncates, bit-flips, overwrites, or truncates and flips `data`.
+fn mutate(rng: &mut Rng, data: &mut Vec<u8>) {
+    match rng.below(4) {
         0 => {
-            // Truncate
-            let new_len = (rng.next() as usize) % (data.len().max(1));
-            data.truncate(new_len);
+            let len = rng.below(data.len() + 1);
+            data.truncate(len);
         }
         1 => {
-            // Bit flip
-            let flips = 1 + (rng.next() % 8) as usize;
-            for _ in 0..flips {
+            for _ in 0..1 + rng.below(8) {
                 if !data.is_empty() {
-                    let idx = (rng.next() as usize) % data.len();
-                    let bit = 1 << ((rng.next() % 8) as u8);
-                    data[idx] ^= bit;
+                    let i = rng.below(data.len());
+                    data[i] ^= 1 << rng.below(8);
+                }
+            }
+        }
+        2 => {
+            for _ in 0..1 + rng.below(16) {
+                if !data.is_empty() {
+                    let i = rng.below(data.len());
+                    data[i] = rng.next() as u8;
                 }
             }
         }
         _ => {
-            // Byte overwrite
-            let count = 1 + (rng.next() % 16) as usize;
-            for _ in 0..count {
-                if !data.is_empty() {
-                    let idx = (rng.next() as usize) % data.len();
-                    data[idx] = (rng.next() % 256) as u8;
-                }
+            let len = rng.below(data.len() + 1);
+            data.truncate(len);
+            if !data.is_empty() {
+                let i = rng.below(data.len());
+                data[i] ^= 1 << rng.below(8);
             }
         }
     }
-    data
 }
 
-#[test]
-fn test_robustness_smm0005_rcv() {
-    let path = fate("vc1/SMM0005.rcv");
-    let original = std::fs::read(&path).expect("read SMM0005.rcv");
-    let mut rng = Rng(0x1234_5678_9ABC_DEF0);
-
-    for _ in 0..MUTATIONS_PER_SAMPLE {
-        let mutated = mutate(&mut rng, &original);
-        feed_through(&mutated, "rcv", "vc1test");
+/// Runs `work` on its own thread. `work` reports progress through its
+/// argument; no report for `HANG_LIMIT` fails the test as a hang, and a
+/// panic on the worker fails it with the worker's message.
+fn guarded(name: &'static str, work: impl FnOnce(&dyn Fn(usize)) + Send + 'static) {
+    let (tx, rx) = mpsc::channel::<usize>();
+    let worker = std::thread::spawn(move || {
+        work(&|step| {
+            let _ = tx.send(step);
+        })
+    });
+    let mut last = 0;
+    loop {
+        match rx.recv_timeout(HANG_LIMIT) {
+            Ok(step) => last = step,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("{name}: no progress for {HANG_LIMIT:?} after step {last}"),
+        }
+    }
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
     }
 }
 
-#[test]
-fn test_robustness_sa00040_vc1() {
-    let path = fate("vc1/SA00040.vc1");
-    let original = std::fs::read(&path).expect("read SA00040.vc1");
-    let mut rng = Rng(0xCAFE_BABE_DEAD_BEEF);
-
-    for _ in 0..MUTATIONS_PER_SAMPLE {
-        let mutated = mutate(&mut rng, &original);
-        feed_through(&mutated, "vc1", "vc1");
+/// The first video stream of `path` (opened as `container`) and its packets.
+fn video_packets(path: &Path, container: &str, registrars: &[Registrar]) -> (CodecParameters, Vec<Packet>) {
+    let mut ctx = RuntimeContext::new();
+    for register in registrars {
+        register(&mut ctx);
     }
+    let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let mut demuxer = ctx
+        .containers
+        .open_demuxer(container, Box::new(file), &ctx.codecs)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let stream = demuxer
+        .streams()
+        .iter()
+        .find(|s| s.params.media_type == MediaType::Video)
+        .unwrap_or_else(|| panic!("{}: no video stream", path.display()))
+        .clone();
+    let mut packets = Vec::new();
+    while let Ok(packet) = demuxer.next_packet() {
+        if packet.stream_index == stream.index {
+            packets.push(packet);
+        }
+    }
+    assert!(!packets.is_empty(), "{}: no video packets", path.display());
+    (stream.params, packets)
+}
+
+fn wmv_decoder(params: &CodecParameters) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
+    let mut ctx = RuntimeContext::new();
+    codec_wmv::register(&mut ctx);
+    ctx.codecs.first_decoder(params)
+}
+
+/// Feeds the stream's packets in order, cycling, to one decoder and mutates
+/// about half of them until `MUTATIONS` mutated packets went through, so
+/// pictures predict from damaged references. Now and then the decoder is
+/// flushed and decoding restarts from wherever the stream is.
+fn fuzz_packets(name: &'static str, params: CodecParameters, packets: Vec<Packet>, seed: u64) {
+    guarded(name, move |tick| {
+        let mut decoder = wmv_decoder(&params).unwrap_or_else(|e| panic!("{name}: no decoder: {e}"));
+        let mut rng = Rng(seed);
+        let mut mutated = 0;
+        let mut fed = 0;
+        while mutated < MUTATIONS {
+            let mut packet = packets[fed % packets.len()].clone();
+            fed += 1;
+            if rng.below(2) == 0 {
+                mutate(&mut rng, &mut packet.data);
+                mutated += 1;
+            }
+            let _ = decoder.send_packet(&packet);
+            while decoder.receive_frame().is_ok() {}
+            if rng.below(97) == 0 {
+                let _ = decoder.flush();
+                while decoder.receive_frame().is_ok() {}
+            }
+            tick(fed);
+        }
+    });
+}
+
+/// Opens `MUTATIONS` decoders on mutated extradata (and, for a quarter of
+/// them, random frame sizes) and decodes the stream's first packets.
+fn fuzz_params(name: &'static str, params: CodecParameters, packets: Vec<Packet>, seed: u64) {
+    guarded(name, move |tick| {
+        let mut rng = Rng(seed);
+        for step in 0..MUTATIONS {
+            let mut p = params.clone();
+            if p.extradata.is_empty() || rng.below(2) == 0 {
+                p.extradata = (0..rng.below(8)).map(|_| rng.next() as u8).collect();
+            } else {
+                mutate(&mut rng, &mut p.extradata);
+            }
+            if rng.below(4) == 0 {
+                p.width = Some(rng.below(800) as u32);
+                p.height = Some(rng.below(600) as u32);
+            }
+            if let Ok(mut decoder) = wmv_decoder(&p) {
+                for packet in packets.iter().take(3) {
+                    let _ = decoder.send_packet(packet);
+                    while decoder.receive_frame().is_ok() {}
+                }
+            }
+            tick(step);
+        }
+    });
+}
+
+/// Demuxes `MUTATIONS` mutated copies of a file with `container`.
+fn fuzz_container(name: &'static str, sample: &str, container: &'static str, seed: u64) {
+    let original = std::fs::read(fate(sample)).unwrap_or_else(|e| panic!("read {sample}: {e}"));
+    guarded(name, move |tick| {
+        let mut ctx = RuntimeContext::new();
+        codec_wmv::register(&mut ctx);
+        let mut rng = Rng(seed);
+        for step in 0..MUTATIONS {
+            let mut data = original.clone();
+            mutate(&mut rng, &mut data);
+            if let Ok(mut demuxer) =
+                ctx.containers.open_demuxer(container, Box::new(std::io::Cursor::new(data)), &ctx.codecs)
+            {
+                while demuxer.next_packet().is_ok() {}
+            }
+            tick(step);
+        }
+    });
+}
+
+#[test]
+fn wmv2_packets_never_panic() {
+    let (params, packets) =
+        video_packets(&fate("wmv8/wmv8_x8intra.wmv"), "asf", &[codec_wmv::register, demux_asf::register]);
+    fuzz_packets("wmv2 packets", params, packets, 0x5747_0002_0000_0001);
+}
+
+#[test]
+fn wmv2_extradata_never_panics() {
+    let (params, packets) =
+        video_packets(&fate("wmv8/wmv8_x8intra.wmv"), "asf", &[codec_wmv::register, demux_asf::register]);
+    fuzz_params("wmv2 extradata", params, packets, 0x5747_0002_0000_0002);
+}
+
+#[test]
+fn msmpeg4v1_packets_never_panic() {
+    let (params, packets) = video_packets(
+        &fate("msmpeg4v1/mpg4.avi"),
+        "avi",
+        &[codec_wmv::register, oxideav_avi::__oxideav_entry],
+    );
+    fuzz_packets("msmpeg4v1 packets", params, packets, 0x4D50_0001_0000_0001);
+}
+
+#[test]
+fn msmpeg4v1_params_never_panic() {
+    let (params, packets) = video_packets(
+        &fate("msmpeg4v1/mpg4.avi"),
+        "avi",
+        &[codec_wmv::register, oxideav_avi::__oxideav_entry],
+    );
+    fuzz_params("msmpeg4v1 params", params, packets, 0x4D50_0001_0000_0002);
+}
+
+#[test]
+fn msmpeg4v3_packets_never_panic() {
+    let (params, packets) =
+        video_packets(&fate("asf/bug821-2.asf"), "asf", &[codec_wmv::register, demux_asf::register]);
+    fuzz_packets("msmpeg4v3 packets", params, packets, 0x4D50_0003_0000_0001);
+}
+
+#[test]
+fn msmpeg4v2_packets_never_panic() {
+    let path = encoded_sample("fuzz_msmpeg4v2", "176x144", &["-c:v", "msmpeg4v2", "-qscale:v", "10"]);
+    let (params, packets) = video_packets(&path, "avi", &[codec_wmv::register, oxideav_avi::__oxideav_entry]);
+    fuzz_packets("msmpeg4v2 packets", params, packets, 0x4D50_0002_0000_0001);
+}
+
+#[test]
+fn wmv1_packets_never_panic() {
+    let path = encoded_sample("fuzz_wmv1", "176x144", &["-c:v", "wmv1", "-b:v", "100k"]);
+    let (params, packets) = video_packets(&path, "avi", &[codec_wmv::register, oxideav_avi::__oxideav_entry]);
+    fuzz_packets("wmv1 packets", params, packets, 0x5747_0001_0000_0001);
+}
+
+#[test]
+fn vc1test_container_never_panics() {
+    fuzz_container("vc1test container", "vc1/SMM0005.rcv", "vc1test", 0x1234_5678_9ABC_DEF0);
+}
+
+#[test]
+fn vc1_container_never_panics() {
+    fuzz_container("vc1 container", "vc1/SA00040.vc1", "vc1", 0xCAFE_BABE_DEAD_BEEF);
 }

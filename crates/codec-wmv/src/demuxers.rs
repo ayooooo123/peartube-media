@@ -5,9 +5,14 @@
 use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
-    MediaType, Packet, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo,
+    Packet, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo,
     TimeBase, PROBE_SCORE_EXTENSION,
 };
+
+/// Codec id of the VC-1 Advanced Profile streams the `vc1` demuxer emits.
+pub const CODEC_ID_VC1: &str = "vc1";
+/// Codec id of the WMV3 (VC-1 Simple/Main) streams in `.rcv` files.
+pub const CODEC_ID_WMV3: &str = "wmv3";
 
 // ───────────────────────── VC-1 Test Format (.rcv) ─────────────────────────
 
@@ -29,7 +34,6 @@ pub fn probe_vc1test(probe: &ProbeData) -> ProbeScore {
 pub struct Vc1TestDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    duration: u32,
     fps: u32,
     pts: i64,
 }
@@ -72,7 +76,7 @@ impl Vc1TestDemuxer {
             TimeBase::new(1, fps as i64)
         };
 
-        let mut params = CodecParameters::video(CodecId::new("wmv3"));
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_WMV3));
         params.width = Some(width);
         params.height = Some(height);
         params.extradata = extradata;
@@ -88,7 +92,6 @@ impl Vc1TestDemuxer {
         Ok(Self {
             input,
             streams: vec![stream],
-            duration: frames,
             fps,
             pts: 0,
         })
@@ -247,7 +250,7 @@ impl Vc1Demuxer {
         }
 
         let time_base = TimeBase::new(1, 25);
-        let mut params = CodecParameters::video(CodecId::new("vc1"));
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_VC1));
         params.width = width;
         params.height = height;
 

@@ -1,15 +1,14 @@
-//! Pure-Rust **MS-MPEG-4 v1/v2/v3 / WMV1 / WMV2 / WMV3 / VC-1** video
-//! decoders and the raw VC-1 (`vc1`) / RCV (`vc1test`) demuxers.
+//! Pure-Rust **MS-MPEG-4 v1/v2/v3 / WMV1 / WMV2** video decoders and the raw
+//! VC-1 (`vc1`) / RCV (`vc1test`) demuxers.
 //!
 //! Ported from FFmpeg commit 2da55bf (libavcodec): `wmv2dec.c`, `wmv2dsp.c`,
 //! `intrax8.c`, `intrax8dsp.c`, `intrax8huf.h`, `msmpeg4dec.c`, `msmpeg4.c`,
 //! `msmpeg4data.c`, `msmpeg4_vc1_data.c`, `h263dec.c`, `h263.c`,
 //! `h263dsp.c`, `ituh263dec.c`, `mpeg4videodec.c`, `mpegvideo.c`,
 //! `mpegvideo_dec.c`, `mpegvideo_motion.c`, `hpeldsp.c`,
-//! `simple_idct_template.c`, `simple_idct.c`, `vlc.c`, `rl.c`, `vc1dec.c`,
-//! `vc1.c`, `vc1_block.c`, `vc1_loopfilter.c`, `vc1_mc.c`, `vc1_pred.c`,
-//! `vc1dsp.c`, `vc1data.c`, `vc1_parser.c`; (libavformat) `vc1dec.c`,
-//! `vc1test.c`. LGPL-2.1-or-later; see LICENSE.
+//! `simple_idct_template.c`, `simple_idct.c`, `vlc.c`, `rl.c`,
+//! `get_bits.h`, `vc1_parser.c`; (libavformat) `vc1dec.c`, `vc1test.c`.
+//! LGPL-2.1-or-later; see LICENSE.
 //!
 //! Every byte comes from untrusted peers: `#![forbid(unsafe_code)]`, checked
 //! arithmetic at bitstream-derived indices, `Error::InvalidData` instead of
@@ -23,15 +22,14 @@ mod bits;
 mod idct;
 mod mpv;
 mod msmpeg4;
-mod vc1;
 mod vlc;
 mod wmv2;
 mod x8;
 
 pub mod demuxers;
 
+pub use demuxers::{CODEC_ID_VC1, CODEC_ID_WMV3};
 pub use msmpeg4::{CODEC_ID_MSMPEG4V1, CODEC_ID_MSMPEG4V2, CODEC_ID_MSMPEG4V3, CODEC_ID_WMV1, CODEC_ID_WMV2};
-pub use vc1::{CODEC_ID_VC1, CODEC_ID_WMV3};
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, PixelFormat};
 
@@ -60,7 +58,7 @@ fn video_info(id: &'static str, implementation: &'static str) -> CodecInfo {
         .with_resolution_priority(RESOLUTION_PRIORITY)
 }
 
-/// Register the WMV/VC-1 decoder family with the codec registry.
+/// Register the MS-MPEG-4 v1/v2/v3, WMV1 and WMV2 decoders.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     use msmpeg4::{MsDecoder, MsVersion};
     // MS-MPEG-4 v1/v2/v3: the same FourCCs FFmpeg's riff.c maps.
@@ -102,22 +100,6 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         video_info(CODEC_ID_WMV2, "wmv2_sw")
             .decoder(|p| Ok(Box::new(MsDecoder::new(p, MsVersion::Wmv2)?)))
             .tags([CodecTag::fourcc(b"WMV2"), CodecTag::fourcc(b"GXVE")]),
-    );
-    // WMV3: FourCC 'WMV3' (Simple/Main profile; extradata = sequence header).
-    reg.register(
-        video_info(CODEC_ID_WMV3, "wmv3_sw")
-            .decoder(|p| Ok(Box::new(vc1::Vc1Decoder::new_wmv3(p)?)))
-            .tag(CodecTag::fourcc(b"WMV3")),
-    );
-    // VC-1 Advanced: FourCC 'WVC1'/'WMVA', Matroska "V_VC1", MP4 'vc-1'.
-    reg.register(
-        video_info(CODEC_ID_VC1, "vc1_sw")
-            .decoder(|p| Ok(Box::new(vc1::Vc1Decoder::new_vc1(p)?)))
-            .tags([
-                CodecTag::fourcc(b"WVC1"),
-                CodecTag::fourcc(b"WMVA"),
-                CodecTag::fourcc(b"VC-1"),
-            ]),
     );
 }
 

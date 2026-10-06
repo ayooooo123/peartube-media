@@ -157,40 +157,24 @@ pub struct RlVlcElem {
 /// `RLTable` with its per-qscale RL-VLC tables (`ff_rl_init` +
 /// `ff_rl_init_vlc`).
 pub struct RlTable {
-    pub n: usize,
-    pub last: usize,
-    pub table_run: &'static [i8],
-    pub table_level: &'static [i8],
     /// `max_level[last][run]`.
     pub max_level: [[i8; 65]; 2],
     /// `max_run[last][level]`.
     pub max_run: [[i8; 128]; 2],
-    /// `index_run[last][run]`.
-    pub index_run: [[u8; 65]; 2],
     pub vlc: Vlc,
     /// `rl_vlc[q]` for q = 0..32 (same layout as `vlc.table`).
     pub rl_vlc: Vec<Vec<RlVlcElem>>,
 }
 
 impl RlTable {
-    pub fn new(
-        n: usize,
-        last: usize,
-        table_vlc: &[[u16; 2]],
-        table_run: &'static [i8],
-        table_level: &'static [i8],
-    ) -> RlTable {
+    pub fn new(n: usize, last: usize, table_vlc: &[[u16; 2]], table_run: &[i8], table_level: &[i8]) -> RlTable {
         let mut max_level = [[0i8; 65]; 2];
         let mut max_run = [[0i8; 128]; 2];
-        let mut index_run = [[n as u8; 65]; 2];
         for l in 0..2 {
             let (start, end) = if l == 0 { (0, last) } else { (last, n) };
             for i in start..end {
                 let run = table_run[i] as usize;
                 let level = table_level[i] as usize;
-                if index_run[l][run] as usize == n {
-                    index_run[l][run] = i as u8;
-                }
                 if table_level[i] > max_level[l][run] {
                     max_level[l][run] = table_level[i];
                 }
@@ -229,7 +213,7 @@ impl RlTable {
             }
             rl_vlc.push(t);
         }
-        RlTable { n, last, table_run, table_level, max_level, max_run, index_run, vlc, rl_vlc }
+        RlTable { max_level, max_run, vlc, rl_vlc }
     }
 
     /// `GET_RL_VLC` with `rl_vlc[q]`: returns (level, run, consumed len>=0).

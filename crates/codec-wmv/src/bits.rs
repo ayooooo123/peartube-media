@@ -2,6 +2,9 @@
 //! the end of the buffer return zero bits (FFmpeg's zeroed input padding)
 //! while the position keeps advancing, so `bits_left()` goes negative
 //! exactly like `get_bits_left()`.
+//!
+//! Ported from FFmpeg commit 2da55bf `libavcodec/get_bits.h`
+//! (LGPL-2.1-or-later).
 
 #[derive(Clone)]
 pub struct BitReader<'a> {
@@ -34,12 +37,6 @@ impl<'a> BitReader<'a> {
     #[inline]
     pub fn position(&self) -> i64 {
         self.bit
-    }
-
-    /// Size of the buffer in bits.
-    #[inline]
-    pub fn size_in_bits(&self) -> i64 {
-        self.data.len() as i64 * 8
     }
 
     /// `get_bits_left` (negative after an overread).
@@ -109,35 +106,6 @@ impl<'a> BitReader<'a> {
             0
         } else {
             1 + self.read_bit()
-        }
-    }
-
-    /// `decode210`: 1 -> 0, 01 -> 1, 00 -> 2.
-    #[inline]
-    pub fn decode210(&mut self) -> u32 {
-        if self.read_bit() != 0 {
-            0
-        } else {
-            2 - self.read_bit()
-        }
-    }
-
-    /// `get_unary(gb, stop, len)`: counts bits until one equal to `stop`
-    /// (consumed) or until `len` bits were read.
-    #[inline]
-    pub fn get_unary(&mut self, stop: u32, len: u32) -> u32 {
-        let mut i = 0;
-        while i < len && self.read_bit() != stop {
-            i += 1;
-        }
-        i
-    }
-
-    /// `align_get_bits`.
-    pub fn align(&mut self) {
-        let r = (self.bit & 7) as u32;
-        if r != 0 {
-            self.skip(8 - r);
         }
     }
 }

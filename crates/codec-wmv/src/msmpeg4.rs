@@ -1525,10 +1525,6 @@ impl MsDecoder {
             }
         }
     }
-
-    pub(crate) fn edge_bufs(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
-        (&mut self.edge_buf, &mut self.edge_buf_c)
-    }
 }
 
 /// `ROUNDED_DIV`.

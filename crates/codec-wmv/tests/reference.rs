@@ -1,6 +1,9 @@
-use std::fs::File;
-use refcheck::fate;
+mod common;
+
+use common::encoded_sample;
 use oxideav_core::RuntimeContext;
+use refcheck::fate;
+use std::fs::File;
 
 #[test]
 fn test_registration() {
@@ -10,8 +13,6 @@ fn test_registration() {
     // Verify all registered codec IDs
     assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("wmv1")));
     assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("wmv2")));
-    assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("wmv3")));
-    assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("vc1")));
     assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("msmpeg4v1")));
     assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("msmpeg4v2")));
     assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("msmpeg4v3")));
@@ -229,22 +230,6 @@ fn msmpeg4v1_mpg4_avi_matches_ffmpeg() {
 #[test]
 fn msmpeg4v3_asf_matches_ffmpeg() {
     check_video("asf/bug821-2.asf", &[codec_wmv::register, demux_asf::register], &["-idct", "simple"]);
-}
-
-/// Encodes a moving test pattern with FFmpeg's own encoder into AVI, the way
-/// FATE's `vsynth` tests produce their WMV1 / MS-MPEG-4 v2 samples (the FATE
-/// suite has no such files). Returns the path of the encoded sample.
-fn encoded_sample(name: &str, size: &str, codec_args: &[&str]) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("codec-wmv-reference");
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let out = dir.join(format!("{name}.avi"));
-    let src = format!("testsrc2=size={size}:rate=25");
-    let mut args = vec!["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", &src, "-frames:v", "40"];
-    args.extend_from_slice(codec_args);
-    args.extend_from_slice(&["-flags", "+bitexact", "-fflags", "+bitexact", out.to_str().unwrap()]);
-    let st = std::process::Command::new("ffmpeg").args(&args).status().expect("ffmpeg must be on PATH");
-    assert!(st.success(), "ffmpeg encode of {name} failed");
-    out
 }
 
 /// WMV1, CIF, fixed quantiser (`fate-vsynth*-wmv1` settings).
