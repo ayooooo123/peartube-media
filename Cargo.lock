@@ -155,6 +155,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-wma"
+version = "0.1.0"
+dependencies = [
+ "demux-asf",
+ "oxideav-core",
+ "oxideav-wma",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-wmv"
 version = "0.1.0"
 dependencies = [
@@ -174,6 +184,7 @@ dependencies = [
  "codec-mlp",
  "codec-ra",
  "codec-rv",
+ "codec-wma",
  "codec-wmv",
  "demux-asf",
  "demux-misc",
