@@ -8,13 +8,19 @@ from git. Run after `./scripts/update-crates.sh` in the clone:
 
     python3 scripts/pin-oxideav.py ~/projects/oxideav
 
-A crate forked to ayooooo123/oxideav-<name> is pinned to the fork when the
-clone's `origin` points there.
+Crates forked to ayooooo123/oxideav-<name> are pinned to the fork: a
+checkout at ~/projects/oxideav-forks/<name> wins over the workspace clone,
+and is pinned at its HEAD, which must be pushed.
 """
 import pathlib, re, subprocess, sys, tomllib
 
 root = pathlib.Path(__file__).resolve().parent.parent
 clone = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "~/projects/oxideav").expanduser() / "crates"
+forks = pathlib.Path("~/projects/oxideav-forks").expanduser()
+
+def checkout(name):
+    fork = forks / name
+    return fork if (fork / "Cargo.toml").is_file() else clone / name
 
 def oxideav_deps(manifest):
     data = tomllib.loads(manifest.read_text())
@@ -38,7 +44,7 @@ while pending:
     if name in seen:
         continue
     seen.add(name)
-    manifest = clone / name / "Cargo.toml"
+    manifest = checkout(name) / "Cargo.toml"
     if not manifest.is_file():
         sys.exit(f"{name}: not in {clone}; run update-crates.sh there")
     data = tomllib.loads(manifest.read_text())
@@ -49,7 +55,7 @@ while pending:
 
 lines = ["[patch.crates-io]"]
 for name in sorted(seen):
-    repo = clone / name
+    repo = checkout(name)
     rev = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
     url = subprocess.check_output(["git", "-C", repo, "remote", "get-url", "origin"], text=True).strip()
     url = url.removesuffix(".git")

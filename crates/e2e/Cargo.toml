@@ -1,0 +1,18 @@
+[package]
+name = "e2e"
+description = "Corpus runner: plays every corpus file through the headless backend and checks it against FFmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+player = { path = "../player" }
+codecs = { path = "../codecs" }
+refcheck = { path = "../refcheck" }
+oxideav-core.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+md5 = "0.7"
+libc = "0.2"
