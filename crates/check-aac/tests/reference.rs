@@ -146,17 +146,12 @@ fn reference_known_gap_samples() {
 /// Keep the raw FD PCM and container presentation trim separate. These
 /// assertions verify the exact untrimmed length and compare every presented
 /// sample, including the first block; no codec startup region is omitted.
-/// FFmpeg 2da55bf parses AudioPreRoll as fill, so xhe_target_level is
-/// compared with its AU0 pre-roll payload removed; the fork's primed
-/// production output is verified separately in `tests/usac_tools.rs`.
+/// xhe_target_level is compared unmodified: while the fork's AudioPreRoll
+/// priming diverges from FFmpeg (which never primes), this test is red.
 #[test]
 fn reference_usac_samples() {
     for &(rel, initial_skip, final_padding, floor) in check_aac::USAC_SAMPLES {
-        let (ours, path, channels) = if rel.ends_with("xhe_target_level.m4a") {
-            check_aac::decoded_usac(rel, 0, true)
-        } else {
-            decoded_f32(rel)
-        };
+        let (ours, path, channels) = decoded_f32(rel);
         let ff = refcheck::ffmpeg_audio_f32(&path, 0);
         let start = initial_skip * channels as usize;
         let end_padding = final_padding * channels as usize;
@@ -197,7 +192,7 @@ fn reference_usac_loudness_targets() {
         ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -31, "aac/usac/Ext_2_c1_Ln_0x03__Lou-31.s16", 139.325931),
         ("aac/usac/xhe_target_level.m4a", -24, "aac/usac/xhe_target_level.s16", 138.133034),
     ] {
-        let (ours, path, channels) = check_aac::decoded_usac(rel, target, rel.ends_with("xhe_target_level.m4a"));
+        let (ours, path, channels) = check_aac::decoded_usac_target(rel, target);
         let reference = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-nostdin", "-target_level", &target.to_string(), "-i"])
             .arg(&path)

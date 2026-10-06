@@ -6,8 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use oxideav_core::bits::{BitReader, BitWriter};
-use oxideav_core::{CodecParameters, Decoder, Frame, MediaType, Packet, SampleFormat, TimeBase};
+use oxideav_core::{CodecParameters, Decoder, Frame, MediaType, Packet, SampleFormat};
 
 /// Decode an `aac.mak` FATE sample through the fork behind OxideAV's
 /// `mov` / `mp4` / `mpegts` containers and convert every audio frame to
@@ -118,46 +117,16 @@ pub fn decode_one(decoder: &mut Box<dyn Decoder>, packet: &Packet) -> oxideav_co
     }
 }
 
-/// `au` (for a configuration whose first element is AudioPreRoll with an
-/// explicit payload length) with that payload removed. FFmpeg 2da55bf parses
-/// AudioPreRoll as a fill element, so this is the input it effectively
-/// decodes.
-pub fn strip_preroll(au: &[u8]) -> Vec<u8> {
-    let mut r = BitReader::new(au);
-    let mut w = BitWriter::new();
-    w.write_u32(r.read_u32(1).unwrap(), 1);
-    if r.read_bit().unwrap() {
-        assert!(!r.read_bit().unwrap(), "AudioPreRoll uses an explicit length");
-        let mut length = r.read_u32(8).unwrap();
-        if length == 255 {
-            length += r.read_u32(16).unwrap() - 2;
-        }
-        r.skip(length * 8).unwrap();
-    }
-    w.write_u32(0, 1);
-    while r.bits_remaining() > 0 {
-        let n = r.bits_remaining().min(32) as u32;
-        w.write_u32(r.read_u32(n).unwrap(), n);
-    }
-    w.finish()
-}
-
-/// Decode a USAC MP4 with optional loudness normalization (`target` 0 is
-/// off). With `strip`, AudioPreRoll payloads are removed first (FFmpeg's
-/// effective input); otherwise the packets are decoded as delivered. The
-/// output remains untrimmed: tests assert presentation bounds themselves.
-pub fn decoded_usac(rel: &str, target: i32, strip: bool) -> (Vec<f32>, std::path::PathBuf, u16) {
+/// Decode a USAC MP4's unmodified packets with FFmpeg-compatible optional
+/// loudness normalization (`target` 0 is off). The output remains untrimmed:
+/// tests assert presentation bounds themselves.
+pub fn decoded_usac_target(rel: &str, target: i32) -> (Vec<f32>, std::path::PathBuf, u16) {
     let (mut params, packets) = usac_packets(rel);
     params.options.insert("target_level", target.to_string());
     let mut decoder = aac_decoder(&params);
     let mut pcm = Vec::new();
     for packet in &packets {
-        let decoded = if strip {
-            decode_one(&mut decoder, &Packet::new(0, TimeBase::new(1, 48000), strip_preroll(&packet.data)))
-        } else {
-            decode_one(&mut decoder, packet)
-        };
-        pcm.extend(decoded.unwrap_or_else(|e| panic!("{rel}: packet {:?}: {e}", packet.pts)));
+        pcm.extend(decode_one(&mut decoder, packet).unwrap_or_else(|e| panic!("{rel}: packet {:?}: {e}", packet.pts)));
     }
     let channels = decoder.output_audio_format().unwrap().channels;
     (pcm, refcheck::fate(rel), channels)

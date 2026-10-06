@@ -169,12 +169,12 @@ fn usac_tool_coverage() {
     }
 }
 
-/// xhe_target_level's AU0 pre-roll AU is non-silent and the stream uses
-/// noise filling, so priming (which also advances the noise generator)
-/// makes the production output differ from FFmpeg, which skips AudioPreRoll.
-/// The FFmpeg comparison in `reference.rs` therefore removes the payload; here
-/// the production output must be exactly the continuous decode of the
-/// encoder's pre-roll AU followed by the stream.
+/// Priming mechanics on the only real AudioPreRoll stream: production output
+/// must equal continuous decoding of the encoder's pre-roll AU followed by the
+/// stream. This checks our decoder against itself; it is not an oracle for
+/// standards-correct output. The SNR against FFmpeg (which never primes) is
+/// printed for the record; the unmodified comparison in `reference.rs` is the
+/// acceptance check.
 #[test]
 fn usac_xhe_primed_production_output() {
     let rel = "aac/usac/xhe_target_level.m4a";
@@ -201,7 +201,6 @@ fn usac_xhe_primed_production_output() {
     let snr = refcheck::snr_db(&ff, presented, 0);
     let first = refcheck::snr_db(&ff[..2048], &presented[..2048], 0);
     eprintln!("{rel}: primed production vs FFmpeg (unprimed): SNR {snr:.6} dB, AU0 {first:.6} dB");
-    assert!(snr < 138.516260, "priming must change the output relative to FFmpeg");
 }
 
 #[test]
