@@ -10,9 +10,6 @@
 //! The differences still listed, all in packet assembly inherited from
 //! upstream oxideav-mkv c0966a6:
 //!
-//! * `key`: every `SimpleBlock` packet is flagged a keyframe, whatever the
-//!   Block's keyframe bit (FFmpeg follows the bit; TrueHD's are set by its
-//!   parser).
 //! * `dts`: always equal to pts; FFmpeg derives dts for reordered video.
 //! * `pts`: FFmpeg subtracts a track's `CodecDelay` (Opus, AAC, AC-3,
 //!   E-AC-3), spreads the frames of a laced Block over its duration, applies
@@ -25,7 +22,9 @@
 //!   doesn't open.
 //!
 //! Fixed by the fork so far: `ContentEncodings` compression (zlib, bzip2,
-//! LZO1X) is undone.
+//! LZO1X) is undone, and keyframe flags follow FFmpeg's rule (the Block's
+//! signal read through the codec's parser; intra-only codecs and subtitles
+//! always keyframes).
 //!
 //! `CHECK_MKV_RECORD=1` prints the rows instead of asserting them.
 
@@ -38,26 +37,26 @@ use check_mkv::{Pkt, corpus_samples, ffprobe_packets, our_packets, FATE_SAMPLES}
 /// are `fate:<path>` (FATE suite) or `gen:<file>` (generated corpus).
 const EXPECTED: &[(&str, &str, &str)] = &[
     ("fate:audiomatch/tones_opus_48000_stereo.mka", "216e9abcbadc3727322ddf46a419f7f7", "s0: pts 101/101, dts 101/101"),
-    ("fate:filter/242_4.mkv", "3cfc5a1b98bdb5797a19555169d0fd36", "s0: dts 156/207, key 205/207"),
-    ("fate:filter/anim.mkv", "441606bf5f2ba654cd807310e45cddea", "s0: key 69/71"),
-    ("fate:h264-high-depth/high-qp.mkv", "0ca405b1f9896fdeeebd3ea84534d5c1", "s0: dts 4/5, key 4/5"),
-    ("fate:h264/H264_might_overflow.mkv", "de6b5e3247775b3b09190657111ad6f1", "s0: dts 5/5, key 4/5"),
-    ("fate:h264/direct-bff.mkv", "fb9c049d144b89176fadf7e2a549edd8", "error: I/O error: EBML: short read (40783 of 72756 bytes); s0: dts 7/11, key 10/11"),
-    ("fate:h264/dts_5frames.mkv", "9ab5a4245f0a62f75305414016f4b525", "s0: key 4/5"),
+    ("fate:filter/242_4.mkv", "fe9870c78a57567b3481324d3473ce14", "s0: dts 156/207"),
+    ("fate:filter/anim.mkv", "eca1c83f2ba1860d623ba712260ffd98", ""),
+    ("fate:h264-high-depth/high-qp.mkv", "eda9bf16dd7b2e2ba27f6763af108607", "s0: dts 4/5"),
+    ("fate:h264/H264_might_overflow.mkv", "1a5fe0ebc5bacb77531cf92f43974078", "s0: dts 5/5"),
+    ("fate:h264/direct-bff.mkv", "62fcb3d28c660abce0dad88bb52b168a", "error: I/O error: EBML: short read (40783 of 72756 bytes); s0: dts 7/11"),
+    ("fate:h264/dts_5frames.mkv", "3f65f4cc6406cd411df5c86081fad640", ""),
     ("fate:lcevc/L_AV1_854x480p_8bit8bit_2D_dd.mkv", "e85e69f88d9f26c37d412ed0b47317df", ""),
-    ("fate:mkv/1242-small.mkv", "29588a8acb94cdf8c12f1fdae23117e1", "error: I/O error: EBML: short read (8172 of 10371 bytes); s0: pts 19/24, dts 19/24; s1: dts 9/12, key 9/12"),
+    ("fate:mkv/1242-small.mkv", "39b2bc46f73c7af5ff8a16429932d25f", "error: I/O error: EBML: short read (8172 of 10371 bytes); s0: pts 19/24, dts 19/24; s1: dts 9/12"),
     ("fate:mkv/codec_delay_opus.mkv", "069fb8a5a4442f91ed694c1eae72e0e2", "s0: pts 52/52, dts 52/52"),
     ("fate:mkv/dovi-p7-hvce.mkv", "20159b16147829d750641a51c565cec5", "s0: dts 1/1"),
     ("fate:mkv/flac_channel_layouts.mka", "dd94daf7eec1680477e4b4860f21826d", "s0: pts 9/12, dts 9/12; s1: pts 9/12, dts 9/12"),
     ("fate:mkv/h264_tta_undecodable.mkv", "50c45e3cf82d3d4c515bee1c1b34d07e", ""),
     ("fate:mkv/hdr10_plus_vp9_sample.webm", "9b688956626b0462d60a6bef82657fa0", ""),
-    ("fate:mkv/hdr10tags-both.mkv", "ceabb755a3c50dddcef12f4eaa5cddd4", "s0: dts 7/10, key 9/10"),
+    ("fate:mkv/hdr10tags-both.mkv", "95b1d18f160775dd999dc592bda59b0a", "s0: dts 7/10"),
     ("fate:mkv/lzo.mka", "d9853eb0b6cefb27b5f3dcb5b731c1d9", "s0: pts 3/4, dts 3/4"),
     ("fate:mkv/prores_bz2.mkv", "7939534cb32cb9689cec641efc97a16e", "s0: size 2/2, md5 2/2; s1: size 2/2, md5 2/2"),
     ("fate:mkv/prores_zlib.mkv", "83bed746f96749e5f529b9dfe99bfc27", ""),
-    ("fate:mkv/spherical.mkv", "bf372a12d060c6acd0842d83f8aadb75", "s0: dts 91/120, key 119/120"),
+    ("fate:mkv/spherical.mkv", "4cfc2b30079dbf1213efb236620bb3d1", "s0: dts 91/120"),
     ("fate:mkv/subtitle_zlib.mks", "22c21b4fc1438305ee004859b4ef14f0", ""),
-    ("fate:mkv/test7_cut.mkv", "59a1988a3deb05e21790768d2e49a95f", "error: I/O error: failed to fill whole buffer; s0: count 24/72, dts 13/24, key 23/24; s1: count 48/143, pts 41/48, dts 41/48"),
+    ("fate:mkv/test7_cut.mkv", "49c2e6a8a909cbfbbac3fddf1f152b75", "error: I/O error: failed to fill whole buffer; s0: count 24/72, dts 13/24; s1: count 48/143, pts 41/48, dts 41/48"),
     ("fate:mkv/tts10.mkv", "bd610379cac4715f9b94c46229bb5c5a", "s0: pts 2/5, dts 2/5"),
     ("fate:mkv/wavpack_missing_codecprivate.mka", "9d041a3294ae1117849c718ba9eae665", "s0: pts 1/2, dts 1/2, size 2/2, md5 2/2"),
     ("fate:mkv/xiph_lacing.mka", "21e599087b1a6520f7d5a59c05df81fd", "s0: pts 72/84, dts 72/84"),
@@ -77,35 +76,35 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("fate:opus/testvector11.mka", "0dd5f9308d4ab3123a9daf3c269b03fd", ""),
     ("fate:opus/testvector12.mka", "5e652b60e6c18586c7a123499c36f3dc", ""),
     ("fate:opus/tron.6ch.tinypkts.mka", "87f9969dd823c8c8251a86f84f5f66ab", ""),
-    ("fate:vp3/coeff_level64.mkv", "e1d293613980bc1e1607217b247fe07c", "s0: pts 8/8, dts 8/8, key 7/8"),
-    ("fate:vp8/RRSF49-short.webm", "63c5612afd028e71f2e9b266f8ba4a28", "error: I/O error: EBML: short read (5068 of 39025 bytes); s0: key 110/111"),
+    ("fate:vp3/coeff_level64.mkv", "09dff1d3741c3eacb9bf4253e7a79f72", "s0: pts 8/8, dts 8/8"),
+    ("fate:vp8/RRSF49-short.webm", "a34a96f78dab2ca6bd7415120c1d18aa", "error: I/O error: EBML: short read (5068 of 39025 bytes)"),
     ("fate:vp8/dash_audio1.webm", "e86ab4a217f78e4588b80efa5990a249", ""),
     ("fate:vp8/dash_audio2.webm", "e86ab4a217f78e4588b80efa5990a249", ""),
     ("fate:vp8/dash_audio3.webm", "e86ab4a217f78e4588b80efa5990a249", ""),
-    ("fate:vp8/dash_video1.webm", "3d79284b65f3fa4ff564e3bfaa637dcb", "s0: key 806/812"),
-    ("fate:vp8/dash_video2.webm", "3d79284b65f3fa4ff564e3bfaa637dcb", "s0: key 806/812"),
-    ("fate:vp8/dash_video3.webm", "3d79284b65f3fa4ff564e3bfaa637dcb", "s0: key 806/812"),
-    ("fate:vp8/dash_video4.webm", "83fe9134854f57a53dae6e9f4aa65232", "s0: key 785/812"),
-    ("fate:vp8/frame_size_change.webm", "6d301109508e6b601730d5cefb5c4f74", "s0: key 200/300"),
-    ("fate:vp8_alpha/vp8_video_with_alpha.webm", "5e2df636a13041edebab19c508e09e26", "s0: key 119/120"),
-    ("fate:vp9-test-vectors/vp90-2-2pass-akiyo.webm", "d87bd07c3bd1de527b088ac10714baed", "s0: key 49/50"),
-    ("fate:vp9-test-vectors/vp90-2-segmentation-aq-akiyo.webm", "ccf4d356d6a3a31b5a84fc7a975c2458", "s0: key 24/25"),
-    ("fate:vp9-test-vectors/vp90-2-segmentation-sf-akiyo.webm", "2f1b43a51834c90f5581f78542ea7601", "s0: key 24/25"),
-    ("fate:vp9-test-vectors/vp93-2-20-12bit-yuv422.webm", "15d67b4904374106ff0d292ebfc60614", "s0: key 9/10"),
+    ("fate:vp8/dash_video1.webm", "15b53f6eeee222067ebefa2d8320b8fd", ""),
+    ("fate:vp8/dash_video2.webm", "15b53f6eeee222067ebefa2d8320b8fd", ""),
+    ("fate:vp8/dash_video3.webm", "15b53f6eeee222067ebefa2d8320b8fd", ""),
+    ("fate:vp8/dash_video4.webm", "93bb333fb0549da36263f7fe47747bec", ""),
+    ("fate:vp8/frame_size_change.webm", "bd72121bf420d0203f1e33d1eddf54d6", ""),
+    ("fate:vp8_alpha/vp8_video_with_alpha.webm", "a1fc2c50567995d6be270892c689bf38", ""),
+    ("fate:vp9-test-vectors/vp90-2-2pass-akiyo.webm", "8d54ea905bf2c415326ff99b6d75f32d", ""),
+    ("fate:vp9-test-vectors/vp90-2-segmentation-aq-akiyo.webm", "3497fac02fbc0fb0159d7d095d2506e9", ""),
+    ("fate:vp9-test-vectors/vp90-2-segmentation-sf-akiyo.webm", "b27bb3bece758f2f5a18ef39957b68c5", ""),
+    ("fate:vp9-test-vectors/vp93-2-20-12bit-yuv422.webm", "337e1614dbdc0c57d045b5669e84b77c", ""),
     ("fate:wavpack/special/matroska_mode.mka", "ffde2e434fece23a3b5a9c62496f73a8", "s0: pts 14/22, dts 14/22, size 22/22, md5 22/22"),
-    ("gen:av1_opus.mkv", "6d77990ceac0b1144647bf367bbc63d9", "s0: key 149/150; s1: pts 301/301, dts 301/301"),
-    ("gen:h264_aac.mkv", "c2361518122a672e3e346e5bab5dd825", "s0: key 149/150; s1: pts 283/283, dts 283/283"),
-    ("gen:h264_aac_ass.mkv", "1e530e4088ca123b9e061fb43f31ba46", "s0: key 149/150; s1: pts 283/283, dts 283/283"),
-    ("gen:h264_aac_pgs.mkv", "4e21e93a4a355cdbf269546211ce1b77", "s0: key 149/150"),
-    ("gen:h264_aac_srt.mkv", "c204facb2a77f01fd8d1949a9fe4370c", "s0: key 149/150; s1: pts 283/283, dts 283/283"),
-    ("gen:h264_ac3.mkv", "28eef6c0adadbaa2fd9779f6ec3f3b72", "s0: key 149/150; s1: pts 188/188, dts 188/188"),
-    ("gen:h264_dts.mkv", "94d6052e12f61b7234ce880df5c40788", "s0: key 149/150"),
-    ("gen:h264_eac3.mkv", "e608d12fbfa4f9c2b233beea69d36537", "s0: key 149/150; s1: pts 188/188, dts 188/188"),
-    ("gen:h264_truehd.mkv", "9a7d4d0e0f41887ac840b7ae9ab87ead", "s0: key 149/150; s1: key 6750/7200"),
-    ("gen:hevc10_eac3.mkv", "f80437b2268a16336d1cdd9f8f0f19ff", "s0: dts 113/150, key 149/150; s1: pts 188/188, dts 188/188"),
-    ("gen:video_vp8.webm", "129dbe713882bbcfe67d5361b882fe6c", "s0: key 148/150; s1: pts 283/283, dts 283/283"),
-    ("gen:vp9_opus.webm", "3b1b9b9c8af6e205de4a7c5ef9b75b0e", "s0: key 148/150; s1: pts 301/301, dts 301/301"),
-    ("gen:vp9_opus_vtt.webm", "befc1dadcdfff062d830e98b8ab06127", "s0: key 148/150; s1: pts 301/301, dts 301/301; s2: size 3/3, md5 3/3"),
+    ("gen:av1_opus.mkv", "d1da5a6acbc0092f7d64087e5daac958", "s1: pts 301/301, dts 301/301"),
+    ("gen:h264_aac.mkv", "d9f4c0fbfe0af5d349e64a7c8f8a770c", "s1: pts 283/283, dts 283/283"),
+    ("gen:h264_aac_ass.mkv", "85f2616b489d5a56ea6bb2ab91a43ede", "s1: pts 283/283, dts 283/283"),
+    ("gen:h264_aac_pgs.mkv", "fef76976a1a7558ec665abf9fff9689b", ""),
+    ("gen:h264_aac_srt.mkv", "6ea833600905c10acd4cd4fbed7e49ef", "s1: pts 283/283, dts 283/283"),
+    ("gen:h264_ac3.mkv", "5c0ff6f5b8f8b14c285bbb171ebf5f5a", "s1: pts 188/188, dts 188/188"),
+    ("gen:h264_dts.mkv", "9404097b274a83f5da2385ac2e8c3c0b", ""),
+    ("gen:h264_eac3.mkv", "4dcb9abbd5e83c175ce2b6f370b1dc45", "s1: pts 188/188, dts 188/188"),
+    ("gen:h264_truehd.mkv", "0ccf0d52859df8b0bb3fa946707b1226", ""),
+    ("gen:hevc10_eac3.mkv", "c5372d4047f21cee05e16c5661416e62", "s0: dts 113/150; s1: pts 188/188, dts 188/188"),
+    ("gen:video_vp8.webm", "865477ebc559a6f59af86f9f401947ea", "s1: pts 283/283, dts 283/283"),
+    ("gen:vp9_opus.webm", "2cb8034dbdfebd2b7cd2242e309d4634", "s1: pts 301/301, dts 301/301"),
+    ("gen:vp9_opus_vtt.webm", "d16ec06e04f5760d1140262bc51b4071", "s1: pts 301/301, dts 301/301; s2: size 3/3, md5 3/3"),
 ];
 
 fn samples() -> Vec<(String, PathBuf)> {

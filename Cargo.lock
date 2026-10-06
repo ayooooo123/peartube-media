@@ -1100,7 +1100,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=258eb88d9b44a6fdb86d1f4e867ad121c7d79bdd#258eb88d9b44a6fdb86d1f4e867ad121c7d79bdd"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=fa6d65d5078136b1c8ca92a374f2c5e8a7dc538c#fa6d65d5078136b1c8ca92a374f2c5e8a7dc538c"
 dependencies = [
  "compcol",
  "oxideav-core",
