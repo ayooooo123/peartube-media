@@ -11,6 +11,8 @@ player = { path = "../player" }
 codecs = { path = "../codecs" }
 refcheck = { path = "../refcheck" }
 oxideav-core.workspace = true
+oxideav-subtitle = { workspace = true, features = ["text"] }
+parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

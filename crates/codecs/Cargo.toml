@@ -69,3 +69,4 @@ subs-text = { path = "../subs-text" }
 codec-ra = { path = "../codec-ra" }
 codec-rv = { path = "../codec-rv" }
 codec-wmv = { path = "../codec-wmv" }
+codec-wma = { path = "../codec-wma" }
