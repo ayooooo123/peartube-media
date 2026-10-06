@@ -5,7 +5,8 @@
 //! WMA Pro (Windows Media Audio 9 Professional) decoder.
 
 use crate::bits::BitReader;
-use crate::fft::{vector_fmul_window, ImdctHalf};
+use crate::dsp::vector_fmul_window;
+use crate::fft::Imdct;
 use crate::dsp::sine_window;
 use crate::tables::CRITICAL_FREQS;
 use crate::wma_common::wma_get_frame_len_bits;
@@ -33,32 +34,19 @@ pub const HUFF_VEC4_MAXBITS: u32 = 14;
 pub const HUFF_VEC2_MAXBITS: u32 = 12;
 pub const HUFF_VEC1_MAXBITS: u32 = 11;
 
-/// Build a canonical Huffman table from (symbol, length) pairs
-/// (FFmpeg's `VLC_INIT_FROM_LENGTHS`: codes assigned in table order,
-/// increasing length, MSB-first).
+/// Build a VLC from (symbol, length) pairs (FFmpeg's
+/// `VLC_INIT_FROM_LENGTHS`): codes are assigned in table order, MSB-first,
+/// so the table order must be kept as is.
 fn vlc_from_pairs(pairs: &[(u8, u8)], symbols_offset: i32) -> Result<VlcTable> {
-    let mut lens: Vec<(usize, i32)> = pairs
-        .iter()
-        .map(|&(s, l)| (l as usize, s as i32 + symbols_offset))
-        .filter(|&(l, _)| l > 0)
-        .collect();
-    lens.sort_by_key(|&(l, _)| l);
-    let lengths: Vec<i8> = lens.iter().map(|&(l, _)| l as i8).collect();
-    let symbols: Vec<i32> = lens.iter().map(|&(_, s)| s).collect();
-    VlcTable::from_lengths(&lengths, Some(&symbols), 0)
+    let lengths: Vec<i8> = pairs.iter().map(|&(_, l)| l as i8).collect();
+    let symbols: Vec<i32> = pairs.iter().map(|&(s, _)| s as i32).collect();
+    VlcTable::from_lengths(&lengths, Some(&symbols), symbols_offset)
 }
 
 fn vlc_from_lens_syms(lens: &[u8], syms: &[u16], symbols_offset: i32) -> Result<VlcTable> {
-    let mut rows: Vec<(usize, i32)> = lens
-        .iter()
-        .zip(syms.iter())
-        .map(|(&l, &s)| (l as usize, s as i32 + symbols_offset))
-        .filter(|&(l, _)| l > 0)
-        .collect();
-    rows.sort_by_key(|&(l, _)| l);
-    let lengths: Vec<i8> = rows.iter().map(|&(l, _)| l as i8).collect();
-    let symbols: Vec<i32> = rows.iter().map(|&(_, s)| s).collect();
-    VlcTable::from_lengths(&lengths, Some(&symbols), 0)
+    let lengths: Vec<i8> = lens.iter().map(|&l| l as i8).collect();
+    let symbols: Vec<i32> = syms.iter().map(|&s| s as i32).collect();
+    VlcTable::from_lengths(&lengths, Some(&symbols), symbols_offset)
 }
 
 #[derive(Clone)]
@@ -159,7 +147,7 @@ pub struct WmaProDecoder {
     sf_offsets: [[[i8; MAX_BANDS]; WMAPRO_BLOCK_SIZES]; WMAPRO_BLOCK_SIZES],
     subwoofer_cutoffs: [i32; WMAPRO_BLOCK_SIZES],
     windows: [Vec<f32>; WMAPRO_BLOCK_SIZES],
-    mdcts: Vec<ImdctHalf>,
+    mdcts: Vec<Imdct>,
     tmp: Vec<f32>,
 
     sf_vlc: VlcTable,
@@ -258,7 +246,8 @@ impl WmaProDecoder {
         let log2_max_num_subframes = ((decode_flags & 0x38) >> 3) as usize;
         let max_num_subframes = 1usize << log2_max_num_subframes;
         let max_subframe_len_bit = max_num_subframes == 16 || max_num_subframes == 4;
-        let subframe_len_bits = 32 - (log2_max_num_subframes as u32).leading_zeros();
+        // av_log2(log2_max_num_subframes) + 1, with av_log2(0) == 0.
+        let subframe_len_bits = (log2_max_num_subframes as u32 | 1).ilog2() + 1;
         let num_possible_block_sizes = log2_max_num_subframes + 1;
         let min_samples_per_subframe = samples_per_frame / max_num_subframes;
         let dynamic_range_compression = decode_flags & 0x80 != 0;
@@ -344,7 +333,7 @@ impl WmaProDecoder {
             let scale = 1.0f32
                 / (1u32 << (WMAPRO_BLOCK_MIN_BITS + i as u32 - 1)) as f32
                 / (1u32 << (bits_per_sample - 1)) as f32;
-            mdcts.push(ImdctHalf::new(mdct_len, scale));
+            mdcts.push(Imdct::new(mdct_len, scale as f64));
         }
 
         let sf_vlc = vlc_from_pairs(&SCALE_TABLE, -60)?;
@@ -1097,7 +1086,7 @@ impl WmaProDecoder {
                 let mdct_len = 1usize << (WMAPRO_BLOCK_MIN_BITS + tx_idx as u32);
                 let mut coeffs_copy = self.channel[c].coeffs.clone();
                 let out = &mut self.channel[c].coeffs;
-                self.mdcts[tx_idx].run(&self.tmp[..mdct_len], &mut coeffs_copy[..mdct_len]);
+                self.mdcts[tx_idx].imdct_half(&mut coeffs_copy[..mdct_len], &self.tmp[..mdct_len]);
                 // FFmpeg: tx_fn(tx, coeffs, tmp) — half MDCT output lands at
                 // the first mdct_len floats of coeffs? For the non-FULL mdct
                 // the output is mdct_len samples (the DCT-IV window).

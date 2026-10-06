@@ -28,3 +28,31 @@ pub fn wma_get_frame_len_bits(sample_rate: u32, version: u32, decode_flags: u32)
 
     frame_len_bits
 }
+
+/// `av_log2` (libavutil/common.h): floor(log2(v)), with `av_log2(0) == 0`.
+#[inline]
+pub fn av_log2(v: u32) -> u32 {
+    (v | 1).ilog2()
+}
+
+/// The leading-sample discard of `discard_samples` (libavcodec/decode.c) for
+/// decoders that set `avctx->delay` / `internal->skip_samples`: frames that
+/// `skip` covers are dropped whole, the next one loses its head. Returns
+/// false when the frame is dropped. `bytes_per_sample` is per plane (the
+/// frames are planar).
+pub fn discard_samples(skip: &mut usize, frame: &mut oxideav_core::AudioFrame, bytes_per_sample: usize) -> bool {
+    if *skip == 0 {
+        return true;
+    }
+    let n = frame.samples as usize;
+    if n <= *skip {
+        *skip -= n;
+        return false;
+    }
+    for plane in frame.data.iter_mut() {
+        plane.drain(..*skip * bytes_per_sample);
+    }
+    frame.samples -= *skip as u32;
+    *skip = 0;
+    true
+}
