@@ -1639,6 +1639,7 @@ dependencies = [
  "oxideav-mkv",
  "oxideav-mpegts",
  "oxideav-sub-image",
+ "parking_lot",
  "refcheck",
 ]
 

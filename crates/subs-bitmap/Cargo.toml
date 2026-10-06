@@ -1,10 +1,10 @@
 [package]
 name = "subs-bitmap"
-description = "Bitmap subtitle decoders (DVB, CVD, SVCD/OGT) for peartube-media"
+description = "Bitmap subtitle decoders and demuxers for peartube-media"
 version.workspace = true
 edition.workspace = true
-# Ports FFmpeg libavcodec/dvbsubdec.c (LGPL-2.1-or-later) and VLC
-# modules/codec/cvdsub.c + svcdsub.c (LGPL-2.1-or-later).
+# Ports FFmpeg libavcodec/pgssubdec.c and libavformat/supdec.c
+# (LGPL-2.1-or-later).
 license = "LGPL-2.1-or-later"
 publish.workspace = true
 
@@ -16,3 +16,4 @@ refcheck.workspace = true
 oxideav-sub-image.workspace = true
 oxideav-mkv.workspace = true
 oxideav-mpegts.workspace = true
+parking_lot = "0.12"

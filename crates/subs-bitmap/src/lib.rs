@@ -20,6 +20,13 @@
 //! FFmpeg sources are from commit 2da55bf; each file's header was checked to
 //! be the GNU Lesser General Public License 2.1 or later, hence this crate's
 //! licence.
+//!
+//! Reference tests compare complete PGS canvases and their timing with
+//! FFmpeg through SUP, Matroska and M2TS. The mutation suite exercises 2400
+//! seeded packet mutations each for SUP and both Matroska remux layouts,
+//! including truncations and header/RLE bit flips in decoder context. After
+//! every mutation, reset and the complete original stream must again decode
+//! to FFmpeg's exact timestamps, durations and RGBA canvases.
 
 #![forbid(unsafe_code)]
 
