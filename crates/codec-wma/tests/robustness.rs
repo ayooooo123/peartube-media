@@ -119,6 +119,12 @@ fn no_panic_on_truncated_and_bit_flipped_wmalossless() {
     mutate_and_feed("lossless-audio/luckynight-partial.wma", 0x5EED_1234_ABCD_0001);
 }
 
+/// The 24-bit path, whose last frame runs past its saved bits.
+#[test]
+fn no_panic_on_truncated_and_bit_flipped_wmalossless_24bit() {
+    mutate_and_feed("lossless-audio/Mega_Weird_Audio_Test_24bit.wma", 0x5EED_1234_ABCD_0024);
+}
+
 #[test]
 fn no_panic_on_truncated_and_bit_flipped_wmapro() {
     mutate_and_feed("wmapro/Beethovens_9th-1_small.wma", 0x5EED_5678_0000_0042);
@@ -127,6 +133,12 @@ fn no_panic_on_truncated_and_bit_flipped_wmapro() {
 #[test]
 fn no_panic_on_truncated_and_bit_flipped_wmavoice() {
     mutate_and_feed("wmavoice/streaming_CBR-7K.wma", 0x5EED_9ABC_DEAD_BEEF);
+}
+
+/// 16 kHz with 16 LSPs: other pitch ranges and LSP tables than 7K.
+#[test]
+fn no_panic_on_truncated_and_bit_flipped_wmavoice_19k() {
+    mutate_and_feed("wmavoice/streaming_CBR-19K.wma", 0x5EED_9ABC_DEAD_0019);
 }
 
 #[test]

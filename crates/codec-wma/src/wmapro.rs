@@ -13,8 +13,7 @@
 //! inverse quantized, transformed with an IMDCT and overlap-added with a
 //! sine window.
 
-use std::collections::VecDeque;
-
+use crate::decode_loop::{Call, DecodeCallback, DecodeLoop};
 use crate::fft::{sine_window, vector_fmul_window_inplace, Imdct};
 use crate::getbits::{GetBits, GetBitsState, PutBits};
 use crate::vlc::VlcTable;
@@ -211,8 +210,6 @@ pub struct WmaProDecoder {
     frame_offset: usize,
     packet_loss: bool,
     packet_done: bool,
-    /// Set by `flush` (end of stream), cleared by `reset`.
-    eof: bool,
 
     // frame decode state
     /// `s->gb`: the reader over the reservoir in `frame_data`.
@@ -235,7 +232,7 @@ pub struct WmaProDecoder {
     chgroup: [ChannelGrp; WMAPRO_MAX_CHANNELS],
     channel: Vec<ChannelCtx>,
 
-    pending: VecDeque<AudioFrame>,
+    lp: DecodeLoop,
 }
 
 impl WmaProDecoder {
@@ -430,7 +427,6 @@ impl WmaProDecoder {
             // frame info
             packet_loss: true,
             packet_done: false,
-            eof: false,
             gb: GetBitsState::default(),
             buf_bit_size: 0,
             // skip first frame
@@ -447,7 +443,7 @@ impl WmaProDecoder {
             num_chgroups: 0,
             chgroup: Default::default(),
             channel,
-            pending: VecDeque::new(),
+            lp: DecodeLoop::new(false),
         })
     }
 
@@ -1407,34 +1403,6 @@ impl WmaProDecoder {
         Some(gb.bits_count() >> 3)
     }
 
-    /// FFmpeg's decode loop over one packet: `decode_packet` runs on the
-    /// unread rest until it consumes everything or fails (the rest is then
-    /// dropped). Frames come out even alongside an error, as with FFmpeg.
-    fn decode_packet_loop(&mut self, data: &[u8]) {
-        let mut data = data;
-        let mut stalls = 0;
-        while !data.is_empty() {
-            let mut frame = None;
-            let res = self.decode_packet(data, &mut frame);
-            let got_frame = frame.is_some();
-            if let Some(f) = frame {
-                self.pending.push_back(f);
-            }
-            let Some(consumed) = res else { break };
-            if consumed >= data.len() {
-                break;
-            }
-            // FFmpeg calls again on the same bytes while frames come out of
-            // the bit reservoir (each one advances its reader); a call that
-            // neither consumes nor decodes would loop forever.
-            stalls = if consumed == 0 && !got_frame { stalls + 1 } else { 0 };
-            if stalls > 2 {
-                break;
-            }
-            data = &data[consumed..];
-        }
-    }
-
     /// `flush`: clear decoder buffers (for seeking).
     fn flush_state(&mut self) {
         // reset output buffer as a part of it is used during the windowing
@@ -1497,36 +1465,45 @@ fn run_level_decode(
     Ok(())
 }
 
+impl DecodeCallback for WmaProDecoder {
+    fn decode(&mut self, data: &[u8]) -> Call {
+        let mut frame = None;
+        let consumed = self.decode_packet(data, &mut frame);
+        // an error return drops the call's frame
+        Call { consumed, frame: frame.filter(|_| consumed.is_some()) }
+    }
+}
+
 impl Decoder for WmaProDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.decode_packet_loop(&packet.data);
+        let mut lp = std::mem::take(&mut self.lp);
+        lp.send(self, &packet.data);
+        self.lp = lp;
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.pending.pop_front() {
-            Some(f) => Ok(Frame::Audio(f)),
-            None if self.eof => Err(Error::Eof),
-            None => Err(Error::NeedMore),
-        }
+        let mut lp = std::mem::take(&mut self.lp);
+        let frame = lp.receive(self);
+        self.lp = lp;
+        frame
     }
 
     /// End of stream. WMA Pro has no decoder delay in FFmpeg (no
     /// `AV_CODEC_CAP_DELAY`): the overlap tail is not output.
     fn flush(&mut self) -> Result<()> {
-        self.eof = true;
+        self.lp.flush();
         Ok(())
     }
 
     /// Seek: FFmpeg's `wmapro_flush`.
     fn reset(&mut self) -> Result<()> {
         self.flush_state();
-        self.eof = false;
-        self.pending.clear();
+        self.lp.reset();
         Ok(())
     }
 

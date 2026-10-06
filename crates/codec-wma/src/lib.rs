@@ -7,6 +7,7 @@
 
 pub mod bits;
 pub mod celp;
+mod decode_loop;
 pub mod fft;
 pub mod getbits;
 pub mod tables;

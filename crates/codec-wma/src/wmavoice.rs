@@ -10,13 +10,12 @@
 //! (`mul_add` below) and every float/double promotion of the C source is
 //! kept, so the output matches FFmpeg's C decoder bit for bit.
 
-use std::collections::VecDeque;
-
 use crate::celp::{
     acelp_apply_order_2_transfer_function, acelp_interpolatef, acelp_lspd2lpc, celp_lp_synthesis_filterf,
     celp_lp_zero_synthesis_filterf, scalarproduct_float, set_fixed_vector, sine_window_init, tilt_compensation,
     weighted_vector_sumf_inplace, AmrFixed,
 };
+use crate::decode_loop::{Call, DecodeCallback, DecodeLoop};
 use crate::getbits::{GetBits, PutBits};
 use crate::tx::{DctI64, DstI64, Rdft128};
 use crate::vlc::VlcTable;
@@ -1332,8 +1331,7 @@ pub struct WmaVoiceDecoder {
     pb: PutBits,
     syn: Synth,
     out: [f32; MAX_SFRAMESIZE],
-    pending: VecDeque<AudioFrame>,
-    eof: bool,
+    lp: DecodeLoop,
 }
 
 impl WmaVoiceDecoder {
@@ -1467,8 +1465,8 @@ impl WmaVoiceDecoder {
             pb: PutBits::default(),
             syn,
             out: [0.0; MAX_SFRAMESIZE],
-            pending: VecDeque::new(),
-            eof: false,
+            // AV_CODEC_CAP_DELAY: the last superframe waits in the cache
+            lp: DecodeLoop::new(true),
         })
     }
 
@@ -1592,49 +1590,20 @@ impl WmaVoiceDecoder {
 
         Some((size, None))
     }
+}
 
-    fn emit(&mut self, n_samples: usize) {
-        let data = self.out[..n_samples].iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.pending.push_back(AudioFrame { samples: n_samples as u32, pts: None, data: vec![data] });
-    }
-
-    /// FFmpeg's decode loop over one demuxer packet: decode from the unread
-    /// rest until it is consumed; an error drops what is left.
-    fn decode_avpacket(&mut self, data: &[u8]) {
-        let mut data = data;
-        let mut stalls = 0;
-        while !data.is_empty() {
-            let Some((consumed, frame)) = self.decode_packet(data) else { break };
-            if let Some(n) = frame {
-                self.emit(n);
-            }
-            if consumed >= data.len() {
-                break;
-            }
-            // a decoder that keeps consuming nothing would loop forever
-            stalls = if consumed == 0 { stalls + 1 } else { 0 };
-            if stalls > 2 {
-                break;
-            }
-            data = &data[consumed..];
-        }
-    }
-
-    /// Draining (`AV_CODEC_CAP_DELAY`): empty packets until no frame comes
-    /// out; FFmpeg tolerates up to 21 errors on the way.
-    fn drain(&mut self) {
-        let mut errors = 0;
-        loop {
-            match self.decode_packet(&[]) {
-                Some((_, Some(n))) => self.emit(n),
-                Some((_, None)) => break,
-                None => {
-                    errors += 1;
-                    if errors > 21 {
-                        break;
-                    }
-                }
-            }
+impl DecodeCallback for WmaVoiceDecoder {
+    fn decode(&mut self, data: &[u8]) -> Call {
+        match self.decode_packet(data) {
+            None => Call { consumed: None, frame: None },
+            Some((consumed, n_samples)) => Call {
+                consumed: Some(consumed),
+                frame: n_samples.map(|n| AudioFrame {
+                    samples: n as u32,
+                    pts: None,
+                    data: vec![self.out[..n].iter().flat_map(|v| v.to_le_bytes()).collect()],
+                }),
+            },
         }
     }
 }
@@ -1645,32 +1614,29 @@ impl Decoder for WmaVoiceDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.decode_avpacket(&packet.data);
+        let mut lp = std::mem::take(&mut self.lp);
+        lp.send(self, &packet.data);
+        self.lp = lp;
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.pending.pop_front() {
-            Some(f) => Ok(Frame::Audio(f)),
-            None if self.eof => Err(Error::Eof),
-            None => Err(Error::NeedMore),
-        }
+        let mut lp = std::mem::take(&mut self.lp);
+        let frame = lp.receive(self);
+        self.lp = lp;
+        frame
     }
 
     /// End of stream: drain the superframe still cached.
     fn flush(&mut self) -> Result<()> {
-        if !self.eof {
-            self.drain();
-            self.eof = true;
-        }
+        self.lp.flush();
         Ok(())
     }
 
     /// Seek: FFmpeg's `wmavoice_flush`.
     fn reset(&mut self) -> Result<()> {
         self.flush_state();
-        self.pending.clear();
-        self.eof = false;
+        self.lp.reset();
         Ok(())
     }
 

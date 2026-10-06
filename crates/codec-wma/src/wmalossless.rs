@@ -11,8 +11,7 @@
 //! decodes from the reservoir's leftover bytes exactly as FFmpeg does, so
 //! the reservoir is one persistent buffer that only `save_bits` writes.
 
-use std::collections::VecDeque;
-
+use crate::decode_loop::{Call, DecodeCallback, DecodeLoop};
 use crate::getbits::{GetBits, GetBitsState, PutBits};
 use crate::wma_common::{av_ceil_log2, av_log2, wma_get_frame_len_bits};
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result, SampleFormat};
@@ -178,8 +177,7 @@ pub struct WmaLosslessDecoder {
     out_pos: [usize; WMALL_MAX_CHANNELS],
     nb_samples: i64,
 
-    pending: VecDeque<AudioFrame>,
-    eof: bool,
+    lp: DecodeLoop,
 }
 
 impl WmaLosslessDecoder {
@@ -284,8 +282,8 @@ impl WmaLosslessDecoder {
             out: vec![vec![0; samples_per_frame]; num_channels],
             out_pos: [0; WMALL_MAX_CHANNELS],
             nb_samples: 0,
-            pending: VecDeque::new(),
-            eof: false,
+            // AV_CODEC_CAP_DELAY: frames wait in the reservoir
+            lp: DecodeLoop::new(true),
         })
     }
 
@@ -1230,52 +1228,6 @@ impl WmaLosslessDecoder {
         Some(AudioFrame { samples: n as u32, pts: None, data })
     }
 
-    /// FFmpeg's decode loop over one demuxer packet: decode from the unread
-    /// rest until it is consumed; an error drops the call's frame and what
-    /// is left of the packet.
-    fn decode_avpacket(&mut self, data: &[u8]) {
-        let mut data = data;
-        let mut stalls = 0;
-        while !data.is_empty() {
-            let Some(consumed) = self.decode_packet(data) else { break };
-            // FFmpeg calls again on the same bytes while frames come out of
-            // the reservoir (each one advances its reader); a call that
-            // neither consumes nor decodes would loop forever.
-            stalls = match self.take_frame() {
-                Some(frame) => {
-                    self.pending.push_back(frame);
-                    0
-                }
-                None if consumed == 0 => stalls + 1,
-                None => 0,
-            };
-            if consumed >= data.len() || stalls > 2 {
-                break;
-            }
-            data = &data[consumed..];
-        }
-    }
-
-    /// Draining (`AV_CODEC_CAP_DELAY`): empty packets until no frame comes
-    /// out; FFmpeg tolerates up to 21 errors on the way.
-    fn drain(&mut self) {
-        let mut errors = 0;
-        loop {
-            match self.decode_packet(&[]) {
-                Some(_) => match self.take_frame() {
-                    Some(frame) => self.pending.push_back(frame),
-                    None => break,
-                },
-                None => {
-                    errors += 1;
-                    if errors > 21 {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     /// FFmpeg's `flush` (seek).
     fn flush_state(&mut self) {
         self.packet_loss = true;
@@ -1289,38 +1241,44 @@ impl WmaLosslessDecoder {
     }
 }
 
+impl DecodeCallback for WmaLosslessDecoder {
+    fn decode(&mut self, data: &[u8]) -> Call {
+        let consumed = self.decode_packet(data);
+        // an error return drops the call's frame
+        let frame = consumed.and_then(|_| self.take_frame());
+        Call { consumed, frame }
+    }
+}
+
 impl Decoder for WmaLosslessDecoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.decode_avpacket(&packet.data);
+        let mut lp = std::mem::take(&mut self.lp);
+        lp.send(self, &packet.data);
+        self.lp = lp;
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.pending.pop_front() {
-            Some(f) => Ok(Frame::Audio(f)),
-            None if self.eof => Err(Error::Eof),
-            None => Err(Error::NeedMore),
-        }
+        let mut lp = std::mem::take(&mut self.lp);
+        let frame = lp.receive(self);
+        self.lp = lp;
+        frame
     }
 
     /// End of stream: drain the frames still in the reservoir.
     fn flush(&mut self) -> Result<()> {
-        if !self.eof {
-            self.drain();
-            self.eof = true;
-        }
+        self.lp.flush();
         Ok(())
     }
 
     /// Seek: FFmpeg's `flush`.
     fn reset(&mut self) -> Result<()> {
         self.flush_state();
-        self.pending.clear();
-        self.eof = false;
+        self.lp.reset();
         Ok(())
     }
 
