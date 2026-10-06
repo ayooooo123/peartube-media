@@ -78,7 +78,7 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     oxideav_midi::register_codecs(&mut ctx.codecs);
 
     // This workspace's crates, after OxideAV so their priorities win.
-    for register in [demux_asf::register, codec_mlp::register] {
+    for register in [demux_asf::register, codec_mlp::register, demux_misc::register, demux_rm::register] {
         register(ctx);
     }
 }

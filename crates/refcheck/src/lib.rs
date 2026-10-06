@@ -7,7 +7,7 @@
 //! A missing sample fails the test: a reference test that skips proves nothing.
 
 use oxideav_core::{
-    CodecParameters, Error, Frame, MediaType, PROBE_SCORE_EXTENSION, PixelFormat, ProbeData, RuntimeContext,
+    AudioFormat, CodecParameters, Error, Frame, MediaType, PROBE_SCORE_EXTENSION, PixelFormat, ProbeData, RuntimeContext,
     SampleFormat, VideoFrame,
 };
 use std::fs::File;
@@ -34,9 +34,11 @@ pub fn fate(relative: &str) -> PathBuf {
     path
 }
 
-/// One decoded stream: its parameters and every frame, in output order.
+/// One decoded stream: its parameters, the decoder's own report of its audio
+/// layout (when it gives one), and every frame, in output order.
 pub struct Decoded {
     pub params: CodecParameters,
+    pub audio_format: Option<AudioFormat>,
     pub frames: Vec<Frame>,
 }
 
@@ -101,7 +103,7 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
     }
     decoder.flush().unwrap_or_else(|e| panic!("flush: {e}"));
     drain(&mut decoder, &mut frames);
-    Decoded { params: stream.params, frames }
+    Decoded { params: stream.params, audio_format: decoder.output_audio_format(), frames }
 }
 
 /// FFmpeg's name for a pixel format, for `-pix_fmt`.
@@ -147,11 +149,21 @@ pub fn pack(frame: &VideoFrame, plane_dims: &[(usize, usize)]) -> Vec<u8> {
 /// does not, because the player applies that at presentation. `-fps_mode
 /// passthrough` keeps FFmpeg from duplicating or dropping frames.
 pub fn ffmpeg_video_md5s(path: &Path, nth: usize, pix_fmt: &str) -> Vec<String> {
-    let out = ffmpeg(&[
-        "-apply_cropping", "codec", "-i", path.to_str().unwrap(), "-map", &format!("0:v:{nth}"),
-        "-fps_mode", "passthrough", "-pix_fmt", pix_fmt, "-f", "framemd5", "-",
+    ffmpeg_video_md5s_with(path, nth, pix_fmt, &[])
+}
+
+/// [`ffmpeg_video_md5s`] with extra decoder options placed before `-i`, e.g.
+/// `&["-idct", "simple"]` to pin FFmpeg's C IDCT: on arm64 its default picks
+/// NEON assembly whose rounding differs from the C reference.
+pub fn ffmpeg_video_md5s_with(path: &Path, nth: usize, pix_fmt: &str, input_args: &[&str]) -> Vec<String> {
+    let map = format!("0:v:{nth}");
+    let mut args = vec!["-apply_cropping", "codec"];
+    args.extend_from_slice(input_args);
+    args.extend_from_slice(&[
+        "-i", path.to_str().unwrap(), "-map", &map, "-fps_mode", "passthrough", "-pix_fmt", pix_fmt, "-f",
+        "framemd5", "-",
     ]);
-    String::from_utf8(out)
+    String::from_utf8(ffmpeg(&args))
         .unwrap()
         .lines()
         .filter(|l| !l.starts_with('#'))
@@ -173,10 +185,17 @@ pub fn ffmpeg_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
     out.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
-/// Every audio frame converted to interleaved f32 in [-1, 1].
+/// Every audio frame converted to interleaved f32 in [-1, 1], read in the
+/// layout the decoder reports through `Decoder::output_audio_format`, else
+/// in the container's declared one.
 pub fn interleaved_f32(decoded: &Decoded) -> Vec<f32> {
-    let channels = decoded.params.channels.unwrap_or(1) as usize;
-    let format = decoded.params.sample_format.expect("audio stream without sample_format");
+    let (format, channels) = match decoded.audio_format {
+        Some(f) => (f.sample_format, f.channels as usize),
+        None => (
+            decoded.params.sample_format.expect("audio stream without sample_format"),
+            decoded.params.channels.unwrap_or(1) as usize,
+        ),
+    };
     let mut out = Vec::new();
     for frame in &decoded.frames {
         let Frame::Audio(a) = frame else { continue };

@@ -8,4 +8,14 @@ publish.workspace = true
 
 [dependencies]
 oxideav-core.workspace = true
+oxideav-http.workspace = true
+oxideav-ass = { workspace = true, features = ["render"] }
+oxideav-subtitle = { workspace = true, features = ["text"] }
+md5 = "0.7"
+libc = "0.2"
 thiserror = "2"
+parking_lot = "0.12"
+
+[dev-dependencies]
+codecs = { path = "../codecs" }
+refcheck = { path = "../refcheck" }

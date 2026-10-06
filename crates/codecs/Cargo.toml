@@ -62,3 +62,5 @@ oxideav-sub-image.workspace = true
 oxideav-subtitle.workspace = true
 demux-asf = { path = "../demux-asf" }
 codec-mlp = { path = "../codec-mlp" }
+demux-misc = { path = "../demux-misc" }
+demux-rm = { path = "../demux-rm" }
