@@ -6,6 +6,7 @@
 //! | USF     | `usf`      | Matroska `S_TEXT/USF`                               | VLC `subsusf.c` + `subsdec.c` (LGPL-2.1-or-later, ported) |
 //! | CMML    | `cmml`     | Ogg logical stream, ident `CMML\0\0\0\0`            | Xiph CMML spec (clean-room) |
 //! | Kate    | `kate`     | Ogg logical stream, ident `\x80kate\0\0\0`; Matroska `S_KATE` | Xiph OggKate spec + libkate bitstream docs (clean-room) |
+//! | WebVTT  | `webvtt`   | Matroska / WebM text packets                       | OxideAV inline parser + container timing |
 //!
 //! Decoders consume one packet per cue and emit `Frame::Subtitle`
 //! (`oxideav_core::SubtitleCue`) — the same representation the
@@ -25,6 +26,7 @@ pub mod subviewer1;
 pub mod text_common;
 pub mod usf;
 pub mod vplayer;
+pub mod webvtt;
 pub mod xml;
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, MediaType};
 
@@ -77,6 +79,16 @@ fn subtitle_caps(impl_name: &str) -> CodecCapabilities {
 
 /// Register every subtitle decoder this crate provides.
 pub fn register_codecs(reg: &mut CodecRegistry) {
+    reg.register(
+        CodecInfo::new(CodecId::new("webvtt"))
+            .capabilities(subtitle_caps("webvtt_packet_sw"))
+            .decoder(webvtt::make_decoder)
+            .tag(oxideav_core::CodecTag::matroska("D_WEBVTT/SUBTITLES"))
+            .tag(oxideav_core::CodecTag::matroska("D_WEBVTT/CAPTIONS"))
+            .tag(oxideav_core::CodecTag::matroska("D_WEBVTT/DESCRIPTIONS"))
+            .tag(oxideav_core::CodecTag::matroska("D_WEBVTT/METADATA"))
+            .tag(oxideav_core::CodecTag::matroska("S_TEXT/WEBVTT")),
+    );
     // mov_text: MP4 `tx3g` (3GPP TS 26.245) and QuickTime `text` sample
     // entries. The MP4 demuxer maps both to the `mov_text` / `text`
     // codec ids; claim the sample-entry FourCCs as tags as well.
