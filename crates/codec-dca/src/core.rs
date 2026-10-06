@@ -360,7 +360,7 @@ impl CoreDecoder {
             x96_rand: 1,
             x96_pos: 0,
             subband: SubbandBuffer::new(dca::DCA_SUBBANDS),
-            x96_subband: SubbandBuffer::new(dca::DCA_SUBBANDS),
+            x96_subband: SubbandBuffer::new(dca::DCA_SUBBANDS_X96),
             lfe_samples: [0; dca::DCA_LFE_HISTORY + dca::DCA_PCMBLOCK_SAMPLES * dca::DCA_SUBBANDS / 2 + 16],
             dcadsp_data: Default::default(),
             output: Vec::new(),

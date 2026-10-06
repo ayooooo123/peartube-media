@@ -237,3 +237,10 @@ impl std::fmt::Debug for Vlc {
         f.debug_struct("Vlc").field("bits", &self.bits).finish()
     }
 }
+
+impl Vlc {
+    /// Test helper: primary table view.
+    pub fn table_ref(&self) -> &[(i32, i8)] {
+        &self.table
+    }
+}
