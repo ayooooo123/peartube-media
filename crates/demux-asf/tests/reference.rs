@@ -356,6 +356,30 @@ fn mss2_region() {
     });
 }
 
+/// FFmpeg microsoft.mak: `FATE_MTS2-$(call FRAMECRC, ASF, MTS2)` — the ASF
+/// demuxer carries an MTS2 (xesc) video stream.
+#[test]
+fn mts2_xesc() {
+    check(&Case {
+        sample: "mts2/sample.xesc",
+        streams: &[("video", "mts2")],
+        packet_counts: &[(0, 17)],
+        first_pts: &[(0, 0)],
+    });
+}
+
+/// FFmpeg microsoft.mak: `FATE_MICROSOFT-$(call FRAMECRC, ASF, MTS2)` —
+/// ScreenCapture.xesc demuxed through the ASF demuxer.
+#[test]
+fn mts2_screen_capture() {
+    check(&Case {
+        sample: "mts2/ScreenCapture.xesc",
+        streams: &[("video", "mts2")],
+        packet_counts: &[(0, 128)],
+        first_pts: &[(0, 0)],
+    });
+}
+
 #[test]
 fn g2m2() {
     check(&Case {

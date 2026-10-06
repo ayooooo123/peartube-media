@@ -76,4 +76,9 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     // MIDI registers its synth only; its decoder plays with the built-in
     // tone instruments.
     oxideav_midi::register_codecs(&mut ctx.codecs);
+
+    // This workspace's crates, after OxideAV so their priorities win.
+    for register in [demux_asf::register, codec_mlp::register, demux_misc::register] {
+        register(ctx);
+    }
 }
