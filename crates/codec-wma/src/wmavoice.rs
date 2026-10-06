@@ -1519,7 +1519,7 @@ impl WmaVoiceDecoder {
             }
         }
 
-        let mut gb_reader = gb.as_reader();
+        let mut gb_reader = gb.as_reader_at();
         if self.has_residual_lsps {
             let mut prev_lsps = vec![0f64; self.lsps];
             let mut a1 = vec![0f64; self.lsps * 2];
@@ -1580,6 +1580,7 @@ impl WmaVoiceDecoder {
             let res = gb_reader.get_bits(4)?;
             gb_reader.skip_bits((10 * (res + 1)) as usize)?;
         }
+        gb.set_bit_pos(gb_reader.bits_count());
 
         // update history
         self.prev_lsps[..self.lsps].copy_from_slice(&lsps[2][..self.lsps]);
@@ -1716,7 +1717,22 @@ impl WmaVoiceDecoder {
         }
         self.nb_superframes -= 1;
         if self.nb_superframes > 0 {
-            self.synth_superframe(&mut gb)?;
+            if let Err(e) = self.synth_superframe(&mut gb) {
+                if gb.bits_left() < 1024 {
+                    // the superframe spills into the next packet: cache the
+                    // remainder and stop consuming this one
+                    self.sframe_cache_size = 0;
+                    for b in self.sframe_cache.iter_mut() {
+                        *b = 0;
+                    }
+                    let rest = gb.bits_left();
+                    let written = self.copy_bits(0, &mut gb, rest);
+                    self.sframe_cache_size = written;
+                    self.nb_superframes += 1; // not yet decoded
+                    return Ok(size);
+                }
+                return Err(e);
+            }
             let cnt = gb.bit_pos();
             self.skip_bits_next = cnt & 7;
             return Ok(cnt >> 3);
