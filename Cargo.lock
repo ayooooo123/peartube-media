@@ -92,6 +92,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-wma"
+version = "0.1.0"
+dependencies = [
+ "demux-asf",
+ "oxideav-core",
+ "oxideav-wma",
+ "refcheck",
+]
+
+[[package]]
 name = "codecs"
 version = "0.1.0"
 dependencies = [
