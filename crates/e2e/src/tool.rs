@@ -8,6 +8,13 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// `ffmpeg -v error -nostdin <args>`; stdout on success.
+pub fn ffmpeg(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut all = vec!["-v".to_string(), "error".into(), "-nostdin".into()];
+    all.extend_from_slice(args);
+    run("ffmpeg", &all, timeout)
+}
+
 /// `ffprobe -v error <args>`; stdout on success. `-nostdin` is an ffmpeg
 /// option that ffprobe rejects, so stdin is only closed.
 pub fn ffprobe(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {

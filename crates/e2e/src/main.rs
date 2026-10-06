@@ -6,6 +6,8 @@
 //! cargo run -p e2e --release -- [--filter X] [--fuzz]
 //! ```
 
+mod compare;
+mod oracle;
 mod tool;
 
 use std::collections::BTreeMap;
@@ -15,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use compare::Compare;
 use player::{Headless, Player, PlayerOptions};
 use serde::Serialize;
 
@@ -163,20 +166,21 @@ fn ffprobe_subtitle_packets(path: &Path, nth: usize) -> Result<usize, String> {
         .map_err(|e| format!("ffprobe output: {e}"))
 }
 
-/// One stream's comparison, run against one capture.
-struct Compare {
-    verdict: &'static str,
-    metric: String,
-    error: Option<String>,
+/// How one audio stream is judged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AudioPolicy {
+    /// Byte-identical to FFmpeg's PCM in the decoder's sample format, same
+    /// sample count (`audio:md5`).
+    Exact,
+    /// SNR at or above the floor, lengths within one decoder frame.
+    Snr(f64),
+    /// FFmpeg cannot decode the format: finite, nonempty output only.
+    Decodes,
 }
 
 fn compare_video(path: &Path, cap: &player::VideoCapture, nth: usize) -> Compare {
     if cap.frame_md5.is_empty() {
-        return Compare {
-            verdict: "FAIL",
-            metric: "frames=0".into(),
-            error: Some("no frames captured".into()),
-        };
+        return Compare::fail("frames=0", "no frames captured");
     }
     let pix = refcheck::ffmpeg_pix_fmt(cap.pixel_format);
     let p = path.to_path_buf();
@@ -188,99 +192,95 @@ fn compare_video(path: &Path, cap: &player::VideoCapture, nth: usize) -> Compare
         refcheck::ffmpeg_video_md5s_with(&p, nth, pix2, &["-idct", "simple"])
     }) {
         Ok(e) => e,
-        Err(e) => {
-            return Compare {
-                verdict: "FAIL",
-                metric: format!("frames={}", cap.frame_md5.len()),
-                error: Some(e),
-            }
-        }
+        Err(e) => return Compare::fail(format!("frames={}", cap.frame_md5.len()), e),
     };
     let got = &cap.frame_md5;
-    let exact = expect == *got;
     let matched = got.iter().filter(|m| expect.contains(m)).count();
     let metric = format!("frames={} matched {matched}/{}", got.len(), expect.len());
-    if exact {
-        Compare { verdict: "PASS", metric, error: None }
+    if expect == *got {
+        Compare::pass(metric)
     } else {
-        Compare { verdict: "FAIL", metric, error: None }
+        Compare::fail(metric, "frame digests differ from FFmpeg's")
     }
 }
 
-fn compare_audio(path: &Path, cap: &player::AudioCapture, nth: usize, floor_db: f64) -> Compare {
+/// The player's PCM for one audio stream against FFmpeg's decode of the
+/// `nth` audio stream, under `policy`. Channel count and rate must agree
+/// with FFmpeg's before any sample is compared.
+fn compare_audio(path: &Path, cap: &player::AudioCapture, nth: usize, policy: AudioPolicy) -> Compare {
+    let samples = cap.pcm.len() / cap.channels.max(1) as usize;
     if cap.pcm.is_empty() {
-        return Compare {
-            verdict: "FAIL",
-            metric: "samples=0".into(),
-            error: Some("no PCM captured".into()),
-        };
+        return Compare::fail("samples=0", "no PCM captured");
     }
     let non_finite = cap.pcm.iter().filter(|x| !x.is_finite()).count();
     if non_finite > 0 {
-        return Compare {
-            verdict: "FAIL",
-            metric: format!(
-                "samples={} non-finite={non_finite}",
-                cap.pcm.len() / cap.channels.max(1) as usize
-            ),
-            error: Some(format!("decoder produced {non_finite} NaN/inf samples")),
-        };
+        return Compare::fail(
+            format!("samples={samples} non-finite={non_finite}"),
+            format!("decoder produced {non_finite} NaN/inf samples"),
+        );
     }
-    let p = path.to_path_buf();
-    let reference = match with_ffmpeg_timeout(path, 180, move || refcheck::ffmpeg_audio_f32(&p, nth)) {
-        Ok(r) => r,
-        Err(e) => {
-            return Compare {
-                verdict: "FAIL",
-                metric: format!(
-                    "samples={}",
-                    cap.pcm.len() / cap.channels.max(1) as usize
-                ),
-                error: Some(e),
+    let metric = format!("samples={samples}");
+    if policy == AudioPolicy::Decodes {
+        return Compare::decodes(metric);
+    }
+    let streams = match oracle::streams(path) {
+        Ok(s) => s,
+        Err(e) => return Compare::fail(metric, e),
+    };
+    let Some(stream) = oracle::of_type(&streams, "audio").get(nth).copied() else {
+        return Compare::fail(metric, format!("FFmpeg has no audio stream #{nth}"));
+    };
+    if stream.channels != Some(cap.channels) || stream.sample_rate != Some(cap.sample_rate) {
+        return Compare::fail(
+            metric,
+            format!(
+                "{} ch {} Hz vs FFmpeg {:?} ch {:?} Hz",
+                cap.channels, cap.sample_rate, stream.channels, stream.sample_rate
+            ),
+        );
+    }
+    match policy {
+        AudioPolicy::Exact => {
+            let Some(pcm) = stream.sample_fmt.as_deref().and_then(oracle::Pcm::of_sample_fmt) else {
+                return Compare::fail(metric, format!("no canonical PCM for FFmpeg's {:?}", stream.sample_fmt));
+            };
+            match oracle::audio_pcm(path, &stream.map(), pcm)
+                .and_then(|reference| compare::exact_pcm(&cap.pcm, &reference, pcm, cap.channels as usize))
+            {
+                Ok(m) => Compare::pass(m),
+                Err(e) => Compare::fail(metric, e),
             }
         }
-    };
-    // One decode frame of slack; floor at one frame of the source rate.
-    let slack = cap.sample_rate.max(1) as usize / 10 + 2048;
-    let snr = refcheck::snr_db(&reference, &cap.pcm, slack);
-    let metric = format!(
-        "samples={} snr={snr:.1} dB",
-        cap.pcm.len() / cap.channels.max(1) as usize
-    );
-    if snr.is_infinite() || snr >= floor_db {
-        Compare { verdict: "PASS", metric, error: None }
-    } else {
-        Compare {
-            verdict: "FAIL",
-            metric,
-            error: Some(format!("SNR {snr:.1} dB below {floor_db} dB floor")),
+        AudioPolicy::Snr(floor) => {
+            let slack = oracle::audio_frames(path, stream.index)
+                .and_then(|frames| compare::lossy_slack(&frames, cap.channels));
+            let reference = oracle::audio_f32(path, &stream.map());
+            match (slack, reference) {
+                (Ok(slack), Ok(reference)) => {
+                    let mut c = compare::snr_pcm(&cap.pcm, &reference, slack, floor);
+                    c.metric = format!("{metric} {}", c.metric);
+                    c
+                }
+                (Err(e), _) | (_, Err(e)) => Compare::fail(metric, e),
+            }
         }
+        AudioPolicy::Decodes => unreachable!("handled above"),
     }
 }
 
 fn compare_subtitles(path: &Path, cap: &player::SubtitleCapture, nth: usize) -> Compare {
     let expect = match ffprobe_subtitle_packets(path, nth) {
         Ok(n) => n,
-        Err(e) => {
-            return Compare {
-                verdict: "FAIL",
-                metric: format!("shows={}", cap.shows.len()),
-                error: Some(e),
-            }
-        }
+        Err(e) => return Compare::fail(format!("shows={}", cap.shows.len()), e),
     };
     // The pipeline shows each cue then clears it, so `shows` counts cleared
     // events too; the cue count is the number of non-empty shows.
     let cues = cap.shows.iter().filter(|(_, n)| *n > 0).count();
     let metric = format!("shows={} ffmpeg_packets={expect}, cues={cues}", cap.shows.len());
     if cues == expect {
-        Compare { verdict: "PASS", metric, error: None }
+        Compare::pass(metric)
     } else {
-        Compare {
-            verdict: "FAIL",
-            metric,
-            error: Some(format!("cue count {cues} != ffprobe {expect}")),
-        }
+        Compare::fail(metric, format!("cue count {cues} != ffprobe {expect}"))
     }
 }
 
@@ -390,9 +390,9 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
         // (no reference possible): playing to Ended with frames is the check.
         let cmp = if entry.compare.iter().any(|c| c == "video:decodes" || c == "decodes") {
             if vc.frame_md5.is_empty() {
-                Compare { verdict: "FAIL", metric: "frames=0".into(), error: Some("no frames captured".into()) }
+                Compare::fail("frames=0", "no frames captured")
             } else {
-                Compare { verdict: "PASS", metric: format!("frames={}", vc.frame_md5.len()), error: None }
+                Compare::decodes(format!("frames={}", vc.frame_md5.len()))
             }
         } else {
             compare_video(path, vc, nth_video)
@@ -404,40 +404,27 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
             decoder: "software".into(),
             frames: Some(vc.frame_md5.len()),
             samples: None,
-            verdict: cmp.verdict.into(),
+            verdict: cmp.verdict.as_str().into(),
             metric: Some(cmp.metric),
             error: cmp.error,
         });
         nth_video += 1;
     }
     for ac in &capture.audio {
-        // Find the SNR floor from the compare rows: `audio:snr:<dB>`, `md5`,
-        // or `decodes`.
+        // `audio:md5` is exact; `audio:snr:<dB>` a floor; `decodes` means
+        // FFmpeg cannot decode the format. Undeclared audio is held to md5.
         let floor = entry
             .compare
             .iter()
             .find_map(|c| c.strip_prefix("audio:snr:").and_then(|d| d.parse::<f64>().ok()));
-        let cmp = if entry.compare.iter().any(|c| c == "audio:decodes" || c == "decodes") {
-            // FFmpeg cannot decode this format; playing to Ended with PCM is
-            // the check.
-            let non_finite = ac.pcm.iter().filter(|x| !x.is_finite()).count();
-            if ac.pcm.is_empty() {
-                Compare { verdict: "FAIL", metric: "samples=0".into(), error: Some("no PCM captured".into()) }
-            } else if non_finite > 0 {
-                Compare { verdict: "FAIL", metric: format!("samples={} non-finite={non_finite}", ac.pcm.len()), error: Some(format!("decoder produced {non_finite} NaN/inf samples")) }
-            } else {
-                Compare { verdict: "PASS", metric: format!("samples={}", ac.pcm.len() / ac.channels.max(1) as usize), error: None }
-            }
-        } else if floor.is_some() {
-            compare_audio(path, ac, nth_audio, floor.unwrap())
-        } else if entry.compare.iter().any(|c| c == "audio:md5") {
-            // md5 on float conversion is too strict to be meaningful across
-            // sample-format conversions; use a 120 dB floor (bit-exact
-            // integer paths pass, lossy float noise fails).
-            compare_audio(path, ac, nth_audio, 120.0)
+        let policy = if entry.compare.iter().any(|c| c == "audio:decodes" || c == "decodes") {
+            AudioPolicy::Decodes
+        } else if let Some(floor) = floor {
+            AudioPolicy::Snr(floor)
         } else {
-            compare_audio(path, ac, nth_audio, 120.0)
+            AudioPolicy::Exact
         };
+        let cmp = compare_audio(path, ac, nth_audio, policy);
         streams_out.push(StreamResult {
             index: ac.stream,
             kind: "audio".into(),
@@ -445,7 +432,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
             decoder: "software".into(),
             frames: None,
             samples: Some(ac.pcm.len() / ac.channels.max(1) as usize),
-            verdict: cmp.verdict.into(),
+            verdict: cmp.verdict.as_str().into(),
             metric: Some(cmp.metric),
             error: cmp.error,
         });
@@ -460,7 +447,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
             decoder: "software".into(),
             frames: None,
             samples: None,
-            verdict: cmp.verdict.into(),
+            verdict: cmp.verdict.as_str().into(),
             metric: Some(cmp.metric),
             error: cmp.error,
         });
@@ -990,7 +977,7 @@ fn main() {
             result
                 .streams
                 .iter()
-                .any(|s| s.kind == kind && s.verdict == "PASS")
+                .any(|s| s.kind == kind && (s.verdict == "PASS" || s.verdict == "DECODES"))
         };
         let v = if pass("video") { "ok" } else { "-" };
         let a = if pass("audio") { "ok" } else { "-" };
