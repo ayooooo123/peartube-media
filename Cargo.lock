@@ -205,6 +205,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "demux-rm"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "e2e"
 version = "0.1.0"
 dependencies = [
