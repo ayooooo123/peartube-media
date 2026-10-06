@@ -1,7 +1,7 @@
 //! Untrusted-input robustness test: decoders must never panic on truncated
-//! or bit-flipped copies of packets. Deterministic: fixed seed, 2000+ mutations
-//! per codec.
-use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
+//! or bit-flipped copies of packets, synthetic ones and the FATE reference
+//! samples' own. Deterministic: fixed seed, 2000+ mutations per decoder.
+use oxideav_core::{CodecId, CodecParameters, Decoder, MediaType, Packet, RuntimeContext, TimeBase};
 
 struct Rng(u64);
 
@@ -30,10 +30,15 @@ impl Rng {
 
 const MUTATIONS: usize = 2000;
 
-fn fuzz_decoder(mut decoder: Box<dyn Decoder>, base_packet: &[u8], seed: u64) {
+fn fuzz_decoder(decoder: Box<dyn Decoder>, base_packet: &[u8], seed: u64) {
+    fuzz_packets(decoder, &[base_packet.to_vec()], seed);
+}
+
+/// Feeds `MUTATIONS` mutated copies of packets picked at random from `base_packets`.
+fn fuzz_packets(mut decoder: Box<dyn Decoder>, base_packets: &[Vec<u8>], seed: u64) {
     let mut rng = Rng::new(seed);
     for _ in 0..MUTATIONS {
-        let mut data = base_packet.to_vec();
+        let mut data = base_packets[rng.next_range(base_packets.len())].clone();
         let mode = rng.next_range(3);
         match mode {
             0 => {
@@ -66,6 +71,83 @@ fn fuzz_decoder(mut decoder: Box<dyn Decoder>, base_packet: &[u8], seed: u64) {
         let pkt = Packet::new(0, TimeBase::new(1, 1000), data);
         let _ = decoder.send_packet(&pkt);
         while decoder.receive_frame().is_ok() {}
+    }
+}
+
+/// The first audio stream of a FATE RealMedia sample and all its packets.
+fn rm_audio_packets(sample: &str) -> (CodecParameters, Vec<Vec<u8>>) {
+    let mut ctx = RuntimeContext::new();
+    codec_ra::register(&mut ctx);
+    demux_rm::register(&mut ctx);
+    let file = std::fs::File::open(refcheck::fate(sample)).unwrap();
+    let mut demuxer = ctx
+        .containers
+        .open_demuxer("rm", Box::new(file), &ctx.codecs)
+        .unwrap_or_else(|e| panic!("{sample}: {e}"));
+    let stream = demuxer
+        .streams()
+        .iter()
+        .find(|s| s.params.media_type == MediaType::Audio)
+        .unwrap_or_else(|| panic!("{sample}: no audio stream"))
+        .clone();
+    let mut packets = Vec::new();
+    while let Ok(packet) = demuxer.next_packet() {
+        if packet.stream_index == stream.index {
+            packets.push(packet.data);
+        }
+    }
+    assert!(!packets.is_empty(), "{sample}: no audio packets");
+    (stream.params, packets)
+}
+
+/// Fuzzes the decoder the registry picks for `sample` with its own packets.
+fn fuzz_sample(sample: &str, seed: u64) {
+    let (params, packets) = rm_audio_packets(sample);
+    let mut ctx = RuntimeContext::new();
+    codec_ra::register(&mut ctx);
+    let decoder = ctx
+        .codecs
+        .first_decoder(&params)
+        .unwrap_or_else(|e| panic!("{sample}: no decoder: {e}"));
+    fuzz_packets(decoder, &packets, seed);
+}
+
+#[test]
+fn test_ra144_sample_robustness() {
+    fuzz_sample("real/ra3_in_rm_file.rm", 0x144_0001);
+    fuzz_sample("realaudio/ra3.ra", 0x144_0002);
+}
+
+#[test]
+fn test_ra288_sample_robustness() {
+    fuzz_sample("real/ra_288.rm", 0x288_0001);
+    fuzz_sample("realaudio/ra4_288.ra", 0x288_0002);
+}
+
+#[test]
+fn test_ralf_sample_robustness() {
+    fuzz_sample("lossless-audio/luckynight-partial.rmvb", 0x1A1F_0001);
+}
+
+#[test]
+fn test_cook_sample_robustness() {
+    fuzz_sample("real/ra_cook.rm", 0xC00C_0001);
+}
+
+#[test]
+fn test_sipr_robustness() {
+    for (sample, seed) in [
+        ("sipr/sipr_5k0.rm", 0x5150_0500),
+        ("sipr/sipr_6k5.rm", 0x5150_0605),
+        ("sipr/sipr_8k5.rm", 0x5150_0805),
+        ("sipr/sipr_16k.rm", 0x5150_1600),
+        ("realaudio/RA5.0_16kbps_voice_wideband.ra", 0x5150_1601),
+    ] {
+        fuzz_sample(sample, seed);
+        // Without a bit rate or sample rate the mode follows the packet length.
+        let (_, packets) = rm_audio_packets(sample);
+        let bare = CodecParameters::audio(CodecId::new("sipr"));
+        fuzz_packets(codec_ra::sipr::make_decoder(&bare).unwrap(), &packets, !seed);
     }
 }
 

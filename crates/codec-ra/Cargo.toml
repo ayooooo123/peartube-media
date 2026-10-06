@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "LGPL-2.1-or-later"
-description = "RealAudio decoders: ra_144, ra_288, ralf, cook"
+description = "RealAudio decoders: ra_144, ra_288, ralf, cook, sipr"
 
 [dependencies]
 oxideav-core.workspace = true

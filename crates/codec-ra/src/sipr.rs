@@ -1,7 +1,7 @@
 //! RealAudio SIPR / ACELP.NET speech decoder.
 //!
 //! Ported from FFmpeg (commit 2da55bf):
-//! - libavcodec/sipr.c
+//! - libavcodec/sipr.c, libavcodec/sipr.h
 //! - libavcodec/sipr16k.c
 //! - libavcodec/siprdata.h
 //! - libavcodec/sipr16kdata.h
@@ -10,12 +10,21 @@
 //! - libavcodec/acelp_filters.c
 //! - libavcodec/celp_filters.c
 //! - libavcodec/lsp.c
+//! - libavutil/float_scalarproduct.c, libavutil/ffmath.h
 //!
 //! License: LGPL-2.1-or-later.
+//!
+//! Float evaluation follows the C code operation by operation: whatever C
+//! computes in double is computed in `f64` here, and every `a * b + c` that
+//! clang contracts inside one C expression (its default `-ffp-contract=on`,
+//! which FFmpeg's arm64 builds use) is a single-rounding `mul_add`. The LPC
+//! and pitch filters are recursive, so rounding differences grow; staying on
+//! FFmpeg's rounding path is what keeps the output on FFmpeg's.
 
 #![forbid(unsafe_code)]
 
-use std::f32::consts::PI;
+use std::f64::consts::{LN_10, LN_2, LOG2_10, PI};
+
 use oxideav_core::{
     AudioFormat, AudioFrame, CodecId, CodecParameters, Decoder, Error as CoreError, Frame,
     Packet, Result as CoreResult, SampleFormat,
@@ -30,11 +39,21 @@ pub const PITCH_MIN: i32 = 30;
 pub const PITCH_MAX: i32 = 281;
 pub const PITCH_DELAY_MIN: i32 = 20;
 pub const PITCH_DELAY_MAX: i32 = 143;
-pub const LSFQ_DIFF_MIN: f32 = 0.0125 * PI;
-pub const L_INTERPOL: usize = LP_FILTER_ORDER + 1; // 11
+/// Minimum LSF spacing; a double constant in sipr.h.
+pub const LSFQ_DIFF_MIN: f64 = 0.0125 * PI;
+/// Number of past samples needed for excitation interpolation.
+pub const L_INTERPOL: usize = LP_FILTER_ORDER + 1;
+/// Subframe size for every mode except 16k.
 pub const SUBFR_SIZE: usize = 48;
 pub const L_SUBFR_16K: usize = 80;
 pub const SUBFRAME_COUNT_16K: usize = 2;
+
+/// Excitation history kept in front of the current NB frame.
+const EXC_HISTORY_NB: usize = PITCH_DELAY_MAX as usize + L_INTERPOL;
+/// Excitation history kept in front of the current 16k frame.
+const EXC_HISTORY_16K: usize = PITCH_MAX as usize + L_INTERPOL;
+/// `SiprContext.excitation` length.
+const EXCITATION_LEN: usize = L_INTERPOL + PITCH_MAX as usize + 2 * L_SUBFR_16K;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SiprMode {
@@ -182,6 +201,17 @@ fn decode_parameters(gb: &mut BitReaderLe, mode: SiprMode) -> Option<SiprParamet
     Some(parms)
 }
 
+/// `FFMIN(a, b)`: `b` when `a > b`, else `a` (keeps a NaN `a`, unlike `f32::min`).
+#[inline]
+fn ffmin(a: f32, b: f32) -> f32 {
+    if a > b { b } else { a }
+}
+
+/// ff_scalarproduct_float_c (`p += v1[i] * v2[i]`, contracted).
+fn scalarproduct(v1: &[f32], v2: &[f32]) -> f32 {
+    v1.iter().zip(v2).fold(0.0f32, |p, (&a, &b)| a.mul_add(b, p))
+}
+
 fn sort_nearly_sorted_floats(vals: &mut [f32]) {
     let len = vals.len();
     if len <= 1 {
@@ -199,11 +229,15 @@ fn sort_nearly_sorted_floats(vals: &mut [f32]) {
     }
 }
 
-fn set_min_dist_lsf(lsf: &mut [f32], min_spacing: f32) {
+/// ff_set_min_dist_lsf: `prev = lsf[i] = FFMAX(lsf[i], prev + min_spacing)`,
+/// the sum and the comparison in double.
+fn set_min_dist_lsf(lsf: &mut [f32], min_spacing: f64) {
     let mut prev = 0.0f32;
     for x in lsf.iter_mut() {
-        prev = (*x).max(prev + min_spacing);
-        *x = prev;
+        let floor = prev as f64 + min_spacing;
+        let v = *x as f64;
+        *x = (if v > floor { v } else { floor }) as f32;
+        prev = *x;
     }
 }
 
@@ -212,25 +246,23 @@ fn lsp2polyf(lsp: &[f64], f: &mut [f64], lp_half_order: usize) {
     f[1] = -2.0 * lsp[0];
     for i in 2..=lp_half_order {
         let val = -2.0 * lsp[2 * i - 2];
-        f[i] = val * f[i - 1] + 2.0 * f[i - 2];
+        f[i] = val.mul_add(f[i - 1], 2.0 * f[i - 2]);
         for j in (2..i).rev() {
-            f[j] += f[j - 1] * val + f[j - 2];
+            f[j] += f[j - 1].mul_add(val, f[j - 2]);
         }
         f[1] += val;
     }
 }
 
-fn amrwb_lsp2lpc(lsp: &[f64; 10], lp: &mut [f32; 10]) {
-    let lp_order = 10;
-    let lp_half_order = 5;
+/// ff_amrwb_lsp2lpc for order 10.
+fn amrwb_lsp2lpc(lsp: &[f64; LP_FILTER_ORDER], lp: &mut [f32]) {
+    let lp_order = LP_FILTER_ORDER;
+    let lp_half_order = lp_order / 2;
     let mut pa = [0.0f64; 6];
-    let mut qa_raw = [0.0f64; 5];
-    lsp2polyf(lsp, &mut pa, lp_half_order);
-    lsp2polyf(&lsp[1..], &mut qa_raw, lp_half_order - 1);
-
+    // qa[k] here is qa[k - 1] in C, whose qa[-1] is 0.
     let mut qa = [0.0f64; 6];
-    qa[1..].copy_from_slice(&qa_raw);
-    qa[0] = 0.0; // qa[-1] in C
+    lsp2polyf(lsp, &mut pa, lp_half_order);
+    lsp2polyf(&lsp[1..], &mut qa[1..], lp_half_order - 1);
 
     for i in 1..lp_half_order {
         let j = lp_order - i;
@@ -244,13 +276,14 @@ fn amrwb_lsp2lpc(lsp: &[f64; 10], lp: &mut [f32; 10]) {
     lp[lp_order - 1] = lsp[lp_order - 1] as f32;
 }
 
+/// ff_acelp_lspd2lpc.
 fn acelp_lspd2lpc(lsp: &[f64], lpc: &mut [f32], lp_half_order: usize) {
     let mut pa = [0.0f64; 11];
     let mut qa = [0.0f64; 11];
     lsp2polyf(lsp, &mut pa[..=lp_half_order], lp_half_order);
     lsp2polyf(&lsp[1..], &mut qa[..=lp_half_order], lp_half_order);
 
-    for k in 0..lp_half_order {
+    for k in (0..lp_half_order).rev() {
         let paf = pa[k + 1] + pa[k];
         let qaf = qa[k + 1] - qa[k];
         lpc[k] = (0.5 * (paf + qaf)) as f32;
@@ -258,43 +291,39 @@ fn acelp_lspd2lpc(lsp: &[f64], lpc: &mut [f32], lp_half_order: usize) {
     }
 }
 
+/// acelp_lp_decodef (sipr16k.c).
 fn acelp_lp_decodef(
-    lp_1st: &mut [f32; 16],
-    lp_2nd: &mut [f32; 16],
-    lsp_2nd: &[f64; 16],
-    lsp_prev: &[f64; 16],
+    lp_1st: &mut [f32; LP_FILTER_ORDER_16K],
+    lp_2nd: &mut [f32; LP_FILTER_ORDER_16K],
+    lsp_2nd: &[f64; LP_FILTER_ORDER_16K],
+    lsp_prev: &[f64; LP_FILTER_ORDER_16K],
 ) {
-    let mut lsp_1st = [0.0f64; 16];
-    for i in 0..16 {
+    let mut lsp_1st = [0.0f64; LP_FILTER_ORDER_16K];
+    for i in 0..LP_FILTER_ORDER_16K {
         lsp_1st[i] = (lsp_2nd[i] + lsp_prev[i]) * 0.5;
     }
-    acelp_lspd2lpc(&lsp_1st, lp_1st, 8);
-    acelp_lspd2lpc(lsp_2nd, lp_2nd, 8);
+    acelp_lspd2lpc(&lsp_1st, lp_1st, LP_FILTER_ORDER_16K / 2);
+    acelp_lspd2lpc(lsp_2nd, lp_2nd, LP_FILTER_ORDER_16K / 2);
 }
 
 fn lsf_decode_fp_16k(
-    lsf_history: &mut [f32; 16],
-    isp_new: &mut [f32; 16],
+    lsf_history: &mut [f32; LP_FILTER_ORDER_16K],
+    isp_new: &mut [f32; LP_FILTER_ORDER_16K],
     parm: &[usize; 5],
     ma_pred: usize,
 ) {
-    let mut isp_q = [0.0f32; 16];
-    let cb1 = &LSF_CB1_16K[parm[0] & 127];
-    let cb2 = &LSF_CB2_16K[parm[1] & 255];
-    let cb3 = &LSF_CB3_16K[parm[2] & 127];
-    let cb4 = &LSF_CB4_16K[parm[3] & 127];
-    let cb5 = &LSF_CB5_16K[parm[4] & 127];
-    isp_q[0..3].copy_from_slice(cb1);
-    isp_q[3..6].copy_from_slice(cb2);
-    isp_q[6..9].copy_from_slice(cb3);
-    isp_q[9..12].copy_from_slice(cb4);
-    isp_q[12..16].copy_from_slice(cb5);
+    let mut isp_q = [0.0f32; LP_FILTER_ORDER_16K];
+    isp_q[0..3].copy_from_slice(&LSF_CB1_16K[parm[0] & 127]);
+    isp_q[3..6].copy_from_slice(&LSF_CB2_16K[parm[1] & 255]);
+    isp_q[6..9].copy_from_slice(&LSF_CB3_16K[parm[2] & 127]);
+    isp_q[9..12].copy_from_slice(&LSF_CB4_16K[parm[3] & 127]);
+    isp_q[12..16].copy_from_slice(&LSF_CB5_16K[parm[4] & 127]);
 
     let q = QU[ma_pred & 1];
-    for i in 0..16 {
-        isp_new[i] = (1.0 - q) * isp_q[i] + q * lsf_history[i] + MEAN_LSF_16K[i];
+    for i in 0..LP_FILTER_ORDER_16K {
+        isp_new[i] = (1.0 - q).mul_add(isp_q[i], q * lsf_history[i]) + MEAN_LSF_16K[i];
     }
-    lsf_history.copy_from_slice(&isp_q);
+    *lsf_history = isp_q;
 }
 
 fn dec_delay3_1st(index: i32) -> i32 {
@@ -319,6 +348,7 @@ fn divide_by_3(x: i32) -> i32 {
     (x * 10923) >> 15
 }
 
+/// ff_decode_pitch_lag.
 fn decode_pitch_lag(
     pitch_index: usize,
     prev_lag_int: i32,
@@ -355,6 +385,10 @@ fn decode_pitch_lag(
     (lag_int, lag_frac)
 }
 
+/// ff_acelp_interpolatef on one buffer: `out = buf[out_pos..]`, `in = buf[in_pos..]`.
+/// The ranges may overlap; like the C loop, each output is written before
+/// later taps read it.
+#[allow(clippy::too_many_arguments)]
 fn acelp_interpolatef(
     buf: &mut [f32],
     out_pos: usize,
@@ -369,14 +403,138 @@ fn acelp_interpolatef(
         let mut idx = 0;
         let mut v = 0.0f32;
         for i in 0..filter_length {
-            v += buf[in_pos + n + i] * filter_coeffs[idx + frac_pos];
+            v = buf[in_pos + n + i].mul_add(filter_coeffs[idx + frac_pos], v);
             idx += precision;
-            v += buf[in_pos + n - (i + 1)] * filter_coeffs[idx - frac_pos];
+            v = buf[in_pos + n - (i + 1)].mul_add(filter_coeffs[idx - frac_pos], v);
         }
         buf[out_pos + n] = v;
     }
 }
 
+/// ff_celp_lp_synthesis_filterf: `out[n] = in[n] - sum(filter_coeffs[i-1] * out[n-i])`,
+/// evaluated in FFmpeg's four-samples-at-a-time order. `out[n]` is
+/// `buf[out_pos + n]`; `buf[out_pos - filter_length..out_pos]` is the filter
+/// memory. `filter_length` must be even and at least 4.
+fn celp_lp_synthesis_filterf(
+    buf: &mut [f32],
+    out_pos: usize,
+    filter_coeffs: &[f32],
+    input: &[f32],
+    filter_length: usize,
+) {
+    let fc = filter_coeffs;
+    let buffer_length = input.len();
+
+    let a = fc[0];
+    let mut b = fc[1];
+    let mut c = fc[2];
+    b = (-fc[0]).mul_add(fc[0], b);
+    c = (-fc[1]).mul_add(fc[0], c);
+    c = (-fc[0]).mul_add(b, c);
+
+    let mut old_out0 = buf[out_pos - 4];
+    let mut old_out1 = buf[out_pos - 3];
+    let mut old_out2 = buf[out_pos - 2];
+    let mut old_out3 = buf[out_pos - 1];
+    let mut n = 0;
+    while n + 4 <= buffer_length {
+        let o = out_pos + n;
+        let mut out0 = input[n];
+        let mut out1 = input[n + 1];
+        let mut out2 = input[n + 2];
+        let mut out3 = input[n + 3];
+
+        out0 = (-fc[2]).mul_add(old_out1, out0);
+        out1 = (-fc[2]).mul_add(old_out2, out1);
+        out2 = (-fc[2]).mul_add(old_out3, out2);
+
+        out0 = (-fc[1]).mul_add(old_out2, out0);
+        out1 = (-fc[1]).mul_add(old_out3, out1);
+
+        out0 = (-fc[0]).mul_add(old_out3, out0);
+
+        let val = fc[3];
+        out0 = (-val).mul_add(old_out0, out0);
+        out1 = (-val).mul_add(old_out1, out1);
+        out2 = (-val).mul_add(old_out2, out2);
+        out3 = (-val).mul_add(old_out3, out3);
+
+        let mut i = 5;
+        while i < filter_length {
+            old_out3 = buf[o - i];
+            let val = fc[i - 1];
+            out0 = (-val).mul_add(old_out3, out0);
+            out1 = (-val).mul_add(old_out0, out1);
+            out2 = (-val).mul_add(old_out1, out2);
+            out3 = (-val).mul_add(old_out2, out3);
+
+            old_out2 = buf[o - i - 1];
+            let val = fc[i];
+            out0 = (-val).mul_add(old_out2, out0);
+            out1 = (-val).mul_add(old_out3, out1);
+            out2 = (-val).mul_add(old_out0, out2);
+            out3 = (-val).mul_add(old_out1, out3);
+
+            std::mem::swap(&mut old_out0, &mut old_out2);
+            old_out1 = old_out3;
+            i += 2;
+        }
+
+        let tmp0 = out0;
+        let tmp1 = out1;
+        let tmp2 = out2;
+
+        out3 = (-a).mul_add(tmp2, out3);
+        out2 = (-a).mul_add(tmp1, out2);
+        out1 = (-a).mul_add(tmp0, out1);
+
+        out3 = (-b).mul_add(tmp1, out3);
+        out2 = (-b).mul_add(tmp0, out2);
+
+        out3 = (-c).mul_add(tmp0, out3);
+
+        buf[o] = out0;
+        buf[o + 1] = out1;
+        buf[o + 2] = out2;
+        buf[o + 3] = out3;
+
+        old_out0 = out0;
+        old_out1 = out1;
+        old_out2 = out2;
+        old_out3 = out3;
+        n += 4;
+    }
+
+    while n < buffer_length {
+        let o = out_pos + n;
+        let mut v = input[n];
+        for i in 1..=filter_length {
+            v = (-fc[i - 1]).mul_add(buf[o - i], v);
+        }
+        buf[o] = v;
+        n += 1;
+    }
+}
+
+/// ff_celp_lp_zero_synthesis_filterf: `out[n] = in[n] + sum(filter_coeffs[i-1] * in[n-i])`
+/// where `in[n]` is `buf[in_pos + n]`.
+fn celp_lp_zero_synthesis_filterf(
+    out: &mut [f32],
+    filter_coeffs: &[f32],
+    buf: &[f32],
+    in_pos: usize,
+    filter_length: usize,
+) {
+    for (n, o) in out.iter_mut().enumerate() {
+        let mut v = buf[in_pos + n];
+        for i in 1..=filter_length {
+            v = filter_coeffs[i - 1].mul_add(buf[in_pos + n - i], v);
+        }
+        *o = v;
+    }
+}
+
+/// ff_decode_10_pulses_35bits.
 fn decode_10_pulses_35bits(
     fixed_index: &[i16; 10],
     fixed_sparse: &mut AmrFixed,
@@ -401,7 +559,9 @@ fn decode_10_pulses_35bits(
     }
 }
 
-fn set_fixed_vector(out: &mut [f32], fixed: &AmrFixed, scale: f32, size: usize) {
+/// ff_set_fixed_vector (no pulse has its repeat bit cleared here).
+fn set_fixed_vector(out: &mut [f32], fixed: &AmrFixed, scale: f32) {
+    let size = out.len();
     for i in 0..fixed.n {
         let mut x = fixed.x[i];
         let mut y = fixed.y[i] * scale;
@@ -415,43 +575,17 @@ fn set_fixed_vector(out: &mut [f32], fixed: &AmrFixed, scale: f32, size: usize) 
     }
 }
 
+/// acelp_decode_gain_codef (sipr16k.c).
 fn acelp_decode_gain_codef(
     gain_corr_factor: f32,
     fc_v: &[f32],
     mut mr_energy: f32,
     quant_energy: &[f32],
     ma_prediction_coeff: &[f32],
-    subframe_size: usize,
-    ma_pred_order: usize,
 ) -> f32 {
-    let dot_quant: f32 = quant_energy[..ma_pred_order]
-        .iter()
-        .zip(&ma_prediction_coeff[..ma_pred_order])
-        .map(|(a, b)| a * b)
-        .sum();
-    mr_energy += dot_quant;
-
-    let dot_fc: f32 = fc_v[..subframe_size].iter().map(|x| x * x).sum();
-
-    gain_corr_factor * ((std::f32::consts::LN_10 / 20.0) * mr_energy).exp()
-        / (0.01 + dot_fc).sqrt()
-}
-
-fn celp_lp_synthesis_filterf(
-    buf: &mut [f32],
-    history_len: usize,
-    filter_coeffs: &[f32],
-    in_samples: &[f32],
-    buffer_length: usize,
-    filter_length: usize,
-) {
-    for n in 0..buffer_length {
-        let mut val = in_samples[n];
-        for i in 1..=filter_length {
-            val -= filter_coeffs[i - 1] * buf[history_len + n - i];
-        }
-        buf[history_len + n] = val;
-    }
+    mr_energy += scalarproduct(quant_energy, ma_prediction_coeff);
+    (gain_corr_factor as f64 * (LN_10 / 20.0 * mr_energy as f64).exp()
+        / (0.01 + scalarproduct(fc_v, fc_v) as f64).sqrt()) as f32
 }
 
 fn lsf_decode_fp(lsfnew: &mut [f32; 10], lsf_history: &mut [f32], vq_indexes: &[usize; 5]) {
@@ -463,72 +597,65 @@ fn lsf_decode_fp(lsfnew: &mut [f32; 10], lsf_history: &mut [f32], vq_indexes: &[
     lsf_tmp[8..10].copy_from_slice(&LSF_CB5[vq_indexes[4] & 31]);
 
     for i in 0..10 {
-        lsfnew[i] = lsf_history[i] * 0.33 + lsf_tmp[i] + MEAN_LSF[i];
+        lsfnew[i] = ((lsf_history[i] as f64).mul_add(0.33, lsf_tmp[i] as f64)
+            + MEAN_LSF[i] as f64) as f32;
     }
 
     sort_nearly_sorted_floats(&mut lsfnew[..9]);
+    // No minimum distance between the last value and the previous one,
+    // contrary to ff_acelp_reorder_lsf().
     set_min_dist_lsf(&mut lsfnew[..9], LSFQ_DIFF_MIN);
-    lsfnew[9] = lsfnew[9].min(1.3 * PI);
+    if lsfnew[9] as f64 > 1.3 * PI {
+        lsfnew[9] = (1.3 * PI) as f32;
+    }
 
     lsf_history.copy_from_slice(&lsf_tmp);
 
-    for i in 0..9 {
-        lsfnew[i] = lsfnew[i].cos();
+    for x in &mut lsfnew[..9] {
+        *x = (*x as f64).cos() as f32;
     }
-    lsfnew[9] *= 6.153848 / PI;
+    lsfnew[9] = (lsfnew[9] as f64 * (6.153848 / PI)) as f32;
 }
 
-fn sipr_decode_lp(
-    lsfnew: &[f32; 10],
-    lsfold: &[f32; 10],
-    az: &mut [f32],
-    num_subfr: usize,
-) {
-    let mut lsfint = [0.0f64; 10];
-    let t0 = 1.0f32 / num_subfr as f32;
-    let mut t = t0 * 0.5;
-    for i in 0..num_subfr {
-        for j in 0..10 {
-            lsfint[j] = (lsfold[j] * (1.0 - t) + t * lsfnew[j]) as f64;
+fn sipr_decode_lp(lsfnew: &[f32; 10], lsfold: &[f32; 10], az: &mut [f32], num_subfr: usize) {
+    let t0 = (1.0 / num_subfr as f64) as f32;
+    let mut t = (t0 as f64 * 0.5) as f32;
+    for out_az in az.chunks_exact_mut(LP_FILTER_ORDER).take(num_subfr) {
+        let mut lsfint = [0.0f64; LP_FILTER_ORDER];
+        for j in 0..LP_FILTER_ORDER {
+            lsfint[j] = lsfold[j].mul_add(1.0 - t, t * lsfnew[j]) as f64;
         }
-        let out_az: &mut [f32; 10] = (&mut az[i * 10..(i + 1) * 10]).try_into().unwrap();
         amrwb_lsp2lpc(&lsfint, out_az);
         t += t0;
     }
 }
 
+/// Adaptive impulse response; `ir_buf[..LP_FILTER_ORDER]` is zero filter memory.
 fn eval_ir(
     az: &[f32],
     pitch_lag: usize,
-    ir_buf: &mut [f32], // size 58 (10 history + 48 output)
+    ir_buf: &mut [f32; SUBFR_SIZE + LP_FILTER_ORDER],
     pitch_sharp_factor: f32,
 ) {
-    let mut tmp1 = [0.0f32; SUBFR_SIZE + 1]; // 49
-    let mut tmp2 = [0.0f32; LP_FILTER_ORDER]; // 10
+    let mut tmp1 = [0.0f32; SUBFR_SIZE + 1];
+    let mut tmp2 = [0.0f32; LP_FILTER_ORDER + 1];
 
     tmp1[0] = 1.0;
     for i in 0..LP_FILTER_ORDER {
         tmp1[i + 1] = az[i] * FF_POW_0_55[i];
         tmp2[i] = az[i] * FF_POW_0_7[i];
     }
-    tmp1[11..48].fill(0.0);
 
-    celp_lp_synthesis_filterf(ir_buf, LP_FILTER_ORDER, &tmp2, &tmp1[..SUBFR_SIZE], SUBFR_SIZE, LP_FILTER_ORDER);
+    celp_lp_synthesis_filterf(ir_buf, LP_FILTER_ORDER, &tmp2, &tmp1[..SUBFR_SIZE], LP_FILTER_ORDER);
 
-    let freq = &mut ir_buf[LP_FILTER_ORDER..LP_FILTER_ORDER + SUBFR_SIZE];
-    if pitch_lag < SUBFR_SIZE {
-        for i in pitch_lag..SUBFR_SIZE {
-            freq[i] += pitch_sharp_factor * freq[i - pitch_lag];
-        }
+    // pitch_sharpening
+    let freq = &mut ir_buf[LP_FILTER_ORDER..];
+    for i in pitch_lag..SUBFR_SIZE {
+        freq[i] = pitch_sharp_factor.mul_add(freq[i - pitch_lag], freq[i]);
     }
 }
 
-fn decode_fixed_sparse(
-    fixed_sparse: &mut AmrFixed,
-    pulses: &[i16; 10],
-    mode: SiprMode,
-    low_gain: bool,
-) {
+fn decode_fixed_sparse(fixed_sparse: &mut AmrFixed, pulses: &[i16; 10], mode: SiprMode, low_gain: bool) {
     match mode {
         SiprMode::Mode6k5 => {
             for i in 0..3 {
@@ -574,24 +701,19 @@ fn decode_fixed_sparse(
     }
 }
 
-fn convolute_with_sparse(
-    out: &mut [f32],
-    pulses: &AmrFixed,
-    shape: &[f32],
-    length: usize,
-) {
-    out[..length].fill(0.0);
+/// Convolution of `shape` with the sparse pulse vector.
+fn convolute_with_sparse(out: &mut [f32; SUBFR_SIZE], pulses: &AmrFixed, shape: &[f32]) {
+    out.fill(0.0);
     for i in 0..pulses.n {
         let px = pulses.x[i];
         let py = pulses.y[i];
-        if px < length {
-            for j in px..length {
-                out[j] += py * shape[j - px];
-            }
+        for j in px..SUBFR_SIZE {
+            out[j] = py.mul_add(shape[j - px], out[j]);
         }
     }
 }
 
+/// ff_amr_set_fixed_gain.
 fn amr_set_fixed_gain(
     fixed_gain_factor: f32,
     fixed_mean_energy: f32,
@@ -599,54 +721,54 @@ fn amr_set_fixed_gain(
     energy_mean: f32,
     pred_table: &[f32; 4],
 ) -> f32 {
-    let dot: f32 = pred_table.iter().zip(prediction_error.iter()).map(|(a, b)| a * b).sum();
-    let exp_arg = 0.05 * (dot + energy_mean);
-    let exp_val = 10.0f64.powf(exp_arg as f64) as f32;
-    let denom = if fixed_mean_energy != 0.0 {
-        fixed_mean_energy.sqrt()
-    } else {
-        1.0
-    };
-    let val = fixed_gain_factor * exp_val / denom;
+    // ff_exp10(x) is exp2(M_LOG2_10 * x).
+    let exponent = 0.05 * (scalarproduct(pred_table, prediction_error) + energy_mean) as f64;
+    let mean_energy = if fixed_mean_energy != 0.0 { fixed_mean_energy } else { 1.0 };
+    let val = (fixed_gain_factor as f64 * (LOG2_10 * exponent).exp2() / mean_energy.sqrt() as f64)
+        as f32;
 
     prediction_error.copy_within(1..4, 0);
-    prediction_error[3] = 20.0 * fixed_gain_factor.log10();
+    prediction_error[3] = (20.0 * fixed_gain_factor.log10() as f64) as f32;
 
     val
 }
 
-fn tilt_compensation(mem: &mut f32, tilt: f32, samples: &mut [f32], size: usize) {
+/// ff_weighted_vector_sumf with `out == in_a`, as sipr calls it.
+fn weighted_vector_sumf(in_a_out: &mut [f32], in_b: &[f32], weight_coeff_a: f32, weight_coeff_b: f32) {
+    for (a, &b) in in_a_out.iter_mut().zip(in_b) {
+        *a = weight_coeff_a.mul_add(*a, weight_coeff_b * b);
+    }
+}
+
+/// ff_tilt_compensation.
+fn tilt_compensation(mem: &mut f32, tilt: f32, samples: &mut [f32]) {
+    let size = samples.len();
     let new_tilt_mem = samples[size - 1];
     for i in (1..size).rev() {
-        samples[i] -= tilt * samples[i - 1];
+        samples[i] = (-tilt).mul_add(samples[i - 1], samples[i]);
     }
-    samples[0] -= tilt * *mem;
+    samples[0] = (-tilt).mul_add(*mem, samples[0]);
     *mem = new_tilt_mem;
 }
 
-fn adaptive_gain_control(
-    out: &mut [f32],
-    input: &[f32],
-    speech_energ: f32,
-    size: usize,
-    alpha: f32,
-    gain_mem: &mut f32,
-) {
-    let postfilter_energ: f32 = input[..size].iter().map(|x| x * x).sum();
+/// ff_adaptive_gain_control in place (`out == in`), as sipr calls it.
+fn adaptive_gain_control(samples: &mut [f32], speech_energ: f32, alpha: f32, gain_mem: &mut f32) {
+    let postfilter_energ = scalarproduct(samples, samples);
     let mut gain_scale_factor = 1.0f32;
     if postfilter_energ != 0.0 {
-        gain_scale_factor = (speech_energ / postfilter_energ).sqrt();
+        gain_scale_factor = ((speech_energ / postfilter_energ) as f64).sqrt() as f32;
     }
-    gain_scale_factor *= 1.0 - alpha;
+    gain_scale_factor = (gain_scale_factor as f64 * (1.0 - alpha as f64)) as f32;
 
     let mut mem = *gain_mem;
-    for i in 0..size {
-        mem = alpha * mem + gain_scale_factor;
-        out[i] = input[i] * mem;
+    for x in samples.iter_mut() {
+        mem = alpha.mul_add(mem, gain_scale_factor);
+        *x *= mem;
     }
     *gain_mem = mem;
 }
 
+/// ff_acelp_apply_order_2_transfer_function.
 fn acelp_apply_order_2_transfer_function(
     out: &mut [f32],
     input: &[f32],
@@ -654,11 +776,10 @@ fn acelp_apply_order_2_transfer_function(
     pole_coeffs: [f32; 2],
     gain: f32,
     mem: &mut [f32; 2],
-    n: usize,
 ) {
-    for i in 0..n {
-        let tmp = gain * input[i] - pole_coeffs[0] * mem[0] - pole_coeffs[1] * mem[1];
-        out[i] = tmp + zero_coeffs[0] * mem[0] + zero_coeffs[1] * mem[1];
+    for (o, &x) in out.iter_mut().zip(input) {
+        let tmp = (-pole_coeffs[1]).mul_add(mem[1], gain.mul_add(x, -(pole_coeffs[0] * mem[0])));
+        *o = zero_coeffs[1].mul_add(mem[1], zero_coeffs[0].mul_add(mem[0], tmp));
         mem[1] = mem[0];
         mem[0] = tmp;
     }
@@ -668,8 +789,10 @@ pub struct SiprContext {
     pub mode: SiprMode,
     past_pitch_gain: f32,
     lsf_history: [f32; LP_FILTER_ORDER_16K],
-    excitation: [f32; L_INTERPOL + PITCH_MAX as usize + 2 * L_SUBFR_16K + 64], // 516
-    synth_buf: [f32; LP_FILTER_ORDER + 5 * SUBFR_SIZE + 16], // 266
+    excitation: [f32; EXCITATION_LEN],
+    /// `synth_buf` of sipr.c: NB keeps its 10 synthesis memory samples at
+    /// [6..16] and the frame at [16..].
+    synth_buf: [f32; LP_FILTER_ORDER + 5 * SUBFR_SIZE + 6],
     lsp_history: [f32; LP_FILTER_ORDER],
     gain_mem: f32,
     energy_history: [f32; 4],
@@ -678,10 +801,11 @@ pub struct SiprContext {
     tilt_mem: f32,
     postfilter_agc: f32,
     postfilter_mem5k0: [f32; LP_FILTER_ORDER],
-    postfilter_syn5k0: [f32; LP_FILTER_ORDER + 5 * SUBFR_SIZE], // 250
+    postfilter_syn5k0: [f32; LP_FILTER_ORDER + 5 * SUBFR_SIZE],
     pitch_lag_prev: i32,
     iir_mem: [f32; LP_FILTER_ORDER_16K],
     filt_buf: [[f32; LP_FILTER_ORDER_16K]; 2],
+    /// Which `filt_buf` is `filt_mem[0]` (the pointers FFmpeg swaps per frame).
     filt_idx: usize,
     mem_preemph: [f32; LP_FILTER_ORDER_16K],
     synth_16k: [f32; LP_FILTER_ORDER_16K],
@@ -694,18 +818,18 @@ impl SiprContext {
             mode,
             past_pitch_gain: 0.0,
             lsf_history: [0.0; LP_FILTER_ORDER_16K],
-            excitation: [0.0; L_INTERPOL + PITCH_MAX as usize + 2 * L_SUBFR_16K + 64],
-            synth_buf: [0.0; LP_FILTER_ORDER + 5 * SUBFR_SIZE + 16],
+            excitation: [0.0; EXCITATION_LEN],
+            synth_buf: [0.0; LP_FILTER_ORDER + 5 * SUBFR_SIZE + 6],
             lsp_history: [0.0; LP_FILTER_ORDER],
             gain_mem: 0.0,
-            energy_history: [-14.0; 4],
+            energy_history: [0.0; 4],
             highpass_filt_mem: [0.0; 2],
             postfilter_mem: [0.0; LP_FILTER_ORDER],
             tilt_mem: 0.0,
             postfilter_agc: 0.0,
             postfilter_mem5k0: [0.0; LP_FILTER_ORDER],
             postfilter_syn5k0: [0.0; LP_FILTER_ORDER + 5 * SUBFR_SIZE],
-            pitch_lag_prev: 180,
+            pitch_lag_prev: 0,
             iir_mem: [0.0; LP_FILTER_ORDER_16K],
             filt_buf: [[0.0; LP_FILTER_ORDER_16K]; 2],
             filt_idx: 0,
@@ -717,13 +841,14 @@ impl SiprContext {
         ctx
     }
 
+    /// The state sipr_decoder_init() and ff_sipr_init_16k() leave in a zeroed context.
     pub fn reset_state(&mut self) {
         self.past_pitch_gain = 0.0;
         self.lsf_history.fill(0.0);
         self.excitation.fill(0.0);
         self.synth_buf.fill(0.0);
-        for i in 0..LP_FILTER_ORDER {
-            self.lsp_history[i] = ((i + 1) as f32 * PI / (LP_FILTER_ORDER + 1) as f32).cos();
+        for (i, x) in self.lsp_history.iter_mut().enumerate() {
+            *x = (((i + 1) as f64 * PI / (LP_FILTER_ORDER + 1) as f64).cos()) as f32;
         }
         self.gain_mem = 0.0;
         self.energy_history = [-14.0; 4];
@@ -739,14 +864,13 @@ impl SiprContext {
         self.filt_idx = 0;
         self.mem_preemph.fill(0.0);
         self.synth_16k.fill(0.0);
-        for i in 0..LP_FILTER_ORDER_16K {
-            self.lsp_history_16k[i] =
-                (((i + 1) as f64) * std::f64::consts::PI / (LP_FILTER_ORDER_16K + 1) as f64).cos();
+        for (i, x) in self.lsp_history_16k.iter_mut().enumerate() {
+            *x = ((i + 1) as f64 * PI / (LP_FILTER_ORDER_16K + 1) as f64).cos();
         }
     }
 
-    fn postfilter_5k0(&mut self, lpc: &[f32], samples: &mut [f32]) {
-        let mut buf = [0.0f32; SUBFR_SIZE + LP_FILTER_ORDER]; // 58
+    fn postfilter_5k0(&mut self, lpc: &[f32], samples: &mut [f32; SUBFR_SIZE]) {
+        let mut buf = [0.0f32; SUBFR_SIZE + LP_FILTER_ORDER];
         let mut lpc_n = [0.0f32; LP_FILTER_ORDER];
         let mut lpc_d = [0.0f32; LP_FILTER_ORDER];
 
@@ -755,153 +879,119 @@ impl SiprContext {
             lpc_n[i] = lpc[i] * FF_POW_0_5[i];
         }
 
+        // pole_out is buf[LP_FILTER_ORDER..].
         buf[..LP_FILTER_ORDER].copy_from_slice(&self.postfilter_mem);
-        celp_lp_synthesis_filterf(
-            &mut buf,
-            LP_FILTER_ORDER,
-            &lpc_d,
-            samples,
-            SUBFR_SIZE,
-            LP_FILTER_ORDER,
-        );
-        self.postfilter_mem
-            .copy_from_slice(&buf[SUBFR_SIZE..SUBFR_SIZE + LP_FILTER_ORDER]);
+        celp_lp_synthesis_filterf(&mut buf, LP_FILTER_ORDER, &lpc_d, samples, LP_FILTER_ORDER);
+        self.postfilter_mem.copy_from_slice(&buf[SUBFR_SIZE..]);
 
-        tilt_compensation(&mut self.tilt_mem, 0.4, &mut buf[LP_FILTER_ORDER..], SUBFR_SIZE);
+        tilt_compensation(&mut self.tilt_mem, 0.4, &mut buf[LP_FILTER_ORDER..]);
 
         buf[..LP_FILTER_ORDER].copy_from_slice(&self.postfilter_mem5k0);
-        self.postfilter_mem5k0
-            .copy_from_slice(&buf[SUBFR_SIZE..SUBFR_SIZE + LP_FILTER_ORDER]);
+        self.postfilter_mem5k0.copy_from_slice(&buf[SUBFR_SIZE..]);
 
-        // celp_lp_zero_synthesis_filterf: samples[n] = buf[10 + n] + sum(lpc_n[i-1] * buf[10 + n - i])
-        for n in 0..SUBFR_SIZE {
-            let mut val = buf[LP_FILTER_ORDER + n];
-            for i in 1..=LP_FILTER_ORDER {
-                val += lpc_n[i - 1] * buf[LP_FILTER_ORDER + n - i];
-            }
-            samples[n] = val;
-        }
+        celp_lp_zero_synthesis_filterf(samples, &lpc_n, &buf, LP_FILTER_ORDER, LP_FILTER_ORDER);
     }
 
-    fn postfilter_16k(&mut self, synth: &[f32], out_data: &mut [f32; 160]) {
-        let mut buf = [0.0f32; 30 + LP_FILTER_ORDER_16K]; // 46
-        let curr_filt = self.filt_idx;
-        let prev_filt = 1 - curr_filt;
+    /// postfilter() of sipr16k.c; `synth_buf[..16]` is free scratch on entry
+    /// (the synthesis memory is already saved) and the frame is `synth_buf[16..]`.
+    fn postfilter_16k(
+        &mut self,
+        synth_buf: &mut [f32; LP_FILTER_ORDER_16K + 2 * L_SUBFR_16K],
+        out_data: &mut [f32],
+    ) {
+        const ORDER: usize = LP_FILTER_ORDER_16K;
+        let cur = self.filt_idx;
+        let prev = cur ^ 1;
+        let mut buf = [0.0f32; 30 + ORDER];
 
-        for i in 0..LP_FILTER_ORDER_16K {
-            self.filt_buf[curr_filt][i] = self.iir_mem[i] * FF_POW_0_5[i];
+        for i in 0..ORDER {
+            self.filt_buf[cur][i] = self.iir_mem[i] * FF_POW_0_5[i];
         }
 
-        buf[..LP_FILTER_ORDER_16K].copy_from_slice(&self.mem_preemph);
-        // tmpbuf = buf[16..46], using filt_buf[prev_filt]
+        // tmpbuf is buf[ORDER..]: the first 30 samples through last frame's filter.
+        buf[..ORDER].copy_from_slice(&self.mem_preemph);
+        celp_lp_synthesis_filterf(&mut buf, ORDER, &self.filt_buf[prev], &synth_buf[ORDER..ORDER + 30], ORDER);
+
+        // The same samples through this frame's filter, in place in synth.
+        let head: [f32; 30] = synth_buf[ORDER..ORDER + 30].try_into().unwrap();
+        synth_buf[..ORDER].copy_from_slice(&self.mem_preemph);
+        celp_lp_synthesis_filterf(synth_buf, ORDER, &self.filt_buf[cur], &head, ORDER);
+
+        out_data[30 - ORDER..30].copy_from_slice(&synth_buf[30..30 + ORDER]);
         celp_lp_synthesis_filterf(
-            &mut buf,
-            LP_FILTER_ORDER_16K,
-            &self.filt_buf[prev_filt],
-            &synth[..30],
+            out_data,
             30,
-            LP_FILTER_ORDER_16K,
+            &self.filt_buf[cur],
+            &synth_buf[ORDER + 30..ORDER + 2 * L_SUBFR_16K],
+            ORDER,
         );
-
-        // synth_buf[0..16] = mem_preemph, synth_buf[16..46] filtered in-place with filt_buf[curr_filt]
-        let mut synth_buf = [0.0f32; 16 + 160];
-        synth_buf[..LP_FILTER_ORDER_16K].copy_from_slice(&self.mem_preemph);
-        celp_lp_synthesis_filterf(
-            &mut synth_buf,
-            LP_FILTER_ORDER_16K,
-            &self.filt_buf[curr_filt],
-            &synth[..30],
-            30,
-            LP_FILTER_ORDER_16K,
-        );
-
-        // out_data[14..30] = synth_buf[30..46]
-        out_data[30 - LP_FILTER_ORDER_16K..30]
-            .copy_from_slice(&synth_buf[30..46]);
-
-        // celp_lp_synthesis_filterf on out_data + 30 (130 samples), using history out_data[14..30]
-        for n in 0..(160 - 30) {
-            let mut val = synth[30 + n];
-            for i in 1..=LP_FILTER_ORDER_16K {
-                val -= self.filt_buf[curr_filt][i - 1] * out_data[30 + n - i];
-            }
-            out_data[30 + n] = val;
-        }
 
         self.mem_preemph
-            .copy_from_slice(&out_data[160 - LP_FILTER_ORDER_16K..160]);
+            .copy_from_slice(&out_data[2 * L_SUBFR_16K - ORDER..2 * L_SUBFR_16K]);
 
-        self.filt_idx = 1 - self.filt_idx;
+        self.filt_idx = prev;
 
+        // Cross-fade from the old filter to the new one; s accumulates 1.0/30 in float.
+        let mut s = 0.0f32;
         for i in 0..30 {
-            let s = (i as f32) / 30.0;
-            out_data[i] = buf[LP_FILTER_ORDER_16K + i]
-                + s * (synth_buf[LP_FILTER_ORDER_16K + i] - buf[LP_FILTER_ORDER_16K + i]);
+            let old = buf[ORDER + i];
+            out_data[i] = s.mul_add(synth_buf[ORDER + i] - old, old);
+            s = (s as f64 + 1.0 / 30.0) as f32;
         }
     }
 
     fn decode_frame_16k(&mut self, params: &SiprParameters, out_data: &mut [f32]) {
-        let frame_size = SUBFRAME_COUNT_16K * L_SUBFR_16K; // 160
-        let mut lsf_new = [0.0f32; LP_FILTER_ORDER_16K];
-        let mut lsp_new = [0.0f64; LP_FILTER_ORDER_16K];
-        let mut az = [[0.0f32; LP_FILTER_ORDER_16K]; 2];
+        const ORDER: usize = LP_FILTER_ORDER_16K;
+        let frame_size = SUBFRAME_COUNT_16K * L_SUBFR_16K;
+        let mut lsf_new = [0.0f32; ORDER];
+        let mut lsp_new = [0.0f64; ORDER];
+        let mut az = [[0.0f32; ORDER]; 2];
         let mut fixed_vector = [0.0f32; L_SUBFR_16K];
 
-        let exc_start = 292; // PITCH_MAX (281) + L_INTERPOL (11)
+        lsf_decode_fp_16k(&mut self.lsf_history, &mut lsf_new, &params.vq_indexes, params.ma_pred_switch);
 
-        lsf_decode_fp_16k(
-            &mut self.lsf_history,
-            &mut lsf_new,
-            &params.vq_indexes,
-            params.ma_pred_switch,
-        );
+        set_min_dist_lsf(&mut lsf_new, LSFQ_DIFF_MIN / 2.0);
 
-        set_min_dist_lsf(&mut lsf_new, LSFQ_DIFF_MIN * 0.5);
-
-        for i in 0..LP_FILTER_ORDER_16K {
-            lsp_new[i] = (lsf_new[i].cos()) as f64;
+        // lsf2lsp: cosf, widened to double.
+        for i in 0..ORDER {
+            lsp_new[i] = lsf_new[i].cos() as f64;
         }
 
-        let (az0, az1) = az.split_at_mut(1);
-        acelp_lp_decodef(&mut az0[0], &mut az1[0], &lsp_new, &self.lsp_history_16k);
-        self.lsp_history_16k.copy_from_slice(&lsp_new);
-        // synth_buf: history 16, samples 160
-        let mut synth_buf = [0.0f32; LP_FILTER_ORDER_16K + 160];
-        synth_buf[..LP_FILTER_ORDER_16K].copy_from_slice(&self.synth_16k);
+        let [az0, az1] = &mut az;
+        acelp_lp_decodef(az0, az1, &lsp_new, &self.lsp_history_16k);
+        self.lsp_history_16k = lsp_new;
+
+        // synth_buf: ORDER samples of synthesis memory, then the frame.
+        let mut synth_buf = [0.0f32; ORDER + 2 * L_SUBFR_16K];
+        synth_buf[..ORDER].copy_from_slice(&self.synth_16k);
+
+        let gain_codef_scale = (L_SUBFR_16K as f64).sqrt() as f32;
+        let energy_mean = (19.0 - 15.0 / (0.05 * LN_10 / LN_2)) as f32;
 
         for i in 0..SUBFRAME_COUNT_16K {
             let i_subfr = i * L_SUBFR_16K;
             let pitch_delay_3x = if i == 0 {
-                dec_delay3_1st(params.pitch_delay[0] as i32)
+                dec_delay3_1st(params.pitch_delay[i] as i32)
             } else {
-                dec_delay3_2nd(
-                    params.pitch_delay[1] as i32,
-                    PITCH_MIN,
-                    PITCH_MAX,
-                    self.pitch_lag_prev,
-                )
+                dec_delay3_2nd(params.pitch_delay[i] as i32, PITCH_MIN, PITCH_MAX, self.pitch_lag_prev)
             };
 
             let pitch_fac = GAIN_PITCH_CB_16K[params.gp_index[i] & 15];
             let mut f = AmrFixed {
-                n: 0,
-                x: [0; 10],
-                y: [0.0; 10],
+                pitch_fac: ffmin(pitch_fac, 1.0),
                 pitch_lag: divide_by_3(pitch_delay_3x + 1) as usize,
-                pitch_fac: pitch_fac.min(1.0),
+                ..AmrFixed::default()
             };
             self.pitch_lag_prev = f.pitch_lag as i32;
 
             let pitch_delay_int = divide_by_3(pitch_delay_3x + 2);
             let pitch_delay_frac = pitch_delay_3x + 2 - 3 * pitch_delay_int;
 
-            let cur_exc_pos = exc_start + i_subfr;
-            let in_pos = (cur_exc_pos as i32 - pitch_delay_int + 1) as usize;
-
+            let exc = EXC_HISTORY_16K + i_subfr;
             acelp_interpolatef(
                 &mut self.excitation,
-                cur_exc_pos,
-                in_pos,
+                exc,
+                (exc as i32 - pitch_delay_int + 1) as usize,
                 &SINC_WIN,
                 3,
                 (pitch_delay_frac + 1) as usize,
@@ -910,62 +1000,45 @@ impl SiprContext {
             );
 
             fixed_vector.fill(0.0);
-            decode_10_pulses_35bits(
-                &params.fc_indexes[i],
-                &mut f,
-                &FF_FC_4PULSES_8BITS_TRACKS_13,
-                5,
-                4,
-            );
-            set_fixed_vector(&mut fixed_vector, &f, 1.0, L_SUBFR_16K);
+            decode_10_pulses_35bits(&params.fc_indexes[i], &mut f, &FF_FC_4PULSES_8BITS_TRACKS_13, 5, 4);
+            set_fixed_vector(&mut fixed_vector, &f, 1.0);
 
             let gain_corr_factor = GAIN_CB_16K[params.gc_index[i] & 31];
-            let energy_mean = 19.0 - 15.0 / (0.05 * std::f32::consts::LN_10 / std::f32::consts::LN_2);
             let gain_code = gain_corr_factor
                 * acelp_decode_gain_codef(
-                    (L_SUBFR_16K as f32).sqrt(),
+                    gain_codef_scale,
                     &fixed_vector,
                     energy_mean,
                     &PRED_16K,
                     &self.energy_history[..2],
-                    L_SUBFR_16K,
-                    2,
                 );
 
-
             self.energy_history[1] = self.energy_history[0];
-            self.energy_history[0] = 20.0 * gain_corr_factor.log10();
+            self.energy_history[0] = (20.0 * gain_corr_factor.log10() as f64) as f32;
 
-            for j in 0..L_SUBFR_16K {
-                self.excitation[cur_exc_pos + j] =
-                    pitch_fac * self.excitation[cur_exc_pos + j] + gain_code * fixed_vector[j];
-            }
-
+            weighted_vector_sumf(
+                &mut self.excitation[exc..exc + L_SUBFR_16K],
+                &fixed_vector,
+                pitch_fac,
+                gain_code,
+            );
 
             celp_lp_synthesis_filterf(
                 &mut synth_buf[i_subfr..],
-                LP_FILTER_ORDER_16K,
+                ORDER,
                 &az[i],
-                &self.excitation[cur_exc_pos..cur_exc_pos + L_SUBFR_16K],
-                L_SUBFR_16K,
-                LP_FILTER_ORDER_16K,
+                &self.excitation[exc..exc + L_SUBFR_16K],
+                ORDER,
             );
-
         }
 
-        self.synth_16k
-            .copy_from_slice(&synth_buf[frame_size..frame_size + LP_FILTER_ORDER_16K]);
+        self.synth_16k.copy_from_slice(&synth_buf[frame_size..frame_size + ORDER]);
 
-        // memmove(ctx->excitation, ctx->excitation + 160, (11 + 281) * sizeof(float));
-        self.excitation
-            .copy_within(frame_size..frame_size + 292, 0);
+        self.excitation.copy_within(frame_size..frame_size + EXC_HISTORY_16K, 0);
 
-        let synth_samples = &synth_buf[LP_FILTER_ORDER_16K..LP_FILTER_ORDER_16K + 160];
-        let out_160: &mut [f32; 160] = (&mut out_data[..160]).try_into().unwrap();
-        self.postfilter_16k(synth_samples, out_160);
+        self.postfilter_16k(&mut synth_buf, &mut out_data[..frame_size]);
 
-        self.iir_mem.copy_from_slice(&az[1]);
-
+        self.iir_mem = az[1];
     }
 
     fn decode_frame_nb(&mut self, params: &SiprParameters, out_data: &mut [f32]) {
@@ -973,14 +1046,13 @@ impl SiprContext {
         let frame_size = subframe_count * SUBFR_SIZE;
         let mut az = [0.0f32; LP_FILTER_ORDER * 5];
         let mut lsf_new = [0.0f32; LP_FILTER_ORDER];
-        let mut ir_buf = [0.0f32; SUBFR_SIZE + LP_FILTER_ORDER]; // 58
+        let mut ir_buf = [0.0f32; SUBFR_SIZE + LP_FILTER_ORDER];
         let mut t0_first = 0i32;
+        let energy_mean = (34.0 - 15.0 / (0.05 * LN_10 / LN_2)) as f32;
 
         lsf_decode_fp(&mut lsf_new, &mut self.lsf_history[..LP_FILTER_ORDER], &params.vq_indexes);
-        sipr_decode_lp(&lsf_new, &self.lsp_history, &mut az[..subframe_count * 10], subframe_count);
-        self.lsp_history.copy_from_slice(&lsf_new);
-
-        let exc_start = PITCH_DELAY_MAX as usize + L_INTERPOL; // 143 + 11 = 154
+        sipr_decode_lp(&lsf_new, &self.lsp_history, &mut az, subframe_count);
+        self.lsp_history = lsf_new;
 
         for i in 0..subframe_count {
             let p_az = &az[i * LP_FILTER_ORDER..(i + 1) * LP_FILTER_ORDER];
@@ -998,69 +1070,50 @@ impl SiprContext {
                 t0_first = t0;
             }
 
-            let cur_exc_pos = exc_start + i * SUBFR_SIZE;
-            let in_offset = if t0_frac <= 0 { 1 } else { 0 };
-            let in_pos = (cur_exc_pos as i32 - t0 + in_offset) as usize;
-            let frac_pos = 2 * (((2 + t0_frac) % 3) + 1) as usize;
-
+            let exc = EXC_HISTORY_NB + i * SUBFR_SIZE;
             acelp_interpolatef(
                 &mut self.excitation,
-                cur_exc_pos,
-                in_pos,
+                exc,
+                (exc as i32 - t0 + i32::from(t0_frac <= 0)) as usize,
                 &FF_B60_SINC,
                 6,
-                frac_pos,
+                (2 * ((2 + t0_frac) % 3 + 1)) as usize,
                 LP_FILTER_ORDER,
                 SUBFR_SIZE,
             );
 
             let mut fixed_cb = AmrFixed::default();
-            decode_fixed_sparse(
-                &mut fixed_cb,
-                &params.fc_indexes[i],
-                self.mode,
-                self.past_pitch_gain < 0.8,
-            );
+            let low_gain = (self.past_pitch_gain as f64) < 0.8;
+            decode_fixed_sparse(&mut fixed_cb, &params.fc_indexes[i], self.mode, low_gain);
 
-            ir_buf[..LP_FILTER_ORDER].fill(0.0);
             eval_ir(p_az, t0 as usize, &mut ir_buf, self.mode.pitch_sharp_factor());
 
-            convolute_with_sparse(
-                &mut fixed_vector,
-                &fixed_cb,
-                &ir_buf[LP_FILTER_ORDER..],
-                SUBFR_SIZE,
-            );
+            convolute_with_sparse(&mut fixed_vector, &fixed_cb, &ir_buf[LP_FILTER_ORDER..]);
 
-            let dot_fixed: f32 = fixed_vector.iter().map(|x| x * x).sum();
-            let avg_energy = (0.01 + dot_fixed) / SUBFR_SIZE as f32;
+            let avg_energy = ((0.01 + scalarproduct(&fixed_vector, &fixed_vector) as f64)
+                / SUBFR_SIZE as f64) as f32;
 
-            let mut pitch_gain = GAIN_CB[params.gc_index[i] & 127][0];
+            let gain = GAIN_CB[params.gc_index[i] & 127];
+            let mut pitch_gain = gain[0];
             self.past_pitch_gain = pitch_gain;
 
-            let energy_mean = 34.0 - 15.0 / (0.05 * std::f32::consts::LN_10 / std::f32::consts::LN_2);
-            let mut gain_code = amr_set_fixed_gain(
-                GAIN_CB[params.gc_index[i] & 127][1],
-                avg_energy,
-                &mut self.energy_history,
-                energy_mean,
-                &PRED,
-            );
+            let mut gain_code =
+                amr_set_fixed_gain(gain[1], avg_energy, &mut self.energy_history, energy_mean, &PRED);
 
-            for j in 0..SUBFR_SIZE {
-                self.excitation[cur_exc_pos + j] =
-                    pitch_gain * self.excitation[cur_exc_pos + j] + gain_code * fixed_vector[j];
+            let excitation = &mut self.excitation[exc..exc + SUBFR_SIZE];
+            weighted_vector_sumf(excitation, &fixed_vector, pitch_gain, gain_code);
+
+            pitch_gain = (pitch_gain as f64 * (0.5 * pitch_gain as f64)) as f32;
+            if pitch_gain as f64 > 0.4 {
+                pitch_gain = 0.4;
             }
 
-            pitch_gain *= 0.5 * pitch_gain;
-            pitch_gain = pitch_gain.min(0.4);
-
-            self.gain_mem = 0.7 * self.gain_mem + 0.3 * pitch_gain;
-            self.gain_mem = self.gain_mem.min(pitch_gain);
+            self.gain_mem = 0.7f64.mul_add(self.gain_mem as f64, 0.3 * pitch_gain as f64) as f32;
+            self.gain_mem = ffmin(self.gain_mem, pitch_gain);
             gain_code *= self.gain_mem;
 
-            for j in 0..SUBFR_SIZE {
-                fixed_vector[j] = self.excitation[cur_exc_pos + j] - gain_code * fixed_vector[j];
+            for (fv, &e) in fixed_vector.iter_mut().zip(excitation.iter()) {
+                *fv = (-gain_code).mul_add(*fv, e);
             }
 
             if self.mode == SiprMode::Mode5k0 {
@@ -1070,37 +1123,31 @@ impl SiprContext {
                     &mut self.postfilter_syn5k0[i * SUBFR_SIZE..],
                     LP_FILTER_ORDER,
                     p_az,
-                    &self.excitation[cur_exc_pos..cur_exc_pos + SUBFR_SIZE],
-                    SUBFR_SIZE,
+                    &self.excitation[exc..exc + SUBFR_SIZE],
                     LP_FILTER_ORDER,
                 );
             }
 
-            // synth_buf[6..16] is 10 history samples, synth_buf[16..] is output
+            // synth = synth_buf + 16; its 10 memory samples sit at synth_buf[6..16].
             celp_lp_synthesis_filterf(
                 &mut self.synth_buf[6 + i * SUBFR_SIZE..],
                 LP_FILTER_ORDER,
                 p_az,
                 &fixed_vector,
-                SUBFR_SIZE,
                 LP_FILTER_ORDER,
             );
         }
 
-        // Copy last 10 samples of synth to synth_buf[6..16]
         self.synth_buf.copy_within(6 + frame_size..16 + frame_size, 6);
 
         if self.mode == SiprMode::Mode5k0 {
             for i in 0..subframe_count {
-                let syn_slice = &self.postfilter_syn5k0[LP_FILTER_ORDER + i * SUBFR_SIZE..LP_FILTER_ORDER + (i + 1) * SUBFR_SIZE];
-                let energy: f32 = syn_slice.iter().map(|x| x * x).sum();
-                let synth_subfr = &mut self.synth_buf[16 + i * SUBFR_SIZE..16 + (i + 1) * SUBFR_SIZE];
-                let in_copy = synth_subfr.to_vec();
+                let start = LP_FILTER_ORDER + i * SUBFR_SIZE;
+                let syn = &self.postfilter_syn5k0[start..start + SUBFR_SIZE];
+                let energy = scalarproduct(syn, syn);
                 adaptive_gain_control(
-                    synth_subfr,
-                    &in_copy,
+                    &mut self.synth_buf[16 + i * SUBFR_SIZE..16 + (i + 1) * SUBFR_SIZE],
                     energy,
-                    SUBFR_SIZE,
                     0.9,
                     &mut self.postfilter_agc,
                 );
@@ -1109,18 +1156,15 @@ impl SiprContext {
             self.postfilter_syn5k0.copy_within(frame_size..frame_size + LP_FILTER_ORDER, 0);
         }
 
-        // memmove(ctx->excitation, excitation - 154, 154 * sizeof(float));
-        let final_exc_pos = exc_start + frame_size;
-        self.excitation.copy_within(final_exc_pos - exc_start..final_exc_pos, 0);
+        self.excitation.copy_within(frame_size..frame_size + EXC_HISTORY_NB, 0);
 
         acelp_apply_order_2_transfer_function(
             &mut out_data[..frame_size],
             &self.synth_buf[16..16 + frame_size],
-            [-1.99997, 1.0],
-            [-1.9330735, 0.935892],
-            0.9398058,
+            [-1.99997, 1.000000000],
+            [-1.93307352, 0.935891986],
+            0.939805806,
             &mut self.highpass_filt_mem,
-            frame_size,
         );
     }
 
@@ -1135,11 +1179,10 @@ impl SiprContext {
         let samples_per_frame = self.mode.samples_per_packet() / frames_count;
         let mut out = vec![0.0f32; self.mode.samples_per_packet()];
 
-        for f_idx in 0..frames_count {
+        for frame_out in out.chunks_exact_mut(samples_per_frame) {
             let parms = decode_parameters(&mut gb, self.mode)
                 .ok_or_else(|| CoreError::invalid("sipr: bitstream truncated"))?;
 
-            let frame_out = &mut out[f_idx * samples_per_frame..(f_idx + 1) * samples_per_frame];
             if self.mode == SiprMode::Mode16k {
                 self.decode_frame_16k(&parms, frame_out);
             } else {
@@ -1218,29 +1261,18 @@ impl Decoder for SiprDecoderWrapper {
         }
 
         if !self.decoder.mode_determined {
-            // Determine mode from packet length if possible
-            match packet.data.len() {
-                20 => {
-                    self.decoder.inner.mode = SiprMode::Mode16k;
-                    self.decoder.inner.reset_state();
-                    self.decoder.mode_determined = true;
-                }
-                19 => {
-                    self.decoder.inner.mode = SiprMode::Mode8k5;
-                    self.decoder.inner.reset_state();
-                    self.decoder.mode_determined = true;
-                }
-                29 => {
-                    self.decoder.inner.mode = SiprMode::Mode6k5;
-                    self.decoder.inner.reset_state();
-                    self.decoder.mode_determined = true;
-                }
-                37 => {
-                    self.decoder.inner.mode = SiprMode::Mode5k0;
-                    self.decoder.inner.reset_state();
-                    self.decoder.mode_determined = true;
-                }
-                _ => {}
+            // Without a bit rate, the mode follows from the packet length.
+            let mode = match packet.data.len() {
+                20 => Some(SiprMode::Mode16k),
+                19 => Some(SiprMode::Mode8k5),
+                29 => Some(SiprMode::Mode6k5),
+                37 => Some(SiprMode::Mode5k0),
+                _ => None,
+            };
+            if let Some(mode) = mode {
+                self.decoder.inner.mode = mode;
+                self.decoder.inner.reset_state();
+                self.decoder.mode_determined = true;
             }
         }
 
@@ -1249,10 +1281,9 @@ impl Decoder for SiprDecoderWrapper {
             return Err(CoreError::invalid("sipr: packet too small"));
         }
 
-        let mut offset = 0;
         let mut pts = packet.pts;
-        while offset + pkt_size <= packet.data.len() {
-            let samples = self.decoder.inner.decode_packet(&packet.data[offset..offset + pkt_size])?;
+        for chunk in packet.data.chunks_exact(pkt_size) {
+            let samples = self.decoder.inner.decode_packet(chunk)?;
             let mut byte_data = Vec::with_capacity(samples.len() * 4);
             for s in &samples {
                 byte_data.extend_from_slice(&s.to_le_bytes());
@@ -1265,7 +1296,6 @@ impl Decoder for SiprDecoderWrapper {
             }));
 
             pts = None;
-            offset += pkt_size;
         }
 
         Ok(())
