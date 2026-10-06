@@ -270,7 +270,7 @@ impl Context {
     }
 
     /// `display_end_segment`: `Ok(true)` when it produced a subtitle.
-    fn display_end_segment(&mut self, sub: &mut Subtitle) -> SegmentResult<bool> {
+    fn display_end_segment(&mut self, sub: &mut Subtitle<'static>) -> SegmentResult<bool> {
         let pts = self.presentation.pts.or(sub.pts);
         *sub = Subtitle { pts, start_display_time: 0, end_display_time: u32::MAX, rects: Vec::new() };
         self.presentation.pts = None;
@@ -285,7 +285,7 @@ impl Context {
         for i in 0..self.presentation.object_count {
             let reference = self.presentation.objects[i];
             let mut rect = Rect::empty();
-            rect.palette.copy_from_slice(&self.palettes[palette].clut);
+            rect.palette.to_mut().copy_from_slice(&self.palettes[palette].clut);
             let Some(index) = self.find_object(reference.id) else {
                 sub.rects.push(rect);
                 continue;
@@ -298,7 +298,7 @@ impl Context {
                 rect.h = object.h;
                 rect.linesize = object.w as usize;
                 match decode_rle(rle, object.w as usize, object.h as usize) {
-                    Some(pixels) => rect.pixels = pixels,
+                    Some(pixels) => rect.pixels = pixels.into(),
                     None => {
                         rect.w = 0;
                         rect.h = 0;
@@ -312,7 +312,7 @@ impl Context {
 
     /// `decode`: the subtitle the packet completes, if any. `Err` is the
     /// packet's error return (too short, or out of memory).
-    fn decode(&mut self, packet: &[u8], pts: Option<i64>) -> std::result::Result<Option<Subtitle>, ()> {
+    fn decode(&mut self, packet: &[u8], pts: Option<i64>) -> std::result::Result<Option<Subtitle<'static>>, ()> {
         let mut sub = Subtitle::for_packet(pts);
         let mut got = false;
         if packet.len() < 3 {

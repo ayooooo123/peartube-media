@@ -159,11 +159,11 @@ pub fn ffprobe_packets(path: &Path, nth: usize) -> Vec<FfPacket> {
             "-select_streams",
             &stream,
             "-show_entries",
-            "packet=pts,dts,duration,size,data_hash",
+            "packet=pts,dts,duration,size,data_hash:packet_side_data=",
             "-show_data_hash",
             "md5",
             "-of",
-            "csv=p=0",
+            "compact=p=0",
             path.to_str().unwrap(),
         ],
     );
@@ -172,15 +172,25 @@ pub fn ffprobe_packets(path: &Path, nth: usize) -> Vec<FfPacket> {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|line| {
-            let f: Vec<&str> = line.trim().split(',').collect();
-            assert_eq!(f.len(), 5, "ffprobe packet line {line:?}");
-            let opt = |s: &str| (s != "N/A").then(|| s.parse::<i64>().unwrap_or_else(|_| panic!("{s:?} in {line:?}")));
+            // MPEG-TS side-data sections add empty CSV fields even when
+            // their entries are excluded. Named fields avoid positional
+            // ambiguity without ignoring any requested packet metadata.
+            let field = |name| {
+                line.split('|')
+                    .filter_map(|part| part.split_once('='))
+                    .find_map(|(key, value)| (key == name).then_some(value))
+                    .unwrap_or_else(|| panic!("missing {name} in ffprobe packet {line:?}"))
+            };
+            let opt = |name| {
+                let value = field(name);
+                (value != "N/A").then(|| value.parse::<i64>().unwrap_or_else(|_| panic!("{value:?} in {line:?}")))
+            };
             FfPacket {
-                pts: opt(f[0]),
-                dts: opt(f[1]),
-                duration: opt(f[2]),
-                size: f[3].parse().unwrap(),
-                md5: f[4].strip_prefix("MD5:").expect("md5").to_string(),
+                pts: opt("pts"),
+                dts: opt("dts"),
+                duration: opt("duration"),
+                size: field("size").parse().unwrap(),
+                md5: field("data_hash").strip_prefix("MD5:").expect("md5").to_string(),
             }
         })
         .collect()

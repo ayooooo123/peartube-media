@@ -8,7 +8,7 @@ mod bitmap;
 use std::sync::mpsc::{self, Sender};
 
 use bitmap::{Scratch, Show, ffmpeg, oracle, pgs_with_clears};
-use oxideav_core::Error;
+use oxideav_core::{Error, MediaType};
 
 use super::*;
 use crate::backend::{SubtitleImage, SubtitleSink};
@@ -100,59 +100,143 @@ fn pgs_show_replace_clear_times_and_canvases_match_ffmpeg_exactly() {
     for (format, path) in [("sup", &sup), ("matroska", &mkv)] {
         let reference = oracle::ffmpeg_reference(path, 0);
         assert_eq!(reference.cues.len(), 5);
-        let mut ctx = codecs::context();
-        subs_bitmap::register(&mut ctx);
-        let ctx = Arc::new(ctx);
-        let mut demux = ctx.containers.open_demuxer(format, Box::new(std::fs::File::open(path).unwrap()), &ctx.codecs).unwrap();
-        let stream = demux.streams()[0].clone();
-        let decoder = ctx.codecs.first_decoder(&stream.params).unwrap();
-        let params = stream.params.clone();
-        let factory_ctx = ctx.clone();
-        let lane = Lane::new();
-        let demux_cv = Arc::new(Condvar::new());
-        let consumer = Consumer::new(&lane, &demux_cv);
-        loop {
-            match demux.next_packet() {
-                Ok(packet) => lane.push(packet),
-                Err(Error::Eof) => break,
-                Err(error) => panic!("{format} demux: {error}"),
+        check_timing(format, path, &reference);
+    }
+}
+
+#[test]
+fn dvb_show_replace_and_timeout_clear_match_ffmpeg_exactly() {
+    let scratch = Scratch::new();
+    let source = refcheck::fate("sub/dvbsubtest_filter.ts");
+    let mkv = scratch.file("clock-dvb.mks");
+    ffmpeg(&["-copyts", "-i", source.to_str().unwrap(), "-map", "0:s:0", "-c:s", "copy", "-f", "matroska", mkv.to_str().unwrap()]);
+    for (format, path) in [("mpegts", &source), ("matroska", &mkv)] {
+        let reference = oracle::ffmpeg_reference(path, 0);
+        assert!(reference.cues.iter().any(|cue| cue.sub.num_rects > 0));
+        assert!(reference.cues.iter().all(|cue| cue.sub.end_us().is_some()));
+        check_timing(format, path, &reference);
+    }
+}
+
+/// Independent presentation schedule derived only from FFmpeg's subtitles.
+/// Suppress redundant blank states, and expire visible states only when a
+/// later cue has not replaced them. A replacement at the exact end has no
+/// intermediate visible clear.
+fn expected_events(reference: &oracle::Reference) -> Vec<(Duration, Option<usize>)> {
+    let mut events = Vec::new();
+    let mut visible = false;
+    let mut end = None;
+    for (index, cue) in reference.cues.iter().enumerate() {
+        let start = cue.sub.start_us();
+        if visible {
+            if let Some(until) = end.filter(|&until| until < start) {
+                events.push((Duration::from_micros(until as u64), None));
+                visible = false;
             }
         }
-        lane.push_eof();
-        let clock = Arc::new(TestClock::default());
-        let stopped = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let sink = Box::new(CaptureSink { clock: clock.clone(), shows: tx });
-        let pipeline = SubtitlePipeline {
-            decoder,
-            new_decoder: Box::new(move || factory_ctx.codecs.first_decoder(&params)),
-            clock: clock.clone(),
-            time_base: stream.time_base,
-            video_width: 160,
-            video_height: 90,
-            realtime: true,
-            lane: lane.clone(),
-            demux_cv,
-            seek_generation: Box::new(|| 0),
-            stopped: stopped.clone(),
-            retired: Arc::new(AtomicBool::new(false)),
-        };
-        let handle = std::thread::spawn(move || {
-            let _consumer = consumer;
-            run_subtitle_loop(pipeline, sink);
-        });
-        let mut running = TestThread { stopped, lane: lane.clone(), handle: Some(handle) };
-        for (index, expected) in reference.cues.iter().enumerate() {
-            let at = Duration::from_micros(expected.sub.start_us() as u64);
-            clock.set(at - Duration::from_micros(1), &lane);
+        let next_visible = cue.canvas.chunks_exact(4).any(|pixel| pixel[3] != 0);
+        if visible || next_visible {
+            events.push((Duration::from_micros(start as u64), Some(index)));
+        }
+        visible = next_visible;
+        end = cue.sub.end_us();
+    }
+    if visible {
+        if let Some(until) = end {
+            events.push((Duration::from_micros(until as u64), None));
+        }
+    }
+    events
+}
+
+fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Reference) {
+    let mut ctx = codecs::context();
+    subs_bitmap::register(&mut ctx);
+    let ctx = Arc::new(ctx);
+    let mut demux = ctx.containers.open_demuxer(format, Box::new(std::fs::File::open(path).unwrap()), &ctx.codecs).unwrap();
+    let stream = demux.streams().iter().find(|stream| stream.params.media_type == MediaType::Subtitle).unwrap().clone();
+    let decoder = ctx.codecs.first_decoder(&stream.params).unwrap();
+    let params = stream.params.clone();
+    let factory_ctx = ctx.clone();
+    let lane = Lane::new();
+    let demux_cv = Arc::new(Condvar::new());
+    let consumer = Consumer::new(&lane, &demux_cv);
+    loop {
+        match demux.next_packet() {
+            Ok(packet) if packet.stream_index == stream.index => lane.push(packet),
+            Ok(_) => {}
+            Err(Error::Eof) => break,
+            Err(error) => panic!("{format} demux: {error}"),
+        }
+    }
+    lane.push_eof();
+    let clock = Arc::new(TestClock::default());
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let sink = Box::new(CaptureSink { clock: clock.clone(), shows: tx });
+    let pipeline = SubtitlePipeline {
+        decoder,
+        new_decoder: Box::new(move || factory_ctx.codecs.first_decoder(&params)),
+        clock: clock.clone(),
+        time_base: stream.time_base,
+        video_width: reference.width as u32,
+        video_height: reference.height as u32,
+        realtime: true,
+        lane: lane.clone(),
+        demux_cv,
+        seek_generation: Box::new(|| 0),
+        stopped: stopped.clone(),
+        retired: Arc::new(AtomicBool::new(false)),
+    };
+    let handle = std::thread::spawn(move || {
+        let _consumer = consumer;
+        run_subtitle_loop(pipeline, sink);
+    });
+    let mut running = TestThread { stopped, lane: lane.clone(), handle: Some(handle) };
+    let events = expected_events(reference);
+    for (index, &(at, cue)) in events.iter().enumerate() {
+        if index == 0 || events[index - 1].0 != at {
+            clock.set(at.saturating_sub(Duration::from_micros(1)), &lane);
             clock.synchronize();
             assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "{format}: unexpected show/clear before event {index}");
             clock.set(at, &lane);
-            let show = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|error| panic!("{format} event {index}: {error}"));
-            assert_eq!(show.at, at, "{format} event {index}: exact media-time boundary");
-            show.assert_canvas(&reference, index);
         }
-        running.handle.take().unwrap().join().unwrap();
-        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "{format}: extra trailing show/clear");
+        let show = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|error| panic!("{format} event {index}: {error}"));
+        assert_eq!(show.at, at, "{format} event {index}: exact media-time boundary");
+        match cue {
+            Some(cue) => show.assert_canvas(reference, cue),
+            None => {
+                assert!(show.blank, "{format} event {index}: timeout must clear");
+                assert_eq!((show.width, show.height), (reference.width, reference.height));
+                assert!(show.canvas.iter().all(|&byte| byte == 0), "complete expired canvas must be transparent");
+            }
+        }
     }
+    // Let redundant trailing blank states reach EOF, including any finite
+    // deadline attached to the final blank. They must not emit another clear.
+    let final_time = reference.cues.iter().map(|cue| cue.sub.end_us().unwrap_or(cue.sub.start_us())).max().unwrap();
+    clock.set(Duration::from_micros(final_time as u64), &lane);
+    running.handle.take().unwrap().join().unwrap();
+    assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "{format}: extra trailing show/clear");
+}
+
+#[test]
+fn dvb_final_visible_state_expires_at_ffmpeg_end_exactly() {
+    let scratch = Scratch::new();
+    let source = refcheck::fate("sub/dvbsubtest_filter.ts");
+    let path = scratch.file("clock-dvb-timeout.mks");
+    let first_visible = oracle::ffprobe_subtitles(&source, 0).iter().position(|cue| cue.num_rects > 0).unwrap();
+    let count = (first_visible + 1).to_string();
+    // A real prefix ending with a visible DVB subtitle, with no later
+    // replacement/blank to hide an incorrect timeout. FFmpeg supplies both
+    // the unchanged bitmap and the last state's finite end.
+    ffmpeg(&[
+        "-copyts", "-i", source.to_str().unwrap(), "-map", "0:s:0", "-c:s", "copy",
+        "-frames:s", &count, "-f", "matroska", path.to_str().unwrap(),
+    ]);
+    let reference = oracle::ffmpeg_reference(&path, 0);
+    assert_eq!(reference.cues.len(), first_visible + 1);
+    assert!(reference.cues.last().unwrap().sub.num_rects > 0);
+    assert!(expected_events(&reference).last().unwrap().1.is_none(), "must exercise an actual expiry");
+    check_timing("matroska", &path, &reference);
 }

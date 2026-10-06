@@ -10,6 +10,7 @@
 //! (`libavcodec/decode.c`: a subtitle with rectangles and no end lasts the
 //! packet's duration) is applied here too.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -22,40 +23,39 @@ pub(crate) const MAX_CANVAS_BYTES: usize = 256 << 20;
 
 /// One `AVSubtitleRect` of type `SUBTITLE_BITMAP`.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Rect {
+pub(crate) struct Rect<'a> {
     pub x: i32,
     pub y: i32,
     pub w: i32,
     pub h: i32,
     pub linesize: usize,
     /// `data[0]`: palette indices, `linesize` bytes per row.
-    pub pixels: Vec<u8>,
-    /// `data[1]`: the 256-entry palette (`AVPALETTE_SIZE`), each word as
-    /// the R, G, B, A bytes sub2video writes; entries past `nb_colors` are
-    /// zero.
-    pub palette: Vec<[u8; 4]>,
+    pub pixels: Cow<'a, [u8]>,
+    /// Palette words as the R, G, B, A bytes sub2video writes; entries
+    /// beyond this table are transparent black.
+    pub palette: Cow<'a, [[u8; 4]]>,
 }
 
-impl Rect {
+impl Rect<'_> {
     /// A rectangle with an all-zero 256-entry palette and no pixels.
     pub(crate) fn empty() -> Self {
-        Self { palette: vec![[0; 4]; 256], ..Self::default() }
+        Self { palette: vec![[0; 4]; 256].into(), ..Self::default() }
     }
 }
 
 /// One `AVSubtitle`.
 #[derive(Clone, Debug)]
-pub(crate) struct Subtitle {
+pub(crate) struct Subtitle<'a> {
     /// `AVSubtitle.pts` in the packet's time base; `None` for
     /// `AV_NOPTS_VALUE`.
     pub pts: Option<i64>,
     pub start_display_time: u32,
     /// Milliseconds from `pts`; `u32::MAX` means until the next subtitle.
     pub end_display_time: u32,
-    pub rects: Vec<Rect>,
+    pub rects: Vec<Rect<'a>>,
 }
 
-impl Subtitle {
+impl Subtitle<'_> {
     /// `get_subtitle_defaults` with the packet's pts, as
     /// `avcodec_decode_subtitle2` hands the decoder its `AVSubtitle`.
     pub(crate) fn for_packet(pts: Option<i64>) -> Self {
@@ -65,7 +65,7 @@ impl Subtitle {
 
 /// Paints `sub` on a transparent `width x height` canvas the way
 /// sub2video does.
-pub(crate) fn paint(sub: &Subtitle, width: usize, height: usize) -> Vec<u8> {
+pub(crate) fn paint(sub: &Subtitle<'_>, width: usize, height: usize) -> Vec<u8> {
     let mut canvas = vec![0u8; width * height * 4];
     for r in &sub.rects {
         let (x, y, w, h) = (i64::from(r.x), i64::from(r.y), i64::from(r.w), i64::from(r.h));
@@ -77,7 +77,7 @@ pub(crate) fn paint(sub: &Subtitle, width: usize, height: usize) -> Vec<u8> {
             let Some(src) = r.pixels.get(row * r.linesize..row * r.linesize + w) else { break };
             let dst = &mut canvas[((y + row) * width + x) * 4..((y + row) * width + x + w) * 4];
             for (px, &index) in dst.chunks_exact_mut(4).zip(src) {
-                px.copy_from_slice(&r.palette[usize::from(index)]);
+                px.copy_from_slice(r.palette.get(usize::from(index)).unwrap_or(&[0; 4]));
             }
         }
     }
@@ -102,7 +102,15 @@ impl CanvasFrames {
 
     /// Queues the canvas frame of `sub`, decoded from `packet` by a decoder
     /// whose `AVCodecContext` size is `decoder_width x decoder_height`.
-    pub(crate) fn push(&mut self, mut sub: Subtitle, packet: &Packet, decoder_width: i32, decoder_height: i32) -> Result<()> {
+    pub(crate) fn push(&mut self, sub: Subtitle<'_>, packet: &Packet, decoder_width: i32, decoder_height: i32) -> Result<()> {
+        let frame = self.render(sub, packet, decoder_width, decoder_height)?;
+        self.queue(frame);
+        Ok(())
+    }
+
+    /// Renders without publishing, so a decoder can discard the result if
+    /// a later segment makes the same packet invalid.
+    pub(crate) fn render(&mut self, mut sub: Subtitle<'_>, packet: &Packet, decoder_width: i32, decoder_height: i32) -> Result<Frame> {
         // avcodec_decode_subtitle2: rectangles without an end last the
         // packet's duration.
         if !sub.rects.is_empty() && sub.end_display_time == 0 {
@@ -128,8 +136,11 @@ impl CanvasFrames {
             let shown = sub.end_display_time.saturating_sub(sub.start_display_time);
             frame.set_display_duration(Duration::from_millis(u64::from(shown)));
         }
-        self.frames.push_back(Frame::Video(frame));
-        Ok(())
+        Ok(Frame::Video(frame))
+    }
+
+    pub(crate) fn queue(&mut self, frame: Frame) {
+        self.frames.push_back(frame);
     }
 
     pub(crate) fn pop(&mut self) -> Option<Frame> {

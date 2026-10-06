@@ -12,6 +12,7 @@
 //! | Format | Codec ids | Ported from |
 //! |---|---|---|
 //! | HDMV PGS | `hdmv_pgs_subtitle`, `pgs` | FFmpeg `libavcodec/pgssubdec.c` |
+//! | DVB subtitles | `dvb_subtitle`, `dvbsub` | FFmpeg `libavcodec/dvbsubdec.c` |
 //!
 //! | Container | Name | Ported from |
 //! |---|---|---|
@@ -22,11 +23,11 @@
 //! licence.
 //!
 //! Reference tests compare complete PGS canvases and their timing with
-//! FFmpeg through SUP, Matroska and M2TS. The mutation suite exercises 2400
-//! seeded packet mutations each for SUP and both Matroska remux layouts,
-//! including truncations and header/RLE bit flips in decoder context. After
-//! every mutation, reset and the complete original stream must again decode
-//! to FFmpeg's exact timestamps, durations and RGBA canvases.
+//! FFmpeg through SUP, Matroska and M2TS, and DVB through MPEG-TS and
+//! Matroska (all 46 display states of FATE `sub/dvbsubtest_filter.ts`).
+//! Mutation tests exercise 7200 seeded PGS packet mutations and 4800 DVB
+//! mutations in real decoder epochs, including truncations and header/RLE
+//! bit flips. Every PGS reset is followed by a complete FFmpeg comparison.
 
 #![forbid(unsafe_code)]
 
@@ -34,6 +35,7 @@ use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag, MediaType, R
 
 mod bytes;
 mod colorspace;
+mod dvb;
 mod pgs;
 mod subtitle;
 mod sup;
@@ -44,9 +46,14 @@ mod sup;
 pub const PGS_CODEC_ID: &str = "hdmv_pgs_subtitle";
 /// OxideAV `oxideav-sub-image`'s id for PGS, also claimed.
 pub const OXIDEAV_PGS_CODEC_ID: &str = "pgs";
+/// DVB subtitles carried by MPEG-TS descriptor 0x59 and Matroska S_DVBSUB.
+pub const DVB_CODEC_ID: &str = "dvb_subtitle";
+/// FFmpeg's decoder name for DVB subtitles, also claimed.
+pub const DVB_DECODER_NAME: &str = "dvbsub";
 
-/// Resolution priority of every registration here: below OxideAV's 100 so
-/// these implementations win where both register an id, tag or container.
+/// Tag-resolution priority, below OxideAV's default 100. Decoder factories
+/// must additionally register before upstream factories: first_decoder
+/// selects by registration order, not by this priority.
 pub const RESOLUTION_PRIORITY: i32 = 50;
 
 fn caps(implementation: &str) -> CodecCapabilities {
@@ -68,6 +75,15 @@ pub fn register(ctx: &mut RuntimeContext) {
                 .with_resolution_priority(RESOLUTION_PRIORITY)
                 .decoder(pgs::make_decoder)
                 .tag(CodecTag::matroska("S_HDMV/PGS")),
+        );
+    }
+    for id in [DVB_CODEC_ID, DVB_DECODER_NAME] {
+        ctx.codecs.register(
+            CodecInfo::new(CodecId::new(id))
+                .capabilities(caps("dvbsub_ffmpeg_port"))
+                .with_resolution_priority(RESOLUTION_PRIORITY)
+                .decoder(dvb::make_decoder)
+                .tag(CodecTag::matroska("S_DVBSUB")),
         );
     }
     sup::register(&mut ctx.containers);
