@@ -342,6 +342,27 @@ impl ParseState {
     }
 }
 
+/// The frames one packet holds, cut where FFmpeg's dca parser would cut a
+/// stream made of it: an MPEG-TS PES can carry several frames, which
+/// FFmpeg's decoder only ever sees one at a time. Bytes ahead of the first
+/// frame are dropped as the parser's initial padding; the last frame runs
+/// to the end of the packet.
+pub(crate) fn split_frames(data: &[u8]) -> Vec<&[u8]> {
+    let mut pc = ParseState::default();
+    let mut frames = Vec::new();
+    let mut rest = data;
+    while let Some(end) = pc.find_frame_end(rest).filter(|&end| end > 0) {
+        let start = std::mem::take(&mut pc.startpos).min(end);
+        frames.push(&rest[start..end]);
+        rest = &rest[end..];
+    }
+    let start = pc.startpos.min(rest.len());
+    if start < rest.len() || frames.is_empty() {
+        frames.push(&rest[start..]);
+    }
+    frames
+}
+
 // ───────────────────────── raw `dts` demuxer ─────────────────────────
 
 /// Raw DTS demuxer: FFmpeg's `ff_raw_read_partial_packet` (1024-byte

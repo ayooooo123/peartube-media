@@ -129,9 +129,8 @@ dependencies = [
 name = "codec-dca"
 version = "0.1.0"
 dependencies = [
- "oxideav-basic",
+ "codecs",
  "oxideav-core",
- "oxideav-mpegts",
  "refcheck",
 ]
 
@@ -1180,7 +1179,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpegts"
 version = "0.0.3"
-source = "git+https://github.com/OxideAV/oxideav-mpegts?rev=0162e6db4e7b60d2c10ba52c1339a6f65c7ce9a3#0162e6db4e7b60d2c10ba52c1339a6f65c7ce9a3"
+source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=d02c19f7911b3b8c61213842bee4a0dea920b1b3#d02c19f7911b3b8c61213842bee4a0dea920b1b3"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",
