@@ -22,7 +22,7 @@ use check_aac::decoded_f32;
 /// Samples the fork matches at ≥ 90 dB SNR against FFmpeg's float
 /// decode: AAC LC / Main / SSR / LTP multichannel (including coupling
 /// channels), HE-AAC v1 (SBR) stereo + 5.1, HE-AAC v2 (SBR + parametric
-/// stereo) in every CT signalling variant, and ER AAC LD. Each floor
+/// stereo) in every CT signalling variant, ER AAC LD and ER AAC ELD. Each floor
 /// sits just under the measured SNR, so a regression fails even while
 /// it stays above 90 dB.
 const PASSING: &[(&str, f64)] = &[
@@ -62,6 +62,20 @@ const PASSING: &[(&str, f64)] = &[
     ("aac/CT_DecoderCheck/sbr_bc-ps_i.3gp", 131.0),
     // ER AAC LD 5.1 (ER tool order + LD TNS widths).
     ("aac/er_ad6000np_44_ep0.mp4", 138.0),
+    // ER AAC ELD 480-line stereo (low-delay filterbank).
+    ("aac/er_eld2100np_48_ep0.mp4", 137.0),
+];
+
+/// ER AAC ELD samples whose MP4 edit list trims the tail of the last
+/// frame: FFmpeg's mov demuxer attaches `discard_padding` to the last
+/// packet (55 mono samples for `er_eld1001np_44`, 32 per channel for
+/// `er_eld2000np_48`; FATE's `SIZE_TOLERANCE` for the same pair) and
+/// libavcodec drops them, while the fork emits the whole frame — the
+/// trim is container data the decoder never sees. Each entry pins the
+/// SNR floor over FFmpeg's length and the exact interleaved surplus.
+const PASSING_END_TRIMMED: &[(&str, f64, usize)] = &[
+    ("aac/er_eld1001np_44_ep0.mp4", 137.0, 55),
+    ("aac/er_eld2000np_48_ep0.mp4", 137.0, 64),
 ];
 
 /// Samples the fork decodes end-to-end whose SNR against FFmpeg's
@@ -70,10 +84,10 @@ const PASSING: &[(&str, f64)] = &[
 /// gap being closed) fails the assert, so the table tracks progress.
 const KNOWN_GAPS: &[(&str, f64)] = &[];
 
-/// Samples `aac.mak` lists that the fork cannot decode at all: AOT 42
-/// (USAC / xHE-AAC) and AOT 39 (ER AAC ELD) decoders do not exist in
-/// the fork yet. Asserted here so adding support fails this table and
-/// the sample moves up to PASSING/KNOWN_GAPS.
+/// Samples `aac.mak` lists that the fork cannot decode at all: the
+/// AOT 42 (USAC / xHE-AAC) decoder does not exist in the fork yet.
+/// Asserted here so adding support fails this table and the sample
+/// moves up to PASSING/KNOWN_GAPS.
 const UNDECODED: &[&str] = &[
     "aac/Fd_2_c1_Ms_0x01.mp4",
     "aac/Fd_2_c1_Ms_0x04.mp4",
@@ -84,9 +98,6 @@ const UNDECODED: &[&str] = &[
     "aac/usac/Fd_2_c1_Tns_0x04.mp4",
     "aac/usac/Ext_2_c1_Ln_0x03.mp4",
     "aac/usac/xhe_target_level.m4a",
-    "aac/er_eld1001np_44_ep0.mp4",
-    "aac/er_eld2000np_48_ep0.mp4",
-    "aac/er_eld2100np_48_ep0.mp4",
 ];
 
 #[test]
@@ -96,6 +107,20 @@ fn reference_passing_samples() {
         let ff = refcheck::ffmpeg_audio_f32(&path, 0);
         assert_eq!(ours.len(), ff.len(), "{rel}: sample count");
         let snr = refcheck::snr_db(&ff, &ours, 4096);
+        assert!(
+            snr >= *floor,
+            "{rel}: SNR {snr:.2} dB below floor {floor} dB"
+        );
+    }
+}
+
+#[test]
+fn reference_end_trimmed_samples() {
+    for (rel, floor, surplus) in PASSING_END_TRIMMED {
+        let (ours, path, _ch) = decoded_f32(rel);
+        let ff = refcheck::ffmpeg_audio_f32(&path, 0);
+        assert_eq!(ours.len(), ff.len() + surplus, "{rel}: sample count");
+        let snr = refcheck::snr_db(&ff, &ours[..ff.len()], 0);
         assert!(
             snr >= *floor,
             "{rel}: SNR {snr:.2} dB below floor {floor} dB"
@@ -135,9 +160,9 @@ fn reference_known_gap_samples() {
     }
 }
 
-/// USAC (AOT 42) and ELD (AOT 39) decoders do not exist yet: the ASC
-/// parse rejects the config. Assert the rejection so the samples stay
-/// visible in the suite.
+/// The USAC (AOT 42) decoder does not exist yet: the ASC parse rejects
+/// the config. Assert the rejection so the samples stay visible in the
+/// suite.
 #[test]
 fn reference_undecoded_samples_rejected_at_config() {
     for rel in UNDECODED {
