@@ -172,7 +172,7 @@ enum Swap {
 }
 
 
-/// One AImageReader (352x288 YUV, 8 slots) with a counting, draining
+/// One AImageReader (160x120, 8 slots) with a counting, draining
 /// listener: `(reader, frames-received)`.
 
 /// Re-opens the stream for `mode` after a window change.
@@ -374,9 +374,9 @@ fn make_reader(mode: Mode) -> (ndk::media::image_reader::ImageReader, Arc<Atomic
         Mode::SoftwareFrames => (ImageFormat::RGBA_8888, None),
     };
     let mut reader = match usage {
-        Some(usage) => ImageReader::new_with_usage(352, 288, format, usage, 8)
-            .or_else(|_| ImageReader::new(352, 288, format, 8)),
-        None => ImageReader::new(352, 288, format, 8),
+        Some(usage) => ImageReader::new_with_usage(160, 120, format, usage, 8)
+            .or_else(|_| ImageReader::new(160, 120, format, 8)),
+        None => ImageReader::new(160, 120, format, 8),
     }
     .expect("ImageReader::new");
     let frames = Arc::new(AtomicUsize::new(0));
