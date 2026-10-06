@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 pub const RING_CAPACITY: usize = 32 * 1024 * 1024; // 32 MiB
 const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB per read
@@ -24,12 +24,61 @@ struct RingState {
     seek_res: Option<std::io::Result<u64>>,
     suspended: bool,
     stop: bool,
+    /// The consumer is blocked in `read` or `seek` waiting for bytes that
+    /// have not arrived: the ring is empty and the source is not at its end.
+    starved: bool,
 }
+
+type StarveHook = Arc<dyn Fn(bool) + Send + Sync>;
 
 struct SharedRing {
     state: Mutex<RingState>,
     consumer_cv: Condvar,
     worker_cv: Condvar,
+    on_starved: Mutex<Option<StarveHook>>,
+}
+
+impl SharedRing {
+    /// Records whether the consumer waits for bytes and reports a change to
+    /// the hook, which runs with the ring unlocked.
+    fn set_starved(&self, state: &mut MutexGuard<'_, RingState>, starved: bool) {
+        if state.starved == starved {
+            return;
+        }
+        state.starved = starved;
+        let hook = self.on_starved.lock().clone();
+        if let Some(hook) = hook {
+            MutexGuard::unlocked(state, || hook(starved));
+        }
+    }
+}
+
+/// The engine's handle on a source it handed to a demuxer: starvation
+/// reports and suspend/resume of the read-ahead.
+#[derive(Clone)]
+pub struct SourceMonitor {
+    shared: Arc<SharedRing>,
+}
+
+impl SourceMonitor {
+    /// Calls `hook(true)` when a read or seek starts waiting for bytes that
+    /// have not arrived (the ring is empty and the source is not at its
+    /// end), and `hook(false)` when it returns. Install it before reading.
+    pub fn on_starved(&self, hook: impl Fn(bool) + Send + Sync + 'static) {
+        *self.shared.on_starved.lock() = Some(Arc::new(hook));
+    }
+
+    pub fn suspend(&self) {
+        let mut state = self.shared.state.lock();
+        state.suspended = true;
+        self.shared.worker_cv.notify_all();
+    }
+
+    pub fn resume(&self) {
+        let mut state = self.shared.state.lock();
+        state.suspended = false;
+        self.shared.worker_cv.notify_all();
+    }
 }
 
 pub struct ReadAheadSource {
@@ -53,9 +102,11 @@ impl ReadAheadSource {
                 seek_res: None,
                 suspended: false,
                 stop: false,
+                starved: false,
             }),
             consumer_cv: Condvar::new(),
             worker_cv: Condvar::new(),
+            on_starved: Mutex::new(None),
         });
 
         let shared_clone = Arc::clone(&shared);
@@ -72,16 +123,12 @@ impl ReadAheadSource {
         }
     }
 
-    pub fn suspend(&self) {
-        let mut state = self.shared.state.lock();
-        state.suspended = true;
-        self.shared.worker_cv.notify_all();
-    }
-
-    pub fn resume(&self) {
-        let mut state = self.shared.state.lock();
-        state.suspended = false;
-        self.shared.worker_cv.notify_all();
+    /// A handle that stays with the engine after the source itself moves
+    /// into a demuxer.
+    pub fn monitor(&self) -> SourceMonitor {
+        SourceMonitor {
+            shared: Arc::clone(&self.shared),
+        }
     }
 }
 
@@ -106,7 +153,7 @@ impl Read for ReadAheadSource {
         }
 
         let mut state = self.shared.state.lock();
-        loop {
+        let result = loop {
             if state.cur_pos < state.head_pos {
                 let available = (state.head_pos - state.cur_pos) as usize;
                 let to_read = buf.len().min(available);
@@ -121,27 +168,35 @@ impl Read for ReadAheadSource {
                 }
                 state.cur_pos += to_read as u64;
                 self.shared.worker_cv.notify_one();
-                return Ok(to_read);
+                break Ok(to_read);
             }
 
             if let Some(err) = &state.fatal_error {
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, err.clone()));
+                break Err(std::io::Error::new(std::io::ErrorKind::Other, err.clone()));
             }
 
             if state.eof {
-                return Ok(0);
+                break Ok(0);
             }
 
             // Stop: a dropped player must not leave a demuxer blocked here.
             if state.stop {
-                return Err(std::io::Error::new(
+                break Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "source stopped",
                 ));
             }
 
+            // Nothing buffered and more to come: the reader is starved. The
+            // hook runs unlocked, so look again before waiting.
+            if !state.starved {
+                self.shared.set_starved(&mut state, true);
+                continue;
+            }
             self.shared.consumer_cv.wait_for(&mut state, Duration::from_millis(100));
-        }
+        };
+        self.shared.set_starved(&mut state, false);
+        result
     }
 }
 
@@ -175,9 +230,16 @@ impl Seek for ReadAheadSource {
         state.seek_res = None;
         self.shared.worker_cv.notify_one();
 
+        // The worker may sit in a network read that has not returned: the
+        // seek waits for bytes like a read does.
         while state.seek_req.is_some() && !state.stop {
+            if !state.starved {
+                self.shared.set_starved(&mut state, true);
+                continue;
+            }
             self.shared.consumer_cv.wait(&mut state);
         }
+        self.shared.set_starved(&mut state, false);
 
         match state.seek_res.take() {
             Some(Ok(new_pos)) => Ok(new_pos),

@@ -68,9 +68,16 @@ pub struct HeadlessClock {
 
 struct HeadlessClockState {
     realtime: bool,
+    /// Without realtime: the end of the audio written so far.
     now: Option<Duration>,
-    start_mono_ns: Option<i64>,
-    first_pts: Option<Duration>,
+    /// Realtime: media time at `run_start_ns` while playing, or where the
+    /// clock stands while paused; set by the first write after a flush.
+    base: Option<Duration>,
+    /// Realtime: CLOCK_MONOTONIC when the clock last started running.
+    run_start_ns: Option<i64>,
+    /// The sink's `play` / `pause`: like an audio device, the clock only
+    /// advances while the output plays.
+    playing: bool,
 }
 
 impl Default for HeadlessClock {
@@ -85,8 +92,9 @@ impl HeadlessClock {
             state: Mutex::new(HeadlessClockState {
                 realtime: false,
                 now: None,
-                start_mono_ns: None,
-                first_pts: None,
+                base: None,
+                run_start_ns: None,
+                playing: true,
             }),
         }
     }
@@ -102,45 +110,61 @@ impl HeadlessClock {
 
     pub fn on_audio_write(&self, pts: Duration) {
         let mut st = self.state.lock();
-        if st.realtime {
-            if st.start_mono_ns.is_none() {
-                st.start_mono_ns = Some(current_monotonic_ns());
-                st.first_pts = Some(pts);
+        if st.realtime && st.base.is_none() {
+            st.base = Some(pts);
+            if st.playing {
+                st.run_start_ns = Some(current_monotonic_ns());
             }
         }
         st.now = Some(pts);
     }
 
+    /// Starts or stops the realtime clock with the output.
+    pub fn set_playing(&self, playing: bool) {
+        let mut st = self.state.lock();
+        if st.playing == playing {
+            return;
+        }
+        st.playing = playing;
+        if playing {
+            if st.base.is_some() {
+                st.run_start_ns = Some(current_monotonic_ns());
+            }
+        } else if let (Some(base), Some(start_ns)) = (st.base, st.run_start_ns.take()) {
+            let elapsed_ns = (current_monotonic_ns() - start_ns).max(0) as u64;
+            st.base = Some(base + Duration::from_nanos(elapsed_ns));
+        }
+    }
+
     pub fn flush(&self) {
         let mut st = self.state.lock();
         st.now = None;
-        st.start_mono_ns = None;
-        st.first_pts = None;
+        st.base = None;
+        st.run_start_ns = None;
     }
 }
 
 impl Clock for HeadlessClock {
     fn now(&self) -> Option<Duration> {
         let st = self.state.lock();
-        if st.realtime {
-            if let (Some(start_ns), Some(first_pts)) = (st.start_mono_ns, st.first_pts) {
-                let now_ns = current_monotonic_ns();
-                let elapsed_ns = (now_ns - start_ns).max(0) as u64;
-                Some(first_pts + Duration::from_nanos(elapsed_ns))
-            } else {
-                st.now
-            }
-        } else {
-            st.now
+        match (st.realtime, st.base) {
+            (true, Some(base)) => Some(match st.run_start_ns {
+                Some(start_ns) => {
+                    let elapsed_ns = (current_monotonic_ns() - start_ns).max(0) as u64;
+                    base + Duration::from_nanos(elapsed_ns)
+                }
+                None => base,
+            }),
+            _ => st.now,
         }
     }
 
     fn monotonic_ns_at(&self, at: Duration) -> Option<i64> {
         let st = self.state.lock();
-        if let (Some(start_ns), Some(first_pts)) = (st.start_mono_ns, st.first_pts) {
+        if let (Some(start_ns), Some(base)) = (st.run_start_ns, st.base) {
             let at_ns = at.as_nanos() as i64;
-            let first_ns = first_pts.as_nanos() as i64;
-            Some(start_ns + (at_ns - first_ns))
+            let base_ns = base.as_nanos() as i64;
+            Some(start_ns + (at_ns - base_ns))
         } else {
             Some(current_monotonic_ns())
         }
@@ -325,9 +349,13 @@ impl AudioSink for HeadlessAudioSink {
         Ok(frames)
     }
 
-    fn play(&mut self) {}
+    fn play(&mut self) {
+        self.clock.set_playing(true);
+    }
 
-    fn pause(&mut self) {}
+    fn pause(&mut self) {
+        self.clock.set_playing(false);
+    }
 
     fn flush(&mut self) {
         self.clock.flush();
