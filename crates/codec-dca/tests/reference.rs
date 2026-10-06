@@ -367,14 +367,11 @@ fn dtshd_demuxer_packet_metadata() {
         // ffprobe: STRMDATA extent read as 1024-byte packets.
         let expect_packets = {
             let out = std::process::Command::new("ffprobe")
-                .args(["-v", "error", "-show_packets", "-of", "default=nw=1"])
+                .args(["-v", "error", "-show_packets", "-of", "csv"])
                 .arg(&path)
                 .output()
                 .unwrap();
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| l.starts_with("[PACKET]"))
-                .count()
+            String::from_utf8_lossy(&out.stdout).lines().count()
         };
         assert_eq!(count, expect_packets, "{rel}: packet count vs ffprobe");
         assert!(samples > 0, "{rel}: no data demuxed");
