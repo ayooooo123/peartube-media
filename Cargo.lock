@@ -124,6 +124,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-rv"
+version = "0.1.0"
+dependencies = [
+ "demux-rm",
+ "oxideav-core",
+ "oxideav-mkv",
+ "refcheck",
+]
+
+[[package]]
 name = "codecs"
 version = "0.1.0"
 dependencies = [
