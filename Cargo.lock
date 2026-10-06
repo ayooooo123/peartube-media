@@ -81,6 +81,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "check-aac"
+version = "0.1.0"
+dependencies = [
+ "oxideav-aac 0.1.7 (git+https://github.com/ayooooo123/oxideav-aac?rev=ffa7fa69f8619c6ade89ba48354d5284d755cd4a)",
+ "oxideav-core",
+ "oxideav-mov",
+ "oxideav-mp4",
+ "oxideav-mpegts",
+ "refcheck",
+]
+
+[[package]]
 name = "check-mpeg4"
 version = "0.1.0"
 dependencies = [
@@ -141,7 +153,7 @@ dependencies = [
  "demux-asf",
  "demux-misc",
  "demux-rm",
- "oxideav-aac",
+ "oxideav-aac 0.1.7 (git+https://github.com/ayooooo123/oxideav-aac?rev=45b5e0c0647549242ca470084417163eb9eeff21)",
  "oxideav-ac3",
  "oxideav-adpcm",
  "oxideav-ape",
@@ -194,6 +206,7 @@ dependencies = [
  "oxideav-vp9",
  "oxideav-wavpack",
  "oxideav-wma",
+ "subs-text",
 ]
 
 [[package]]
@@ -805,7 +818,15 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "oxideav-aac"
 version = "0.1.7"
-source = "git+https://github.com/OxideAV/oxideav-aac?rev=fe8e4986fc748004d14e634428a9b2495ce6ed26#fe8e4986fc748004d14e634428a9b2495ce6ed26"
+source = "git+https://github.com/ayooooo123/oxideav-aac?rev=45b5e0c0647549242ca470084417163eb9eeff21#45b5e0c0647549242ca470084417163eb9eeff21"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
+name = "oxideav-aac"
+version = "0.1.7"
+source = "git+https://github.com/ayooooo123/oxideav-aac?rev=ffa7fa69f8619c6ade89ba48354d5284d755cd4a#ffa7fa69f8619c6ade89ba48354d5284d755cd4a"
 dependencies = [
  "oxideav-core",
 ]
@@ -1570,6 +1591,19 @@ name = "smallvec"
 version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
+
+[[package]]
+name = "subs-text"
+version = "0.1.0"
+dependencies = [
+ "oxideav-ass",
+ "oxideav-core",
+ "oxideav-mkv",
+ "oxideav-mp4",
+ "oxideav-ogg",
+ "oxideav-subtitle",
+ "refcheck",
+]
 
 [[package]]
 name = "subtle"
