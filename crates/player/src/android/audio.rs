@@ -41,9 +41,16 @@ impl AndroidAudioSink {
     }
 
     pub fn resume(&self) -> Result<(), SinkError> {
-        *self.is_suspended.lock() = false;
+        // Same guard as `open`: never hand AAudio a zero channel count on
+        // the recreate path.
         let sample_rate = self.sample_rate;
         let channels = self.channels;
+        if channels == 0 || channels > 64 || sample_rate == 0 {
+            return Err(SinkError::Fatal(
+                "resume with unconfigured rate/channels".into(),
+            ));
+        }
+        *self.is_suspended.lock() = false;
         self.create_stream(sample_rate, channels)?;
 
         if self.clock.inner.is_playing.load(Ordering::SeqCst) {
@@ -87,11 +94,24 @@ impl AndroidAudioSink {
 
 impl AudioSink for AndroidAudioSink {
     fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), SinkError> {
+        // Reject before touching AAudio: channels = 0 maps to
+        // AAUDIO_UNSPECIFIED, which can open stereo while `write` would
+        // compute frame counts from a different channel count.
+        if channels == 0 || channels > 64 {
+            return Err(SinkError::Fatal(format!(
+                "invalid channel count {channels}"
+            )));
+        }
+        if sample_rate == 0 {
+            return Err(SinkError::Fatal("invalid sample rate 0".into()));
+        }
+        // Open first, commit the configured values only on success: a
+        // failed reopen must leave the previous stream paired with its
+        // original rate/channels.
+        self.create_stream(sample_rate, channels)?;
         self.sample_rate = sample_rate;
         self.channels = channels;
         *self.is_suspended.lock() = false;
-
-        self.create_stream(sample_rate, channels)?;
         self.flush();
 
         Ok(())
@@ -107,7 +127,9 @@ impl AudioSink for AndroidAudioSink {
             None => return Err(SinkError::Unavailable),
         };
 
-        let channels = self.channels.max(1) as usize;
+        // `open` rejects 0 before any write can happen, so no clamp: a
+        // clamp here would misinterpret the buffer's frame count.
+        let channels = self.channels as usize;
         let num_frames = pcm.len() / channels;
         if num_frames == 0 {
             return Ok(0);

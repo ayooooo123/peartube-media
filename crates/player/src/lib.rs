@@ -2,6 +2,7 @@
 //! demuxers and decoders and a platform [`backend::Backend`].
 
 pub mod backend;
+pub mod subtitle_compose;
 
 pub mod clock;
 pub mod engine;

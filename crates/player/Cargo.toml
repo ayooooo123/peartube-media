@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+autoexamples = false
+
+[features]
+# The on-device probe links the Android NDK; it only builds for the
+# aarch64-linux-android target. Host `cargo test --no-run` skips it because
+# the feature is off by default.
+probe = []
 
 [dependencies]
 oxideav-core.workspace = true
@@ -26,3 +33,10 @@ oxideav-h264.workspace = true
 parking_lot = "0.12"
 codecs = { path = "../codecs" }
 refcheck = { path = "../refcheck" }
+
+[[example]]
+name = "android_probe"
+# The example only compiles for Android (ndk dependency); building it on the
+# host is meaningless and would break `cargo test --no-run`. The android
+# build enables the feature.
+required-features = ["probe"]

@@ -77,7 +77,10 @@ fn video_probe(mode: Mode) -> i32 {
     }
 
     // One reader up front; the swap/fallback windows are created lazily
-    // (a fresh reader is exactly what the swap path needs).
+    // (a fresh reader is exactly what the swap path needs). Reader A lives
+    // in a shared slot that `run_stream` empties right after
+    // `set_video_window(None)` returns — mirroring the app, which destroys
+    // its SurfaceView as soon as `surfaceDestroyed` completes.
     let reader_a = make_reader(mode);
     let frames_a = reader_a.1.clone();
     let window_a = reader_a
@@ -85,20 +88,30 @@ fn video_probe(mode: Mode) -> i32 {
         .window()
         .map_err(|e| format!("reader A window: {e:?}"))
         .unwrap();
-    let _keep_a = reader_a;
+    let reader_a_slot: Arc<parking_lot::Mutex<Option<ndk::media::image_reader::ImageReader>>> =
+        Arc::new(parking_lot::Mutex::new(Some(reader_a.0)));
 
     let backend = AndroidBackend::new();
     backend.set_video_window(Some(window_a));
 
     // The emulator's vendor (goldfish) H.264 decoder wedges without ever
-    // queueing input, so this probe drives the sink directly and prefers
-    // the platform's software decoder (c2.android.*) up front. A real
-    // device uses the type-derived hardware decoder; the window-swap
-    // semantics under test are decoder-agnostic.
+    // queueing input, so this probe prefers the platform's software decoder
+    // (c2.android.*) up front. A real device uses the type-derived hardware
+    // decoder; the window-swap semantics under test are decoder-agnostic.
+    // The sink comes from `Backend::video`, which registers it in
+    // `active_video` — that registration is what makes
+    // `set_video_window(None)` able to detach the codec. The typed Arc is
+    // recovered from the registration so the probe can call sink methods
+    // directly while the backend still tracks it.
     let clock = Arc::new(NullClock);
-    let sink_video = Arc::new(parking_lot::Mutex::new(
-        player::android::AndroidVideoSink::new(backend.shared().clone(), clock),
-    ));
+    let _box_sink = backend.video(clock);
+    let sink_video: Arc<parking_lot::Mutex<player::android::AndroidVideoSink>> = backend
+        .shared()
+        .active_video
+        .lock()
+        .as_ref()
+        .and_then(|w| w.upgrade())
+        .expect("Backend::video registers the sink in active_video");
     sink_video.lock().prefer_software_decoder(true);
     let packets = Arc::new(packets);
 
@@ -124,6 +137,7 @@ fn video_probe(mode: Mode) -> i32 {
         time_base,
         swap_at,
         &swap_state,
+        &reader_a_slot,
         &frames_b_slot,
         &frames_c_slot,
         mode,
@@ -180,11 +194,10 @@ enum Swap {
 
 /// Re-opens the stream for `mode` after a window change.
 fn reopen_mode(
-    sink_video: &Arc<parking_lot::Mutex<player::android::AndroidVideoSink>>,
+    sink: &mut player::android::AndroidVideoSink,
     mode: Mode,
     params: &oxideav_core::CodecParameters,
 ) -> Result<(), SinkError> {
-    let mut sink = sink_video.lock();
     match mode {
         Mode::Compressed => {
             sink.prefer_software_decoder(true);
@@ -257,6 +270,7 @@ fn run_stream(
     time_base: TimeBase,
     swap_at: usize,
     swap_state: &Arc<parking_lot::Mutex<Swap>>,
+    reader_a_slot: &Arc<parking_lot::Mutex<Option<ndk::media::image_reader::ImageReader>>>,
     frames_b_slot: &Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>>,
     frames_c_slot: &Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>>,
     mode: Mode,
@@ -293,6 +307,11 @@ fn run_stream(
                 "[video] set_video_window(None) blocked for {:?}",
                 t0.elapsed()
             );
+            // The None barrier guarantees nothing touches the old surface;
+            // destroy it now, exactly like the app destroying the
+            // SurfaceView once `surfaceDestroyed` returns.
+            *reader_a_slot.lock() = None;
+            println!("[video] old ImageReader destroyed");
             *swap_state.lock() = Swap::WindowCleared;
         }
         let pts = packet_media_time(pkt, time_base);
@@ -318,7 +337,7 @@ fn run_stream(
                     *swap_state.lock() = Swap::NewWindowSet;
                     println!("[video] swap: new window set at packet {pushed}");
                     let mut sink = sink_video.lock();
-                    reopen_mode(sink_video, mode, params)?;
+                    reopen_mode(&mut sink, mode, params)?;
                     sink.push_packet(pkt, pts)?;
                 } else {
                     return Err(SinkError::Unavailable);
@@ -345,7 +364,7 @@ fn run_stream(
                 backend.set_video_window(Some(w));
                 println!("[video] moved to fresh window (reader C)");
                 let mut sink = sink_video.lock();
-                reopen_mode(sink_video, mode, params)?;
+                reopen_mode(&mut sink, mode, params)?;
                 sink.push_packet(pkt, pts)?;
             }
             Err(e) => return Err(e),
@@ -559,12 +578,14 @@ fn sw_first_probe() -> i32 {
     let window = reader.window().unwrap();
     let backend = AndroidBackend::new();
     backend.set_video_window(Some(window));
-    let sink_video = Arc::new(parking_lot::Mutex::new(
-        player::android::AndroidVideoSink::new(
-            backend.shared().clone(),
-            Arc::new(NullClock),
-        ),
-    ));
+    let _box_sink = backend.video(Arc::new(NullClock));
+    let sink_video: Arc<parking_lot::Mutex<player::android::AndroidVideoSink>> = backend
+        .shared()
+        .active_video
+        .lock()
+        .as_ref()
+        .and_then(|w| w.upgrade())
+        .expect("Backend::video registers the sink in active_video");
     let t0 = Instant::now();
     {
         let mut sink = sink_video.lock();

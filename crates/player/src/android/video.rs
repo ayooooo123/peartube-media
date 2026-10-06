@@ -31,7 +31,14 @@ pub struct AndroidVideoSink {
     stop_output_signal: Arc<AtomicBool>,
     midstream_error: Arc<Mutex<Option<String>>>,
     is_playing: Arc<AtomicBool>,
+    /// Length-prefix size taken from avcC/hvcC.
     nal_length_size: usize,
+    /// How the demuxer frames this stream's packets: `true` = Annex B start
+    /// codes (extradata was Annex B), `false` = length-prefixed AVCC/HVCC.
+    /// Decided once from the extradata, never sniffed per packet: a valid
+    /// 4-byte AVCC NAL length of 256–511 starts with `00 00 01`, which a
+    /// sniffer would misread as Annex B.
+    packets_are_annex_b: bool,
     software_frame_info: Option<(PixelFormat, u32, u32)>,
     last_compressed_params: Option<CodecParameters>,
     is_compressed: bool,
@@ -58,6 +65,7 @@ impl AndroidVideoSink {
             midstream_error: Arc::new(Mutex::new(None)),
             is_playing: Arc::new(AtomicBool::new(true)),
             nal_length_size: 4,
+            packets_are_annex_b: false,
             software_frame_info: None,
             last_compressed_params: None,
             is_compressed: false,
@@ -183,9 +191,15 @@ impl AndroidVideoSink {
         let mut csd0 = Vec::new();
         let mut csd1 = Vec::new();
         let mut nal_len_size = 4;
+        // Stream framing decided once, from the extradata itself.
+        let mut packets_annex_b = false;
 
         if mime == "video/avc" {
             if !params.extradata.is_empty() {
+                // Annex B extradata carries the parameter sets inline with
+                // start codes; avcC is the ISO/IEC 14496-15 record.
+                packets_annex_b = params.extradata.starts_with(&[0, 0, 0, 1])
+                    || params.extradata.starts_with(&[0, 0, 1]);
                 if let Some((s0, s1, nls)) = parse_avcc_to_annex_b(&params.extradata) {
                     csd0 = s0;
                     csd1 = s1;
@@ -194,6 +208,8 @@ impl AndroidVideoSink {
             }
         } else if mime == "video/hevc" {
             if !params.extradata.is_empty() {
+                packets_annex_b = params.extradata.starts_with(&[0, 0, 0, 1])
+                    || params.extradata.starts_with(&[0, 0, 1]);
                 if let Some((s0, nls)) = parse_hvcc_to_annex_b(&params.extradata) {
                     csd0 = s0;
                     nal_len_size = nls;
@@ -203,6 +219,7 @@ impl AndroidVideoSink {
             csd0 = params.extradata.clone();
         }
         self.nal_length_size = nal_len_size;
+        self.packets_are_annex_b = packets_annex_b;
 
         let codec = if force_software {
             match software_decoder_name(mime).and_then(MediaCodec::from_codec_name) {
@@ -273,7 +290,11 @@ impl AndroidVideoSink {
         self.codec = Some(codec_arc.clone());
         self.stop_output_signal.store(false, Ordering::SeqCst);
         *self.midstream_error.lock() = None;
-        self.awaiting_keyframe = false;
+        // NOTE: `awaiting_keyframe` is deliberately NOT cleared here. When
+        // the codec was rebuilt after a window loss, the next packet pushed
+        // must still be a keyframe; the gate clears itself in `push_packet`
+        // when a keyframe arrives. A fresh-open (no loss) enters with the
+        // gate already false.
 
         // Output thread
         let thread_codec = codec_arc;
@@ -546,10 +567,14 @@ impl VideoSink for AndroidVideoSink {
             None => return Err(SinkError::Fallback("decoder not active".into())),
         };
 
+        // Framing comes from the extradata decision made at open time, not
+        // from sniffing: a 4-byte AVCC NAL length of 256–511 starts with
+        // `00 00 01` and would be misread as Annex B.
         let annex_b_data = if self.last_compressed_params.as_ref().map_or(false, |p| {
             let mime = codec_id_to_mime(&p.codec_id.0).unwrap_or("");
             mime == "video/avc" || mime == "video/hevc"
-        }) {
+        }) && !self.packets_are_annex_b
+        {
             convert_packet_to_annex_b(&packet.data, self.nal_length_size)
         } else {
             packet.data.clone()
