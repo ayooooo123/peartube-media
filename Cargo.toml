@@ -90,7 +90,7 @@ opt-level = 3
 
 # BEGIN pin-oxideav
 [patch.crates-io]
-oxideav-aac = { git = "https://github.com/OxideAV/oxideav-aac", rev = "fe8e4986fc748004d14e634428a9b2495ce6ed26" }
+oxideav-aac = { git = "https://github.com/ayooooo123/oxideav-aac", rev = "6e06708ebc76c25d6db5c309762fa248325ab64e" }
 oxideav-ac3 = { git = "https://github.com/OxideAV/oxideav-ac3", rev = "99228831d2b29a35fe2b2035118a18f8cb0cae59" }
 oxideav-adpcm = { git = "https://github.com/OxideAV/oxideav-adpcm", rev = "0802fb34c6c57bfa8913670fe78882547416fd16" }
 oxideav-ape = { git = "https://github.com/OxideAV/oxideav-ape", rev = "ea6e8ca2848b18716a49ca6de0fe4d8d26d4893a" }

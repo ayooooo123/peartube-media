@@ -1,0 +1,17 @@
+[package]
+name = "check-aac"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oxideav-core.workspace = true
+oxideav-mov.workspace = true
+oxideav-mp4.workspace = true
+oxideav-mpegts.workspace = true
+oxideav-aac = { git = "https://github.com/ayooooo123/oxideav-aac", branch = "peartube" }
+refcheck.workspace = true

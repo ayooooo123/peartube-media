@@ -72,6 +72,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "check-aac"
+version = "0.1.0"
+dependencies = [
+ "oxideav-aac 0.1.7 (git+https://github.com/ayooooo123/oxideav-aac?branch=peartube)",
+ "oxideav-core",
+ "oxideav-mov",
+ "oxideav-mp4",
+ "oxideav-mpegts",
+ "refcheck",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -98,7 +110,7 @@ dependencies = [
  "codec-mlp",
  "demux-asf",
  "demux-misc",
- "oxideav-aac",
+ "oxideav-aac 0.1.7 (git+https://github.com/ayooooo123/oxideav-aac?rev=6e06708ebc76c25d6db5c309762fa248325ab64e)",
  "oxideav-ac3",
  "oxideav-adpcm",
  "oxideav-ape",
@@ -311,7 +323,15 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "oxideav-aac"
 version = "0.1.7"
-source = "git+https://github.com/OxideAV/oxideav-aac?rev=fe8e4986fc748004d14e634428a9b2495ce6ed26#fe8e4986fc748004d14e634428a9b2495ce6ed26"
+source = "git+https://github.com/ayooooo123/oxideav-aac?branch=peartube#6e06708ebc76c25d6db5c309762fa248325ab64e"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
+name = "oxideav-aac"
+version = "0.1.7"
+source = "git+https://github.com/ayooooo123/oxideav-aac?rev=6e06708ebc76c25d6db5c309762fa248325ab64e#6e06708ebc76c25d6db5c309762fa248325ab64e"
 dependencies = [
  "oxideav-core",
 ]
