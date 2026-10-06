@@ -320,15 +320,17 @@ pub fn h_s_overlap(buf: &mut [i16], left: usize, right: usize, left_stride: usiz
 /// `vc1_filter_line`: filters across the edge between `p - stride` and `p`.
 #[inline]
 fn filter_line(src: &mut [u8], p: isize, stride: isize, pq: i32) -> bool {
-    let g = |s: &[u8], k: isize| s[(p + k * stride) as usize] as i32;
-    let mut a0 = (2 * (g(src, -2) - g(src, 1)) - 5 * (g(src, -1) - g(src, 0)) + 4) >> 3;
+    let at = |k: isize| (p + k * stride) as usize;
+    let (m2, m1, z0, p1) = (src[at(-2)] as i32, src[at(-1)] as i32, src[at(0)] as i32, src[at(1)] as i32);
+    let mut a0 = (2 * (m2 - p1) - 5 * (m1 - z0) + 4) >> 3;
     let a0_sign = a0 >> 31;
     a0 = (a0 ^ a0_sign) - a0_sign;
     if a0 < pq {
-        let a1 = ((2 * (g(src, -4) - g(src, -1)) - 5 * (g(src, -3) - g(src, -2)) + 4) >> 3).abs();
-        let a2 = ((2 * (g(src, 0) - g(src, 3)) - 5 * (g(src, 1) - g(src, 2)) + 4) >> 3).abs();
+        let (m4, m3, p2, p3) = (src[at(-4)] as i32, src[at(-3)] as i32, src[at(2)] as i32, src[at(3)] as i32);
+        let a1 = ((2 * (m4 - m1) - 5 * (m3 - m2) + 4) >> 3).abs();
+        let a2 = ((2 * (z0 - p3) - 5 * (p1 - p2) + 4) >> 3).abs();
         if a1 < a0 || a2 < a0 {
-            let mut clip = g(src, -1) - g(src, 0);
+            let mut clip = m1 - z0;
             let clip_sign = clip >> 31;
             clip = ((clip ^ clip_sign) - clip_sign) >> 1;
             if clip != 0 {
@@ -337,10 +339,8 @@ fn filter_line(src: &mut [u8], p: isize, stride: isize, pq: i32) -> bool {
                 if (a0_sign ^ clip_sign) != 0 {
                     d = d.min(clip);
                     d = (d ^ clip_sign) - clip_sign;
-                    let i1 = (p - stride) as usize;
-                    let i0 = p as usize;
-                    src[i1] = clip_u8(src[i1] as i32 - d);
-                    src[i0] = clip_u8(src[i0] as i32 + d);
+                    src[at(-1)] = clip_u8(m1 - d);
+                    src[at(0)] = clip_u8(z0 + d);
                 }
                 return true;
             }
@@ -385,47 +385,42 @@ pub struct Src<'a> {
 }
 
 impl Src<'_> {
+    /// `len` pixels of row `y` starting at column `x`.
     #[inline(always)]
-    fn at(&self, x: isize, y: isize) -> i32 {
-        self.data[(self.off + y * self.stride + x) as usize] as i32
+    fn row(&self, x: isize, y: isize, len: usize) -> &[u8] {
+        let start = (self.off + y * self.stride + x) as usize;
+        &self.data[start..start + len]
     }
 }
 
+/// `vc1_mspel_{ver,hor}_filter_16bits` on the four taps `a`..`d`.
 #[inline(always)]
-fn ver_filter_16bits(s: &Src, x: isize, y: isize, mode: i32) -> i32 {
+fn filter_16bits(a: i32, b: i32, c: i32, d: i32, mode: i32) -> i32 {
     match mode {
-        1 => -4 * s.at(x, y - 1) + 53 * s.at(x, y) + 18 * s.at(x, y + 1) - 3 * s.at(x, y + 2),
-        2 => -s.at(x, y - 1) + 9 * s.at(x, y) + 9 * s.at(x, y + 1) - s.at(x, y + 2),
-        3 => -3 * s.at(x, y - 1) + 18 * s.at(x, y) + 53 * s.at(x, y + 1) - 4 * s.at(x, y + 2),
+        1 => -4 * a + 53 * b + 18 * c - 3 * d,
+        2 => -a + 9 * b + 9 * c - d,
+        3 => -3 * a + 18 * b + 53 * c - 4 * d,
         _ => 0,
     }
 }
 
+/// `vc1_mspel_filter` (modes 1..3) on the four taps `a`..`d`.
 #[inline(always)]
-fn hor_filter_16bits(t: &[i16], i: usize, mode: i32) -> i32 {
-    let g = |k: usize| t[k] as i32;
+fn mspel_filter(a: i32, b: i32, c: i32, d: i32, mode: i32, r: i32) -> i32 {
     match mode {
-        1 => -4 * g(i - 1) + 53 * g(i) + 18 * g(i + 1) - 3 * g(i + 2),
-        2 => -g(i - 1) + 9 * g(i) + 9 * g(i + 1) - g(i + 2),
-        3 => -3 * g(i - 1) + 18 * g(i) + 53 * g(i + 1) - 4 * g(i + 2),
-        _ => 0,
+        1 => (-4 * a + 53 * b + 18 * c - 3 * d + 32 - r) >> 6,
+        2 => (-a + 9 * b + 9 * c - d + 8 - r) >> 4,
+        _ => (-3 * a + 18 * b + 53 * c - 4 * d + 32 - r) >> 6,
     }
 }
 
-/// `vc1_mspel_filter` along direction (dx, dy).
+/// `op_put` / `op_avg` of the mspel functions.
 #[inline(always)]
-fn mspel_filter(s: &Src, x: isize, y: isize, dx: isize, dy: isize, mode: i32, r: i32) -> i32 {
-    match mode {
-        0 => s.at(x, y),
-        1 => (-4 * s.at(x - dx, y - dy) + 53 * s.at(x, y) + 18 * s.at(x + dx, y + dy) - 3 * s.at(x + 2 * dx, y + 2 * dy)
-            + 32
-            - r)
-            >> 6,
-        2 => (-s.at(x - dx, y - dy) + 9 * s.at(x, y) + 9 * s.at(x + dx, y + dy) - s.at(x + 2 * dx, y + 2 * dy) + 8 - r) >> 4,
-        _ => (-3 * s.at(x - dx, y - dy) + 18 * s.at(x, y) + 53 * s.at(x + dx, y + dy) - 4 * s.at(x + 2 * dx, y + 2 * dy)
-            + 32
-            - r)
-            >> 6,
+fn mspel_op(d: &mut u8, v: i32, avg: bool) {
+    if avg {
+        *d = ((*d as i32 + clip_u8(v) as i32 + 1) >> 1) as u8;
+    } else {
+        *d = clip_u8(v);
     }
 }
 
@@ -434,24 +429,17 @@ fn mspel_filter(s: &Src, x: isize, y: isize, dx: isize, dy: isize, mode: i32, r:
 pub fn vc1_mspel_mc(dst: &mut [u8], doff: usize, dstride: usize, src: &Src, n: usize, dxy: usize, rnd: i32, avg: bool) {
     let hmode = (dxy & 3) as i32;
     let vmode = (dxy >> 2) as i32;
-    let op = |d: &mut u8, v: i32| {
-        if avg {
-            *d = ((*d as i32 + clip_u8(v) as i32 + 1) >> 1) as u8;
-        } else {
-            *d = clip_u8(v);
-        }
-    };
     if hmode == 0 && vmode == 0 {
         // put/avg_pixels{8x8,16x16}_c
         for y in 0..n {
-            for x in 0..n {
-                let v = src.at(x as isize, y as isize);
-                let d = &mut dst[doff + y * dstride + x];
-                if avg {
-                    *d = ((*d as i32 + v + 1) >> 1) as u8;
-                } else {
-                    *d = v as u8;
+            let s = src.row(0, y as isize, n);
+            let d = &mut dst[doff + y * dstride..doff + y * dstride + n];
+            if avg {
+                for (d, &s) in d.iter_mut().zip(s) {
+                    *d = ((*d as i32 + s as i32 + 1) >> 1) as u8;
                 }
+            } else {
+                d.copy_from_slice(s);
             }
         }
         return;
@@ -464,33 +452,40 @@ pub fn vc1_mspel_mc(dst: &mut [u8], doff: usize, dstride: usize, src: &Src, n: u
             let mut tmp = [0i16; 19 * 16];
             let r = (1 << (shift - 1)) + rnd - 1;
             for j in 0..n {
-                for i in 0..w {
-                    tmp[j * w + i] =
-                        ((ver_filter_16bits(src, i as isize - 1, j as isize, vmode) + r) >> shift) as i16;
+                let jy = j as isize;
+                let (a, b, c, d) = (src.row(-1, jy - 1, w), src.row(-1, jy, w), src.row(-1, jy + 1, w), src.row(-1, jy + 2, w));
+                for (i, t) in tmp[j * w..(j + 1) * w].iter_mut().enumerate() {
+                    let v = filter_16bits(a[i] as i32, b[i] as i32, c[i] as i32, d[i] as i32, vmode);
+                    *t = ((v + r) >> shift) as i16;
                 }
             }
             let r = 64 - rnd;
             for j in 0..n {
-                for i in 0..n {
-                    let v = (hor_filter_16bits(&tmp[j * w..], i + 1, hmode) + r) >> 7;
-                    op(&mut dst[doff + j * dstride + i], v);
+                let t = &tmp[j * w..(j + 1) * w];
+                let drow = &mut dst[doff + j * dstride..doff + j * dstride + n];
+                for (i, d) in drow.iter_mut().enumerate() {
+                    let v = filter_16bits(t[i] as i32, t[i + 1] as i32, t[i + 2] as i32, t[i + 3] as i32, hmode);
+                    mspel_op(d, (v + r) >> 7, avg);
                 }
             }
             return;
         }
         let r = 1 - rnd;
         for j in 0..n {
-            for i in 0..n {
-                let v = mspel_filter(src, i as isize, j as isize, 0, 1, vmode, r);
-                op(&mut dst[doff + j * dstride + i], v);
+            let jy = j as isize;
+            let (a, b, c, d) = (src.row(0, jy - 1, n), src.row(0, jy, n), src.row(0, jy + 1, n), src.row(0, jy + 2, n));
+            let drow = &mut dst[doff + j * dstride..doff + j * dstride + n];
+            for (i, o) in drow.iter_mut().enumerate() {
+                mspel_op(o, mspel_filter(a[i] as i32, b[i] as i32, c[i] as i32, d[i] as i32, vmode, r), avg);
             }
         }
         return;
     }
     for j in 0..n {
-        for i in 0..n {
-            let v = mspel_filter(src, i as isize, j as isize, 1, 0, hmode, rnd);
-            op(&mut dst[doff + j * dstride + i], v);
+        let s = src.row(-1, j as isize, n + 3);
+        let drow = &mut dst[doff + j * dstride..doff + j * dstride + n];
+        for (i, o) in drow.iter_mut().enumerate() {
+            mspel_op(o, mspel_filter(s[i] as i32, s[i + 1] as i32, s[i + 2] as i32, s[i + 3] as i32, hmode, rnd), avg);
         }
     }
 }
@@ -500,20 +495,40 @@ pub fn vc1_mspel_mc(dst: &mut [u8], doff: usize, dstride: usize, src: &Src, n: u
 pub fn hpel(dst: &mut [u8], doff: usize, dstride: usize, src: &Src, n: usize, dxy: usize, no_rnd: bool, avg: bool) {
     let r1 = if no_rnd { 0 } else { 1 };
     let r2 = if no_rnd { 1 } else { 2 };
+    let op = |d: &mut u8, v: i32| {
+        if avg {
+            *d = ((*d as i32 + v + 1) >> 1) as u8;
+        } else {
+            *d = v as u8;
+        }
+    };
     for y in 0..n {
-        for x in 0..n {
-            let (xi, yi) = (x as isize, y as isize);
-            let v = match dxy {
-                0 => src.at(xi, yi),
-                1 => (src.at(xi, yi) + src.at(xi + 1, yi) + r1) >> 1,
-                2 => (src.at(xi, yi) + src.at(xi, yi + 1) + r1) >> 1,
-                _ => (src.at(xi, yi) + src.at(xi + 1, yi) + src.at(xi, yi + 1) + src.at(xi + 1, yi + 1) + r2) >> 2,
-            };
-            let d = &mut dst[doff + y * dstride + x];
-            if avg {
-                *d = ((*d as i32 + v + 1) >> 1) as u8;
-            } else {
-                *d = v as u8;
+        let yi = y as isize;
+        let drow = &mut dst[doff + y * dstride..doff + y * dstride + n];
+        match dxy {
+            0 => {
+                let s = src.row(0, yi, n);
+                for (d, &s) in drow.iter_mut().zip(s) {
+                    op(d, s as i32);
+                }
+            }
+            1 => {
+                let s = src.row(0, yi, n + 1);
+                for (i, d) in drow.iter_mut().enumerate() {
+                    op(d, (s[i] as i32 + s[i + 1] as i32 + r1) >> 1);
+                }
+            }
+            2 => {
+                let (s, t) = (src.row(0, yi, n), src.row(0, yi + 1, n));
+                for (i, d) in drow.iter_mut().enumerate() {
+                    op(d, (s[i] as i32 + t[i] as i32 + r1) >> 1);
+                }
+            }
+            _ => {
+                let (s, t) = (src.row(0, yi, n + 1), src.row(0, yi + 1, n + 1));
+                for (i, d) in drow.iter_mut().enumerate() {
+                    op(d, (s[i] as i32 + s[i + 1] as i32 + t[i] as i32 + t[i + 1] as i32 + r2) >> 2);
+                }
             }
         }
     }
@@ -542,22 +557,25 @@ pub fn chroma_mc(
     let c = (8 - x) * y;
     let d = x * y;
     let bias = if no_rnd { 32 - 4 } else { 32 };
+    // Taps right of / below the block are only read when they are weighted.
+    let wx = if x != 0 { w + 1 } else { w };
     for j in 0..h {
         let jy = j as isize;
-        for i in 0..w {
-            let ix = i as isize;
-            let mut sum = a * src.at(ix, jy);
+        let s = src.row(0, jy, wx);
+        let t = if y != 0 { src.row(0, jy + 1, wx) } else { &[][..] };
+        let drow = &mut dst[doff + j * dstride..doff + j * dstride + w];
+        for (i, p) in drow.iter_mut().enumerate() {
+            let mut sum = a * s[i] as i32;
             if b != 0 {
-                sum += b * src.at(ix + 1, jy);
+                sum += b * s[i + 1] as i32;
             }
             if c != 0 {
-                sum += c * src.at(ix, jy + 1);
+                sum += c * t[i] as i32;
             }
             if d != 0 {
-                sum += d * src.at(ix + 1, jy + 1);
+                sum += d * t[i + 1] as i32;
             }
             let v = (sum + bias) >> 6;
-            let p = &mut dst[doff + j * dstride + i];
             if avg {
                 *p = ((*p as i32 + v + 1) >> 1) as u8;
             } else {

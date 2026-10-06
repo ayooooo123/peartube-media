@@ -5,9 +5,11 @@
 use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
-    Packet, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo,
+    Packet, ProbeData, ProbeScore, Rational, ReadSeek, Result, StreamInfo,
     TimeBase, PROBE_SCORE_EXTENSION,
 };
+
+use crate::bits::BitReader;
 
 /// Codec id of the VC-1 Advanced Profile streams the `vc1` demuxer emits.
 pub const CODEC_ID_VC1: &str = "vc1";
@@ -217,87 +219,247 @@ pub fn probe_vc1(probe: &ProbeData) -> ProbeScore {
     }
 }
 
+/// FFmpeg's raw-video time base.
+const VC1_TIME_BASE: i64 = 1_200_000;
+/// Bytes of each header `vc1_parse` unescapes and reads (`UNESCAPED_THRESHOLD`).
+const VC1_HEADER_BYTES: usize = 37;
+
+/// What FFmpeg's `vc1_parse` learns from the sequence and picture headers,
+/// which libavformat turns into packet durations and key flags.
+#[derive(Default)]
+struct Vc1EsHeaders {
+    max_coded_size: Option<(u32, u32)>,
+    broadcast: bool,
+    interlace: bool,
+    tfcntrflag: bool,
+    psf: bool,
+    /// `avctx->framerate` (frames per second, num/den) from the display
+    /// extension.
+    framerate: Option<(i64, i64)>,
+    rff: bool,
+    rptfrm: i64,
+    repeat_pict: i64,
+    /// The last picture header was an I picture (`pict_type == I`).
+    key: bool,
+}
+
+impl Vc1EsHeaders {
+    /// Reads the sequence and frame headers of every unit in `data`.
+    fn scan(&mut self, data: &[u8]) {
+        let mut i = 0;
+        while i + 4 <= data.len() {
+            if data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1 {
+                i += 1;
+                continue;
+            }
+            let code = data[i + 3];
+            if code == 0x0F || code == 0x0D {
+                let head = Self::unescape_head(&data[i + 4..]);
+                let mut gb = BitReader::new(&head);
+                if code == 0x0F {
+                    self.sequence_header(&mut gb);
+                } else {
+                    self.frame_header(&mut gb);
+                }
+            }
+            i += 4;
+        }
+    }
+
+    /// The first `VC1_HEADER_BYTES` of a unit with emulation prevention
+    /// bytes (`00 00 03`) removed, up to the next start code.
+    fn unescape_head(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(VC1_HEADER_BYTES);
+        let mut zeros = 0;
+        for (k, &b) in payload.iter().enumerate() {
+            if out.len() >= VC1_HEADER_BYTES || (zeros >= 2 && b == 1 && k >= 2) {
+                break;
+            }
+            if zeros >= 2 && b == 3 {
+                zeros = 0;
+                continue;
+            }
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+            out.push(b);
+        }
+        out
+    }
+
+    /// The fields of `decode_sequence_header_adv` that time packets.
+    fn sequence_header(&mut self, gb: &mut BitReader) {
+        if gb.read(2) != 3 {
+            return;
+        }
+        gb.skip(3); // level
+        if gb.read(2) != 1 {
+            return; // only 4:2:0 is valid
+        }
+        gb.skip(3 + 5 + 1); // frmrtq_postproc, bitrtq_postproc, postprocflag
+        let w = (gb.read(12) + 1) * 2;
+        let h = (gb.read(12) + 1) * 2;
+        self.max_coded_size = Some((w, h));
+        self.broadcast = gb.read_bit() != 0;
+        self.interlace = gb.read_bit() != 0;
+        self.tfcntrflag = gb.read_bit() != 0;
+        gb.skip(2); // finterpflag, reserved
+        self.psf = gb.read_bit() != 0;
+        if self.psf || gb.read_bit() == 0 {
+            return;
+        }
+        gb.skip(28); // display size
+        let ar = if gb.read_bit() != 0 { gb.read(4) } else { 0 };
+        if ar == 15 {
+            gb.skip(16);
+        }
+        if gb.read_bit() != 0 {
+            if gb.read_bit() != 0 {
+                self.framerate = Some((gb.read(16) as i64 + 1, 32));
+            } else {
+                const FPS_NR: [i64; 7] = [24, 25, 30, 50, 60, 48, 72];
+                const FPS_DR: [i64; 2] = [1000, 1001];
+                let nr = gb.read(8) as usize;
+                let dr = gb.read(4) as usize;
+                if (1..8).contains(&nr) && (1..3).contains(&dr) {
+                    self.framerate = Some((FPS_NR[nr - 1] * 1000, FPS_DR[dr - 1]));
+                }
+            }
+        }
+    }
+
+    /// The start of `ff_vc1_parse_frame_header_adv`: picture type and the
+    /// pulldown flags (`vc1_extract_header`'s `repeat_pict`).
+    fn frame_header(&mut self, gb: &mut BitReader) {
+        let field_mode = self.interlace && gb.decode012() == 2;
+        self.key = if field_mode { gb.read(3) & 6 == 0 } else { gb.get_unary(0, 4) == 2 };
+        if self.tfcntrflag {
+            gb.skip(8);
+        }
+        self.repeat_pict = if self.broadcast {
+            if !self.interlace || self.psf {
+                self.rptfrm = gb.read(2) as i64;
+            } else {
+                gb.skip(1); // tff
+                self.rff = gb.read_bit() != 0;
+            }
+            if self.rff {
+                2
+            } else if self.rptfrm != 0 {
+                self.rptfrm * 2 + 1
+            } else {
+                1
+            }
+        } else {
+            0
+        };
+    }
+
+    /// libavformat's `compute_frame_duration` in `VC1_TIME_BASE` ticks: the
+    /// coded frame rate (two fields per frame, plus repeats) when the
+    /// sequence header has one, else the raw demuxer's 25 fps.
+    fn duration(&self) -> i64 {
+        match self.framerate {
+            Some((num, den)) if den * 1000 > num => den * (1 + self.repeat_pict) * VC1_TIME_BASE / (num * 2),
+            Some(_) => 0,
+            None => VC1_TIME_BASE / 25,
+        }
+    }
+}
+
 pub struct Vc1Demuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     buffer: Vec<u8>,
+    /// Next buffer offset the frame-boundary search examines.
+    scan: usize,
+    /// A frame or field start code was seen in the pending packet
+    /// (`frame_start_found`).
+    pic_found: bool,
     eof_reached: bool,
-    pts: i64,
+    headers: Vc1EsHeaders,
+    next_dts: i64,
 }
 
 impl Vc1Demuxer {
     pub fn open(mut input: Box<dyn ReadSeek>) -> Result<Self> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 16384];
-        let n = input.read(&mut chunk).map_err(Error::Io)?;
-        buffer.extend_from_slice(&chunk[..n]);
+        let mut buffer = vec![0u8; 16384];
+        let n = input.read(&mut buffer).map_err(Error::Io)?;
+        buffer.truncate(n);
 
-        let mut width = None;
-        let mut height = None;
-
-        // Try to parse sequence header from initial buffer
-        for i in 0..buffer.len().saturating_sub(10) {
-            if buffer[i] == 0 && buffer[i + 1] == 0 && buffer[i + 2] == 1 && buffer[i + 3] == 0x0F {
-                let b = &buffer[i + 4..];
-                if b.len() >= 6 {
-                    let w_val = ((b[2] as u32) << 4) | ((b[3] as u32) >> 4);
-                    let h_val = (((b[3] as u32) & 0x0F) << 8) | (b[4] as u32);
-                    width = Some((w_val + 1) * 2);
-                    height = Some((h_val + 1) * 2);
-                }
-                break;
-            }
+        // Size and frame rate from the first sequence header.
+        let mut first = Vc1EsHeaders::default();
+        if let Some(i) = buffer.windows(4).position(|w| w == [0, 0, 1, 0x0F]) {
+            first.scan(&buffer[i..(i + 4 + VC1_HEADER_BYTES).min(buffer.len())]);
         }
-
-        let time_base = TimeBase::new(1, 25);
         let mut params = CodecParameters::video(CodecId::new(CODEC_ID_VC1));
-        params.width = width;
-        params.height = height;
-
+        params.width = first.max_coded_size.map(|s| s.0);
+        params.height = first.max_coded_size.map(|s| s.1);
+        params.frame_rate = Some(match first.framerate {
+            Some((num, den)) => Rational::new(num, den),
+            None => Rational::new(25, 1),
+        });
         let stream = StreamInfo {
             index: 0,
             params,
-            time_base,
+            time_base: TimeBase::new(1, VC1_TIME_BASE),
             duration: None,
             start_time: Some(0),
         };
-
         Ok(Self {
             input,
             streams: vec![stream],
             buffer,
+            scan: 0,
+            pic_found: false,
             eof_reached: n == 0,
-            pts: 0,
-
+            headers: Vc1EsHeaders::default(),
+            next_dts: 0,
         })
     }
 
-    /// Finds the next start-code boundary that begins a new frame.
-    /// FFmpeg parser logic: once `pic_found` is true (we have seen a 0x0D or 0x0C),
-    /// any subsequent start code OTHER than FIELD (0x0C), SLICE (0x0B), or ENDOFSEQ (0x0A)
-    /// ends the current frame and begins the next.
-    fn find_next_frame_boundary(&self) -> Option<usize> {
-        let mut i = 0;
-        let mut pic_seen = false;
-
-        while i + 4 <= self.buffer.len() {
-            if self.buffer[i] == 0 && self.buffer[i + 1] == 0 && self.buffer[i + 2] == 1 {
-                let code = self.buffer[i + 3];
-                if !pic_seen {
-                    if code == 0x0D || code == 0x0C {
-                        pic_seen = true;
-                    }
-                    i += 4;
+    /// `vc1_parse`'s frame split: once a frame or field start code was seen,
+    /// the next start code other than field, slice or end-of-sequence
+    /// begins the next packet. Resumes where the previous call stopped.
+    fn find_frame_end(&mut self) -> Option<usize> {
+        let buf = &self.buffer;
+        let mut i = self.scan;
+        while i + 4 <= buf.len() {
+            if buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 1 {
+                let code = buf[i + 3];
+                if !self.pic_found {
+                    self.pic_found = code == 0x0D || code == 0x0C;
                 } else if code != 0x0C && code != 0x0B && code != 0x0A {
+                    self.scan = 0;
+                    self.pic_found = false;
                     return Some(i);
-                } else {
-                    i += 4;
                 }
+                i += 4;
             } else {
                 i += 1;
             }
         }
+        self.scan = i;
         None
+    }
+
+    /// One packet per frame, timed and flagged like FFmpeg's raw demuxer:
+    /// dts advances by each frame's duration, I pictures are key frames.
+    /// FFmpeg leaves the pts of some frames unset; ours equals the dts.
+    fn packet(&mut self, data: Vec<u8>) -> Packet {
+        self.headers.scan(&data);
+        let duration = self.headers.duration();
+        let ts = self.next_dts;
+        self.next_dts += duration;
+        let mut pkt = Packet {
+            stream_index: 0,
+            time_base: self.streams[0].time_base,
+            pts: Some(ts),
+            dts: Some(ts),
+            duration: Some(duration),
+            flags: Default::default(),
+            data,
+        };
+        pkt.flags.keyframe = self.headers.key;
+        pkt
     }
 }
 
@@ -312,58 +474,27 @@ impl Demuxer for Vc1Demuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         let mut chunk = [0u8; 16384];
-
         loop {
-            if let Some(boundary) = self.find_next_frame_boundary() {
-                let packet_data = self.buffer.drain(..boundary).collect();
-                let pts = self.pts;
-                self.pts += 1;
-                let mut pkt = Packet {
-                    stream_index: 0,
-                    time_base: self.streams[0].time_base,
-                    pts: Some(pts),
-                    dts: Some(pts),
-                    duration: Some(1),
-                    flags: Default::default(),
-                    data: packet_data,
-                };
-                if pts == 0 {
-                    pkt.flags.keyframe = true;
-                }
-                return Ok(pkt);
+            if let Some(end) = self.find_frame_end() {
+                let data = self.buffer.drain(..end).collect();
+                return Ok(self.packet(data));
             }
-
             if self.eof_reached {
-                if !self.buffer.is_empty() {
-                    let packet_data = std::mem::take(&mut self.buffer);
-                    let pts = self.pts;
-                    self.pts += 1;
-                    let mut pkt = Packet {
-                        stream_index: 0,
-                        time_base: self.streams[0].time_base,
-                        pts: Some(pts),
-                        dts: Some(pts),
-                        duration: Some(1),
-                        flags: Default::default(),
-                        data: packet_data,
-                    };
-                    if pts == 0 {
-                        pkt.flags.keyframe = true;
-                    }
-                    return Ok(pkt);
+                // End of file ends the last frame; trailing bytes without a
+                // picture are dropped, as FFmpeg's parser does.
+                if self.pic_found && !self.buffer.is_empty() {
+                    self.pic_found = false;
+                    self.scan = 0;
+                    let data = std::mem::take(&mut self.buffer);
+                    return Ok(self.packet(data));
                 }
+                self.buffer.clear();
                 return Err(Error::Eof);
             }
-
-            let n = match self.input.read(&mut chunk) {
-                Ok(0) => {
-                    self.eof_reached = true;
-                    0
-                }
-                Ok(n) => n,
-                Err(e) => return Err(Error::Io(e)),
-            };
-            if n > 0 {
+            let n = self.input.read(&mut chunk).map_err(Error::Io)?;
+            if n == 0 {
+                self.eof_reached = true;
+            } else {
                 if self.buffer.len() + n > 16 * 1024 * 1024 {
                     return Err(Error::invalid("vc1: frame exceeded 16 MiB"));
                 }

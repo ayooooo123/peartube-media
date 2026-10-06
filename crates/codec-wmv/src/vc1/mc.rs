@@ -39,9 +39,14 @@ struct Fetch {
 }
 
 fn fetch(plane: &[u8], stride: usize, f: &Fetch, out: &mut [u8]) {
+    if f.w == 0 {
+        return;
+    }
     let hmax = f.hmax.max(1);
     let vmax = f.vmax.max(1);
-    for r in 0..f.h {
+    // Rows whose columns all lie inside the picture are plain copies.
+    let inside_x = f.x0 >= 0 && f.x0 + f.w as i32 <= hmax;
+    for (r, dst) in out.chunks_exact_mut(f.w).take(f.h).enumerate() {
         let y = f.y0 + f.step * r as i32;
         let row = if f.interlaced {
             let fh = (vmax >> 1).max(1);
@@ -50,9 +55,16 @@ fn fetch(plane: &[u8], stride: usize, f: &Fetch, out: &mut [u8]) {
             y.clamp(0, vmax - 1)
         } as usize;
         let base = row * stride;
-        for c in 0..f.w {
+        if inside_x {
+            let start = base + f.x0 as usize;
+            if let Some(src) = plane.get(start..start + f.w) {
+                dst.copy_from_slice(src);
+                continue;
+            }
+        }
+        for (c, d) in dst.iter_mut().enumerate() {
             let x = (f.x0 + c as i32).clamp(0, hmax - 1) as usize;
-            out[r * f.w + c] = plane.get(base + x).copied().unwrap_or(0);
+            *d = plane.get(base + x).copied().unwrap_or(0);
         }
     }
 }
