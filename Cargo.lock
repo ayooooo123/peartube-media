@@ -165,6 +165,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-wma"
+version = "0.1.0"
+dependencies = [
+ "demux-asf",
+ "oxideav-core",
+ "oxideav-wma",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-wmv"
 version = "0.1.0"
 dependencies = [
@@ -1090,8 +1100,9 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=f07b1a79317f53d31385715e6969b479219d10a1#f07b1a79317f53d31385715e6969b479219d10a1"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=258eb88d9b44a6fdb86d1f4e867ad121c7d79bdd#258eb88d9b44a6fdb86d1f4e867ad121c7d79bdd"
 dependencies = [
+ "compcol",
  "oxideav-core",
 ]
 

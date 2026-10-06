@@ -5,10 +5,10 @@
 //!
 //! Every sample has one row in `EXPECTED`: the MD5 of our whole packet list
 //! and the differences from `ffprobe`, per stream and field ("" = every
-//! packet equal on every field). Both were recorded with upstream
-//! oxideav-mkv c0966a6, before the fork: the fork changes how a file is
-//! read, never what comes out of it, and every difference listed predates
-//! it. Their causes, all in upstream's packet assembly:
+//! packet equal on every field). A row changes only when the fork's output
+//! does; a difference is never re-pinned to a value FFmpeg doesn't produce.
+//! The differences still listed, all in packet assembly inherited from
+//! upstream oxideav-mkv c0966a6:
 //!
 //! * `key`: every `SimpleBlock` packet is flagged a keyframe, whatever the
 //!   Block's keyframe bit (FFmpeg follows the bit; TrueHD's are set by its
@@ -18,12 +18,14 @@
 //!   E-AC-3), spreads the frames of a laced Block over its duration, applies
 //!   `TrackTimestampScale` (`tts10.mkv`) and drops negative Block
 //!   timestamps (`coeff_level64.mkv`).
-//! * `size` / `md5`: FFmpeg undoes `ContentCompression` (zlib, bzlib, lzo),
-//!   rebuilds WavPack block headers and moves WebVTT cue settings to side
-//!   data.
+//! * `size` / `md5`: FFmpeg rebuilds WavPack block headers, restores
+//!   ProRes frame headers and moves WebVTT cue settings to side data.
 //! * `error` / `count`: a truncated sample ends the strict demux with an
 //!   error where FFmpeg returns the Blocks that fit; `zero_length_block.mks`
 //!   doesn't open.
+//!
+//! Fixed by the fork so far: `ContentEncodings` compression (zlib, bzip2,
+//! LZO1X) is undone.
 //!
 //! `CHECK_MKV_RECORD=1` prints the rows instead of asserting them.
 
@@ -50,14 +52,14 @@ const EXPECTED: &[(&str, &str, &str)] = &[
     ("fate:mkv/h264_tta_undecodable.mkv", "50c45e3cf82d3d4c515bee1c1b34d07e", ""),
     ("fate:mkv/hdr10_plus_vp9_sample.webm", "9b688956626b0462d60a6bef82657fa0", ""),
     ("fate:mkv/hdr10tags-both.mkv", "ceabb755a3c50dddcef12f4eaa5cddd4", "s0: dts 7/10, key 9/10"),
-    ("fate:mkv/lzo.mka", "51fd8e618aa5aa2e91c596852a6dd6c1", "s0: pts 3/4, dts 3/4, size 4/4, md5 4/4"),
-    ("fate:mkv/prores_bz2.mkv", "3d10e66e53e251723b451bd54f29c9b1", "s0: size 2/2, md5 2/2; s1: size 2/2, md5 2/2"),
-    ("fate:mkv/prores_zlib.mkv", "9a5c626ac70c4d4321d7177c99c4ef56", "s0: size 2/2, md5 2/2"),
+    ("fate:mkv/lzo.mka", "d9853eb0b6cefb27b5f3dcb5b731c1d9", "s0: pts 3/4, dts 3/4"),
+    ("fate:mkv/prores_bz2.mkv", "7939534cb32cb9689cec641efc97a16e", "s0: size 2/2, md5 2/2; s1: size 2/2, md5 2/2"),
+    ("fate:mkv/prores_zlib.mkv", "83bed746f96749e5f529b9dfe99bfc27", ""),
     ("fate:mkv/spherical.mkv", "bf372a12d060c6acd0842d83f8aadb75", "s0: dts 91/120, key 119/120"),
-    ("fate:mkv/subtitle_zlib.mks", "c7f3be721cc83ef13ca1f93342327eaa", "s0: size 1/1, md5 1/1"),
+    ("fate:mkv/subtitle_zlib.mks", "22c21b4fc1438305ee004859b4ef14f0", ""),
     ("fate:mkv/test7_cut.mkv", "59a1988a3deb05e21790768d2e49a95f", "error: I/O error: failed to fill whole buffer; s0: count 24/72, dts 13/24, key 23/24; s1: count 48/143, pts 41/48, dts 41/48"),
     ("fate:mkv/tts10.mkv", "bd610379cac4715f9b94c46229bb5c5a", "s0: pts 2/5, dts 2/5"),
-    ("fate:mkv/wavpack_missing_codecprivate.mka", "5236f1440a75c390ce7b12de0adeb68a", "s0: pts 1/2, dts 1/2, size 2/2, md5 2/2"),
+    ("fate:mkv/wavpack_missing_codecprivate.mka", "9d041a3294ae1117849c718ba9eae665", "s0: pts 1/2, dts 1/2, size 2/2, md5 2/2"),
     ("fate:mkv/xiph_lacing.mka", "21e599087b1a6520f7d5a59c05df81fd", "s0: pts 72/84, dts 72/84"),
     ("fate:mkv/zero_length_block.mks", "b25dbbdf3c2d9065ab72d092c162437d", "error: open: invalid data: MKV: no tracks found; s0: count 0/2"),
     ("fate:opus/silk-lbrr-mono.mka", "307e28a2b4172e25f06c8129a1e12281", "s0: pts 46/46, dts 46/46"),
@@ -191,7 +193,7 @@ fn packets_equal_ffprobe() {
             continue;
         };
         if got_digest != digest {
-            failures.push(format!("{name}: packets changed from upstream (digest {got_digest}, want {digest})"));
+            failures.push(format!("{name}: packets changed (digest {got_digest}, want {digest})"));
         }
         if got_diff != diff {
             failures.push(format!("{name}: differences from ffprobe \"{got_diff}\", want \"{diff}\""));
@@ -211,7 +213,7 @@ fn packets_equal_ffprobe() {
         }
     }
     println!(
-        "{} samples: {exact} equal ffprobe on every packet, {known} with differences that predate the fork",
+        "{} samples: {exact} equal ffprobe on every packet, {known} with differences inherited from upstream",
         samples.len()
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
