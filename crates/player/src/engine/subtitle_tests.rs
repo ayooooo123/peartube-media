@@ -212,10 +212,11 @@ fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Refere
             }
         }
     }
-    // Let redundant trailing blank states reach EOF, including any finite
-    // deadline attached to the final blank. They must not emit another clear.
-    let final_time = reference.cues.iter().map(|cue| cue.sub.end_us().unwrap_or(cue.sub.start_us())).max().unwrap();
-    clock.set(Duration::from_micros(final_time as u64), &lane);
+    // Reach trailing blank states, but never advance to their nominal page
+    // timeouts: once blank, nothing remains to expire and EOF must finish.
+    let final_cue = Duration::from_micros(reference.cues.last().unwrap().sub.start_us() as u64);
+    let final_event = events.last().map_or(Duration::ZERO, |event| event.0);
+    clock.set(final_cue.max(final_event), &lane);
     running.handle.take().unwrap().join().unwrap();
     assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "{format}: extra trailing show/clear");
 }

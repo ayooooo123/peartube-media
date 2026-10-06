@@ -202,7 +202,11 @@ impl OnScreen {
             Content::Bitmap(state) => {
                 self.text.clear();
                 self.text_ends.clear();
-                self.bitmap = Some((state, cue.end));
+                // A blank state has already cleared the screen; its own
+                // nominal duration must not delay EOF or schedule a second
+                // clear (DVB attaches its page timeout to blank states too).
+                let end = state.image.as_ref().and(cue.end);
+                self.bitmap = Some((state, end));
             }
         }
     }
@@ -548,6 +552,17 @@ mod tests {
         assert!(advance(&mut on, &mut pending, Duration::from_secs(5)));
         assert!(on.bitmap.as_ref().unwrap().0.image.is_none());
         assert!(on.next_end().is_none());
+    }
+
+    #[test]
+    fn finite_blank_state_has_nothing_left_to_expire() {
+        let mut on = OnScreen::default();
+        on.put(cue(bitmap(1000, Some(Duration::from_secs(15)), true)));
+        assert_eq!(on.next_end(), Some(Duration::from_secs(16)));
+        on.put(cue(bitmap(2000, Some(Duration::from_secs(15)), false)));
+        assert!(on.bitmap.as_ref().unwrap().0.image.is_none());
+        assert_eq!(on.next_end(), None);
+        assert!(!advance(&mut on, &mut VecDeque::new(), Duration::from_secs(17)));
     }
 
     #[test]
