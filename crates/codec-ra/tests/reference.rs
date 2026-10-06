@@ -90,23 +90,9 @@ fn test_sipr_6k5() {
 
 #[test]
 fn test_sipr_8k5() {
-    let path = fate("sipr/sipr_8k5.rm");
-    let decoded = decode(
-        &path,
-        &[codec_ra::register, demux_rm::register],
-        MediaType::Audio,
-        0,
-    );
-    let got = interleaved_f32(&decoded);
-    let ref_samples = ffmpeg_audio_f32(&path, 0);
-    for f in 0..20 {
-        let start = f * 144;
-        let end = start + 144;
-        let snr = snr_db(&ref_samples[start..end], &got[start..end], 0);
-        println!("8k5 Frame {f}: SNR = {snr:.2} dB");
-    }
     check_audio("sipr/sipr_8k5.rm", 90.0, 144);
 }
+
 #[test]
 fn test_sipr_16k() {
     let path = fate("sipr/sipr_16k.rm");

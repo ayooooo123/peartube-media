@@ -454,11 +454,7 @@ fn celp_lp_synthesis_filterf(
     }
 }
 
-fn lsf_decode_fp(
-    lsfnew: &mut [f32; 10],
-    lsf_history: &mut [f32; 10],
-    vq_indexes: &[usize; 5],
-) {
+fn lsf_decode_fp(lsfnew: &mut [f32; 10], lsf_history: &mut [f32], vq_indexes: &[usize; 5]) {
     let mut lsf_tmp = [0.0f32; 10];
     lsf_tmp[0..2].copy_from_slice(&LSF_CB1[vq_indexes[0] & 63]);
     lsf_tmp[2..4].copy_from_slice(&LSF_CB2[vq_indexes[1] & 127]);
@@ -980,7 +976,7 @@ impl SiprContext {
         let mut ir_buf = [0.0f32; SUBFR_SIZE + LP_FILTER_ORDER]; // 58
         let mut t0_first = 0i32;
 
-        lsf_decode_fp(&mut lsf_new, &mut self.lsf_history[..10].try_into().unwrap(), &params.vq_indexes);
+        lsf_decode_fp(&mut lsf_new, &mut self.lsf_history[..LP_FILTER_ORDER], &params.vq_indexes);
         sipr_decode_lp(&lsf_new, &self.lsp_history, &mut az[..subframe_count * 10], subframe_count);
         self.lsp_history.copy_from_slice(&lsf_new);
 
@@ -1126,14 +1122,6 @@ impl SiprContext {
             &mut self.highpass_filt_mem,
             frame_size,
         );
-        static NB_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let f = NB_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if f < 5 {
-            println!("8k5 Rust Frame {f}: s[0]={:e}, s[{}]={:e}, gain_mem={}, past_pitch_gain={}",
-                out_data[0], frame_size - 1, out_data[frame_size - 1], self.gain_mem, self.past_pitch_gain);
-            println!("    synth_buf[6..16]: {:e}, {:e}, {:e}, {:e}",
-                self.synth_buf[6], self.synth_buf[7], self.synth_buf[8], self.synth_buf[9]);
-        }
     }
 
     pub fn decode_packet(&mut self, data: &[u8]) -> CoreResult<Vec<f32>> {
