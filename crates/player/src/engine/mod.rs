@@ -102,6 +102,9 @@ const SUB_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) struct Lane {
     pub(crate) queue: Mutex<Vec<Packet>>,
     pub(crate) cv: Condvar,
+    /// Seek generation the queued packets belong to; changed only with
+    /// `queue` locked, when the demuxer empties the lane for a seek.
+    seek_gen: AtomicU64,
 }
 
 /// What a pipeline got from its lane.
@@ -109,7 +112,8 @@ enum Pop {
     Packet(Packet),
     /// The demuxer's end marker.
     Eof,
-    /// The caller's `wake` condition turned true while the lane was empty.
+    /// The lane holds packets of a seek the pipeline has not reset for, or
+    /// the caller's `wake` condition turned true while it waited.
     Wake,
 }
 
@@ -118,6 +122,7 @@ impl Lane {
         Arc::new(Lane {
             queue: Mutex::new(Vec::new()),
             cv: Condvar::new(),
+            seek_gen: AtomicU64::new(0),
         })
     }
 
@@ -133,6 +138,16 @@ impl Lane {
 
     fn clear(&self) {
         self.queue.lock().clear();
+    }
+
+    /// Empties the lane for the demuxer's seek `generation`: what it queues
+    /// next comes from the seek target.
+    fn clear_for_seek(&self, generation: u64) {
+        let mut q = self.queue.lock();
+        q.clear();
+        self.seek_gen.store(generation, Ordering::SeqCst);
+        drop(q);
+        self.cv.notify_all();
     }
 
     /// Media span (seconds between the first and last pts) and bytes queued.
@@ -154,14 +169,18 @@ impl Lane {
         (span, bytes)
     }
 
-    /// The next packet or the end marker, waiting while the lane is empty.
-    /// An empty lane short of its end starves the pipeline: `report(true)`
-    /// when that starts and `report(false)` once a packet or the end
-    /// arrives (`starved` carries the reported state across calls; both
-    /// reports run with the lane unlocked). Returns `Wake` as soon as `wake`
-    /// holds while the lane is empty.
+    /// The next packet or the end marker for seek generation `seen_seek`,
+    /// waiting while there is none: packets queued before the demuxer
+    /// applied that seek are never handed out, and `Wake` asks a pipeline
+    /// that has not reset for the demuxer's newest seek to do so first. An
+    /// empty lane short of its end starves the pipeline: `report(true)` when
+    /// that starts and `report(false)` once a packet or the end arrives
+    /// (`starved` carries the reported state across calls; both reports run
+    /// with the lane unlocked). Also returns `Wake` as soon as `wake` holds
+    /// while waiting.
     fn pop(
         &self,
+        seen_seek: u64,
         demux_cv: &Condvar,
         wake: impl Fn() -> bool,
         starved: &mut bool,
@@ -169,18 +188,23 @@ impl Lane {
     ) -> Pop {
         let mut q = self.queue.lock();
         let popped = loop {
+            let generation = self.seek_gen.load(Ordering::SeqCst);
+            if generation > seen_seek {
+                break Pop::Wake;
+            }
+            let current = generation == seen_seek;
             match q.first() {
-                Some(p) if p.stream_index == u32::MAX => {
+                Some(p) if current && p.stream_index == u32::MAX => {
                     q.remove(0);
                     break Pop::Eof;
                 }
-                Some(_) => break Pop::Packet(q.remove(0)),
-                None if wake() => break Pop::Wake,
-                None if !*starved => {
+                Some(_) if current => break Pop::Packet(q.remove(0)),
+                _ if wake() => break Pop::Wake,
+                _ if !*starved => {
                     *starved = true;
                     MutexGuard::unlocked(&mut q, || report(true));
                 }
-                None => {
+                _ => {
                     demux_cv.notify_one();
                     self.cv.wait_for(&mut q, Duration::from_millis(100));
                 }
@@ -237,7 +261,8 @@ struct SharedState {
     /// newest request; decoder threads compare their local copy against it to
     /// detect a seek they have not yet honoured.
     seek_gen: AtomicU64,
-    /// Seek request from the latest `seek`, consumed by the demux loop.
+    /// Target of the latest `seek`; the demux loop applies it once per
+    /// generation.
     seek_target: Mutex<Option<Duration>>,
     /// Seek the demux loop has applied (`seek_to` returned): generation and
     /// target. Decoder threads read it to drop pre-target output.
@@ -873,8 +898,9 @@ fn run_demux_loop(run: &mut Run<'_>) {
             }
         }
 
-        // Bounded queues: wait while a lane is full. The buffering hold
-        // lets go then: nothing more can be queued until the clock moves.
+        // Bounded queues: wait while a lane is full. Nothing more can be
+        // queued until the clock moves, so a buffering hold lets go as soon
+        // as the pipelines have output.
         let now_full = !eof && lanes_full(run);
         if now_full != full {
             full = now_full;
@@ -986,14 +1012,15 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
         .unwrap_or_else(|| TimeBase::new(1, 1000));
     let ticks = tb.ticks_of(target.as_secs_f64());
 
-    *shared.seek_target.lock() = None;
+    // `seek_target` keeps the newest request: the generation decides what
+    // has been applied, so a seek arriving meanwhile is not lost.
     *shared.active_seek.lock() = Some(Seek {
         generation,
         target: target.as_secs_f64(),
     });
-    run.video_lane.clear();
-    run.audio_lane.clear();
-    run.sub_lane.clear();
+    run.video_lane.clear_for_seek(generation);
+    run.audio_lane.clear_for_seek(generation);
+    run.sub_lane.clear_for_seek(generation);
     *eof = false;
     shared.demux_seeked(generation);
 
@@ -1196,7 +1223,7 @@ fn run_audio_thread(
         // Pull a packet; the EOF marker ends this pipeline.
         let woken = || shared.stopped.load(Ordering::SeqCst) || Some(shared.running()) != sink_running;
         let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
-        let packet = match lane.pop(&demux_cv, woken, &mut starved, report) {
+        let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
@@ -1577,7 +1604,7 @@ fn run_video_thread(
 
         let woken = || shared.stopped.load(Ordering::SeqCst) || Some(shared.running()) != sink_running;
         let report = |dry| shared.pipe_starved(Pipe::Video, dry);
-        let packet = match lane.pop(&demux_cv, woken, &mut starved, report) {
+        let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
