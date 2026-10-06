@@ -179,6 +179,12 @@ struct HttpServer {
 
 impl HttpServer {
     fn start(bytes: Arc<Vec<u8>>) -> Self {
+        Self::start_with(bytes, false)
+    }
+
+    /// With `trickle`, each response body starts with 8 bytes and a pause
+    /// before the rest, as a stream arriving from peers does.
+    fn start_with(bytes: Arc<Vec<u8>>, trickle: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
@@ -215,7 +221,14 @@ impl HttpServer {
                     body.len()
                 );
                 let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(body);
+                if trickle && body.len() > 8 {
+                    let _ = stream.write_all(&body[..8]);
+                    let _ = stream.flush();
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = stream.write_all(&body[8..]);
+                } else {
+                    let _ = stream.write_all(body);
+                }
                 let _ = stream.flush();
             }
         });
@@ -267,6 +280,18 @@ fn http_file_matches_ffmpeg() {
     let audio = &capture.audio[0];
     let ff = ffmpeg_audio_f32(&bytes);
     assert_eq!(audio.pcm.len(), ff.len(), "sample count over HTTP");
+}
+
+/// A P2P stream delivers its first bytes before the rest: the container
+/// probe must wait for enough of them instead of probing a few bytes.
+#[test]
+fn http_stream_arriving_slowly_still_probes() {
+    let bytes = Arc::new(make_ref_mkv());
+    let server = HttpServer::start_with(Arc::clone(&bytes), true);
+    let (capture, state) = play_to_end(&server.url());
+    assert!(state.error.is_none(), "unexpected error: {:?}", state.error);
+    assert!(state.ended);
+    assert_eq!(capture.video[0].frame_md5, ffmpeg_video_md5s(&bytes));
 }
 
 #[test]
