@@ -44,6 +44,7 @@ pub fn register(ctx: &mut RuntimeContext) {
 pub fn register_codecs(reg: &mut CodecRegistry) {
     reg.register(
         CodecInfo::new(CodecId::new("wmav1"))
+            .with_resolution_priority(50)
             .capabilities(
                 CodecCapabilities::audio("wmav1_sw_dec")
                     .with_max_channels(2)
@@ -54,6 +55,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
     reg.register(
         CodecInfo::new(CodecId::new("wmav2"))
+            .with_resolution_priority(50)
             .capabilities(
                 CodecCapabilities::audio("wmav2_sw_dec")
                     .with_max_channels(2)
@@ -64,6 +66,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
     reg.register(
         CodecInfo::new(CodecId::new("wmapro"))
+            .with_resolution_priority(50)
             .capabilities(
                 CodecCapabilities::audio("wmapro_sw_dec")
                     .with_max_channels(8)
@@ -74,6 +77,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
     reg.register(
         CodecInfo::new(CodecId::new("wmalossless"))
+            .with_resolution_priority(50)
             .capabilities(
                 CodecCapabilities::audio("wmalossless_sw_dec")
                     .with_lossless(true)
@@ -85,6 +89,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
     reg.register(
         CodecInfo::new(CodecId::new("wmavoice"))
+            .with_resolution_priority(50)
             .capabilities(
                 CodecCapabilities::audio("wmavoice_sw_dec")
                     .with_max_channels(1)

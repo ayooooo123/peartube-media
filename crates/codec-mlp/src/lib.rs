@@ -13,6 +13,7 @@ mod common;
 pub mod crc;
 pub mod decoder;
 mod demuxer;
+pub use demuxer::register_containers;
 pub mod dsp;
 mod error;
 mod parse;

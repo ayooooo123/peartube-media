@@ -29,12 +29,17 @@
 
 [[entry]]
 path = "fate:isom/vc1-wmapro.ism"
-rows = ["video:vc1", "video:wmv3", "audio:wmapro", "container:mp4"]
+rows = ["video:vc1", "audio:wmapro", "container:mp4"]
 compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "fate:vc1/SA00050.vc1"
 rows = ["video:vc1"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:vc1/SMM0005.rcv"
+rows = ["video:wmv3"]
 compare = ["video:md5"]
 
 [[entry]]
@@ -121,7 +126,12 @@ compare = ["video:md5"]
 
 [[entry]]
 path = "fate:wmv8/wmv8_x8intra.wmv"
-rows = ["video:wmv1", "video:wmv2", "audio:wma1", "audio:wma2", "container:asf"]
+rows = ["video:wmv2", "audio:wma2", "container:asf"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:wmv1_wma1.asf"
+rows = ["video:wmv1", "audio:wma1"]
 compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
@@ -171,8 +181,13 @@ compare = ["video:md5"]
 
 [[entry]]
 path = "fate:real/G2_with_SVT_320_240.rm"
-rows = ["video:rv10", "video:rv20", "container:rm"]
+rows = ["video:rv20", "container:rm"]
 compare = ["video:md5"]
+
+[[entry]]
+path = "fate:sipr/sipr_5k0.rm"
+rows = ["video:rv10", "audio:sipr", "container:rm"]
+compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "fate:real/rv30.rm"

@@ -24,6 +24,7 @@ pub mod vlc;
 pub mod xll;
 
 mod demuxer;
+pub use demuxer::register_containers;
 
 use crate::decoder::DcaDecoder;
 use oxideav_core::{AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, Decoder, Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, SampleFormat};
