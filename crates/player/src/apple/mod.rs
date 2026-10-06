@@ -20,6 +20,7 @@ use objc2_app_kit::NSView;
 #[cfg(target_os = "ios")]
 use objc2_ui_kit::UIView;
 use objc2_av_foundation::{AVSampleBufferAudioRenderer, AVSampleBufferRenderSynchronizer};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_quartz_core::CALayer;
