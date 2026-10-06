@@ -98,6 +98,7 @@ dependencies = [
  "codec-mlp",
  "demux-asf",
  "demux-misc",
+ "demux-rm",
  "oxideav-aac",
  "oxideav-ac3",
  "oxideav-adpcm",
@@ -200,6 +201,14 @@ name = "demux-misc"
 version = "0.1.0"
 dependencies = [
  "codecs",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
+name = "demux-rm"
+version = "0.1.0"
+dependencies = [
  "oxideav-core",
  "refcheck",
 ]
