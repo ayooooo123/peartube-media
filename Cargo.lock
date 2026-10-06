@@ -96,9 +96,11 @@ dependencies = [
 name = "check-mkv"
 version = "0.1.0"
 dependencies = [
+ "codecs",
  "oxideav-core",
  "oxideav-mkv",
  "parking_lot",
+ "player",
  "refcheck",
 ]
 
