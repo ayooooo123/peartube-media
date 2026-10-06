@@ -80,6 +80,17 @@ pub fn of_type<'a>(streams: &'a [FfStream], codec_type: &str) -> Vec<&'a FfStrea
     streams.iter().filter(|s| s.codec_type == codec_type && !s.attached_pic).collect()
 }
 
+/// MD5 of every frame FFmpeg decodes from stream `map`, through refcheck's
+/// video oracle. FFmpeg's C IDCT is pinned for every stream (`-idct simple`,
+/// 6ac540e): the IDCT codecs port FFmpeg's C `simple_idct`, which arm64
+/// FFmpeg replaces with NEON assembly that rounds differently by default,
+/// and decoders without an IDCT ignore the option.
+pub fn video_md5s(path: &Path, map: &str, pix_fmt: &str) -> Result<Vec<String>, String> {
+    let args = refcheck::ffmpeg_video_md5_args(path, map, pix_fmt, &["-idct", "simple"]);
+    let out = tool::ffmpeg(&args, TIMEOUT)?;
+    Ok(refcheck::parse_framemd5(&String::from_utf8_lossy(&out)))
+}
+
 /// A canonical interleaved PCM encoding FFmpeg can write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pcm {

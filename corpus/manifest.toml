@@ -486,6 +486,28 @@ path = "fate:caf/opus.caf"
 rows = ["audio:opus", "container:caf"]
 compare = ["audio:snr:90"]
 
+# Two MP2 tracks of different content (FFmpeg md5s differ): the default
+# selection plays stream 1 and is compared with FFmpeg's 0:1, the explicit
+# one plays stream 2 and is compared with FFmpeg's 0:2.
+[[entry]]
+path = "fate:h264/h264_intra_first-small.ts"
+rows = ["audio:mp2", "container:mpeg_ts"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:h264/h264_intra_first-small.ts"
+rows = ["audio:mp2", "container:mpeg_ts"]
+compare = ["video:md5", "audio:md5"]
+streams = { audio = 2 }
+
+# The second of two FLAC tracks (same PCM as the first, so this exercises the
+# explicit selection and its mapping to FFmpeg's 0:1, not their distinction).
+[[entry]]
+path = "fate:mkv/flac_channel_layouts.mka"
+rows = ["audio:flac", "container:mkv"]
+compare = ["audio:md5"]
+streams = { audio = 1 }
+
 # ---------------- Subtitles ----------------
 
 [[entry]]

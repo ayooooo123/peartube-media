@@ -15,11 +15,12 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use compare::{Compare, Verdict};
 use manifest::{Entry, Kind, Policy};
+use oxideav_core::{MediaType, RuntimeContext};
 use player::{Headless, Player, PlayerOptions};
 use serde::Serialize;
 
@@ -68,6 +69,9 @@ struct StreamResult {
     kind: String,
     codec: String,
     decoder: String,
+    /// The FFmpeg stream the comparison used (`0:<index>`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ffmpeg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     frames: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,7 +91,26 @@ struct StreamResult {
 #[derive(Serialize)]
 struct EntryResult {
     path: String,
+    /// The container the player's probe rule picked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    demuxer: Option<String>,
+    /// Every track the player offered, and which of them were checked: only
+    /// the selected track of each kind plays, so the rest are unchecked.
+    tracks: Vec<TrackReport>,
     streams: Vec<StreamResult>,
+}
+
+#[derive(Serialize)]
+struct TrackReport {
+    stream: u32,
+    kind: Kind,
+    codec: String,
+    /// `default` (the player's choice), `explicit` (the manifest's), or
+    /// `not selected`.
+    selection: &'static str,
+    checked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ffmpeg: Option<String>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -140,12 +163,127 @@ fn play(
     }
 }
 
-/// Subtitle packet count by `ffprobe -count_packets`, bounded by
-/// [`tool::ffprobe`] (stdin closed, 30 s kill timeout: ffmpeg's subtitle
-/// parsers can spin on malformed samples).
-fn ffprobe_subtitle_packets(path: &Path, nth: usize) -> Result<usize, String> {
+/// The registry the player plays with, for discovering streams the way the
+/// player does.
+fn registry() -> &'static RuntimeContext {
+    static CTX: OnceLock<RuntimeContext> = OnceLock::new();
+    CTX.get_or_init(codecs::context)
+}
+
+/// One track the player offers.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct TrackInfo {
+    stream: u32,
+    kind: Kind,
+    codec: String,
+}
+
+/// What the player is offered, found the way the player finds it: its probe
+/// rule and registry, and the engine's track filter (audio, video within the
+/// size caps, subtitles; at most 64 streams).
+struct Discovery {
+    demuxer: String,
+    tracks: Vec<TrackInfo>,
+}
+
+fn discover(path: &Path) -> Result<Discovery, String> {
+    let ctx = registry();
+    let demuxer = refcheck::probe_container(ctx, path)?;
+    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.containers.open_demuxer(&demuxer, Box::new(file), &ctx.codecs)
+    }));
+    let d = match opened {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return Err(format!("failed to open demuxer: {e}")),
+        Err(_) => return Err(format!("the {demuxer} demuxer panicked while opening")),
+    };
+    let mut tracks = Vec::new();
+    for s in d.streams().iter().take(64) {
+        let kind = match s.params.media_type {
+            MediaType::Audio => Kind::Audio,
+            MediaType::Video => {
+                let (w, h) = (s.params.width.unwrap_or(0), s.params.height.unwrap_or(0));
+                if w > 16384 || h > 16384 || u64::from(w) * u64::from(h) > 8192 * 8192 {
+                    continue;
+                }
+                Kind::Video
+            }
+            MediaType::Subtitle => Kind::Subtitle,
+            _ => continue,
+        };
+        tracks.push(TrackInfo { stream: s.index, kind, codec: s.params.codec_id.as_str().to_string() });
+    }
+    Ok(Discovery { demuxer, tracks })
+}
+
+fn track_kind(kind: player::TrackKind) -> Kind {
+    match kind {
+        player::TrackKind::Video => Kind::Video,
+        player::TrackKind::Audio => Kind::Audio,
+        player::TrackKind::Subtitle => Kind::Subtitle,
+    }
+}
+
+/// A track the runner plays and checks: the manifest's choice for its kind
+/// (`explicit`), else the player's default (`default`: the first video and
+/// audio track; for subtitles, which the player leaves off, the runner
+/// selects the first).
+struct Selected {
+    track: TrackInfo,
+    how: &'static str,
+}
+
+fn select(entry: &Entry, disc: &Discovery) -> Result<Vec<Selected>, String> {
+    let mut out = Vec::new();
+    for (kind, explicit) in [
+        (Kind::Video, entry.selection.video),
+        (Kind::Audio, entry.selection.audio),
+        (Kind::Subtitle, entry.selection.subtitle),
+    ] {
+        let mut of_kind = disc.tracks.iter().filter(|t| t.kind == kind);
+        match explicit {
+            Some(index) => {
+                let track = of_kind.find(|t| t.stream == index).ok_or_else(|| {
+                    format!("streams.{} = {index} is not one of this file's {} tracks", kind.name(), kind.name())
+                })?;
+                out.push(Selected { track: track.clone(), how: "explicit" });
+            }
+            None => {
+                if let Some(track) = of_kind.next() {
+                    out.push(Selected { track: track.clone(), how: "default" });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// FFmpeg's stream for a selected track: the same position among FFmpeg's
+/// streams of the kind (cover art excluded) as among the player's tracks of
+/// the kind. Both lists must be equally long, or the position means nothing.
+fn map_to_ffmpeg(track: &TrackInfo, disc: &Discovery, ff: &[oracle::FfStream]) -> Result<oracle::FfStream, String> {
+    let ours: Vec<u32> = disc.tracks.iter().filter(|t| t.kind == track.kind).map(|t| t.stream).collect();
+    let theirs = oracle::of_type(ff, track.kind.ffmpeg_type());
+    if ours.len() != theirs.len() {
+        return Err(format!(
+            "the player offers {} {} track(s), FFmpeg {}: stream {} has no FFmpeg counterpart",
+            ours.len(),
+            track.kind.name(),
+            theirs.len(),
+            track.stream
+        ));
+    }
+    let nth = ours.iter().position(|&s| s == track.stream).ok_or(format!("stream {} not offered", track.stream))?;
+    Ok(theirs[nth].clone())
+}
+
+/// Subtitle packet count of FFmpeg's stream `index` by `ffprobe
+/// -count_packets`, bounded by [`tool::ffprobe`] (stdin closed, 30 s kill
+/// timeout: ffmpeg's subtitle parsers can spin on malformed samples).
+fn ffprobe_subtitle_packets(path: &Path, index: u32) -> Result<usize, String> {
     let args: Vec<String> = [
-        "-select_streams", &format!("s:{nth}"), "-count_packets", "-show_entries", "stream=nb_read_packets",
+        "-select_streams", &index.to_string(), "-count_packets", "-show_entries", "stream=nb_read_packets",
         "-of", "csv=p=0", path.to_str().ok_or("path not utf8")?,
     ]
     .iter()
@@ -158,21 +296,17 @@ fn ffprobe_subtitle_packets(path: &Path, nth: usize) -> Result<usize, String> {
         .map_err(|e| format!("ffprobe output: {e}"))
 }
 
-fn compare_video(path: &Path, cap: &player::VideoCapture, nth: usize) -> Compare {
+fn compare_video(path: &Path, cap: &player::VideoCapture, ff: &oracle::FfStream) -> Compare {
+    let output = format!("frames={}", cap.frame_md5.len());
     if cap.frame_md5.is_empty() {
-        return Compare::fail("frames=0", "no frames captured");
+        return Compare::fail(output, "no frames captured");
     }
-    let pix = refcheck::ffmpeg_pix_fmt(cap.pixel_format);
-    let p = path.to_path_buf();
-    let pix2 = pix;
-    // The IDCT codecs here are ports of FFmpeg's C IDCT; on arm64 FFmpeg
-    // picks NEON assembly that rounds differently, so pin the C one, as the
-    // codec crates' reference tests do. Codecs without an IDCT ignore it.
-    let expect = match with_ffmpeg_timeout(path, 180, move || {
-        refcheck::ffmpeg_video_md5s_with(&p, nth, pix2, &["-idct", "simple"])
-    }) {
+    let Some(pix) = refcheck::ffmpeg_pix_fmt_name(cap.pixel_format) else {
+        return Compare::fail(output, format!("FFmpeg has no pixel format for {:?}", cap.pixel_format));
+    };
+    let expect = match oracle::video_md5s(path, &ff.map(), pix) {
         Ok(e) => e,
-        Err(e) => return Compare::fail(format!("frames={}", cap.frame_md5.len()), e),
+        Err(e) => return Compare::fail(output, e),
     };
     let got = &cap.frame_md5;
     let matched = got.iter().filter(|m| expect.contains(m)).count();
@@ -184,57 +318,32 @@ fn compare_video(path: &Path, cap: &player::VideoCapture, nth: usize) -> Compare
     }
 }
 
-/// FFmpeg's view of the `nth` audio stream, checked against the capture's
-/// channel count and rate: no sample comparison means anything until those
-/// agree.
-fn ffmpeg_audio_stream(path: &Path, cap: &player::AudioCapture, nth: usize) -> Result<oracle::FfStream, String> {
-    let streams = oracle::streams(path)?;
-    let stream =
-        oracle::of_type(&streams, "audio").get(nth).map(|s| (*s).clone()).ok_or(format!("FFmpeg has no audio stream #{nth}"))?;
-    if stream.channels != Some(cap.channels) || stream.sample_rate != Some(cap.sample_rate) {
+/// FFmpeg's stream must decode to the capture's channel count and rate: no
+/// sample comparison means anything until those agree.
+fn check_audio_layout(cap: &player::AudioCapture, ff: &oracle::FfStream) -> Result<(), String> {
+    if ff.channels != Some(cap.channels) || ff.sample_rate != Some(cap.sample_rate) {
         return Err(format!(
             "{} ch {} Hz vs FFmpeg {:?} ch {:?} Hz",
-            cap.channels, cap.sample_rate, stream.channels, stream.sample_rate
+            cap.channels, cap.sample_rate, ff.channels, ff.sample_rate
         ));
     }
-    Ok(stream)
+    Ok(())
 }
 
-/// SNR of the capture against FFmpeg's f32 decode, lengths within one
-/// decoder frame.
-fn audio_snr(path: &Path, cap: &player::AudioCapture, stream: &oracle::FfStream) -> Result<f64, String> {
-    let slack = compare::lossy_slack(&oracle::audio_frames(path, stream.index)?, cap.channels)?;
-    refcheck::try_snr_db(&oracle::audio_f32(path, &stream.map())?, &cap.pcm, slack)
-}
-
-/// The player's PCM for one audio stream against FFmpeg's decode of the
-/// `nth` audio stream, under `policy`.
-fn compare_audio(path: &Path, cap: &player::AudioCapture, nth: usize, policy: Policy) -> Compare {
+/// The player's PCM for one audio stream against FFmpeg's decode of `ff`,
+/// under `policy`.
+fn compare_audio(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStream, policy: Policy) -> Compare {
     let samples = cap.pcm.len() / cap.channels.max(1) as usize;
-    if cap.pcm.is_empty() {
-        return Compare::fail("samples=0", "no PCM captured");
-    }
-    let non_finite = cap.pcm.iter().filter(|x| !x.is_finite()).count();
-    if non_finite > 0 {
-        return Compare::fail(
-            format!("samples={samples} non-finite={non_finite}"),
-            format!("decoder produced {non_finite} NaN/inf samples"),
-        );
-    }
     let metric = format!("samples={samples}");
-    if let Policy::Decodes(_) = policy {
-        return Compare::decodes(metric);
+    if let Err(e) = check_audio_layout(cap, ff) {
+        return Compare::fail(metric, e);
     }
-    let stream = match ffmpeg_audio_stream(path, cap, nth) {
-        Ok(s) => s,
-        Err(e) => return Compare::fail(metric, e),
-    };
     match policy {
         Policy::AudioMd5 => {
-            let Some(pcm) = stream.sample_fmt.as_deref().and_then(oracle::Pcm::of_sample_fmt) else {
-                return Compare::fail(metric, format!("no canonical PCM for FFmpeg's {:?}", stream.sample_fmt));
+            let Some(pcm) = ff.sample_fmt.as_deref().and_then(oracle::Pcm::of_sample_fmt) else {
+                return Compare::fail(metric, format!("no canonical PCM for FFmpeg's {:?}", ff.sample_fmt));
             };
-            match oracle::audio_pcm(path, &stream.map(), pcm)
+            match oracle::audio_pcm(path, &ff.map(), pcm)
                 .and_then(|reference| compare::exact_pcm(&cap.pcm, &reference, pcm, cap.channels as usize))
             {
                 Ok(m) => Compare::pass(m),
@@ -242,9 +351,8 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, nth: usize, policy: Po
             }
         }
         Policy::AudioSnr(floor) => {
-            let slack = oracle::audio_frames(path, stream.index)
-                .and_then(|frames| compare::lossy_slack(&frames, cap.channels));
-            let reference = oracle::audio_f32(path, &stream.map());
+            let slack = oracle::audio_frames(path, ff.index).and_then(|frames| compare::lossy_slack(&frames, cap.channels));
+            let reference = oracle::audio_f32(path, &ff.map());
             match (slack, reference) {
                 (Ok(slack), Ok(reference)) => {
                     let mut c = compare::snr_pcm(&cap.pcm, &reference, slack, floor);
@@ -260,11 +368,14 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, nth: usize, policy: Po
 
 /// `diag:audio:snr:<dB>`: the SNR against each diagnostic floor, reported
 /// for formats whose decoders do not reach the contract yet. Never a pass.
-fn audio_diagnostics(path: &Path, cap: &player::AudioCapture, nth: usize, floors: &[f64]) -> Vec<String> {
+fn audio_diagnostics(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStream, floors: &[f64]) -> Vec<String> {
     if floors.is_empty() || cap.pcm.is_empty() {
         return Vec::new();
     }
-    let snr = ffmpeg_audio_stream(path, cap, nth).and_then(|stream| audio_snr(path, cap, &stream));
+    let snr = check_audio_layout(cap, ff).and_then(|()| {
+        let slack = compare::lossy_slack(&oracle::audio_frames(path, ff.index)?, cap.channels)?;
+        refcheck::try_snr_db(&oracle::audio_f32(path, &ff.map())?, &cap.pcm, slack)
+    });
     floors
         .iter()
         .map(|floor| match &snr {
@@ -275,8 +386,8 @@ fn audio_diagnostics(path: &Path, cap: &player::AudioCapture, nth: usize, floors
         .collect()
 }
 
-fn compare_subtitles(path: &Path, cap: &player::SubtitleCapture, nth: usize) -> Compare {
-    let expect = match ffprobe_subtitle_packets(path, nth) {
+fn compare_subtitles(path: &Path, cap: &player::SubtitleCapture, ff: &oracle::FfStream) -> Compare {
+    let expect = match ffprobe_subtitle_packets(path, ff.index) {
         Ok(n) => n,
         Err(e) => return Compare::fail(format!("shows={}", cap.shows.len()), e),
     };
@@ -293,64 +404,33 @@ fn compare_subtitles(path: &Path, cap: &player::SubtitleCapture, nth: usize) -> 
 
 // ---------------------------------------------------------------- entries
 
-/// Runs `f` on a worker thread with a `secs` timeout. ffmpeg's demuxers spin
-/// forever on some malformed subtitle samples; on timeout the ffmpeg child
-/// the worker spawned is killed by command line and the caller gets an error.
-/// The worker thread itself leaks (it dies with the process); `f` must be
-/// `'static`-safe (refcheck's helpers take owned `PathBuf`s).
-fn with_ffmpeg_timeout<T: Send + 'static>(
-    path: &Path,
-    secs: u64,
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, String> {
-    let p = path.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(f());
-    });
-    match rx.recv_timeout(Duration::from_secs(secs)) {
-        Ok(v) => Ok(v),
-        Err(_) => {
-            // Kill any ffmpeg/ffprobe working on this exact path.
-            let pat = p.to_string_lossy().into_owned();
-            let _ = std::process::Command::new("pkill")
-                .args(["-9", "-f", &pat])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            Err(format!("ffmpeg reference timed out after {secs}s on {}", p.display()))
-        }
-    }
-}
-
-/// The manifest's policy for one captured stream's kind, judged: a missing
+/// The manifest's policy for one selected stream's kind, judged: a missing
 /// policy fails, and a `decodes` policy fails when FFmpeg does decode the
 /// stream (it is only for formats FFmpeg cannot produce a reference for).
-/// Otherwise `compare` runs under the policy.
+/// Otherwise `compare` runs under the policy with FFmpeg's stream, or fails
+/// with why there is none.
 fn judge(
     entry: &Entry,
     path: &Path,
     kind: Kind,
-    nth: usize,
+    ff: &Result<oracle::FfStream, String>,
     output: &str,
-    compare: impl FnOnce(Policy) -> Compare,
+    compare: impl FnOnce(Policy, &oracle::FfStream) -> Compare,
+    decodes: impl FnOnce() -> Compare,
 ) -> (Option<Policy>, Compare) {
     let Some(&policy) = entry.policies.get(&kind) else {
         return (None, Compare::fail(output, format!("the manifest declares no {} policy for this entry", kind.name())));
     };
-    if let Policy::Decodes(_) = policy {
-        let map = oracle::streams(path)
-            .ok()
-            .and_then(|s| oracle::of_type(&s, kind.ffmpeg_type()).get(nth).map(|s| s.map()));
-        if let Some(map) = map.filter(|m| oracle::decodes(path, m)) {
-            return (
-                Some(policy),
-                Compare::fail(output, format!("FFmpeg decodes {map}: declare an oracle policy, not {}", policy.token())),
-            );
-        }
-    }
-    (Some(policy), compare(policy))
+    let cmp = match (policy, ff) {
+        (Policy::Decodes(_), Ok(ff)) if oracle::decodes(path, &ff.map()) => Compare::fail(
+            output,
+            format!("FFmpeg decodes {}: declare an oracle policy, not {}", ff.map(), policy.token()),
+        ),
+        (Policy::Decodes(_), _) => decodes(),
+        (_, Ok(ff)) => compare(policy, ff),
+        (_, Err(e)) => Compare::fail(output, e.clone()),
+    };
+    (Some(policy), cmp)
 }
 
 /// The policy does not apply to the stream's kind (the manifest assigns
@@ -360,13 +440,15 @@ fn misapplied(policy: Policy, kind: Kind) -> Compare {
 }
 
 impl StreamResult {
-    /// A failure of the entry as a whole (`kind` = open, engine, http, row).
+    /// A failure of the entry as a whole (`kind` = open, engine, tracks,
+    /// selection, http, row).
     fn entry_level(kind: &str, index: u32, metric: Option<String>, error: impl Into<String>) -> Self {
         StreamResult {
             index,
             kind: kind.into(),
             codec: String::new(),
             decoder: String::new(),
+            ffmpeg: None,
             frames: None,
             samples: None,
             policy: None,
@@ -383,6 +465,7 @@ impl StreamResult {
             kind: kind.name().into(),
             codec: codec.into(),
             decoder: "software".into(),
+            ffmpeg: None,
             frames: None,
             samples: None,
             policy: policy.map(Policy::token),
@@ -394,75 +477,218 @@ impl StreamResult {
     }
 }
 
-fn player_options(entry: &Entry) -> PlayerOptions {
-    PlayerOptions {
-        realtime: false,
-        audio: entry.selection.audio,
-        video: entry.selection.video,
-        subtitle: entry.selection.subtitle,
-    }
-}
-
-/// Plays one entry once and returns its per-stream results. With `http_base`,
-/// the entry is played a second time over HTTP from a Range-capable local
-/// server and the same digests are compared; the HTTP result replaces the
-/// file one when it disagrees.
-fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult {
-    let mut streams_out: Vec<StreamResult> = Vec::new();
-    let done = |streams| EntryResult { path: entry.path.clone(), streams };
-
-    let (capture, state) = match play(&path.to_string_lossy(), player_options(entry), 300) {
-        Ok(r) => r,
-        Err(e) => {
-            streams_out.push(StreamResult::entry_level("open", 0, None, e));
-            return done(streams_out);
+/// Judges one selected track against its capture.
+fn judge_track(
+    entry: &Entry,
+    path: &Path,
+    sel: &Selected,
+    ff: &Result<oracle::FfStream, String>,
+    capture: &player::Capture,
+    state: &player::State,
+) -> StreamResult {
+    let t = &sel.track;
+    let missing = || {
+        let why = state.error.as_deref().map(|e| format!(" (engine: {e})")).unwrap_or_default();
+        format!("selected stream {} never captured{why}", t.stream)
+    };
+    let mut r = match t.kind {
+        Kind::Video => {
+            let cap = capture.video.iter().find(|c| c.stream == t.stream);
+            let frames = cap.map_or(0, |c| c.frame_md5.len());
+            let output = format!("frames={frames}");
+            let (policy, cmp) = judge(
+                entry,
+                path,
+                Kind::Video,
+                ff,
+                &output,
+                |policy, ff| match (policy, cap) {
+                    (Policy::VideoMd5, Some(cap)) => compare_video(path, cap, ff),
+                    (Policy::VideoMd5, None) => Compare::fail(output.clone(), missing()),
+                    (other, _) => misapplied(other, Kind::Video),
+                },
+                || match cap {
+                    Some(cap) if !cap.frame_md5.is_empty() => Compare::decodes(output.clone()),
+                    _ => Compare::fail(output.clone(), missing()),
+                },
+            );
+            let mut r = StreamResult::judged(t.stream, Kind::Video, &t.codec, policy, cmp);
+            r.frames = Some(frames);
+            r
+        }
+        Kind::Audio => {
+            let cap = capture.audio.iter().find(|c| c.stream == t.stream);
+            let samples = cap.map_or(0, |c| c.pcm.len() / c.channels.max(1) as usize);
+            let output = format!("samples={samples}");
+            let non_finite = cap.map_or(0, |c| c.pcm.iter().filter(|x| !x.is_finite()).count());
+            let usable = || match cap {
+                None => Err(Compare::fail(output.clone(), missing())),
+                Some(c) if c.pcm.is_empty() => Err(Compare::fail(output.clone(), "no PCM captured")),
+                Some(_) if non_finite > 0 => Err(Compare::fail(
+                    format!("{output} non-finite={non_finite}"),
+                    format!("decoder produced {non_finite} NaN/inf samples"),
+                )),
+                Some(c) => Ok(c),
+            };
+            let (policy, cmp) = judge(
+                entry,
+                path,
+                Kind::Audio,
+                ff,
+                &output,
+                |policy, ff| match usable() {
+                    Ok(cap) => compare_audio(path, cap, ff, policy),
+                    Err(fail) => fail,
+                },
+                || match usable() {
+                    Ok(_) => Compare::decodes(output.clone()),
+                    Err(fail) => fail,
+                },
+            );
+            let mut r = StreamResult::judged(t.stream, Kind::Audio, &t.codec, policy, cmp);
+            r.samples = Some(samples);
+            if let (Some(cap), Ok(ff)) = (cap, ff) {
+                r.diagnostics = audio_diagnostics(path, cap, ff, &entry.diagnostics);
+            }
+            r
+        }
+        Kind::Subtitle => {
+            let cap = capture.subtitles.iter().find(|c| c.stream == t.stream);
+            let shown = cap.map_or(0, |c| c.shows.iter().filter(|(_, n)| *n > 0).count());
+            let output = format!("cues={shown}");
+            let (policy, cmp) = judge(
+                entry,
+                path,
+                Kind::Subtitle,
+                ff,
+                &output,
+                |policy, ff| match (policy, cap) {
+                    (Policy::SubCount, Some(cap)) => compare_subtitles(path, cap, ff),
+                    (Policy::SubCount, None) => Compare::fail(output.clone(), missing()),
+                    (other, _) => misapplied(other, Kind::Subtitle),
+                },
+                || {
+                    if shown > 0 { Compare::decodes(output.clone()) } else { Compare::fail(output.clone(), missing()) }
+                },
+            );
+            StreamResult::judged(t.stream, Kind::Subtitle, &t.codec, policy, cmp)
         }
     };
-    if let Some(err) = &state.error {
-        let metric = Some(format!("ended={} position={:?}", state.ended, state.position));
-        streams_out.push(StreamResult::entry_level("engine", 0, metric, err.clone()));
-        return done(streams_out);
-    }
+    r.ffmpeg = ff.as_ref().ok().map(oracle::FfStream::map);
+    r
+}
+
+/// Plays one entry and returns its per-stream results. The tracks to check
+/// are discovered as the player discovers them, selected per the manifest
+/// (else the player's defaults), and each is compared with FFmpeg's stream at
+/// the same position among the streams of its kind. With `http_base`, the
+/// entry is played a second time over HTTP from a Range-capable local server
+/// and the same digests are compared.
+fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult {
+    let mut result = EntryResult { path: entry.path.clone(), demuxer: None, tracks: Vec::new(), streams: Vec::new() };
+
+    let disc = match discover(path) {
+        Ok(d) => d,
+        Err(e) => {
+            result.streams.push(StreamResult::entry_level("open", 0, None, e));
+            return result;
+        }
+    };
+    result.demuxer = Some(disc.demuxer.clone());
+    let selected = match select(entry, &disc) {
+        Ok(s) => s,
+        Err(e) => {
+            result.streams.push(StreamResult::entry_level("selection", 0, None, e));
+            return result;
+        }
+    };
+    let options = PlayerOptions {
+        realtime: false,
+        video: entry.selection.video,
+        audio: entry.selection.audio,
+        subtitle: selected.iter().find(|s| s.track.kind == Kind::Subtitle).map(|s| s.track.stream),
+    };
+    let ff_streams = oracle::streams(path);
+
+    let (capture, state) = match play(&path.to_string_lossy(), options.clone(), 300) {
+        Ok(r) => r,
+        Err(e) => {
+            result.streams.push(StreamResult::entry_level("open", 0, None, e));
+            return result;
+        }
+    };
     if !state.ended {
-        streams_out.push(StreamResult::entry_level("engine", 0, None, "playback did not reach Ended"));
-        return done(streams_out);
+        let error = state.error.clone().unwrap_or_else(|| "playback did not reach Ended".into());
+        let metric = Some(format!("ended=false position={:?}", state.position));
+        result.streams.push(StreamResult::entry_level("engine", 0, metric, error));
+        return result;
+    }
+    // Playback ended but reported an error (e.g. a stream without a
+    // decoder): the entry fails, the captured streams are still judged.
+    if let Some(err) = &state.error {
+        let metric = Some(format!("ended=true position={:?}", state.position));
+        result.streams.push(StreamResult::entry_level("engine", 0, metric, err.clone()));
     }
 
-    // Compare each captured stream with FFmpeg under its kind's policy.
-    for (nth, vc) in capture.video.iter().enumerate() {
-        let output = format!("frames={}", vc.frame_md5.len());
-        let (policy, cmp) = judge(entry, path, Kind::Video, nth, &output, |policy| match policy {
-            Policy::VideoMd5 => compare_video(path, vc, nth),
-            Policy::Decodes(_) if vc.frame_md5.is_empty() => Compare::fail("frames=0", "no frames captured"),
-            Policy::Decodes(_) => Compare::decodes(output.clone()),
-            other => misapplied(other, Kind::Video),
-        });
-        let mut r = StreamResult::judged(vc.stream, Kind::Video, &vc.codec, policy, cmp);
-        r.frames = Some(vc.frame_md5.len());
-        streams_out.push(r);
+    let offered: Vec<TrackInfo> = state
+        .tracks
+        .iter()
+        .map(|t| TrackInfo { stream: t.stream, kind: track_kind(t.kind), codec: t.codec.clone() })
+        .collect();
+    if offered != disc.tracks {
+        result.streams.push(StreamResult::entry_level(
+            "tracks",
+            u32::MAX,
+            Some(format!("player {offered:?} vs discovered {:?}", disc.tracks)),
+            "the player offered other tracks than discovery found",
+        ));
     }
-    for (nth, ac) in capture.audio.iter().enumerate() {
-        let output = format!("samples={}", ac.pcm.len() / ac.channels.max(1) as usize);
-        let (policy, cmp) = judge(entry, path, Kind::Audio, nth, &output, |policy| match policy {
-            Policy::AudioMd5 | Policy::AudioSnr(_) | Policy::Decodes(_) => compare_audio(path, ac, nth, policy),
-            other => misapplied(other, Kind::Audio),
-        });
-        let mut r = StreamResult::judged(ac.stream, Kind::Audio, &ac.codec, policy, cmp);
-        r.samples = Some(ac.pcm.len() / ac.channels.max(1) as usize);
-        r.diagnostics = audio_diagnostics(path, ac, nth, &entry.diagnostics);
-        streams_out.push(r);
+    for sel in &selected {
+        let current = match sel.track.kind {
+            Kind::Video => state.video,
+            Kind::Audio => state.audio,
+            Kind::Subtitle => state.subtitle,
+        };
+        if current != Some(sel.track.stream) {
+            result.streams.push(StreamResult::entry_level(
+                "selection",
+                sel.track.stream,
+                Some(format!("player {} = {current:?}", sel.track.kind.name())),
+                format!("the player did not play {} stream {}", sel.track.kind.name(), sel.track.stream),
+            ));
+        }
     }
-    for (nth, sc) in capture.subtitles.iter().enumerate() {
-        let shown = sc.shows.iter().filter(|(_, n)| *n > 0).count();
-        let output = format!("cues={shown}");
-        let (policy, cmp) = judge(entry, path, Kind::Subtitle, nth, &output, |policy| match policy {
-            Policy::SubCount => compare_subtitles(path, sc, nth),
-            Policy::Decodes(_) if shown == 0 => Compare::fail("cues=0", "no cue shown"),
-            Policy::Decodes(_) => Compare::decodes(output.clone()),
-            other => misapplied(other, Kind::Subtitle),
-        });
-        streams_out.push(StreamResult::judged(sc.stream, Kind::Subtitle, &sc.codec, policy, cmp));
+
+    for sel in &selected {
+        let ff = ff_streams.as_ref().map_err(Clone::clone).and_then(|ff| map_to_ffmpeg(&sel.track, &disc, ff));
+        result.streams.push(judge_track(entry, path, sel, &ff, &capture, &state));
     }
+    let selected_stream = |s: u32| selected.iter().any(|sel| sel.track.stream == s);
+    for s in capture
+        .video
+        .iter()
+        .map(|c| c.stream)
+        .chain(capture.audio.iter().map(|c| c.stream))
+        .chain(capture.subtitles.iter().map(|c| c.stream))
+        .filter(|&s| !selected_stream(s))
+    {
+        result.streams.push(StreamResult::entry_level("selection", s, None, format!("stream {s} captured unselected")));
+    }
+    result.tracks = disc
+        .tracks
+        .iter()
+        .map(|t| {
+            let sel = selected.iter().find(|s| s.track.stream == t.stream);
+            TrackReport {
+                stream: t.stream,
+                kind: t.kind,
+                codec: t.codec.clone(),
+                selection: sel.map_or("not selected", |s| s.how),
+                checked: sel.is_some(),
+                ffmpeg: result.streams.iter().find(|r| sel.is_some() && r.index == t.stream).and_then(|r| r.ffmpeg.clone()),
+            }
+        })
+        .collect();
 
     // Rows the entry declares whose kind never produced any stream are
     // failures (a kind that ran but failed already shows its own FAIL).
@@ -473,10 +699,10 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
             Some(("sub", _)) => "subtitle",
             _ => "",
         };
-        if !kind.is_empty() && !streams_out.iter().any(|s| s.kind == kind) {
-            let already = streams_out.iter().any(|s| s.kind == "row" && s.metric.as_deref() == Some(row.as_str()));
+        if !kind.is_empty() && !result.streams.iter().any(|s| s.kind == kind) {
+            let already = result.streams.iter().any(|s| s.kind == "row" && s.metric.as_deref() == Some(row.as_str()));
             if !already {
-                streams_out.push(StreamResult::entry_level("row", u32::MAX, Some(row.clone()), "stream never captured"));
+                result.streams.push(StreamResult::entry_level("row", u32::MAX, Some(row.clone()), "stream never captured"));
             }
         }
     }
@@ -487,12 +713,13 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
     // a hung or errored decode never pays the second watchdog delay.
     if let Some(base) = http_base {
         let url = format!("{base}/{}", http_path(&entry.path));
-        match play(&url, player_options(entry), 300) {
+        match play(&url, options, 300) {
             Ok((hcap, hstate)) => {
-                if let Some(err) = &hstate.error {
-                    streams_out.push(StreamResult::entry_level("http", u32::MAX - 1, None, err.clone()));
+                if hstate.error != state.error {
+                    let error = format!("http playback error {:?} vs file {:?}", hstate.error, state.error);
+                    result.streams.push(StreamResult::entry_level("http", u32::MAX - 1, None, error));
                 } else if !hstate.ended {
-                    streams_out.push(StreamResult::entry_level(
+                    result.streams.push(StreamResult::entry_level(
                         "http",
                         u32::MAX - 1,
                         None,
@@ -511,7 +738,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
                             );
                             r.codec = h.codec.clone();
                             r.frames = Some(h.frame_md5.len());
-                            streams_out.push(r);
+                            result.streams.push(r);
                         }
                     }
                     for (i, (h, f)) in hcap.audio.iter().zip(capture.audio.iter()).enumerate() {
@@ -529,16 +756,16 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
                             );
                             r.codec = h.codec.clone();
                             r.samples = Some(h.pcm.len() / h.channels.max(1) as usize);
-                            streams_out.push(r);
+                            result.streams.push(r);
                         }
                     }
                 }
             }
-            Err(e) => streams_out.push(StreamResult::entry_level("http", u32::MAX - 1, None, e)),
+            Err(e) => result.streams.push(StreamResult::entry_level("http", u32::MAX - 1, None, e)),
         }
     }
 
-    done(streams_out)
+    result
 }
 
 fn urlencode(s: &str) -> String {
@@ -903,6 +1130,8 @@ fn main() {
         let Some(path) = resolve(&entry.path) else {
             entry_results.push(EntryResult {
                 path: entry.path.clone(),
+                demuxer: None,
+                tracks: Vec::new(),
                 streams: vec![StreamResult::entry_level(
                     "open",
                     0,
@@ -1025,6 +1254,77 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn track(stream: u32, kind: Kind, codec: &str) -> TrackInfo {
+        TrackInfo { stream, kind, codec: codec.into() }
+    }
+
+    fn ff(index: u32, codec_type: &str, codec_name: &str, attached_pic: bool) -> oracle::FfStream {
+        oracle::FfStream {
+            index,
+            codec_type: codec_type.into(),
+            codec_name: codec_name.into(),
+            codec_tag: String::new(),
+            sample_fmt: None,
+            sample_rate: None,
+            channels: None,
+            attached_pic,
+        }
+    }
+
+    fn entry(selection: manifest::Selection) -> Entry {
+        Entry {
+            path: "fate:h264/h264_intra_first-small.ts".into(),
+            rows: Vec::new(),
+            policies: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            selection,
+        }
+    }
+
+    /// h264_intra_first-small.ts: H.264 and two MP2 tracks of different
+    /// content, in the same order in OxideAV's demuxer and FFmpeg's.
+    fn two_audio_tracks() -> (Discovery, Vec<oracle::FfStream>) {
+        let disc = Discovery {
+            demuxer: "mpegts".into(),
+            tracks: vec![track(0, Kind::Video, "h264"), track(1, Kind::Audio, "mp2"), track(2, Kind::Audio, "mp2")],
+        };
+        let ff = vec![ff(0, "video", "h264", false), ff(1, "audio", "mp2", false), ff(2, "audio", "mp2", false)];
+        (disc, ff)
+    }
+
+    #[test]
+    fn a_selected_second_track_maps_to_ffmpegs_second_stream_of_its_kind() {
+        let (disc, ff) = two_audio_tracks();
+        let explicit = manifest::Selection { audio: Some(2), ..Default::default() };
+        let selected = select(&entry(explicit), &disc).unwrap();
+        let audio = selected.iter().find(|s| s.track.kind == Kind::Audio).unwrap();
+        assert_eq!((audio.track.stream, audio.how), (2, "explicit"));
+        // The old runner counted captured streams of the kind from zero and
+        // compared this track with FFmpeg's first audio stream, 0:a:0 = 0:1.
+        assert_eq!(map_to_ffmpeg(&audio.track, &disc, &ff).unwrap().map(), "0:2");
+        let default = select(&entry(manifest::Selection::default()), &disc).unwrap();
+        let audio = default.iter().find(|s| s.track.kind == Kind::Audio).unwrap();
+        assert_eq!((audio.track.stream, audio.how), (1, "default"));
+        assert_eq!(map_to_ffmpeg(&audio.track, &disc, &ff).unwrap().map(), "0:1");
+    }
+
+    #[test]
+    fn cover_art_is_not_a_video_track_and_unequal_lists_do_not_map() {
+        let disc = Discovery { demuxer: "mp3".into(), tracks: vec![track(0, Kind::Audio, "mp3")] };
+        let with_cover = vec![ff(0, "audio", "mp3", false), ff(1, "video", "mjpeg", true)];
+        assert_eq!(map_to_ffmpeg(&disc.tracks[0], &disc, &with_cover).unwrap().map(), "0:0");
+        let (disc, mut ff) = two_audio_tracks();
+        ff.pop();
+        assert!(map_to_ffmpeg(&disc.tracks[2], &disc, &ff).is_err(), "FFmpeg lists one audio stream, the player two");
+    }
+
+    #[test]
+    fn an_explicit_selection_must_name_a_track_of_its_kind() {
+        let (disc, _) = two_audio_tracks();
+        let wrong = manifest::Selection { audio: Some(0), ..Default::default() };
+        assert!(select(&entry(wrong), &disc).is_err(), "stream 0 is video");
+    }
 
     #[test]
     fn ffprobe_subtitle_packets_counts_a_fate_sample() {
