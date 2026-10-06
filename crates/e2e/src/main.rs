@@ -6,6 +6,8 @@
 //! cargo run -p e2e --release -- [--filter X] [--fuzz]
 //! ```
 
+mod tool;
+
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
@@ -143,51 +145,22 @@ fn play(
     }
 }
 
-/// Subtitle packet count by `ffprobe -show_packets`. Bounded: ffmpeg's
-/// subtitle parsers can spin on malformed samples, so the call is given
-/// `stdin(null)`, `-nostdin`, and a 30 s kill timeout.
+/// Subtitle packet count by `ffprobe -count_packets`, bounded by
+/// [`tool::ffprobe`] (stdin closed, 30 s kill timeout: ffmpeg's subtitle
+/// parsers can spin on malformed samples).
 fn ffprobe_subtitle_packets(path: &Path, nth: usize) -> Result<usize, String> {
-    let mut child = std::process::Command::new("ffprobe")
-        .args([
-            "-v", "error", "-nostdin", "-select_streams", &format!("s:{nth}"),
-            "-count_packets", "-show_entries", "stream=nb_read_packets",
-            "-of", "csv=p=0", path.to_str().ok_or("path not utf8")?,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut o) = child.stdout.take() {
-                    let _ = o.read_to_string(&mut out);
-                }
-                if !status.success() {
-                    let mut err = String::new();
-                    if let Some(mut e) = child.stderr.take() {
-                        let _ = e.read_to_string(&mut err);
-                    }
-                    return Err(format!("ffprobe failed: {}", err.trim()));
-                }
-                return out
-                    .trim()
-                    .parse::<usize>()
-                    .map_err(|e| format!("ffprobe output: {e}"));
-            }
-            Ok(None) => {
-                if Instant::now() > deadline {
-                    let _ = child.kill();
-                    return Err("ffprobe timed out after 30s (sample likely loops the parser)".into());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    }
+    let args: Vec<String> = [
+        "-select_streams", &format!("s:{nth}"), "-count_packets", "-show_entries", "stream=nb_read_packets",
+        "-of", "csv=p=0", path.to_str().ok_or("path not utf8")?,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let out = tool::ffprobe(&args, Duration::from_secs(30))?;
+    String::from_utf8_lossy(&out)
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| format!("ffprobe output: {e}"))
 }
 
 /// One stream's comparison, run against one capture.
@@ -1117,5 +1090,17 @@ fn main() {
             empty_rows.join(", ")
         );
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffprobe_subtitle_packets_counts_a_fate_sample() {
+        // ffprobe -select_streams s:0 -count_packets on the SubRip tester: 37.
+        let path = refcheck::fate("sub/SubRip_capability_tester.srt");
+        assert_eq!(ffprobe_subtitle_packets(&path, 0), Ok(37));
     }
 }
