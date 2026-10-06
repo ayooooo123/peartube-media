@@ -7,13 +7,18 @@
 //!    frame of 2 s;
 //! 4. a file truncated at 60% and a copy with 500 seeded byte flips end with
 //!    Ended or Error, no panic, within 20 s;
-//! 5. realtime=true playback of 2 s keeps sink pts within 50 ms of the clock.
+//! 5. realtime=true playback of 2 s keeps sink pts within 50 ms of the clock;
+//! 6. buffering (realtime, a server that withholds the first bytes for 3 s
+//!    and stalls 3 s at the midpoint): the clock holds at the start until
+//!    data arrives, holds through a mid-stream stall without dropping a
+//!    frame, and a pause during buffering stays paused.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use player::{Capture, Event, Headless, Player, PlayerOptions};
 
 /// A fresh full-registry context per test.
@@ -171,69 +176,60 @@ fn local_file_matches_ffmpeg() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A tiny HTTP/1.1 server on 127.0.0.1 serving `bytes` with Range support.
+/// How the test server hands out the file's bytes.
+#[derive(Clone, Copy, Default)]
+struct Delivery {
+    /// Each response body starts with 8 bytes and a 200 ms pause before the
+    /// rest, as a stream arriving from peers does.
+    trickle: bool,
+    /// No body byte leaves the server until this long after the first GET:
+    /// the stream's first bytes are still on their way from peers.
+    first_byte_delay: Option<Duration>,
+    /// The second half of the file arrives this long after a response first
+    /// reaches the midpoint: a stall at about the file's midpoint.
+    mid_stall: Option<Duration>,
+}
+
+/// When bytes become available. Shared by every connection: peers deliver
+/// each byte once, whichever request asks for it.
+#[derive(Default)]
+struct Arrival {
+    first_get: Option<Instant>,
+    /// Start and end of the midpoint stall, once a response reached it.
+    stall: Option<(Instant, Instant)>,
+    /// Body bytes written so far.
+    sent: u64,
+}
+
+/// A tiny HTTP/1.1 server on 127.0.0.1 serving `bytes` with Range support,
+/// one thread per connection.
 struct HttpServer {
     addr: std::net::SocketAddr,
+    arrival: Arc<Mutex<Arrival>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HttpServer {
     fn start(bytes: Arc<Vec<u8>>) -> Self {
-        Self::start_with(bytes, false)
+        Self::start_with(bytes, Delivery::default())
     }
 
-    /// With `trickle`, each response body starts with 8 bytes and a pause
-    /// before the rest, as a stream arriving from peers does.
-    fn start_with(bytes: Arc<Vec<u8>>, trickle: bool) -> Self {
+    fn start_with(bytes: Arc<Vec<u8>>, delivery: Delivery) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let arrival = Arc::new(Mutex::new(Arrival::default()));
+        let shared_arrival = Arc::clone(&arrival);
         let handle = std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let mut req = String::new();
-                let mut buf = [0u8; 4096];
-                // Read until end of headers.
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            req.push_str(&String::from_utf8_lossy(&buf[..n]));
-                            if req.contains("\r\n\r\n") {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let range = req
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("range:"))
-                    .and_then(|l| l.split_once(':'))
-                    .map(|(_, v)| v.trim().to_string());
-                let len = bytes.len() as u64;
-                let (status, start, end) = match range.as_deref().and_then(parse_range) {
-                    Some((s, e)) => ("206 Partial Content", s, e.min(len - 1)),
-                    None => ("200 OK", 0, len.saturating_sub(1)),
-                };
-                let body = &bytes[start as usize..=(end.min(len - 1)) as usize];
-                let head = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: video/x-matroska\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{len}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(head.as_bytes());
-                if trickle && body.len() > 8 {
-                    let _ = stream.write_all(&body[..8]);
-                    let _ = stream.flush();
-                    std::thread::sleep(Duration::from_millis(200));
-                    let _ = stream.write_all(&body[8..]);
-                } else {
-                    let _ = stream.write_all(body);
-                }
-                let _ = stream.flush();
+                let Ok(stream) = stream else { break };
+                let bytes = Arc::clone(&bytes);
+                let arrival = Arc::clone(&shared_arrival);
+                std::thread::spawn(move || serve(stream, &bytes, delivery, &arrival));
             }
         });
         Self {
             addr,
+            arrival,
             handle: Some(handle),
         }
     }
@@ -241,12 +237,99 @@ impl HttpServer {
     fn url(&self) -> String {
         format!("http://{}", self.addr)
     }
+
+    /// Body bytes sent so far.
+    fn sent(&self) -> u64 {
+        self.arrival.lock().sent
+    }
+
+    /// When the midpoint stall started and ended.
+    fn stall(&self) -> Option<(Instant, Instant)> {
+        self.arrival.lock().stall
+    }
 }
 
 impl Drop for HttpServer {
     fn drop(&mut self) {
         // Closing the listener socket: connect once to wake accept, then drop.
         drop(self.handle.take());
+    }
+}
+
+fn serve(mut stream: TcpStream, bytes: &[u8], delivery: Delivery, arrival: &Mutex<Arrival>) {
+    let mut req = String::new();
+    let mut buf = [0u8; 4096];
+    // Read until end of headers.
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if req.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let range = req
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string());
+    let len = bytes.len() as u64;
+    let (status, start, end) = match range.as_deref().and_then(parse_range) {
+        Some((s, e)) => ("206 Partial Content", s, e.min(len - 1)),
+        None => ("200 OK", 0, len.saturating_sub(1)),
+    };
+    let body_len = end + 1 - start.min(end + 1);
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: video/x-matroska\r\nContent-Length: {body_len}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {start}-{end}/{len}\r\nConnection: close\r\n\r\n",
+    );
+    let _ = stream.write_all(head.as_bytes());
+    if req.starts_with("HEAD ") || body_len == 0 {
+        let _ = stream.flush();
+        return;
+    }
+
+    let first_get = *arrival.lock().first_get.get_or_insert_with(Instant::now);
+    let released = first_get + delivery.first_byte_delay.unwrap_or_default();
+    let mid = len / 2;
+    let mut pos = start;
+    let mut first = true;
+    while pos <= end {
+        // When byte `pos` is available.
+        let ready_at = match delivery.mid_stall {
+            Some(stall) if pos >= mid => {
+                let mut a = arrival.lock();
+                let (_, stall_end) = *a.stall.get_or_insert_with(|| {
+                    let at = Instant::now().max(released);
+                    (at, at + stall)
+                });
+                stall_end
+            }
+            _ => released,
+        };
+        if let Some(wait) = ready_at.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        let mut stop = if delivery.mid_stall.is_some() && pos < mid {
+            mid.min(end + 1)
+        } else {
+            end + 1
+        };
+        if delivery.trickle && first && stop - pos > 8 {
+            stop = pos + 8;
+        }
+        if stream.write_all(&bytes[pos as usize..stop as usize]).is_err() || stream.flush().is_err() {
+            return;
+        }
+        arrival.lock().sent += stop - pos;
+        if delivery.trickle && first {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        first = false;
+        pos = stop;
     }
 }
 
@@ -287,7 +370,11 @@ fn http_file_matches_ffmpeg() {
 #[test]
 fn http_stream_arriving_slowly_still_probes() {
     let bytes = Arc::new(make_ref_mkv());
-    let server = HttpServer::start_with(Arc::clone(&bytes), true);
+    let delivery = Delivery {
+        trickle: true,
+        ..Delivery::default()
+    };
+    let server = HttpServer::start_with(Arc::clone(&bytes), delivery);
     let (capture, state) = play_to_end(&server.url());
     assert!(state.error.is_none(), "unexpected error: {:?}", state.error);
     assert!(state.ended);
@@ -578,4 +665,283 @@ fn realtime_tracks_the_clock() {
     let _ = rx;
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(&short).ok();
+}
+
+/// The reference content muxed for streaming: Cues ahead of the clusters
+/// and a cluster every ~0.3 s (keyframe every 0.4 s), so the demuxer reads
+/// front to back and hands out packets shortly after their bytes arrive.
+/// Stereo PCM audio makes the file big enough (yet cheap to decode) that its
+/// midpoint lies past the 256 KiB the container probe reads, so a stall
+/// there hits playback rather than opening. (`make_ref_mkv` is probed to its
+/// end, oxideav-mkv scans a Cues-less file to its end when it opens, and it
+/// reads each sized cluster whole before demuxing it, which with FFmpeg's
+/// default 5 s clusters is the whole file.)
+fn make_streaming_mkv() -> Vec<u8> {
+    let path = tempfile("mkv");
+    let out = std::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error", "-nostdin", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-t", "3",
+            "-c:v", "libx264", "-g", "10", "-pix_fmt", "yuv420p",
+            "-c:a", "pcm_s16le", "-ac", "2",
+            "-reserve_index_space", "4096",
+            "-cluster_size_limit", "100000", "-cluster_time_limit", "300",
+        ])
+        .arg(&path)
+        .output()
+        .expect("ffmpeg must be on PATH");
+    assert!(
+        out.status.success(),
+        "ffmpeg generate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).ok();
+    assert!(
+        bytes.len() / 2 > 288 * 1024,
+        "the midpoint of {} bytes is too close to the 256 KiB probe",
+        bytes.len()
+    );
+    bytes
+}
+
+/// A peer that withholds the first byte for 3 s and stalls 3 s at the
+/// file's midpoint.
+fn slow_peer(bytes: &Arc<Vec<u8>>) -> HttpServer {
+    HttpServer::start_with(
+        Arc::clone(bytes),
+        Delivery {
+            first_byte_delay: Some(Duration::from_secs(3)),
+            mid_stall: Some(Duration::from_secs(3)),
+            ..Delivery::default()
+        },
+    )
+}
+
+/// Opens `url` with realtime pacing on a fresh headless backend, recording
+/// when each `Event::Changed` arrives.
+fn open_realtime(url: &str) -> (Player, Arc<Headless>, Arc<Mutex<Vec<Instant>>>) {
+    let backend = Headless::new();
+    let changed = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&changed);
+    let p = Player::open(
+        url,
+        backend.clone(),
+        test_context(),
+        PlayerOptions {
+            realtime: true,
+            ..PlayerOptions::default()
+        },
+        move |e| {
+            if matches!(e, Event::Changed) {
+                log.lock().push(Instant::now());
+            }
+        },
+    );
+    (p, backend, changed)
+}
+
+/// One poll of `Player::state`.
+#[derive(Clone, Debug)]
+struct Sample {
+    at: Instant,
+    position: Duration,
+    buffering: bool,
+    playing: bool,
+}
+
+/// Polls the player every 10 ms until `done` holds for its state; failing
+/// the test after `limit`.
+fn sample_until(
+    p: &Player,
+    limit: Duration,
+    done: impl Fn(&player::State) -> bool,
+) -> (Vec<Sample>, player::State) {
+    let deadline = Instant::now() + limit;
+    let mut samples = Vec::new();
+    loop {
+        let st = p.state();
+        samples.push(Sample {
+            at: Instant::now(),
+            position: st.position,
+            buffering: st.buffering,
+            playing: st.playing,
+        });
+        if done(&st) {
+            return (samples, st);
+        }
+        assert!(Instant::now() < deadline, "timed out; last state {st:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn finished(st: &player::State) -> bool {
+    st.ended || st.error.is_some()
+}
+
+/// An `Event::Changed` arrived with the change seen between two samples.
+fn assert_changed_between(changed: &Mutex<Vec<Instant>>, before: &Sample, after: &Sample, what: &str) {
+    let window = before.at..=after.at + Duration::from_millis(100);
+    assert!(
+        changed.lock().iter().any(|t| window.contains(t)),
+        "no Event::Changed when {what}"
+    );
+}
+
+/// Every frame presented, in order, none dropped as late, and every audio
+/// sample: the capture equals FFmpeg's decode of `bytes`.
+fn assert_complete(capture: &Capture, state: &player::State, bytes: &[u8]) {
+    let video = &capture.video[0];
+    assert!(
+        video.pts.windows(2).all(|w| w[0] < w[1]),
+        "frames out of order: {:?}",
+        video.pts
+    );
+    assert_eq!(
+        state.dropped_frames, 0,
+        "frames dropped as late ({} of them presented)",
+        video.pts.len()
+    );
+    let ff = ffmpeg_video_md5s(bytes);
+    assert_eq!(video.frame_md5.len(), ff.len(), "frame count; presented {:?}", video.pts);
+    for (i, (a, b)) in video.frame_md5.iter().zip(&ff).enumerate() {
+        assert_eq!(a, b, "frame {i} md5: ours={a} ffmpeg={b}");
+    }
+    let audio = &capture.audio[0];
+    let ff = ffmpeg_audio_f32(bytes);
+    assert_eq!(audio.pcm.len(), ff.len(), "sample count");
+    for (i, (a, b)) in audio.pcm.iter().zip(&ff).enumerate() {
+        assert!((a - b).abs() < 1e-6, "sample {i}: {a} vs ffmpeg {b}");
+    }
+}
+
+/// The first bytes take 3 s to arrive: until there is media to play the
+/// clock stays at the start and the player reports buffering. Then the whole
+/// file plays.
+#[test]
+fn starts_held_until_data() {
+    let bytes = Arc::new(make_ref_mkv());
+    let server = slow_peer(&bytes);
+    let (p, backend, changed) = open_realtime(&server.url());
+    p.play();
+    std::thread::sleep(Duration::from_secs(2));
+    let st = p.state();
+    assert_eq!(server.sent(), 0, "the server sent bytes before its delay");
+    assert_eq!(st.position, Duration::ZERO, "the clock ran before any data arrived");
+    assert!(st.buffering, "not buffering while waiting for data");
+    assert!(st.playing, "play() intent lost while buffering");
+
+    let (samples, state) = sample_until(&p, Duration::from_secs(40), finished);
+    drop(p);
+    assert!(state.error.is_none(), "unexpected error: {:?}", state.error);
+    assert!(state.ended);
+    let started = samples
+        .iter()
+        .position(|s| !s.buffering)
+        .expect("never stopped buffering");
+    assert!(started > 0, "stopped buffering before the data arrived");
+    assert!(
+        samples[..started].iter().all(|s| s.position == Duration::ZERO),
+        "the clock moved while buffering"
+    );
+    assert_changed_between(&changed, &samples[started - 1], &samples[started], "buffering ended");
+    assert_complete(&backend.capture(), &state, &bytes);
+}
+
+/// The stream stalls for 3 s at its midpoint: once the first half has
+/// played the clock holds (buffering) until the rest arrives, then every
+/// frame plays in order and none is skipped as late.
+#[test]
+fn stall_mid_stream_holds_clock() {
+    let bytes = Arc::new(make_streaming_mkv());
+    let server = slow_peer(&bytes);
+    let (p, backend, changed) = open_realtime(&server.url());
+    p.play();
+    let (samples, state) = sample_until(&p, Duration::from_secs(40), finished);
+    drop(p);
+    assert!(state.error.is_none(), "unexpected error: {:?}", state.error);
+    assert!(state.ended);
+    let (stall_start, stall_end) = server.stall().expect("no response reached the midpoint");
+
+    let started = samples
+        .iter()
+        .position(|s| !s.buffering)
+        .expect("never stopped buffering");
+    let held = started
+        + samples[started..]
+            .iter()
+            .position(|s| s.buffering)
+            .expect("never buffered during the stall");
+    let resumed = held
+        + samples[held..]
+            .iter()
+            .position(|s| !s.buffering)
+            .expect("never resumed");
+    let (before, first, last, after) = (
+        &samples[held - 1],
+        &samples[held],
+        &samples[resumed - 1],
+        &samples[resumed],
+    );
+    assert!(
+        first.at >= stall_start && first.at <= stall_end,
+        "the hold started {:?} after the stall began, which lasted {:?}",
+        first.at.saturating_duration_since(stall_start),
+        stall_end - stall_start
+    );
+    assert!(
+        last.at + Duration::from_millis(50) >= stall_end,
+        "resumed {:?} before the data arrived",
+        stall_end - last.at
+    );
+    assert!(
+        samples[held..resumed].iter().all(|s| s.position == first.position),
+        "the clock moved while holding"
+    );
+    let advanced = after.position.saturating_sub(before.position);
+    assert!(
+        advanced < Duration::from_millis(150),
+        "position advanced {advanced:?} over a {:?} hold",
+        after.at - before.at
+    );
+    assert_changed_between(&changed, before, first, "buffering started");
+    assert_changed_between(&changed, last, after, "buffering ended");
+    assert_complete(&backend.capture(), &state, &bytes);
+}
+
+/// A pause while buffering is the user's: once the data is there buffering
+/// ends but the clock stays put, and `play()` then plays the whole file.
+#[test]
+fn pause_during_buffering_stays_paused() {
+    let bytes = Arc::new(make_ref_mkv());
+    let server = slow_peer(&bytes);
+    let (p, backend, _changed) = open_realtime(&server.url());
+    p.play();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(p.state().buffering, "not buffering while waiting for data");
+    p.pause();
+
+    let (_, st) = sample_until(&p, Duration::from_secs(20), |st| !st.buffering || finished(st));
+    assert!(server.sent() > 0, "stopped buffering without data");
+    assert!(!finished(&st), "playback finished while paused: {st:?}");
+    assert!(!st.playing, "the pause was lost when buffering ended");
+    let paused_at = Instant::now();
+    let (held, _) = sample_until(&p, Duration::from_secs(5), |_| {
+        paused_at.elapsed() >= Duration::from_secs(1)
+    });
+    assert!(
+        held
+            .iter()
+            .all(|s| s.position == Duration::ZERO && !s.playing && !s.buffering),
+        "the clock moved while paused: {held:?}"
+    );
+
+    p.play();
+    let (_, state) = sample_until(&p, Duration::from_secs(30), finished);
+    drop(p);
+    assert!(state.error.is_none(), "unexpected error: {:?}", state.error);
+    assert!(state.ended);
+    assert_complete(&backend.capture(), &state, &bytes);
 }

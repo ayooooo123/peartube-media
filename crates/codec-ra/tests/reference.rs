@@ -95,8 +95,8 @@ fn test_sipr_8k5() {
 
 #[test]
 fn test_sipr_16k() {
-    // fate-sipr-16k stops at 3250 frames: the file is cut inside its last
-    // interleave block, so the tail depends on how the demuxer pads it.
+    // The file is cut inside its last interleave block: the demuxer must
+    // keep the bytes it has and zero only the missing tail, as FFmpeg does.
     let path = fate("sipr/sipr_16k.rm");
     let decoded = decode(
         &path,
@@ -107,9 +107,8 @@ fn test_sipr_16k() {
     let got = interleaved_f32(&decoded);
     let ref_samples = ffmpeg_audio_f32(&path, 0);
     assert_eq!(got.len(), ref_samples.len(), "sipr/sipr_16k.rm: sample count");
-    let limit = 3250 * 160;
-    let snr = snr_db(&ref_samples[..limit], &got[..limit], 0);
-    println!("sipr/sipr_16k.rm (first 3250 frames): SNR = {snr:.2} dB");
+    let snr = snr_db(&ref_samples, &got, 0);
+    println!("sipr/sipr_16k.rm: SNR = {snr:.2} dB");
     assert!(snr >= 90.0, "sipr/sipr_16k.rm: SNR {snr:.2} dB below minimum 90 dB");
 }
 

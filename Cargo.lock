@@ -145,11 +145,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-rv"
+version = "0.1.0"
+dependencies = [
+ "demux-rm",
+ "oxideav-core",
+ "oxideav-mkv",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-wmv"
+version = "0.1.0"
+dependencies = [
+ "demux-asf",
+ "oxideav-avi",
+ "oxideav-core",
+ "oxideav-mov",
+ "oxideav-mp4",
+ "refcheck",
+]
+
+[[package]]
 name = "codecs"
 version = "0.1.0"
 dependencies = [
  "codec-dca",
  "codec-mlp",
+ "codec-ra",
+ "codec-rv",
+ "codec-wmv",
  "demux-asf",
  "demux-misc",
  "demux-rm",

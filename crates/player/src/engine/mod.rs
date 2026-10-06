@@ -1,9 +1,9 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use oxideav_core::{
     Decoder, Demuxer, Frame, MediaType, Packet, ProbeData, RuntimeContext,
@@ -13,8 +13,11 @@ use oxideav_core::{
 use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
 use crate::clock::FreeRunningClock;
 use crate::headless::find_headless;
-use crate::source::{open_source, ReadAheadSource};
+use crate::source::{open_source, ReadAheadSource, SourceMonitor};
 use crate::subs::run_subtitle_loop;
+
+mod transport;
+use transport::{Due, Live, Pipe, Transport};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
@@ -99,12 +102,19 @@ const SUB_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) struct Lane {
     pub(crate) queue: Mutex<Vec<Packet>>,
     pub(crate) cv: Condvar,
-    /// Bytes currently queued, tracked alongside the Vec to avoid rescans.
-    bytes: AtomicU64,
-    /// Set when the demux loop hit EOF or a fatal demux error: the queue ends
-    /// with a final `None` the consumer removes before treating a bare empty
-    /// queue as "keep waiting".
-    eof: AtomicBool,
+    /// Seek generation the queued packets belong to; changed only with
+    /// `queue` locked, when the demuxer empties the lane for a seek.
+    seek_gen: AtomicU64,
+}
+
+/// What a pipeline got from its lane.
+enum Pop {
+    Packet(Packet),
+    /// The demuxer's end marker.
+    Eof,
+    /// The lane holds packets of a seek the pipeline has not reset for, or
+    /// the caller's `wake` condition turned true while it waited.
+    Wake,
 }
 
 impl Lane {
@@ -112,46 +122,101 @@ impl Lane {
         Arc::new(Lane {
             queue: Mutex::new(Vec::new()),
             cv: Condvar::new(),
-            bytes: AtomicU64::new(0),
-            eof: AtomicBool::new(false),
+            seek_gen: AtomicU64::new(0),
         })
     }
 
     fn push(&self, packet: Packet) {
-        self.bytes.fetch_add(packet.data.len() as u64, Ordering::SeqCst);
         self.queue.lock().push(packet);
         self.cv.notify_one();
     }
 
     fn push_eof(&self) {
-        self.eof.store(true, Ordering::SeqCst);
         self.queue.lock().push_eof_marker();
         self.cv.notify_all();
     }
 
     fn clear(&self) {
-        let mut q = self.queue.lock();
-        q.clear();
-        // A cleared queue may have been past EOF (seek); reopen it.
-        self.eof.store(false, Ordering::SeqCst);
-        self.bytes.store(0, Ordering::SeqCst);
+        self.queue.lock().clear();
     }
 
-    fn queued_secs(&self, time_base: TimeBase) -> f64 {
+    /// Empties the lane for the demuxer's seek `generation`: what it queues
+    /// next comes from the seek target.
+    fn clear_for_seek(&self, generation: u64) {
+        let mut q = self.queue.lock();
+        q.clear();
+        self.seek_gen.store(generation, Ordering::SeqCst);
+        drop(q);
+        self.cv.notify_all();
+    }
+
+    /// Media span (seconds between the first and last pts) and bytes queued.
+    fn queued(&self, time_base: TimeBase) -> (f64, usize) {
         let q = self.queue.lock();
-        let mut last: Option<f64> = None;
         let mut first: Option<f64> = None;
+        let mut last: Option<f64> = None;
+        let mut bytes = 0;
         for p in q.iter() {
             let secs = time_base.seconds_of(p.pts.unwrap_or(0));
-            if first.is_none() {
-                first = Some(secs);
-            }
+            first.get_or_insert(secs);
             last = Some(secs);
+            bytes += p.data.len();
         }
-        match (first, last) {
+        let span = match (first, last) {
             (Some(a), Some(b)) => (b - a).max(0.0),
             _ => 0.0,
+        };
+        (span, bytes)
+    }
+
+    /// The next packet or the end marker for seek generation `seen_seek`,
+    /// waiting while there is none: packets queued before the demuxer
+    /// applied that seek are never handed out, and `Wake` asks a pipeline
+    /// that has not reset for the demuxer's newest seek to do so first. An
+    /// empty lane short of its end starves the pipeline: `report(true)` when
+    /// that starts and `report(false)` once a packet or the end arrives
+    /// (`starved` carries the reported state across calls; both reports run
+    /// with the lane unlocked). Also returns `Wake` as soon as `wake` holds
+    /// while waiting.
+    fn pop(
+        &self,
+        seen_seek: u64,
+        demux_cv: &Condvar,
+        wake: impl Fn() -> bool,
+        starved: &mut bool,
+        report: impl Fn(bool),
+    ) -> Pop {
+        let mut q = self.queue.lock();
+        let popped = loop {
+            let generation = self.seek_gen.load(Ordering::SeqCst);
+            if generation > seen_seek {
+                break Pop::Wake;
+            }
+            let current = generation == seen_seek;
+            match q.first() {
+                Some(p) if current && p.stream_index == u32::MAX => {
+                    q.remove(0);
+                    break Pop::Eof;
+                }
+                Some(_) if current => break Pop::Packet(q.remove(0)),
+                _ if wake() => break Pop::Wake,
+                _ if !*starved => {
+                    *starved = true;
+                    MutexGuard::unlocked(&mut q, || report(true));
+                }
+                _ => {
+                    demux_cv.notify_one();
+                    self.cv.wait_for(&mut q, Duration::from_millis(100));
+                }
+            }
+        };
+        drop(q);
+        if *starved && !matches!(popped, Pop::Wake) {
+            *starved = false;
+            report(false);
         }
+        demux_cv.notify_one();
+        popped
     }
 }
 
@@ -173,19 +238,31 @@ impl PushEof for Vec<Packet> {
     }
 }
 
+/// End of `p` in seconds (pts, else dts, plus its duration).
+fn packet_end_secs(p: &Packet) -> Option<f64> {
+    if !p.time_base.is_valid() {
+        return None;
+    }
+    let start = p.pts.or(p.dts)?;
+    let end = start.saturating_add(p.duration.unwrap_or(0).max(0));
+    Some(p.time_base.seconds_of(end))
+}
+
 struct SharedState {
     state: Mutex<State>,
     stopped: Arc<AtomicBool>,
-    paused: AtomicBool,
+    /// Paired with `state` for `Player::wait`.
     condvar: Condvar,
     on_event: Arc<dyn Fn(Event) + Send + Sync>,
     last_changed: Mutex<Instant>,
-    source: Mutex<Option<Arc<ReadAheadSource>>>,
+    /// The demuxer's source, for suspend/resume.
+    source: Mutex<Option<SourceMonitor>>,
     /// Monotonic counter bumped by every `seek`. The demux loop applies the
     /// newest request; decoder threads compare their local copy against it to
     /// detect a seek they have not yet honoured.
     seek_gen: AtomicU64,
-    /// Seek request from the latest `seek`, consumed by the demux loop.
+    /// Target of the latest `seek`; the demux loop applies it once per
+    /// generation.
     seek_target: Mutex<Option<Duration>>,
     /// Seek the demux loop has applied (`seek_to` returned): generation and
     /// target. Decoder threads read it to drop pre-target output.
@@ -199,6 +276,17 @@ struct SharedState {
     select_gen: AtomicU64,
     backend: Arc<dyn Backend>,
     free_clock: Arc<FreeRunningClock>,
+    /// Play/pause intent and the buffering hold; decides when `free_clock`
+    /// runs (see `transport`).
+    transport: Mutex<Transport>,
+    /// Paired with `transport`: notified whenever the clock's run state,
+    /// position or the hold changes.
+    transport_cv: Condvar,
+    /// Lock-free mirror of `Transport::running`.
+    running: AtomicBool,
+    /// The playback's lanes, woken when the clock starts or stops so idle
+    /// pipelines pause or resume their sinks.
+    lanes: Mutex<Vec<Arc<Lane>>>,
     ctx: Arc<RuntimeContext>,
 }
 
@@ -210,24 +298,11 @@ struct Seek {
 }
 
 impl SharedState {
-    /// The clock every sink of this playback follows: the free-running clock
-    /// (the audio sink's headless clock also derives its reads from the audio
-    /// writes; the platform sinks' own clock keeps audio as master).
+    /// The clock every sink of this playback follows: the free-running
+    /// clock, held while buffering (the audio sinks follow it through
+    /// `AudioSink::play`/`pause`).
     fn sink_clock(&self) -> Arc<dyn Clock> {
         self.free_clock.clone()
-    }
-
-    /// The pipeline stops feeding while paused: every thread parks here
-    /// instead of decoding ahead, and resumes on `play`.
-    fn wait_while_paused(&self) {
-        if !self.paused.load(Ordering::SeqCst) {
-            return;
-        }
-        let gate = Mutex::new(());
-        let mut g = gate.lock();
-        while self.paused.load(Ordering::SeqCst) && !self.stopped.load(Ordering::SeqCst) {
-            self.condvar.wait_for(&mut g, Duration::from_millis(20));
-        }
     }
 }
 
@@ -246,19 +321,21 @@ impl Player {
     ) -> Player {
         let on_event_arc: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(on_event);
 
+        // Playing is the intent; the clock holds at the start (buffering)
+        // until the first audio/video is ready.
         let initial_state = State {
             playing: true,
+            buffering: true,
             ..State::default()
         };
 
         let free = Arc::new(FreeRunningClock::new());
-        free.play();
+        free.set_position(Duration::ZERO);
 
         let stopped = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(SharedState {
             state: Mutex::new(initial_state),
             stopped,
-            paused: AtomicBool::new(false),
             condvar: Condvar::new(),
             on_event: on_event_arc,
             last_changed: Mutex::new(Instant::now() - Duration::from_secs(1)),
@@ -272,6 +349,10 @@ impl Player {
             select_gen: AtomicU64::new(1),
             backend,
             free_clock: Arc::clone(&free),
+            transport: Mutex::new(Transport::new()),
+            transport_cv: Condvar::new(),
+            running: AtomicBool::new(false),
+            lanes: Mutex::new(Vec::new()),
             ctx,
         });
 
@@ -291,24 +372,17 @@ impl Player {
         }
     }
 
+    /// The user's intent; the clock also waits for data while buffering.
     pub fn play(&self) {
-        self.shared.paused.store(false, Ordering::SeqCst);
-        self.shared.free_clock.play();
-        {
-            let mut st = self.shared.state.lock();
-            st.playing = true;
-        }
-        self.shared.condvar.notify_all();
+        self.shared.set_paused(false);
+        self.shared.state.lock().playing = true;
         notify_changed(&self.shared);
     }
 
+    /// The user's intent: stays paused when buffering ends.
     pub fn pause(&self) {
-        self.shared.paused.store(true, Ordering::SeqCst);
-        self.shared.free_clock.pause();
-        {
-            let mut st = self.shared.state.lock();
-            st.playing = false;
-        }
+        self.shared.set_paused(true);
+        self.shared.state.lock().playing = false;
         notify_changed(&self.shared);
     }
 
@@ -318,12 +392,11 @@ impl Player {
             *target = Some(to);
         }
         self.shared.seek_gen.fetch_add(1, Ordering::SeqCst);
-        self.shared.free_clock.set_position(to);
+        self.shared.seek_clock(to);
         {
             let mut st = self.shared.state.lock();
             st.position = to;
         }
-        self.shared.condvar.notify_all();
         notify_changed(&self.shared);
     }
 
@@ -377,6 +450,7 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         self.shared.stopped.store(true, Ordering::SeqCst);
+        self.shared.stop();
         self.shared.condvar.notify_all();
         let threads = self.threads.lock().drain(..).collect::<Vec<_>>();
         for t in threads {
@@ -385,7 +459,8 @@ impl Drop for Player {
     }
 }
 
-fn notify_changed(shared: &Arc<SharedState>) {
+/// `Event::Changed`, at most every 100 ms.
+fn notify_changed(shared: &SharedState) {
     let mut last = shared.last_changed.lock();
     let now = Instant::now();
     if now.duration_since(*last) >= Duration::from_millis(100) {
@@ -394,7 +469,13 @@ fn notify_changed(shared: &Arc<SharedState>) {
     }
 }
 
-fn set_error(shared: &Arc<SharedState>, err: String) {
+/// `Event::Changed` that must not be dropped (buffering started or ended).
+fn notify_changed_now(shared: &SharedState) {
+    *shared.last_changed.lock() = Instant::now();
+    (shared.on_event)(Event::Changed);
+}
+
+fn set_error(shared: &SharedState, err: String) {
     {
         let mut st = shared.state.lock();
         if st.error.is_none() {
@@ -402,58 +483,20 @@ fn set_error(shared: &Arc<SharedState>, err: String) {
             st.playing = false;
         }
     }
+    shared.finish();
     (shared.on_event)(Event::Error(err));
     shared.condvar.notify_all();
 }
 
-fn set_ended(shared: &Arc<SharedState>) {
+fn set_ended(shared: &SharedState) {
     {
         let mut st = shared.state.lock();
         st.ended = true;
         st.playing = false;
     }
+    shared.finish();
     (shared.on_event)(Event::Ended);
     shared.condvar.notify_all();
-}
-
-/// A `Read + Seek` handle for the demuxer: one read-ahead source per consumer
-/// (probe, demuxer), each over its own connection to the URL.
-struct SourceHandle {
-    url: String,
-    inner: Option<ReadAheadSource>,
-}
-
-impl SourceHandle {
-    fn new(url: &str) -> std::io::Result<Self> {
-        Ok(Self {
-            url: url.to_string(),
-            inner: Some(open_source(url)?),
-        })
-    }
-}
-
-impl std::io::Read for SourceHandle {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.inner.is_none() {
-            self.inner = Some(open_source(&self.url)?);
-        }
-        self.inner.as_mut().unwrap().read(buf)
-    }
-}
-
-impl std::io::Seek for SourceHandle {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        if self.inner.is_none() {
-            self.inner = Some(open_source(&self.url)?);
-        }
-        self.inner.as_mut().unwrap().seek(pos)
-    }
-}
-
-impl Drop for SourceHandle {
-    fn drop(&mut self) {
-        self.inner = None;
-    }
 }
 
 fn run_player_pipeline(
@@ -462,21 +505,32 @@ fn run_player_pipeline(
     shared: Arc<SharedState>,
 ) {
     let ctx = &*shared.ctx;
-    // 1. Open the source, keep it for suspend/resume.
-    let source = match open_source(&url) {
-        Ok(s) => Arc::new(s),
+    // 1. One read-ahead source feeds the probe and then the demuxer. The
+    //    engine keeps its monitor: starvation reports drive the buffering
+    //    hold, suspend/resume pause the download.
+    let mut source = match open_source(&url) {
+        Ok(s) => s,
         Err(e) => {
             set_error(&shared, format!("failed to open source: {e}"));
             return;
         }
     };
-    *shared.source.lock() = Some(Arc::clone(&source));
+    let monitor = source.monitor();
+    let weak: Weak<SharedState> = Arc::downgrade(&shared);
+    monitor.on_starved(move |starved| {
+        if let Some(shared) = weak.upgrade() {
+            shared.source_starved(starved);
+        }
+    });
+    *shared.source.lock() = Some(monitor);
 
-    // 2. Probe (rule from engine-api.md, same as refcheck).
-    let container = match probe_container(&url, &ctx) {
+    // 2. Probe (rule from engine-api.md, same as refcheck), then rewind.
+    let container = match probe_container(&url, &mut source, &shared) {
         Ok(c) => c,
         Err(e) => {
-            set_error(&shared, e);
+            if !shared.stopped.load(Ordering::SeqCst) {
+                set_error(&shared, e);
+            }
             return;
         }
     };
@@ -484,20 +538,13 @@ fn run_player_pipeline(
     // 3. Demuxer. Container codec tags resolve through the registry — the
     //    mpeg4video fork claims Matroska's MPEG-4 Part 2 CodecIDs
     //    (V_MPEG4/ISO/ASP, //SP, //AP) directly.
-    let demuxer_source = SourceHandle::new(&url);
-    let mut demuxer = match demuxer_source {
-        Ok(src) => match ctx
-            .containers
-            .open_demuxer(&container, Box::new(src), &ctx.codecs)
-        {
-            Ok(d) => d,
-            Err(e) => {
-                set_error(&shared, format!("failed to open demuxer: {e}"));
-                return;
-            }
-        },
+    let mut demuxer = match ctx
+        .containers
+        .open_demuxer(&container, Box::new(source), &ctx.codecs)
+    {
+        Ok(d) => d,
         Err(e) => {
-            set_error(&shared, format!("failed to open source: {e}"));
+            set_error(&shared, format!("failed to open demuxer: {e}"));
             return;
         }
     };
@@ -620,6 +667,11 @@ fn run_player_pipeline(
     let video_lane = Lane::new();
     let audio_lane = Lane::new();
     let sub_lane = Lane::new();
+    *shared.lanes.lock() = vec![
+        Arc::clone(&video_lane),
+        Arc::clone(&audio_lane),
+        Arc::clone(&sub_lane),
+    ];
     let demux_cv = Arc::new(Condvar::new());
     let video_tb = current_video
         .and_then(|i| streams.iter().find(|s| s.index == i))
@@ -644,16 +696,15 @@ fn run_player_pipeline(
         let lane = Arc::clone(&video_lane);
         let demux_cv2 = Arc::clone(&demux_cv);
         let shared2 = Arc::clone(&shared);
-        let clock = shared.sink_clock();
-        let sink = shared.backend.video(Arc::clone(&clock));
+        let sink = shared.backend.video(shared.sink_clock());
         let ctx_video = Arc::clone(&shared.ctx);
         let realtime = options.realtime;
+        let live = Live::new(&shared, Pipe::Video);
         let handle = std::thread::Builder::new()
             .name("peartube-video".into())
             .spawn(move || {
-                run_video_thread(
-                    stream, sink, clock, lane, demux_cv2, shared2, ctx_video, realtime,
-                );
+                let _live = live;
+                run_video_thread(stream, sink, lane, demux_cv2, shared2, ctx_video, realtime);
             })
             .expect("failed to spawn video thread");
         threads.lock().push(handle);
@@ -663,16 +714,15 @@ fn run_player_pipeline(
         let lane = Arc::clone(&audio_lane);
         let demux_cv2 = Arc::clone(&demux_cv);
         let shared2 = Arc::clone(&shared);
-        let clock = shared.sink_clock();
         let sink = shared.backend.audio();
         let ctx_audio = Arc::clone(&shared.ctx);
         let realtime = options.realtime;
+        let live = Live::new(&shared, Pipe::Audio);
         let handle = std::thread::Builder::new()
             .name("peartube-audio".into())
             .spawn(move || {
-                run_audio_thread(
-                    stream, sink, clock, lane, demux_cv2, shared2, ctx_audio, realtime,
-                );
+                let _live = live;
+                run_audio_thread(stream, sink, lane, demux_cv2, shared2, ctx_audio, realtime);
             })
             .expect("failed to spawn audio thread");
         threads.lock().push(handle);
@@ -713,7 +763,9 @@ fn run_player_pipeline(
     }
 
     // 8. Demux loop owns spawn/join so a selection switch can drain lanes and
-    // respawn the affected pipeline thread without ending playback.
+    // respawn the affected pipeline thread without ending playback. From
+    // here the buffering hold follows the pipelines' data.
+    shared.pipelines_started();
     run_demux_loop(&mut Run {
         shared: &shared,
         demuxer: &mut *demuxer,
@@ -741,23 +793,33 @@ fn run_player_pipeline(
     }
 }
 
-fn probe_container(url: &str, ctx: &RuntimeContext) -> Result<String, String> {
-    // The probe re-opens the URL through its own read-ahead source; the
-    // demuxer's read position is untouched.
-    let mut probe_reader = SourceHandle::new(url).map_err(|e| format!("failed to open source: {e}"))?;
+/// Probes the first 256 KiB of `source` and rewinds it to the start (the
+/// read-ahead ring still holds those bytes, so the demuxer re-reads them
+/// without another request).
+fn probe_container(
+    url: &str,
+    source: &mut ReadAheadSource,
+    shared: &SharedState,
+) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let ctx = &*shared.ctx;
     // One read returns what has arrived so far, which over a P2P stream can
     // be a few bytes: fill the buffer (or reach the end) before probing.
     let mut probe_buf = vec![0u8; 256 * 1024];
     let mut n = 0;
     while n < probe_buf.len() {
-        match std::io::Read::read(&mut probe_reader, &mut probe_buf[n..]) {
+        if shared.stopped.load(Ordering::SeqCst) {
+            return Err("stopped".into());
+        }
+        match source.read(&mut probe_buf[n..]) {
             Ok(0) => break,
             Ok(read) => n += read,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(format!("failed to read for probe: {e}")),
         }
     }
-    let _ = std::io::Seek::seek(&mut probe_reader, std::io::SeekFrom::Start(0));
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("failed to rewind after probing: {e}"))?;
     probe_buf.truncate(n);
 
     let ext = url.split(['?', '#']).next().unwrap_or(url);
@@ -811,6 +873,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
     let _ = run.demuxer.set_active_streams(&active);
     let mut select_gen_seen = shared.select_gen.load(Ordering::SeqCst);
     let mut eof = false;
+    let mut full = false;
 
     while !shared.stopped.load(Ordering::SeqCst) {
         // Selection switch: flush lanes, respawn changed pipelines.
@@ -818,7 +881,10 @@ fn run_demux_loop(run: &mut Run<'_>) {
         if gen_now != select_gen_seen {
             select_gen_seen = gen_now;
             apply_selection_switch(run, &mut active);
-            eof = false;
+            if eof {
+                eof = false;
+                shared.demux_eof(false);
+            }
         }
 
         // Seek: apply each new request; a request already applied for this
@@ -832,8 +898,15 @@ fn run_demux_loop(run: &mut Run<'_>) {
             }
         }
 
-        // Bounded queues: wait while every lane is full.
-        if lanes_full(run) && !eof {
+        // Bounded queues: wait while a lane is full. Nothing more can be
+        // queued until the clock moves, so a buffering hold lets go as soon
+        // as the pipelines have output.
+        let now_full = !eof && lanes_full(run);
+        if now_full != full {
+            full = now_full;
+            shared.demux_full(full);
+        }
+        if full {
             let mut none: Option<()> = None;
             let guard = Mutex::new(&mut none);
             let mut g = guard.lock();
@@ -863,7 +936,11 @@ fn run_demux_loop(run: &mut Run<'_>) {
             if drained {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            // Consumers notify `demux_cv` on every packet they take.
+            let mut none: Option<()> = None;
+            let guard = Mutex::new(&mut none);
+            let mut g = guard.lock();
+            run.demux_cv.wait_for(&mut g, Duration::from_millis(10));
             continue;
         }
 
@@ -871,20 +948,31 @@ fn run_demux_loop(run: &mut Run<'_>) {
         match packet_res {
             Ok(Ok(packet)) => {
                 let stream_id = packet.stream_index;
-                if Some(stream_id) == *run.current_video {
-                    run.video_lane.push(packet);
+                let pipe = if Some(stream_id) == *run.current_video {
+                    Some(Pipe::Video)
                 } else if Some(stream_id) == *run.current_audio {
-                    run.audio_lane.push(packet);
-                } else if Some(stream_id) == *run.current_subtitle {
-                    run.sub_lane.push(packet);
+                    Some(Pipe::Audio)
+                } else {
+                    None
+                };
+                let end = pipe.and_then(|_| packet_end_secs(&packet));
+                match pipe {
+                    Some(Pipe::Video) => run.video_lane.push(packet),
+                    Some(Pipe::Audio) => run.audio_lane.push(packet),
+                    None if Some(stream_id) == *run.current_subtitle => run.sub_lane.push(packet),
+                    // Inactive streams' packets are dropped.
+                    None => {}
                 }
-                // Inactive streams' packets are dropped.
+                if let (Some(pipe), Some(end)) = (pipe, end) {
+                    shared.demuxed(pipe, end);
+                }
             }
             Ok(Err(oxideav_core::Error::Eof)) => {
                 eof = true;
                 run.video_lane.push_eof();
                 run.audio_lane.push_eof();
                 run.sub_lane.push_eof();
+                shared.demux_eof(true);
             }
             Ok(Err(e)) => {
                 // Transient demux errors are retried; a demuxer that keeps
@@ -902,13 +990,13 @@ fn run_demux_loop(run: &mut Run<'_>) {
 }
 
 fn lanes_full(run: &Run<'_>) -> bool {
-    let v_full = run.video_lane.bytes.load(Ordering::SeqCst) >= VIDEO_MAX_BYTES as u64
-        || run.video_lane.queued_secs(run.video_tb) >= QUEUE_MAX_SECS;
-    let a_full = run.audio_lane.bytes.load(Ordering::SeqCst) >= AUDIO_MAX_BYTES as u64
-        || run.audio_lane.queued_secs(run.audio_tb) >= QUEUE_MAX_SECS;
-    let s_full = run.sub_lane.bytes.load(Ordering::SeqCst) >= SUB_MAX_BYTES as u64
-        || run.sub_lane.queued_secs(run.sub_tb) >= QUEUE_MAX_SECS;
-    v_full || a_full || s_full
+    let full = |lane: &Lane, tb: TimeBase, max_bytes: usize| {
+        let (secs, bytes) = lane.queued(tb);
+        secs >= QUEUE_MAX_SECS || bytes >= max_bytes
+    };
+    full(run.video_lane, run.video_tb, VIDEO_MAX_BYTES)
+        || full(run.audio_lane, run.audio_tb, AUDIO_MAX_BYTES)
+        || full(run.sub_lane, run.sub_tb, SUB_MAX_BYTES)
 }
 
 fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool) {
@@ -924,15 +1012,17 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
         .unwrap_or_else(|| TimeBase::new(1, 1000));
     let ticks = tb.ticks_of(target.as_secs_f64());
 
-    *shared.seek_target.lock() = None;
+    // `seek_target` keeps the newest request: the generation decides what
+    // has been applied, so a seek arriving meanwhile is not lost.
     *shared.active_seek.lock() = Some(Seek {
         generation,
         target: target.as_secs_f64(),
     });
-    run.video_lane.clear();
-    run.audio_lane.clear();
-    run.sub_lane.clear();
+    run.video_lane.clear_for_seek(generation);
+    run.audio_lane.clear_for_seek(generation);
+    run.sub_lane.clear_for_seek(generation);
     *eof = false;
+    shared.demux_seeked(generation);
 
     let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
         run.demuxer.seek_to(seek_stream, ticks)
@@ -943,7 +1033,6 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
             set_error(shared, "demuxer panicked during seek".into());
         }
     }
-    shared.condvar.notify_all();
 }
 
 /// `select_audio` / `select_subtitle` took effect: flush the affected lane,
@@ -1016,11 +1105,12 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
             let ctx_audio = Arc::clone(&shared.ctx);
             let realtime = run.options.realtime;
             let sink = shared.backend.audio();
-            let clock = shared.sink_clock();
+            let live = Live::new(shared, Pipe::Audio);
             let handle = std::thread::Builder::new()
                 .name("peartube-audio".into())
                 .spawn(move || {
-                    run_audio_thread(stream, sink, clock, lane, demux_cv, shared2, ctx_audio, realtime);
+                    let _live = live;
+                    run_audio_thread(stream, sink, lane, demux_cv, shared2, ctx_audio, realtime);
                 })
                 .expect("failed to spawn audio thread");
             run.threads.lock().push(handle);
@@ -1074,20 +1164,19 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let _ = run.demuxer.set_active_streams(active);
 }
 
-/// Packet lanes → decoder → sink, for one audio stream. The sink's clock is
-/// the master. Reaches Ended with the rest of the pipeline at EOF.
-#[allow(clippy::too_many_arguments)]
+/// Packet lanes → decoder → sink, for one audio stream. The sink follows the
+/// clock's run state (`play`/`pause`); while the clock stands still, PCM goes
+/// out only up to `PREROLL` past it. Reaches Ended with the rest of the
+/// pipeline at EOF.
 fn run_audio_thread(
     stream: StreamInfo,
     mut sink: Box<dyn AudioSink>,
-    clock: Arc<dyn Clock>,
     lane: Arc<Lane>,
     demux_cv: Arc<Condvar>,
     shared: Arc<SharedState>,
     ctx: Arc<RuntimeContext>,
     realtime: bool,
 ) {
-    let _ = realtime;
     let mut decoder = match ctx.codecs.first_decoder(&stream.params) {
         Ok(d) => d,
         Err(e) => {
@@ -1103,17 +1192,23 @@ fn run_audio_thread(
     let mut current_rate = stream.params.sample_rate.unwrap_or(48000);
     let mut current_channels = stream.params.channels.unwrap_or(2);
     let mut sink_open = sink.open(current_rate, current_channels).is_ok();
+    // The clock run state last applied to the sink (`play`/`pause`).
+    let mut sink_running: Option<bool> = None;
+    let mut starved = false;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
     let mut seen_seek_target: u64 = 0;
-    let mut eof_seen = false;
+    let mut primed: Option<u64> = None;
 
     while !shared.stopped.load(Ordering::SeqCst) {
-        // Pause gate: no feeding while paused.
-        shared.wait_while_paused();
-        if shared.stopped.load(Ordering::SeqCst) {
-            break;
+        if !realtime {
+            // Nothing waits on the clock: park while paused instead.
+            shared.wait_while_paused();
+            if shared.stopped.load(Ordering::SeqCst) {
+                break;
+            }
         }
+        sync_audio_sink(&mut *sink, &shared, &mut sink_running);
 
         // Seek generation: always reset the decoder and the sink, drop
         // pre-target output after the demuxer's seek lands.
@@ -1125,50 +1220,42 @@ fn run_audio_thread(
             consecutive_errors = 0;
         }
 
-        // Pull a packet: None (EOF marker) ends this pipeline.
-        let packet = {
-            let mut q = lane.queue.lock();
-            loop {
-                match q.first() {
-                    Some(p) if p.stream_index == u32::MAX => {
-                        q.remove(0);
-                        break None;
-                    }
-                    Some(_) => break Some(q.remove(0)),
-                    None => {
-                        if shared.stopped.load(Ordering::SeqCst) {
-                            break None;
+        // Pull a packet; the EOF marker ends this pipeline.
+        let woken = || shared.stopped.load(Ordering::SeqCst) || Some(shared.running()) != sink_running;
+        let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
+        let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+            Pop::Packet(p) => p,
+            Pop::Wake => continue,
+            Pop::Eof => {
+                // Drain the decoder's tail into the sink.
+                let _ = decoder.flush();
+                while !shared.stopped.load(Ordering::SeqCst) {
+                    let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
+                    match recv {
+                        Ok(Ok(Frame::Audio(af))) => {
+                            let (format, rate, channels) =
+                                audio_layout(decoder.as_ref(), &stream.params, &af);
+                            let pcm = convert_audio_to_f32(&af, format, channels as usize);
+                            if pcm.is_empty() {
+                                break;
+                            }
+                            let ticks = af.pts.unwrap_or(0).max(0);
+                            let secs = stream.time_base.seconds_of(ticks).max(0.0);
+                            let pts = Duration::from_secs_f64(secs);
+                            if !write_pcm(
+                                &mut *sink, &shared, &pcm, channels as usize, rate, pts,
+                                seen_seek, realtime, &mut sink_running,
+                            ) {
+                                break;
+                            }
                         }
-                        demux_cv.notify_one();
-                        lane.cv.wait_for(&mut q, Duration::from_millis(100));
+                        Ok(Ok(_)) => {}
+                        _ => break,
                     }
                 }
+                break;
             }
         };
-        let Some(packet) = packet else {
-            // EOF marker: drain the decoder's tail into the sink.
-            let _ = decoder.flush();
-            while !shared.stopped.load(Ordering::SeqCst) {
-                let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
-                match recv {
-                    Ok(Ok(Frame::Audio(af))) => {
-                        let (format, _, channels) = audio_layout(decoder.as_ref(), &stream.params, &af);
-                        let pcm = convert_audio_to_f32(&af, format, channels as usize);
-                        if pcm.is_empty() {
-                            break;
-                        }
-                        let ticks = af.pts.unwrap_or(0).max(0);
-                        let secs = stream.time_base.seconds_of(ticks).max(0.0);
-                        let _ = sink.write(&pcm, Duration::from_secs_f64(secs));
-                    }
-                    Ok(Ok(_)) => {}
-                    _ => break,
-                }
-            }
-            eof_seen = true;
-            break;
-        };
-        demux_cv.notify_one();
 
         // Decode one packet under catch_unwind. A decoder that panics or
         // errors 3 times in a row on this stream disables it: the track goes
@@ -1231,10 +1318,9 @@ fn run_audio_thread(
                 current_rate = sample_rate;
                 current_channels = channels as u16;
                 sink_open = sink.open(current_rate, current_channels).is_ok();
+                sink_running = None;
             }
-            if !sink_open {
-                continue;
-            }
+            let sink_failed = !sink_open;
 
             let mut pcm = convert_audio_to_f32(&af, format, channels);
             let ticks = af.pts.or(packet.pts).unwrap_or(0).max(0);
@@ -1253,21 +1339,98 @@ fn run_audio_thread(
                         pcm.clear();
                     }
                 }
-                seen_seek_target = seen_seek;
+                if !pcm.is_empty() {
+                    seen_seek_target = seen_seek;
+                }
             }
             if pcm.is_empty() {
                 continue;
             }
 
-            if sink.write(&pcm, Duration::from_secs_f64(pts_secs)).is_err() {
-                // Sink refused (device lost): keep the engine alive; the
-                // platform resume path reopens it.
-                let _ = sink.open(current_rate, current_channels);
+            // Decoded audio counts as ready even when the output refused to
+            // open: the clock must not wait for a sink that drops it.
+            if primed != Some(seen_seek) {
+                primed = Some(seen_seek);
+                shared.pipe_primed(Pipe::Audio, seen_seek);
             }
-            let _ = &clock;
+            if sink_failed {
+                continue;
+            }
+            let pts = Duration::from_secs_f64(pts_secs);
+            if !write_pcm(
+                &mut *sink, &shared, &pcm, channels, sample_rate, pts, seen_seek, realtime,
+                &mut sink_running,
+            ) {
+                // Stopped, or a seek: the rest of this packet is stale.
+                break;
+            }
         }
     }
-    let _ = eof_seen;
+}
+
+/// Applies the clock's run state to an audio sink when it changed.
+fn sync_audio_sink(sink: &mut dyn AudioSink, shared: &SharedState, applied: &mut Option<bool>) {
+    let running = shared.running();
+    if *applied != Some(running) {
+        if running {
+            sink.play();
+        } else {
+            sink.pause();
+        }
+        *applied = Some(running);
+    }
+}
+
+/// Hands interleaved `pcm`, whose first frame plays at `pts`, to the sink.
+/// While the clock stands still (buffering or paused), audio goes out only up
+/// to `PREROLL` past it, so a paused output never fills up and blocks; what a
+/// paused sink did not take is written again once the clock runs, so no
+/// audio is skipped across a hold. False when the player stopped or a seek
+/// superseded this audio.
+#[allow(clippy::too_many_arguments)]
+fn write_pcm(
+    sink: &mut dyn AudioSink,
+    shared: &SharedState,
+    pcm: &[f32],
+    channels: usize,
+    rate: u32,
+    pts: Duration,
+    seen_seek: u64,
+    realtime: bool,
+    sink_running: &mut Option<bool>,
+) -> bool {
+    let channels = channels.max(1);
+    let frames = pcm.len() / channels;
+    let mut done = 0;
+    while done < frames {
+        let at = pts + Duration::from_secs_f64(done as f64 / f64::from(rate.max(1)));
+        if realtime && !shared.preroll(at, seen_seek) {
+            return false;
+        }
+        sync_audio_sink(sink, shared, sink_running);
+        match sink.write(&pcm[done * channels..frames * channels], at) {
+            Ok(0) => {
+                // A paused output that is full: write the rest once the clock
+                // runs. A playing output that takes nothing has nowhere to
+                // put it.
+                if shared.running() {
+                    return true;
+                }
+                if !shared.wait_running(seen_seek) {
+                    return false;
+                }
+            }
+            Ok(n) => done += n,
+            Err(_) => {
+                // Sink refused (device lost): keep the engine alive; the
+                // platform resume path reopens it.
+                let _ = sink.open(rate, channels as u16);
+                *sink_running = None;
+                return true;
+            }
+        }
+    }
+    true
 }
 
 /// The layout of `af`: what the decoder says it emits, else the container's
@@ -1374,12 +1537,11 @@ fn sample_f32(
 }
 
 /// Video lane → platform decoder or registry software decoder → sink, paced
-/// against the master clock in realtime, pushed immediately otherwise.
-#[allow(clippy::too_many_arguments)]
+/// against the clock in realtime, pushed immediately otherwise. The sink
+/// follows the clock's run state (`set_playing`).
 fn run_video_thread(
     stream: StreamInfo,
     mut sink: Box<dyn VideoSink>,
-    clock: Arc<dyn Clock>,
     lane: Arc<Lane>,
     demux_cv: Arc<Condvar>,
     shared: Arc<SharedState>,
@@ -1392,6 +1554,10 @@ fn run_video_thread(
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
     let mut seen_seek_target: u64 = 0;
+    // The clock run state last applied to the sink (`set_playing`).
+    let mut sink_running: Option<bool> = None;
+    let mut starved = false;
+    let mut primed: Option<u64> = None;
 
     if !compressed {
         match ctx.codecs.first_decoder(&stream.params) {
@@ -1414,11 +1580,14 @@ fn run_video_thread(
     }
 
     while !shared.stopped.load(Ordering::SeqCst) {
-        // Pause gate.
-        shared.wait_while_paused();
-        if shared.stopped.load(Ordering::SeqCst) {
-            break;
+        if !realtime {
+            // Nothing waits on the clock: park while paused instead.
+            shared.wait_while_paused();
+            if shared.stopped.load(Ordering::SeqCst) {
+                break;
+            }
         }
+        sync_video_sink(&mut *sink, &shared, &mut sink_running);
 
         // Seek generation: always reset decoder state; drop pre-target
         // frames; resume from the next keyframe.
@@ -1433,45 +1602,38 @@ fn run_video_thread(
             consecutive_errors = 0;
         }
 
-        let packet = {
-            let mut q = lane.queue.lock();
-            loop {
-                match q.first() {
-                    Some(p) if p.stream_index == u32::MAX => {
-                        q.remove(0);
-                        break None;
-                    }
-                    Some(_) => break Some(q.remove(0)),
-                    None => {
-                        if shared.stopped.load(Ordering::SeqCst) {
-                            break None;
+        let woken = || shared.stopped.load(Ordering::SeqCst) || Some(shared.running()) != sink_running;
+        let report = |dry| shared.pipe_starved(Pipe::Video, dry);
+        let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+            Pop::Packet(p) => p,
+            Pop::Wake => continue,
+            Pop::Eof => {
+                // Drain the decoder's delayed frames, on the clock like the
+                // rest.
+                if let Some(dec) = sw_decoder.as_mut() {
+                    let _ = dec.flush();
+                    while !shared.stopped.load(Ordering::SeqCst) {
+                        let recv = std::panic::catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
+                        match recv {
+                            Ok(Ok(Frame::Video(vf))) => {
+                                let ticks = vf.pts.unwrap_or(0).max(0);
+                                let secs = stream.time_base.seconds_of(ticks).max(0.0);
+                                let shown = present_frame(
+                                    &mut *sink, &shared, &vf, Duration::from_secs_f64(secs),
+                                    seen_seek, realtime, &mut sink_running, &mut primed,
+                                );
+                                if !shown {
+                                    break;
+                                }
+                            }
+                            Ok(Ok(_)) => {}
+                            _ => break,
                         }
-                        demux_cv.notify_one();
-                        lane.cv.wait_for(&mut q, Duration::from_millis(100));
                     }
                 }
+                break;
             }
         };
-        let Some(packet) = packet else {
-            // EOF marker: drain the decoder (delayed frames) into the sink.
-            if let Some(dec) = sw_decoder.as_mut() {
-                let _ = dec.flush();
-                while !shared.stopped.load(Ordering::SeqCst) {
-                    let recv = std::panic::catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
-                    match recv {
-                        Ok(Ok(Frame::Video(vf))) => {
-                            let ticks = vf.pts.unwrap_or(0).max(0);
-                            let secs = stream.time_base.seconds_of(ticks).max(0.0);
-                            let _ = sink.push_frame(&vf, Duration::from_secs_f64(secs));
-                        }
-                        Ok(Ok(_)) => {}
-                        _ => break,
-                    }
-                }
-            }
-            break;
-        };
-        demux_cv.notify_one();
 
         if need_keyframe && !packet.flags.keyframe {
             continue;
@@ -1481,6 +1643,17 @@ fn run_video_thread(
         if compressed {
             let ticks = packet.pts.unwrap_or(0).max(0);
             let pts = Duration::from_secs_f64(stream.time_base.seconds_of(ticks).max(0.0));
+            // While the clock stands still the platform decoder cannot
+            // present anything: feed it only up to `PREROLL` past the clock,
+            // so its input queue never fills and blocks `push_packet`.
+            if realtime && !shared.preroll(pts, seen_seek) {
+                continue;
+            }
+            sync_video_sink(&mut *sink, &shared, &mut sink_running);
+            if primed != Some(seen_seek) {
+                primed = Some(seen_seek);
+                shared.pipe_primed(Pipe::Video, seen_seek);
+            }
             match sink.push_packet(&packet, pts) {
                 Ok(()) => {
                     consecutive_errors = 0;
@@ -1593,36 +1766,59 @@ fn run_video_thread(
                     seen_seek_target = seen_seek;
                 }
 
-                let frame_pts = Duration::from_secs_f64(frame_pts_secs);
-                if !realtime {
-                    let _ = sink.push_frame(&vf, frame_pts);
-                } else {
-                    // Realtime pacing: push up to 100 ms before pts; drop
-                    // frames more than 100 ms late (counted in State).
-                    let mut dropped = false;
-                    while !shared.stopped.load(Ordering::SeqCst) {
-                        if let Some(now) = clock.now() {
-                            if now > frame_pts + Duration::from_millis(100) {
-                                shared.state.lock().dropped_frames += 1;
-                                dropped = true;
-                                break;
-                            }
-                            if frame_pts <= now + Duration::from_millis(100) {
-                                break;
-                            }
-                            let lead = frame_pts - now;
-                            let sleep = (lead - Duration::from_millis(100))
-                                .min(Duration::from_millis(10));
-                            std::thread::sleep(sleep);
-                        } else {
-                            break;
-                        }
-                    }
-                    if !dropped && !shared.stopped.load(Ordering::SeqCst) {
-                        let _ = sink.push_frame(&vf, frame_pts);
-                    }
+                let shown = present_frame(
+                    &mut *sink, &shared, &vf, Duration::from_secs_f64(frame_pts_secs),
+                    seen_seek, realtime, &mut sink_running, &mut primed,
+                );
+                if !shown {
+                    // Stopped, or a seek: the decoder's output is stale.
+                    break;
                 }
             }
         }
     }
+}
+
+/// Applies the clock's run state to a video sink when it changed.
+fn sync_video_sink(sink: &mut dyn VideoSink, shared: &SharedState, applied: &mut Option<bool>) {
+    let running = shared.running();
+    if *applied != Some(running) {
+        sink.set_playing(running);
+        *applied = Some(running);
+    }
+}
+
+/// Hands one decoded frame to the sink: in realtime once it is due on the
+/// clock (pushed up to 100 ms early; more than 100 ms late it is dropped and
+/// counted), immediately otherwise. A frame waiting for its time counts as
+/// output ready for the buffering hold. False when the player stopped or a
+/// seek superseded the frame.
+#[allow(clippy::too_many_arguments)]
+fn present_frame(
+    sink: &mut dyn VideoSink,
+    shared: &SharedState,
+    frame: &oxideav_core::VideoFrame,
+    pts: Duration,
+    seen_seek: u64,
+    realtime: bool,
+    sink_running: &mut Option<bool>,
+    primed: &mut Option<u64>,
+) -> bool {
+    if *primed != Some(seen_seek) {
+        *primed = Some(seen_seek);
+        shared.pipe_primed(Pipe::Video, seen_seek);
+    }
+    if realtime {
+        match shared.wait_due(pts, seen_seek) {
+            Due::Now => {}
+            Due::Late => {
+                shared.state.lock().dropped_frames += 1;
+                return true;
+            }
+            Due::Abort => return false,
+        }
+    }
+    sync_video_sink(sink, shared, sink_running);
+    let _ = sink.push_frame(frame, pts);
+    true
 }
