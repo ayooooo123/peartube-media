@@ -1610,10 +1610,6 @@ impl CoreDecoder {
 
                 let cap = 7 + 8 * i32::from(self.x96_high_res);
                 if abits < 0 || abits > cap {
-                    if std::env::var("DCA_TRACE").is_ok() {
-                        eprintln!("TRACE-R x96abits ch={ch} band={band} abits={abits} cap={cap} sel={sel} hr={} start={} nsub={}",
-                            self.x96_high_res, self.x96_subband_start, self.nsubbands[ch]);
-                    }
                     return Err("invalid X96 bit allocation index");
                 }
 
