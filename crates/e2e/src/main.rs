@@ -7,14 +7,14 @@
 //! ```
 
 mod compare;
+mod http;
 mod manifest;
 mod oracle;
 mod tap;
 mod tool;
 
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::TcpListener;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -89,6 +89,12 @@ struct StreamResult {
     /// Non-accepting measurements (`diag:` tokens).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     diagnostics: Vec<String>,
+    /// The HTTP pass for this stream: PASS when playing the sample over HTTP
+    /// captured exactly what the file playback did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -133,9 +139,41 @@ struct Report {
 #[derive(Serialize, Default)]
 struct FuzzReport {
     mutations: usize,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// No mutation failed; set by [`FuzzReport::finish`].
     passed: bool,
     failures: Vec<String>,
+}
+
+impl FuzzReport {
+    /// The verdict, from the failures collected.
+    fn finish(&mut self) {
+        self.passed = self.mutations > 0 && self.failures.is_empty();
+    }
+}
+
+/// Whether `result` credits a row of `kind` (`video`, `audio`, `subtitle`,
+/// or `container`): a stream of the kind passed its comparison and the HTTP
+/// pass agreed (a stream whose HTTP capture differed, or an entry whose HTTP
+/// pass failed outright, credits nothing); containers need every stream and
+/// the entry itself free of failures.
+fn accepted(result: &EntryResult, kind: &str) -> bool {
+    let http_failed = result.streams.iter().any(|s| s.kind == "http" && s.verdict == "FAIL");
+    let stream_ok = |s: &StreamResult| (s.verdict == "PASS" || s.verdict == "DECODES") && s.http != Some("FAIL");
+    if http_failed {
+        return false;
+    }
+    if kind == "container" {
+        let entry_failed = result.streams.iter().any(|s| matches!(s.kind.as_str(), "open" | "engine") && s.verdict == "FAIL");
+        let stream_failed = result.streams.iter().any(|s| s.http == Some("FAIL"));
+        return !entry_failed && !stream_failed;
+    }
+    result.streams.iter().any(|s| s.kind == kind && stream_ok(s))
+}
+
+/// The process exit code: 1 when a judged row has no passing entry or the
+/// fuzz pass ran and failed.
+fn exit_code(rows_without_pass: usize, fuzz: Option<&FuzzReport>) -> i32 {
+    i32::from(rows_without_pass > 0 || fuzz.is_some_and(|f| !f.passed))
 }
 
 // ---------------------------------------------------------------- playback
@@ -470,6 +508,8 @@ impl StreamResult {
             metric,
             error: Some(error.into()),
             diagnostics: Vec::new(),
+            http: None,
+            http_error: None,
         }
     }
 
@@ -488,6 +528,8 @@ impl StreamResult {
             metric: Some(cmp.metric),
             error: cmp.error,
             diagnostics: cmp.diagnostics,
+            http: None,
+            http_error: None,
         }
     }
 }
@@ -599,6 +641,49 @@ fn judge_track(
     };
     r.ffmpeg = ff.as_ref().ok().map(oracle::FfStream::map);
     r
+}
+
+/// Whether two playbacks captured the same output for `track`: equal frame
+/// digests, bit-identical PCM in the same layout, equal decoded cues shown
+/// as often.
+fn same_capture(file: &Played, http: &Played, track: &TrackInfo) -> Result<(), String> {
+    let s = track.stream;
+    match track.kind {
+        Kind::Video => {
+            let (f, h) = (file.capture.video.iter().find(|c| c.stream == s), http.capture.video.iter().find(|c| c.stream == s));
+            let (f, h) = (f.map(|c| &c.frame_md5[..]).unwrap_or(&[]), h.map(|c| &c.frame_md5[..]).unwrap_or(&[]));
+            match f.iter().zip(h).position(|(a, b)| a != b) {
+                Some(i) => Err(format!("frame {i} differs from the file playback's")),
+                None if f.len() != h.len() => Err(format!("{} frames vs file {}", h.len(), f.len())),
+                None => Ok(()),
+            }
+        }
+        Kind::Audio => {
+            let (f, h) = (file.capture.audio.iter().find(|c| c.stream == s), http.capture.audio.iter().find(|c| c.stream == s));
+            let layout = |c: Option<&player::AudioCapture>| c.map(|c| (c.channels, c.sample_rate));
+            if layout(f) != layout(h) {
+                return Err(format!("layout {:?} vs file {:?}", layout(h), layout(f)));
+            }
+            let (f, h) = (f.map(|c| &c.pcm[..]).unwrap_or(&[]), h.map(|c| &c.pcm[..]).unwrap_or(&[]));
+            match f.iter().zip(h).position(|(a, b)| a.to_bits() != b.to_bits()) {
+                Some(i) => Err(format!("PCM sample {i} differs from the file playback's")),
+                None if f.len() != h.len() => Err(format!("{} PCM samples vs file {}", h.len(), f.len())),
+                None => Ok(()),
+            }
+        }
+        Kind::Subtitle => {
+            let shown = |p: &Played| {
+                p.capture.subtitles.iter().find(|c| c.stream == s).map_or(0, |c| c.shows.iter().filter(|(_, n)| *n > 0).count())
+            };
+            if http.cues != file.cues {
+                return Err(format!("{} decoded cues vs file {}, or their content differs", http.cues.len(), file.cues.len()));
+            }
+            if shown(http) != shown(file) {
+                return Err(format!("{} cues shown vs file {}", shown(http), shown(file)));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Plays one entry and returns its per-stream results. The tracks to check
@@ -731,78 +816,42 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
         }
     }
 
-    // HTTP pass: same digests over a Range-capable local server. The HTTP
-    // run replaces the verdict when it disagrees (a source-level regression).
-    // Unreachable after an open/engine failure: those return early above, so
-    // a hung or errored decode never pays the second watchdog delay.
+    // HTTP pass: the server must serve the very bytes the file run read,
+    // and playing them over HTTP must capture exactly what the file run did,
+    // stream by stream. Any disagreement fails the stream (or, for the bytes,
+    // the open and the end of playback, the whole entry). Unreachable after a
+    // fatal open/engine failure: those return early above, so a hung or
+    // errored decode never pays the second watchdog delay.
     if let Some(base) = http_base {
-        let url = format!("{base}/{}", http_path(&entry.path));
-        match play(&url, options, 300) {
-            Ok(Played { capture: hcap, state: hstate, .. }) => {
-                if hstate.error != state.error {
-                    let error = format!("http playback error {:?} vs file {:?}", hstate.error, state.error);
+        let url = format!("{base}/{}", http::url_path(&entry.path));
+        let outcome = http::verify_bytes(&url, path).and_then(|()| play(&url, options, 300));
+        match outcome {
+            Err(e) => result.streams.push(StreamResult::entry_level("http", u32::MAX - 1, None, e)),
+            Ok(h) if !h.state.ended => result.streams.push(StreamResult::entry_level(
+                "http",
+                u32::MAX - 1,
+                None,
+                format!("http playback did not reach Ended: {:?}", h.state.error),
+            )),
+            Ok(h) => {
+                if h.state.error != state.error {
+                    let error = format!("http playback error {:?} vs file {:?}", h.state.error, state.error);
                     result.streams.push(StreamResult::entry_level("http", u32::MAX - 1, None, error));
-                } else if !hstate.ended {
-                    result.streams.push(StreamResult::entry_level(
-                        "http",
-                        u32::MAX - 1,
-                        None,
-                        "http playback did not reach Ended",
-                    ));
-                } else {
-                    for (i, (h, f)) in hcap.video.iter().zip(capture.video.iter()).enumerate() {
-                        if h.frame_md5 != f.frame_md5 {
-                            let metric =
-                                format!("video[{i}] http frames {} vs file {}", h.frame_md5.len(), f.frame_md5.len());
-                            let mut r = StreamResult::entry_level(
-                                "http",
-                                h.stream,
-                                Some(metric),
-                                "http frame digests differ from file playback",
-                            );
-                            r.codec = h.codec.clone();
-                            r.frames = Some(h.frame_md5.len());
-                            result.streams.push(r);
-                        }
-                    }
-                    for (i, (h, f)) in hcap.audio.iter().zip(capture.audio.iter()).enumerate() {
-                        // A decoder that emits NaN fails via the non-finite
-                        // check above; NaN != NaN would otherwise also flag
-                        // the pass as "differs".
-                        let clean = |p: &[f32]| p.iter().all(|x| x.is_finite());
-                        if clean(&h.pcm) && clean(&f.pcm) && h.pcm != f.pcm {
-                            let metric = format!("audio[{i}] http PCM differs from file playback");
-                            let mut r = StreamResult::entry_level(
-                                "http",
-                                h.stream,
-                                Some(metric),
-                                "http PCM differs from file playback",
-                            );
-                            r.codec = h.codec.clone();
-                            r.samples = Some(h.pcm.len() / h.channels.max(1) as usize);
-                            result.streams.push(r);
-                        }
+                }
+                for sel in &selected {
+                    let verdict = same_capture(&played, &h, &sel.track);
+                    if let Some(r) =
+                        result.streams.iter_mut().find(|r| r.index == sel.track.stream && r.kind == sel.track.kind.name())
+                    {
+                        r.http = Some(if verdict.is_ok() { "PASS" } else { "FAIL" });
+                        r.http_error = verdict.err();
                     }
                 }
             }
-            Err(e) => result.streams.push(StreamResult::entry_level("http", u32::MAX - 1, None, e)),
         }
     }
 
     result
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------- fuzz
@@ -964,135 +1013,6 @@ fn self_rss_bytes() -> Option<u64> {
     }
 }
 
-// ---------------------------------------------------------------- HTTP pass
-
-/// Serves every manifest sample over HTTP/1.1 with Range support, at
-/// `/<kind>/<path>` for the manifest path `<kind>:<path>` (FATE samples and
-/// generated files alike), one thread per connection, and returns the base
-/// URL. The listener is never closed (process exit reaps it), so every entry
-/// reuses the same server.
-fn start_http_server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind http server");
-    let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            // A response the client stopped reading (a seek dropped it)
-            // must not hold up the next request.
-            std::thread::spawn(move || serve_http(stream));
-        }
-    });
-    format!("http://127.0.0.1:{port}")
-}
-
-/// The URL path the HTTP pass serves a manifest path at.
-fn http_path(manifest_path: &str) -> String {
-    let (kind, rel) = manifest_path.split_once(':').unwrap_or(("", manifest_path));
-    let rel: Vec<String> = rel.split('/').map(urlencode).collect();
-    format!("{kind}/{}", rel.join("/"))
-}
-
-/// Answers one request: the sample at the URL path, or a byte range of it.
-fn serve_http(mut stream: std::net::TcpStream) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    // Read until the end of the request head.
-    loop {
-        match stream.read(&mut byte) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                buf.push(byte[0]);
-                if buf.ends_with(b"\r\n\r\n") || buf.ends_with(b"\n\n") {
-                    break;
-                }
-            }
-        }
-    }
-    let req = String::from_utf8_lossy(&buf);
-    let mut lines = req.lines();
-    let first = lines.next().unwrap_or("");
-    let mut parts = first.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("").to_string();
-    let path = target.split('?').next().unwrap_or("");
-    let path = percent_decode(path);
-    let path = path.trim_start_matches('/');
-    let file = path
-        .split_once('/')
-        .and_then(|(kind, rel)| resolve(&format!("{kind}:{rel}")));
-    let mut range_start = 0u64;
-    let mut range_end_incl: Option<u64> = None;
-    for line in lines {
-        if let Some(v) = line.to_ascii_lowercase().strip_prefix("range:") {
-            if let Some(spec) = v.trim().strip_prefix("bytes=") {
-                let mut it = spec.split('-');
-                if let Some(s) = it.next().and_then(|s| s.parse::<u64>().ok()) {
-                    range_start = s;
-                }
-                range_end_incl = it.next().and_then(|s| s.parse::<u64>().ok());
-            }
-        }
-    }
-    let Some((file, meta)) = file.and_then(|f| std::fs::metadata(&f).ok().map(|m| (f, m))) else {
-        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        let _ = stream.write_all(resp.as_bytes());
-        return;
-    };
-    let total = meta.len();
-    let end = range_end_incl.map(|e| e.min(total.saturating_sub(1))).unwrap_or(total.saturating_sub(1));
-    let status = if range_start > 0 || range_end_incl.is_some() { "HTTP/1.1 206 Partial Content" } else { "HTTP/1.1 200 OK" };
-    let accept = if range_start > 0 || range_end_incl.is_some() {
-        format!("Accept-Ranges: bytes\r\nContent-Range: bytes {range_start}-{end}/{total}\r\n")
-    } else {
-        "Accept-Ranges: bytes\r\n".to_string()
-    };
-    let clen = end.saturating_sub(range_start) + 1;
-    let head = format!(
-        "{status}\r\n{accept}Content-Type: application/octet-stream\r\nContent-Length: {clen}\r\nConnection: close\r\n\r\n"
-    );
-    if stream.write_all(head.as_bytes()).is_err() || method == "HEAD" {
-        return;
-    }
-    if let Ok(mut f) = std::fs::File::open(&file) {
-        if f.seek(SeekFrom::Start(range_start)).is_ok() {
-            let mut remaining = clen;
-            let mut chunk = vec![0u8; 256 * 1024];
-            while remaining > 0 {
-                let n = (remaining as usize).min(chunk.len());
-                match f.read(&mut chunk[..n]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n2) => {
-                        if stream.write_all(&chunk[..n2]).is_err() {
-                            break;
-                        }
-                        remaining -= n2 as u64;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 // ---------------------------------------------------------------- main
 
 fn main() {
@@ -1135,7 +1055,7 @@ fn main() {
         }
     };
 
-    let http_base = http.then(start_http_server);
+    let http_base = http.then(|| http::start(resolve));
 
     let mut entry_results: Vec<EntryResult> = Vec::new();
     let mut row_map: BTreeMap<Row, RowResult> = yardstick
@@ -1168,12 +1088,7 @@ fn main() {
         };
 
         let result = run_entry(entry, &path, http_base.as_deref());
-        let pass = |kind: &str| {
-            result
-                .streams
-                .iter()
-                .any(|s| s.kind == kind && (s.verdict == "PASS" || s.verdict == "DECODES"))
-        };
+        let pass = |kind: &str| accepted(&result, kind);
         let v = if pass("video") { "ok" } else { "-" };
         let a = if pass("audio") { "ok" } else { "-" };
         let s = if pass("subtitle") { "ok" } else { "-" };
@@ -1187,17 +1102,10 @@ fn main() {
                 Some(("video", _)) => "video",
                 Some(("audio", _)) => "audio",
                 Some(("sub", _)) => "subtitle",
-                Some(("container", _)) => "engine",
+                Some(("container", _)) => "container",
                 _ => "",
             };
-            let ok = if kind == "engine" {
-                !result.streams.iter().any(|s| s.kind == "engine" && s.verdict == "FAIL")
-                    && !result.streams.iter().any(|s| s.kind == "open" && s.verdict == "FAIL")
-            } else if kind.is_empty() {
-                false
-            } else {
-                pass(kind)
-            };
+            let ok = !kind.is_empty() && pass(kind);
             if ok {
                 rr.passing_entries.push(entry.path.clone());
             } else {
@@ -1233,7 +1141,8 @@ fn main() {
             let Some(path) = resolve(&entry.path) else { continue };
             fuzz_entry(entry, &path, &mut fr);
         }
-        let verdict = if fr.failures.is_empty() { "ok" } else { "FAILED" };
+        fr.finish();
+        let verdict = if fr.passed { "ok" } else { "FAILED" };
         println!(
             "fuzz: {} mutations, {} failures — {verdict}",
             fr.mutations,
@@ -1271,8 +1180,11 @@ fn main() {
             empty_rows.len(),
             empty_rows.join(", ")
         );
-        std::process::exit(1);
     }
+    if let Some(fr) = report.fuzz.as_ref().filter(|f| !f.passed) {
+        eprintln!("fuzz: {} of {} mutations failed", fr.failures.len(), fr.mutations);
+    }
+    std::process::exit(exit_code(empty_rows.len(), report.fuzz.as_ref()));
 }
 
 #[cfg(test)]
@@ -1341,6 +1253,48 @@ mod tests {
         let (disc, mut ff) = two_audio_tracks();
         ff.pop();
         assert!(map_to_ffmpeg(&disc.tracks[2], &disc, &ff).is_err(), "FFmpeg lists one audio stream, the player two");
+    }
+
+    fn stream(kind: &str, verdict: &str, http: Option<&'static str>) -> StreamResult {
+        let mut s = StreamResult::entry_level(kind, 0, None, "");
+        s.verdict = verdict.into();
+        s.error = None;
+        s.http = http;
+        s
+    }
+
+    fn entry_result(streams: Vec<StreamResult>) -> EntryResult {
+        EntryResult { path: "gen:x.mkv".into(), demuxer: None, tracks: Vec::new(), streams }
+    }
+
+    #[test]
+    fn an_http_disagreement_withdraws_the_entrys_coverage() {
+        let ok = entry_result(vec![stream("video", "PASS", Some("PASS")), stream("audio", "PASS", Some("PASS"))]);
+        assert!(accepted(&ok, "video") && accepted(&ok, "audio") && accepted(&ok, "container"));
+        // The old attribution credited a local PASS whatever the HTTP pass
+        // appended.
+        let differs = entry_result(vec![stream("video", "PASS", Some("FAIL")), stream("audio", "PASS", Some("PASS"))]);
+        assert!(!accepted(&differs, "video"));
+        assert!(accepted(&differs, "audio"));
+        assert!(!accepted(&differs, "container"));
+        let broken = entry_result(vec![stream("video", "PASS", None), stream("http", "FAIL", None)]);
+        assert!(!accepted(&broken, "video") && !accepted(&broken, "container"));
+    }
+
+    #[test]
+    fn fuzz_failures_fail_the_run_and_set_the_verdict() {
+        let mut fr = FuzzReport { mutations: 20, ..Default::default() };
+        fr.finish();
+        assert!(fr.passed);
+        assert_eq!(exit_code(0, Some(&fr)), 0);
+        fr.failures.push("x: mutation 3 neither Ended nor Error".into());
+        fr.finish();
+        assert!(!fr.passed);
+        assert_eq!(exit_code(0, Some(&fr)), 1, "rows all pass, the fuzz pass does not");
+        assert_eq!(exit_code(0, None), 0);
+        assert_eq!(exit_code(2, None), 1);
+        let json = serde_json::to_value(&fr).unwrap();
+        assert_eq!(json["passed"], false, "the verdict is always serialized");
     }
 
     #[test]
