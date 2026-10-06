@@ -31,6 +31,9 @@ pub struct VideoCapture {
     pub height: u32,
     pub frame_md5: Vec<String>,
     pub pts: Vec<Duration>,
+    /// One entry per `VideoSink::flush` (the engine flushes on a seek): how
+    /// many frames had been captured by then.
+    pub flushes: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +43,12 @@ pub struct AudioCapture {
     pub sample_rate: u32,
     pub channels: u16,
     pub pcm: Vec<f32>,
+    /// One entry per accepted `AudioSink::write`: the pts the engine gave
+    /// it and where its samples start in `pcm` (interleaved sample index).
+    pub writes: Vec<(Duration, usize)>,
+    /// One entry per `AudioSink::flush` (the engine flushes on a seek): how
+    /// many writes had been captured by then.
+    pub flushes: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +322,8 @@ impl AudioSink for HeadlessAudioSink {
                 sample_rate,
                 channels,
                 pcm: Vec::new(),
+                writes: Vec::new(),
+                flushes: Vec::new(),
             });
         }
         Ok(())
@@ -329,7 +340,9 @@ impl AudioSink for HeadlessAudioSink {
             let mut inner = self.inner.lock();
             let stream = inner.active_audio_stream.unwrap_or(0);
             if let Some(ac) = inner.audio.iter_mut().find(|a| a.stream == stream) {
+                let offset = ac.pcm.len();
                 ac.pcm.extend_from_slice(pcm);
+                ac.writes.push((pts, offset));
             }
         }
 
@@ -358,6 +371,14 @@ impl AudioSink for HeadlessAudioSink {
     }
 
     fn flush(&mut self) {
+        {
+            let mut inner = self.inner.lock();
+            let stream = inner.active_audio_stream.unwrap_or(0);
+            if let Some(ac) = inner.audio.iter_mut().find(|a| a.stream == stream) {
+                let writes = ac.writes.len();
+                ac.flushes.push(writes);
+            }
+        }
         self.clock.flush();
     }
 
@@ -416,6 +437,7 @@ impl VideoSink for HeadlessVideoSink {
                 height: self.height,
                 frame_md5: Vec::new(),
                 pts: Vec::new(),
+                flushes: Vec::new(),
             });
         }
         Ok(())
@@ -441,11 +463,27 @@ impl VideoSink for HeadlessVideoSink {
         Ok(())
     }
 
-    fn flush(&mut self) {}
+    fn flush(&mut self) {
+        let mut inner = self.inner.lock();
+        if let Some(vc) = inner
+            .video
+            .iter_mut()
+            .find(|v| v.stream == self.stream_index)
+        {
+            let frames = vc.frame_md5.len();
+            vc.flushes.push(frames);
+        }
+    }
 
     fn set_playing(&mut self, _playing: bool) {}
 }
 
+/// The frame's image planes packed without stride padding, the layout
+/// FFmpeg's framemd5 hashes (`av_image_copy_to_buffer`). A `Pal8` frame is
+/// followed by its 256-entry palette, 4 bytes per entry: FFmpeg's ARGB word
+/// in little-endian order (B, G, R, A). OxideAV palettes carry RGB only, so
+/// present entries are opaque and missing ones zero, as in FFmpeg's zeroed
+/// palette buffer.
 pub fn pack_frame(frame: &VideoFrame, pix_fmt: PixelFormat, width: u32, height: u32) -> Vec<u8> {
     let plane_count = pix_fmt.plane_count();
     let planes = frame.image_planes();
@@ -461,6 +499,15 @@ pub fn pack_frame(frame: &VideoFrame, pix_fmt: PixelFormat, width: u32, height: 
                 if end <= plane.data.len() {
                     out.extend_from_slice(&plane.data[start..end]);
                 }
+            }
+        }
+    }
+    if pix_fmt.is_palette() {
+        let palette = frame.palette().unwrap_or(&[]);
+        for entry in 0..256 {
+            match palette.get(entry * 3..entry * 3 + 3) {
+                Some(rgb) => out.extend_from_slice(&[rgb[2], rgb[1], rgb[0], 0xFF]),
+                None => out.extend_from_slice(&[0; 4]),
             }
         }
     }

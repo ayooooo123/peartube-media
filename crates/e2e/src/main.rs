@@ -208,8 +208,11 @@ fn compare_video(path: &Path, cap: &player::VideoCapture, nth: usize) -> Compare
     let pix = refcheck::ffmpeg_pix_fmt(cap.pixel_format);
     let p = path.to_path_buf();
     let pix2 = pix;
+    // The IDCT codecs here are ports of FFmpeg's C IDCT; on arm64 FFmpeg
+    // picks NEON assembly that rounds differently, so pin the C one, as the
+    // codec crates' reference tests do. Codecs without an IDCT ignore it.
     let expect = match with_ffmpeg_timeout(path, 180, move || {
-        refcheck::ffmpeg_video_md5s(&p, nth, pix2)
+        refcheck::ffmpeg_video_md5s_with(&p, nth, pix2, &["-idct", "simple"])
     }) {
         Ok(e) => e,
         Err(e) => {
@@ -531,8 +534,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
     // Unreachable after an open/engine failure: those return early above, so
     // a hung or errored decode never pays the second watchdog delay.
     if let Some(base) = http_base {
-        let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let url = format!("{base}/{}", urlencode(&name));
+        let url = format!("{base}/{}", http_path(&entry.path));
         let options = PlayerOptions {
             realtime: false,
             audio: entry.streams.get("audio").copied(),
@@ -799,96 +801,113 @@ fn self_rss_bytes() -> Option<u64> {
 
 // ---------------------------------------------------------------- HTTP pass
 
-/// Serves `root` over HTTP/1.1 with Range support and returns the base URL.
-/// Runs on a background thread; the listener is never closed (process-exit
-/// reaps it) so every entry can reuse the same server.
-fn start_http_server(root: PathBuf) -> String {
+/// Serves every manifest sample over HTTP/1.1 with Range support, at
+/// `/<kind>/<path>` for the manifest path `<kind>:<path>` (FATE samples and
+/// generated files alike), one thread per connection, and returns the base
+/// URL. The listener is never closed (process exit reaps it), so every entry
+/// reuses the same server.
+fn start_http_server() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind http server");
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
-            let mut buf = Vec::new();
-            let mut byte = [0u8; 1];
-            // Read until the end of the request head.
-            loop {
-                match stream.read(&mut byte) {
+            let Ok(stream) = stream else { continue };
+            // A response the client stopped reading (a seek dropped it)
+            // must not hold up the next request.
+            std::thread::spawn(move || serve_http(stream));
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// The URL path the HTTP pass serves a manifest path at.
+fn http_path(manifest_path: &str) -> String {
+    let (kind, rel) = manifest_path.split_once(':').unwrap_or(("", manifest_path));
+    let rel: Vec<String> = rel.split('/').map(urlencode).collect();
+    format!("{kind}/{}", rel.join("/"))
+}
+
+/// Answers one request: the sample at the URL path, or a byte range of it.
+fn serve_http(mut stream: std::net::TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    // Read until the end of the request head.
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") || buf.ends_with(b"\n\n") {
+                    break;
+                }
+            }
+        }
+    }
+    let req = String::from_utf8_lossy(&buf);
+    let mut lines = req.lines();
+    let first = lines.next().unwrap_or("");
+    let mut parts = first.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("").to_string();
+    let path = target.split('?').next().unwrap_or("");
+    let path = percent_decode(path);
+    let path = path.trim_start_matches('/');
+    let file = path
+        .split_once('/')
+        .and_then(|(kind, rel)| resolve(&format!("{kind}:{rel}")));
+    let mut range_start = 0u64;
+    let mut range_end_incl: Option<u64> = None;
+    for line in lines {
+        if let Some(v) = line.to_ascii_lowercase().strip_prefix("range:") {
+            if let Some(spec) = v.trim().strip_prefix("bytes=") {
+                let mut it = spec.split('-');
+                if let Some(s) = it.next().and_then(|s| s.parse::<u64>().ok()) {
+                    range_start = s;
+                }
+                range_end_incl = it.next().and_then(|s| s.parse::<u64>().ok());
+            }
+        }
+    }
+    let Some((file, meta)) = file.and_then(|f| std::fs::metadata(&f).ok().map(|m| (f, m))) else {
+        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    };
+    let total = meta.len();
+    let end = range_end_incl.map(|e| e.min(total.saturating_sub(1))).unwrap_or(total.saturating_sub(1));
+    let status = if range_start > 0 || range_end_incl.is_some() { "HTTP/1.1 206 Partial Content" } else { "HTTP/1.1 200 OK" };
+    let accept = if range_start > 0 || range_end_incl.is_some() {
+        format!("Accept-Ranges: bytes\r\nContent-Range: bytes {range_start}-{end}/{total}\r\n")
+    } else {
+        "Accept-Ranges: bytes\r\n".to_string()
+    };
+    let clen = end.saturating_sub(range_start) + 1;
+    let head = format!(
+        "{status}\r\n{accept}Content-Type: application/octet-stream\r\nContent-Length: {clen}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(head.as_bytes()).is_err() || method == "HEAD" {
+        return;
+    }
+    if let Ok(mut f) = std::fs::File::open(&file) {
+        if f.seek(SeekFrom::Start(range_start)).is_ok() {
+            let mut remaining = clen;
+            let mut chunk = vec![0u8; 256 * 1024];
+            while remaining > 0 {
+                let n = (remaining as usize).min(chunk.len());
+                match f.read(&mut chunk[..n]) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        buf.push(byte[0]);
-                        if buf.ends_with(b"\r\n\r\n") || buf.ends_with(b"\n\n") {
+                    Ok(n2) => {
+                        if stream.write_all(&chunk[..n2]).is_err() {
                             break;
                         }
-                    }
-                }
-            }
-            let req = String::from_utf8_lossy(&buf);
-            let mut lines = req.lines();
-            let first = lines.next().unwrap_or("");
-            let mut parts = first.split_whitespace();
-            let _method = parts.next().unwrap_or("");
-            let target = parts.next().unwrap_or("").to_string();
-            let path = target.split('?').next().unwrap_or("");
-            let path = percent_decode(path);
-            let path = path.trim_start_matches('/');
-            let file = root.join(path);
-            let meta = std::fs::metadata(&file).ok().filter(|m| m.is_file());
-            let mut range_start = 0u64;
-            let mut range_end_incl: Option<u64> = None;
-            for line in lines {
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("range:") {
-                    if let Some(spec) = v.trim().strip_prefix("bytes=") {
-                        let mut it = spec.split('-');
-                        if let Some(s) = it.next().and_then(|s| s.parse::<u64>().ok()) {
-                            range_start = s;
-                        }
-                        range_end_incl = it.next().and_then(|s| s.parse::<u64>().ok());
-                    }
-                }
-            }
-            let Some(meta) = meta else {
-                let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(resp.as_bytes());
-                continue;
-            };
-            let total = meta.len();
-            let end = range_end_incl.map(|e| e.min(total.saturating_sub(1))).unwrap_or(total.saturating_sub(1));
-            let status = if range_start > 0 || range_end_incl.is_some() { "HTTP/1.1 206 Partial Content" } else { "HTTP/1.1 200 OK" };
-            let accept = if range_start > 0 || range_end_incl.is_some() {
-                format!("Accept-Ranges: bytes\r\nContent-Range: bytes {range_start}-{end}/{total}\r\n")
-            } else {
-                "Accept-Ranges: bytes\r\n".to_string()
-            };
-            let clen = end.saturating_sub(range_start) + 1;
-            let head = format!(
-                "{status}\r\n{accept}Content-Type: application/octet-stream\r\nContent-Length: {clen}\r\nConnection: close\r\n\r\n"
-            );
-            if stream.write_all(head.as_bytes()).is_err() {
-                continue;
-            }
-            if let Ok(mut f) = std::fs::File::open(&file) {
-                if f.seek(SeekFrom::Start(range_start)).is_ok() {
-                    let mut remaining = clen;
-                    let mut chunk = vec![0u8; 256 * 1024];
-                    while remaining > 0 {
-                        let n = (remaining as usize).min(chunk.len());
-                        match f.read(&mut chunk[..n]) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n2) => {
-                                if stream.write_all(&chunk[..n2]).is_err() {
-                                    break;
-                                }
-                                remaining -= n2 as u64;
-                            }
-                        }
+                        remaining -= n2 as u64;
                     }
                 }
             }
         }
-    });
-    format!("http://127.0.0.1:{port}")
+    }
 }
 
 fn percent_decode(s: &str) -> String {
@@ -958,7 +977,7 @@ fn main() {
         }
     });
 
-    let http_base = http.then(|| start_http_server(corpus_dir()));
+    let http_base = http.then(start_http_server);
 
     let mut entry_results: Vec<EntryResult> = Vec::new();
     let mut row_map: BTreeMap<Row, RowResult> = yardstick
@@ -1082,11 +1101,13 @@ fn main() {
     std::fs::write(&out_path, &json).expect("write codecs.json");
     println!("\nwrote {}", out_path.display());
 
-    // Exit non-zero when any row has no passing entry.
+    // Exit non-zero when a row has no passing entry. Under --filter only the
+    // rows the selected entries cover are judged.
     let empty_rows: Vec<String> = report
         .rows
         .iter()
         .filter(|r| r.passing_entries.is_empty())
+        .filter(|r| filter.is_none() || !r.failing_entries.is_empty())
         .map(|r| r.row.clone())
         .collect();
     if !empty_rows.is_empty() {
