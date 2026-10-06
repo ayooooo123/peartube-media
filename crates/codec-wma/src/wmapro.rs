@@ -1416,6 +1416,7 @@ impl WmaProDecoder {
         while !data.is_empty() {
             let mut frame = None;
             let res = self.decode_packet(data, &mut frame);
+            let got_frame = frame.is_some();
             if let Some(f) = frame {
                 self.pending.push_back(f);
             }
@@ -1423,8 +1424,10 @@ impl WmaProDecoder {
             if consumed >= data.len() {
                 break;
             }
-            // a decoder that keeps consuming nothing would loop forever
-            stalls = if consumed == 0 { stalls + 1 } else { 0 };
+            // FFmpeg calls again on the same bytes while frames come out of
+            // the bit reservoir (each one advances its reader); a call that
+            // neither consumes nor decodes would loop forever.
+            stalls = if consumed == 0 && !got_frame { stalls + 1 } else { 0 };
             if stalls > 2 {
                 break;
             }

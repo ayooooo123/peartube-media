@@ -6,10 +6,11 @@
 #![forbid(unsafe_code)]
 
 pub mod bits;
-pub mod dsp;
+pub mod celp;
 pub mod fft;
 pub mod getbits;
 pub mod tables;
+pub mod tx;
 pub mod vlc;
 pub mod wma;
 pub mod wma_common;

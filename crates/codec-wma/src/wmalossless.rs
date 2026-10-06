@@ -1,308 +1,83 @@
 // Ported from FFmpeg (commit 2da55bf): libavcodec/wmalosslessdec.c and
-// libavcodec/lossless_audiodsp.c (scalarproduct_and_madd_*), with
+// libavcodec/lossless_audiodsp.c (scalarproduct_and_madd_int16/32_c), with
 // wma_common.c's frame-length helper.
-// GNU Lesser General Public License 2.1 or later
+// GNU Lesser General Public License 2.1 or later.
 
-//! WMA Lossless decoder.
+//! WMA Lossless decoder (`wmalossless`).
+//!
+//! The bitstream side follows FFmpeg's checked reader: reads past a frame's
+//! saved bits return whatever the reservoir buffer holds beyond them, and
+//! the position stops 8 bits past the end. A truncated final frame thus
+//! decodes from the reservoir's leftover bytes exactly as FFmpeg does, so
+//! the reservoir is one persistent buffer that only `save_bits` writes.
 
-use crate::bits::{BitReader, OwnedBitReader};
-use crate::wma_common::wma_get_frame_len_bits;
+use std::collections::VecDeque;
+
+use crate::getbits::{GetBits, GetBitsState, PutBits};
+use crate::wma_common::{av_ceil_log2, av_log2, wma_get_frame_len_bits};
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result, SampleFormat};
 
-pub const WMALL_MAX_CHANNELS: usize = 8;
-pub const MAX_SUBFRAMES: usize = 32;
-pub const MAX_BANDS: usize = 29;
-pub const MAX_FRAMESIZE: usize = 32768;
-pub const MAX_ORDER: usize = 256;
-pub const WMALL_BLOCK_MIN_BITS: u32 = 6;
-pub const WMALL_BLOCK_MAX_BITS: u32 = 14;
-pub const WMALL_BLOCK_MAX_SIZE: usize = 1 << WMALL_BLOCK_MAX_BITS;
-pub const WMALL_COEFF_PAD: usize = 8; // pad entries (int16) for the LMS arrays
+const WMALL_MAX_CHANNELS: usize = 8;
+const MAX_SUBFRAMES: usize = 32;
+const MAX_FRAMESIZE: usize = 32768;
+const MAX_ORDER: usize = 256;
+const WMALL_BLOCK_MAX_BITS: u32 = 14;
+const WMALL_BLOCK_MAX_SIZE: usize = 1 << WMALL_BLOCK_MAX_BITS;
+/// `WMALL_COEFF_PAD_SIZE` (16 bytes) in int16 elements.
+const COEFF_PAD: usize = 8;
+const AV_INPUT_BUFFER_PADDING_SIZE: usize = 64;
 
+/// `WMASIGN`.
 #[inline]
 fn wmasign(x: i32) -> i32 {
-    if x > 0 {
-        1
-    } else if x < 0 {
-        -1
+    (x > 0) as i32 - (x < 0) as i32
+}
+
+/// `av_clip`.
+#[inline]
+fn av_clip(a: i32, amin: i32, amax: i32) -> i32 {
+    if a < amin {
+        amin
+    } else if a > amax {
+        amax
     } else {
-        0
+        a
     }
 }
 
+/// `FFALIGN`.
 #[inline]
-fn clip_i32(x: i32, lo: i32, hi: i32) -> i32 {
-    x.max(lo).min(hi)
+fn ffalign(x: usize, a: usize) -> usize {
+    (x + a - 1) & !(a - 1)
 }
 
-#[derive(Clone)]
+/// `WmallChannelCtx`.
+#[derive(Clone, Copy, Default)]
 struct ChannelCtx {
-    #[allow(dead_code)]
-    prev_block_len: usize,
     num_subframes: usize,
-    subframe_len: [usize; MAX_SUBFRAMES],
-    subframe_offsets: [usize; MAX_SUBFRAMES],
+    subframe_len: [u16; MAX_SUBFRAMES],
+    subframe_offsets: [u16; MAX_SUBFRAMES],
     cur_subframe: usize,
     decoded_samples: usize,
     transient_counter: i32,
 }
 
-impl Default for ChannelCtx {
-    fn default() -> Self {
-        Self {
-            prev_block_len: 0,
-            num_subframes: 0,
-            subframe_len: [0; MAX_SUBFRAMES],
-            subframe_offsets: [0; MAX_SUBFRAMES],
-            cur_subframe: 0,
-            decoded_samples: 0,
-            transient_counter: 0,
-        }
+impl ChannelCtx {
+    /// `subframe_len[i]`, 0 past the array (FFmpeg reads the next field).
+    fn len_at(&self, i: usize) -> usize {
+        self.subframe_len.get(i).copied().unwrap_or(0) as usize
     }
 }
 
+/// One cascaded LMS filter (`WmallDecodeCtx.cdlms[ch][i]`).
 #[derive(Clone)]
 struct Cdlms {
     order: usize,
-    scaling: i32,
-    coefsend: usize,
-    bitsend: i32,
-    coefs: [i16; MAX_ORDER + WMALL_COEFF_PAD],
-    lms_prevvalues: [i32; MAX_ORDER * 2 + WMALL_COEFF_PAD],
-    lms_updates: [i16; MAX_ORDER * 2 + WMALL_COEFF_PAD],
+    scaling: u32,
+    coefs: [i16; MAX_ORDER + COEFF_PAD],
+    lms_prevvalues: [i32; MAX_ORDER * 2 + COEFF_PAD],
+    lms_updates: [i16; MAX_ORDER * 2 + COEFF_PAD],
     recent: usize,
-}
-
-/// Whole-decoder state (`WmallDecodeCtx`).
-pub struct WmaLosslessDecoder {
-    codec_id: CodecId,
-    channels: usize,
-    sample_rate: u32,
-
-    #[allow(dead_code)]
-    decode_flags: u32,
-    len_prefix: bool,
-    dynamic_range_compression: bool,
-    bits_per_sample: u32,
-    samples_per_frame: usize,
-    log2_frame_size: u32,
-    #[allow(dead_code)]
-    lfe_channel: i32,
-    max_num_subframes: usize,
-    #[allow(dead_code)]
-    subframe_len_bits: u32,
-    #[allow(dead_code)]
-    max_subframe_len_bit: bool,
-    min_samples_per_subframe: usize,
-
-    max_frame_size: usize,
-    block_align_stored: usize,
-    frame_data: Vec<u8>,
-    num_saved_bits: usize,
-    frame_offset: usize,
-    subframe_offset: usize,
-    packet_loss: bool,
-    packet_done: bool,
-    packet_sequence_number: u8,
-    packet_offset: usize,
-    next_packet_start: usize,
-    trim_end: usize,
-    buf_bit_size: usize,
-
-    gb: OwnedBitReader,
-    drc_gain: u8,
-    skip_frame: bool,
-    parsed_all_subframes: bool,
-    #[allow(dead_code)]
-    subframe_len: usize,
-    channels_for_cur_subframe: usize,
-    channel_indexes_for_cur_subframe: [usize; WMALL_MAX_CHANNELS],
-    channel: Vec<ChannelCtx>,
-    out: Vec<Vec<i32>>, // per-channel 32-bit accumulation buffer for the current frame
-
-    do_arith_coding: bool,
-    do_ac_filter: bool,
-    do_inter_ch_decorr: bool,
-    do_mclms: bool,
-    do_lpc: bool,
-
-    acfilter_order: usize,
-    acfilter_scaling: i32,
-    acfilter_coeffs: [i16; 16],
-    acfilter_prevvalues: [[i32; 16]; WMALL_MAX_CHANNELS],
-
-    mclms_order: usize,
-    mclms_scaling: i32,
-    mclms_coeffs: Vec<i16>,
-    mclms_coeffs_cur: Vec<i16>,
-    mclms_prevvalues: Vec<i32>,
-    mclms_updates: Vec<i16>,
-    mclms_recent: usize,
-
-    movave_scaling: i32,
-    quant_stepsize: i32,
-
-    cdlms: Vec<[Cdlms; 9]>,
-    cdlms_ttl: [usize; WMALL_MAX_CHANNELS],
-
-    b_v3_rtm: bool,
-    is_channel_coded: [bool; WMALL_MAX_CHANNELS],
-    update_speed: [i32; WMALL_MAX_CHANNELS],
-
-    transient: [bool; WMALL_MAX_CHANNELS],
-    transient_pos: [usize; WMALL_MAX_CHANNELS],
-    seekable_tile: bool,
-
-    ave_sum: [u32; WMALL_MAX_CHANNELS],
-    channel_residues: Vec<[i32; WMALL_BLOCK_MAX_SIZE]>,
-
-    lpc_coefs: [[i32; 40]; WMALL_MAX_CHANNELS],
-    lpc_order: usize,
-    lpc_scaling: i32,
-    lpc_intbits: i32,
-
-    pending: Vec<AudioFrame>,
-}
-
-#[inline]
-fn ceil_log2(v: u32) -> usize {
-    if v <= 1 {
-        0
-    } else {
-        (32 - (v - 1).leading_zeros()) as usize
-    }
-}
-impl WmaLosslessDecoder {
-    /// `decode_init` (wmalosslessdec.c).
-    pub fn new(params: &CodecParameters) -> Result<Self> {
-        let channels = params.channels.unwrap_or(0) as usize;
-        let sample_rate = params.sample_rate.unwrap_or(0);
-        let block_align = params
-            .options
-            .get("block_align")
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|&b| b > 0 && b <= (1 << 21))
-            .ok_or_else(|| Error::invalid("wmall: block_align is not set or invalid"))? as usize;
-        let extradata = &params.extradata;
-        if extradata.len() < 18 {
-            return Err(Error::unsupported("wmall: unsupported extradata size"));
-        }
-        let rd16 = |p: usize| u16::from_le_bytes([extradata[p], extradata[p + 1]]) as u32;
-        let rd32 =
-            |p: usize| u32::from_le_bytes([extradata[p], extradata[p + 1], extradata[p + 2], extradata[p + 3]]);
-        let decode_flags = rd16(14);
-        let channel_mask = rd32(2);
-        let bits_per_sample = rd16(0);
-        if bits_per_sample != 16 && bits_per_sample != 24 {
-            return Err(Error::invalid(format!("wmall: unknown bit-depth {bits_per_sample}")));
-        }
-        if channels == 0 || channels > WMALL_MAX_CHANNELS {
-            return Err(Error::unsupported("wmall: more than 8 channels"));
-        }
-
-        let mut lfe_channel: i32 = -1;
-        if channel_mask & 8 != 0 {
-            let mut mask = 1u32;
-            while mask < 16 {
-                if channel_mask & mask != 0 {
-                    lfe_channel += 1;
-                }
-                mask <<= 1;
-            }
-        }
-
-        let max_frame_size = MAX_FRAMESIZE * channels;
-        let log2_frame_size: u32 = (32 - (block_align as u32).leading_zeros() - 1) + 4;
-        let len_prefix = decode_flags & 0x40 != 0;
-        let samples_per_frame = 1usize << wma_get_frame_len_bits(sample_rate, 3, decode_flags);
-
-        let log2_max_num_subframes = ((decode_flags & 0x38) >> 3) as usize;
-        let max_num_subframes = 1usize << log2_max_num_subframes;
-        let subframe_len_bits = 32 - (log2_max_num_subframes as u32).leading_zeros();
-        let min_samples_per_subframe = samples_per_frame / max_num_subframes;
-        let b_v3_rtm = decode_flags & 0x100 != 0;
-
-        if max_num_subframes > MAX_SUBFRAMES {
-            return Err(Error::invalid("wmall: invalid number of subframes"));
-        }
-
-        Ok(Self {
-            codec_id: params.codec_id.clone(),
-            channels,
-            sample_rate,
-            decode_flags,
-            len_prefix,
-            dynamic_range_compression: decode_flags & 0x80 != 0,
-            bits_per_sample,
-            samples_per_frame,
-            log2_frame_size,
-            lfe_channel,
-            max_num_subframes,
-            subframe_len_bits,
-            max_subframe_len_bit: false,
-            min_samples_per_subframe,
-            max_frame_size,
-            block_align_stored: block_align,
-            frame_data: vec![0u8; max_frame_size + 64],
-            num_saved_bits: 0,
-            frame_offset: 0,
-            subframe_offset: 0,
-            packet_loss: true,
-            packet_done: false,
-            packet_sequence_number: 0,
-            packet_offset: 0,
-            next_packet_start: 0,
-            trim_end: 0,
-            buf_bit_size: 0,
-            gb: OwnedBitReader::new(),
-            drc_gain: 0,
-            skip_frame: true,
-            parsed_all_subframes: false,
-            subframe_len: 0,
-            channels_for_cur_subframe: 0,
-            channel_indexes_for_cur_subframe: [0; WMALL_MAX_CHANNELS],
-            channel: (0..channels)
-                .map(|_| ChannelCtx {
-                    prev_block_len: samples_per_frame,
-                    ..Default::default()
-                })
-                .collect(),
-            out: (0..channels).map(|_| vec![0i32; samples_per_frame]).collect(),
-            do_arith_coding: false,
-            do_ac_filter: false,
-            do_inter_ch_decorr: false,
-            do_mclms: false,
-            do_lpc: false,
-            acfilter_order: 0,
-            acfilter_scaling: 0,
-            acfilter_coeffs: [0; 16],
-            acfilter_prevvalues: [[0; 16]; WMALL_MAX_CHANNELS],
-            mclms_order: 0,
-            mclms_scaling: 0,
-            mclms_coeffs: vec![0; WMALL_MAX_CHANNELS * WMALL_MAX_CHANNELS * 32],
-            mclms_coeffs_cur: vec![0; WMALL_MAX_CHANNELS * WMALL_MAX_CHANNELS],
-            mclms_prevvalues: vec![0; WMALL_MAX_CHANNELS * 2 * 32],
-            mclms_updates: vec![0; WMALL_MAX_CHANNELS * 2 * 32],
-            mclms_recent: 0,
-            movave_scaling: 0,
-            quant_stepsize: 1,
-            cdlms: (0..WMALL_MAX_CHANNELS).map(|_| Default::default()).collect(),
-            cdlms_ttl: [0; WMALL_MAX_CHANNELS],
-            b_v3_rtm,
-            is_channel_coded: [false; WMALL_MAX_CHANNELS],
-            update_speed: [8; WMALL_MAX_CHANNELS],
-            transient: [false; WMALL_MAX_CHANNELS],
-            transient_pos: [0; WMALL_MAX_CHANNELS],
-            seekable_tile: false,
-            ave_sum: [0; WMALL_MAX_CHANNELS],
-            channel_residues: (0..WMALL_MAX_CHANNELS).map(|_| [0i32; WMALL_BLOCK_MAX_SIZE]).collect(),
-            lpc_coefs: [[0; 40]; WMALL_MAX_CHANNELS],
-            lpc_order: 0,
-            lpc_scaling: 0,
-            lpc_intbits: 0,
-            pending: Vec::new(),
-        })
-    }
 }
 
 impl Default for Cdlms {
@@ -310,80 +85,283 @@ impl Default for Cdlms {
         Self {
             order: 0,
             scaling: 0,
-            coefsend: 0,
-            bitsend: 0,
-            coefs: [0; MAX_ORDER + WMALL_COEFF_PAD],
-            lms_prevvalues: [0; MAX_ORDER * 2 + WMALL_COEFF_PAD],
-            lms_updates: [0; MAX_ORDER * 2 + WMALL_COEFF_PAD],
+            coefs: [0; MAX_ORDER + COEFF_PAD],
+            lms_prevvalues: [0; MAX_ORDER * 2 + COEFF_PAD],
+            lms_updates: [0; MAX_ORDER * 2 + COEFF_PAD],
             recent: 0,
         }
     }
 }
 
+/// WMA Lossless decoder (FFmpeg's `wmalossless`, `WmallDecodeCtx`).
+pub struct WmaLosslessDecoder {
+    codec_id: CodecId,
+    sample_rate: u32,
+    block_align: usize,
+
+    // frame size dependent frame information (set during initialization)
+    len_prefix: bool,
+    dynamic_range_compression: bool,
+    bits_per_sample: u32,
+    samples_per_frame: usize,
+    log2_frame_size: u32,
+    num_channels: usize,
+    max_num_subframes: usize,
+    min_samples_per_subframe: usize,
+    max_frame_size: usize,
+    frame_data: Vec<u8>,
+    pb: PutBits,
+
+    // packet decode state
+    /// `s->pgb`: position of the packet reader, kept for draining calls.
+    pgb: GetBitsState,
+    next_packet_start: usize,
+    packet_offset: usize,
+    packet_sequence_number: u32,
+    num_saved_bits: usize,
+    frame_offset: usize,
+    packet_loss: bool,
+    packet_done: bool,
+
+    // frame decode state
+    /// `s->gb`: the reader over the reservoir in `frame_data`.
+    gb: GetBitsState,
+    buf_bit_size: i64,
+    parsed_all_subframes: bool,
+
+    // subframe/block decode state
+    channels_for_cur_subframe: usize,
+    channel_indexes_for_cur_subframe: [usize; WMALL_MAX_CHANNELS],
+    channel: [ChannelCtx; WMALL_MAX_CHANNELS],
+
+    do_ac_filter: bool,
+    do_inter_ch_decorr: bool,
+    do_mclms: bool,
+
+    acfilter_order: usize,
+    acfilter_scaling: u32,
+    acfilter_coeffs: [i16; 16],
+    acfilter_prevvalues: [[i32; 16]; WMALL_MAX_CHANNELS],
+
+    mclms_order: usize,
+    mclms_scaling: u32,
+    mclms_coeffs: [i16; WMALL_MAX_CHANNELS * WMALL_MAX_CHANNELS * 32],
+    mclms_coeffs_cur: [i16; WMALL_MAX_CHANNELS * WMALL_MAX_CHANNELS],
+    mclms_prevvalues: [i32; WMALL_MAX_CHANNELS * 2 * 32],
+    mclms_updates: [i32; WMALL_MAX_CHANNELS * 2 * 32],
+    mclms_recent: usize,
+
+    movave_scaling: u32,
+    quant_stepsize: u32,
+
+    cdlms: Vec<[Cdlms; 9]>,
+    cdlms_ttl: [usize; WMALL_MAX_CHANNELS],
+
+    b_v3_rtm: bool,
+
+    is_channel_coded: [bool; WMALL_MAX_CHANNELS],
+    update_speed: [i32; WMALL_MAX_CHANNELS],
+
+    transient: [bool; WMALL_MAX_CHANNELS],
+    transient_pos: [u32; WMALL_MAX_CHANNELS],
+    seekable_tile: bool,
+
+    ave_sum: [u32; WMALL_MAX_CHANNELS],
+
+    channel_residues: Vec<[i32; WMALL_BLOCK_MAX_SIZE]>,
+
+    lpc_coefs: [[i32; 40]; WMALL_MAX_CHANNELS],
+    lpc_order: usize,
+
+    // `s->frame`: the output frame being decoded
+    out: Vec<Vec<i32>>,
+    out_pos: [usize; WMALL_MAX_CHANNELS],
+    nb_samples: i64,
+
+    pending: VecDeque<AudioFrame>,
+    eof: bool,
+}
+
 impl WmaLosslessDecoder {
-    /// `decode_subframe_length` (wmalosslessdec.c).
-    fn decode_subframe_length(&mut self, offset: usize) -> Result<usize> {
-        if offset == self.samples_per_frame - self.min_samples_per_subframe {
-            return Ok(self.min_samples_per_subframe);
+    /// `decode_init`.
+    pub fn new(params: &CodecParameters) -> Result<Self> {
+        let block_align = params
+            .options
+            .get("block_align")
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|&b| b > 0 && b <= 1 << 21)
+            .ok_or_else(|| Error::invalid("wmalossless: block_align is not set or invalid"))?
+            as usize;
+
+        let extradata = &params.extradata;
+        if extradata.len() < 18 {
+            return Err(Error::unsupported("wmalossless: unsupported extradata size"));
         }
-        let len = 32 - ((self.max_num_subframes - 1) as u32).leading_zeros() as usize;
-        let frame_len_ratio = self.gb.get_bits(len)? as usize;
-        let subframe_len = self.min_samples_per_subframe * (frame_len_ratio + 1);
-        if subframe_len < self.min_samples_per_subframe || subframe_len > self.samples_per_frame {
-            return Err(Error::invalid("wmall: broken frame: subframe_len"));
+        let rl16 = |p: usize| u16::from_le_bytes([extradata[p], extradata[p + 1]]) as u32;
+        let decode_flags = rl16(14);
+        let channel_mask =
+            u32::from_le_bytes([extradata[2], extradata[3], extradata[4], extradata[5]]);
+        let bits_per_sample = rl16(0);
+        if bits_per_sample != 16 && bits_per_sample != 24 {
+            return Err(Error::invalid(format!("wmalossless: unknown bit-depth {bits_per_sample}")));
         }
-        Ok(subframe_len)
+
+        let num_channels =
+            if channel_mask != 0 { channel_mask.count_ones() as usize } else { params.channels.unwrap_or(0) as usize };
+        if num_channels > WMALL_MAX_CHANNELS {
+            return Err(Error::unsupported("wmalossless: more than 8 channels"));
+        }
+        if num_channels == 0 {
+            return Err(Error::invalid("wmalossless: no channels"));
+        }
+
+        let max_frame_size = MAX_FRAMESIZE * num_channels;
+        let sample_rate = params.sample_rate.unwrap_or(0);
+        let samples_per_frame = 1usize << wma_get_frame_len_bits(sample_rate, 3, decode_flags);
+        let log2_max_num_subframes = (decode_flags & 0x38) >> 3;
+        let max_num_subframes = 1usize << log2_max_num_subframes;
+        if max_num_subframes > MAX_SUBFRAMES {
+            return Err(Error::invalid(format!("wmalossless: invalid number of subframes {max_num_subframes}")));
+        }
+
+        Ok(Self {
+            codec_id: params.codec_id.clone(),
+            sample_rate,
+            block_align,
+            len_prefix: decode_flags & 0x40 != 0,
+            dynamic_range_compression: decode_flags & 0x80 != 0,
+            bits_per_sample,
+            samples_per_frame,
+            log2_frame_size: av_log2(block_align as u32) + 4,
+            num_channels,
+            max_num_subframes,
+            min_samples_per_subframe: samples_per_frame / max_num_subframes,
+            max_frame_size,
+            frame_data: vec![0; max_frame_size + AV_INPUT_BUFFER_PADDING_SIZE],
+            pb: PutBits::default(),
+            pgb: GetBitsState::default(),
+            next_packet_start: 0,
+            packet_offset: 0,
+            packet_sequence_number: 0,
+            num_saved_bits: 0,
+            frame_offset: 0,
+            packet_loss: true,
+            packet_done: false,
+            gb: GetBitsState::default(),
+            buf_bit_size: 0,
+            parsed_all_subframes: false,
+            channels_for_cur_subframe: 0,
+            channel_indexes_for_cur_subframe: [0; WMALL_MAX_CHANNELS],
+            channel: [ChannelCtx::default(); WMALL_MAX_CHANNELS],
+            do_ac_filter: false,
+            do_inter_ch_decorr: false,
+            do_mclms: false,
+            acfilter_order: 0,
+            acfilter_scaling: 0,
+            acfilter_coeffs: [0; 16],
+            acfilter_prevvalues: [[0; 16]; WMALL_MAX_CHANNELS],
+            mclms_order: 0,
+            mclms_scaling: 0,
+            mclms_coeffs: [0; WMALL_MAX_CHANNELS * WMALL_MAX_CHANNELS * 32],
+            mclms_coeffs_cur: [0; WMALL_MAX_CHANNELS * WMALL_MAX_CHANNELS],
+            mclms_prevvalues: [0; WMALL_MAX_CHANNELS * 2 * 32],
+            mclms_updates: [0; WMALL_MAX_CHANNELS * 2 * 32],
+            mclms_recent: 0,
+            movave_scaling: 0,
+            quant_stepsize: 0,
+            cdlms: vec![Default::default(); WMALL_MAX_CHANNELS],
+            cdlms_ttl: [0; WMALL_MAX_CHANNELS],
+            b_v3_rtm: decode_flags & 0x100 != 0,
+            is_channel_coded: [false; WMALL_MAX_CHANNELS],
+            update_speed: [0; WMALL_MAX_CHANNELS],
+            transient: [false; WMALL_MAX_CHANNELS],
+            transient_pos: [0; WMALL_MAX_CHANNELS],
+            seekable_tile: false,
+            ave_sum: [0; WMALL_MAX_CHANNELS],
+            channel_residues: vec![[0; WMALL_BLOCK_MAX_SIZE]; WMALL_MAX_CHANNELS],
+            lpc_coefs: [[0; 40]; WMALL_MAX_CHANNELS],
+            lpc_order: 0,
+            out: vec![vec![0; samples_per_frame]; num_channels],
+            out_pos: [0; WMALL_MAX_CHANNELS],
+            nb_samples: 0,
+            pending: VecDeque::new(),
+            eof: false,
+        })
     }
 
-    /// `decode_tilehdr` (wmalosslessdec.c).
-    fn decode_tilehdr(&mut self) -> Result<()> {
-        let nch = self.channels;
+    /// `decode_subframe_length`.
+    fn decode_subframe_length(&self, gb: &mut GetBits<'_>, offset: usize) -> Option<usize> {
+        // no need to read from the bitstream when only one length is possible
+        if offset == self.samples_per_frame - self.min_samples_per_subframe {
+            return Some(self.min_samples_per_subframe);
+        }
+
+        let len = av_log2(self.max_num_subframes as u32 - 1) + 1;
+        let frame_len_ratio = gb.get_bits(len) as usize;
+        let subframe_len = self.min_samples_per_subframe * (frame_len_ratio + 1);
+
+        // sanity check the length
+        (subframe_len >= self.min_samples_per_subframe && subframe_len <= self.samples_per_frame)
+            .then_some(subframe_len)
+    }
+
+    /// `decode_tilehdr`: how the frame splits into subframes per channel.
+    fn decode_tilehdr(&mut self, gb: &mut GetBits<'_>) -> Option<()> {
+        let nch = self.num_channels;
         let mut num_samples = [0usize; WMALL_MAX_CHANNELS];
         let mut contains_subframe = [false; WMALL_MAX_CHANNELS];
         let mut channels_for_cur_subframe = nch;
-        let mut fixed_channel_layout = false;
-        let mut min_channel_len = 0usize;
+        let mut min_channel_len = 0;
 
-        for c in 0..nch {
-            self.channel[c].num_subframes = 0;
+        // reset tiling information
+        for ch in self.channel[..nch].iter_mut() {
+            ch.num_subframes = 0;
         }
 
-        let tile_aligned = self.gb.get_bits1()? != 0;
-        if self.max_num_subframes == 1 || tile_aligned {
-            fixed_channel_layout = true;
-        }
+        let tile_aligned = gb.get_bits1() != 0;
+        let fixed_channel_layout = self.max_num_subframes == 1 || tile_aligned;
 
+        // loop until the frame data is split between the subframes
         loop {
             let mut in_use = false;
+
+            // check which channels contain the subframe
             for c in 0..nch {
                 if num_samples[c] == min_channel_len {
-                    contains_subframe[c] = fixed_channel_layout
+                    contains_subframe[c] = if fixed_channel_layout
                         || channels_for_cur_subframe == 1
-                        || min_channel_len == self.samples_per_frame - self.min_samples_per_subframe;
-                    if !contains_subframe[c] {
-                        contains_subframe[c] = self.gb.get_bits1()? != 0;
-                    }
+                        || min_channel_len == self.samples_per_frame - self.min_samples_per_subframe
+                    {
+                        true
+                    } else {
+                        gb.get_bits1() != 0
+                    };
                     in_use |= contains_subframe[c];
                 } else {
                     contains_subframe[c] = false;
                 }
             }
+
             if !in_use {
-                return Err(Error::invalid("wmall: found empty subframe"));
+                return None;
             }
-            let subframe_len = self.decode_subframe_length(min_channel_len)?;
+
+            // get subframe length, subframe_len == 0 is not allowed
+            let subframe_len = self.decode_subframe_length(gb, min_channel_len)?;
+            // add subframes to the individual channels and find new
+            // min_channel_len
             min_channel_len += subframe_len;
             for c in 0..nch {
+                let chan = &mut self.channel[c];
                 if contains_subframe[c] {
-                    let ch = &mut self.channel[c];
-                    if ch.num_subframes >= MAX_SUBFRAMES {
-                        return Err(Error::invalid("wmall: num subframes > 31"));
+                    if chan.num_subframes >= MAX_SUBFRAMES {
+                        return None;
                     }
-                    ch.subframe_len[ch.num_subframes] = subframe_len;
+                    chan.subframe_len[chan.num_subframes] = subframe_len as u16;
                     num_samples[c] += subframe_len;
-                    ch.num_subframes += 1;
+                    chan.num_subframes += 1;
                     if num_samples[c] > self.samples_per_frame {
-                        return Err(Error::invalid("wmall: channel len > samples_per_frame"));
+                        return None;
                     }
                 } else if num_samples[c] <= min_channel_len {
                     if num_samples[c] < min_channel_len {
@@ -398,97 +376,109 @@ impl WmaLosslessDecoder {
             }
         }
 
-        for c in 0..nch {
-            let mut offset = 0usize;
-            for i in 0..self.channel[c].num_subframes {
-                self.channel[c].subframe_offsets[i] = offset;
-                offset += self.channel[c].subframe_len[i];
+        for chan in self.channel[..nch].iter_mut() {
+            let mut offset = 0u16;
+            for i in 0..chan.num_subframes {
+                chan.subframe_offsets[i] = offset;
+                offset += chan.subframe_len[i];
             }
         }
-        Ok(())
+
+        Some(())
     }
 
-    /// `decode_ac_filter` (wmalosslessdec.c).
-    fn decode_ac_filter(&mut self) -> Result<()> {
-        self.acfilter_order = self.gb.get_bits(4)? as usize + 1;
-        self.acfilter_scaling = self.gb.get_bits(4)? as i32;
+    /// `decode_ac_filter`.
+    fn decode_ac_filter(&mut self, gb: &mut GetBits<'_>) {
+        self.acfilter_order = gb.get_bits(4) as usize + 1;
+        self.acfilter_scaling = gb.get_bits(4);
+
         for i in 0..self.acfilter_order {
-            self.acfilter_coeffs[i] = (self.gb.get_bits(self.acfilter_scaling as usize)? + 1) as i16;
+            self.acfilter_coeffs[i] = (gb.get_bitsz(self.acfilter_scaling) + 1) as i16;
         }
-        Ok(())
     }
 
-    /// `decode_mclms` (wmalosslessdec.c).
-    fn decode_mclms(&mut self) -> Result<()> {
-        self.mclms_order = ((self.gb.get_bits(4)? + 1) * 2) as usize;
-        self.mclms_scaling = self.gb.get_bits(4)? as i32;
-        if self.gb.get_bits1()? != 0 {
-            let mut cbits = 32 - ((self.mclms_scaling + 1) as u32).leading_zeros() - 1;
-            if (1 << cbits) < self.mclms_scaling + 1 {
+    /// `decode_mclms`.
+    fn decode_mclms(&mut self, gb: &mut GetBits<'_>) {
+        self.mclms_order = (gb.get_bits(4) as usize + 1) * 2;
+        self.mclms_scaling = gb.get_bits(4);
+        if gb.get_bits1() != 0 {
+            let mut cbits = av_log2(self.mclms_scaling + 1);
+            if 1 << cbits < self.mclms_scaling + 1 {
                 cbits += 1;
             }
-            let send_coef_bits = self.gb.get_bits(cbits as usize)? + 2;
-            let n = self.mclms_order * self.channels * self.channels;
-            for item in self.mclms_coeffs.iter_mut().take(n) {
-                *item = self.gb.get_bits(send_coef_bits as usize)? as i16;
+
+            let send_coef_bits = gb.get_bitsz(cbits) + 2;
+
+            let nch = self.num_channels;
+            for c in self.mclms_coeffs[..self.mclms_order * nch * nch].iter_mut() {
+                *c = gb.get_bits(send_coef_bits) as i16;
             }
-            for i in 0..self.channels {
+
+            for i in 0..nch {
                 for c in 0..i {
-                    self.mclms_coeffs_cur[i * self.channels + c] =
-                        self.gb.get_bits(send_coef_bits as usize)? as i16;
+                    self.mclms_coeffs_cur[i * nch + c] = gb.get_bits(send_coef_bits) as i16;
                 }
             }
         }
-        Ok(())
     }
 
-    /// `decode_cdlms` (wmalosslessdec.c).
-    fn decode_cdlms(&mut self) -> Result<()> {
-        let cdlms_send_coef = self.gb.get_bits1()? != 0;
-        for c in 0..self.channels {
-            self.cdlms_ttl[c] = self.gb.get_bits(3)? as usize + 1;
+    /// `decode_cdlms`.
+    fn decode_cdlms(&mut self, gb: &mut GetBits<'_>) -> Option<()> {
+        let cdlms_send_coef = gb.get_bits1() != 0;
+
+        for c in 0..self.num_channels {
+            self.cdlms_ttl[c] = gb.get_bits(3) as usize + 1;
             for i in 0..self.cdlms_ttl[c] {
-                self.cdlms[c][i].order = ((self.gb.get_bits(7)? + 1) * 8) as usize;
+                self.cdlms[c][i].order = (gb.get_bits(7) as usize + 1) * 8;
                 if self.cdlms[c][i].order > MAX_ORDER {
                     self.cdlms[0][0].order = 0;
-                    return Err(Error::invalid("wmall: cdlms order > max"));
+                    return None;
                 }
             }
+
             for i in 0..self.cdlms_ttl[c] {
-                self.cdlms[c][i].scaling = self.gb.get_bits(4)? as i32;
+                self.cdlms[c][i].scaling = gb.get_bits(4);
             }
+
             if cdlms_send_coef {
                 for i in 0..self.cdlms_ttl[c] {
-                    let order = self.cdlms[c][i].order;
-                    let mut cbits = 32 - (order as u32).leading_zeros() - 1;
-                    if (1 << cbits) < order as i32 {
+                    let lms = &mut self.cdlms[c][i];
+                    let mut cbits = av_log2(lms.order as u32);
+                    if 1 << cbits < lms.order {
                         cbits += 1;
                     }
-                    self.cdlms[c][i].coefsend = self.gb.get_bits(cbits as usize)? as usize + 1;
+                    let coefsend = gb.get_bits(cbits) as usize + 1;
 
-                    let mut cbits = 32 - ((self.cdlms[c][i].scaling + 1) as u32).leading_zeros() - 1;
-                    if (1 << cbits) < self.cdlms[c][i].scaling + 1 {
+                    let mut cbits = av_log2(lms.scaling + 1);
+                    if 1 << cbits < lms.scaling + 1 {
                         cbits += 1;
                     }
-                    self.cdlms[c][i].bitsend = self.gb.get_bits(cbits as usize)? as i32 + 2;
-                    let shift_l = 32 - self.cdlms[c][i].bitsend;
-                    let shift_r = 32 - self.cdlms[c][i].scaling - 2;
-                    for j in 0..self.cdlms[c][i].coefsend {
-                        let v = self.gb.get_bits(self.cdlms[c][i].bitsend as usize)? as u32;
-                        self.cdlms[c][i].coefs[j] = (((v << shift_l) >> shift_r) as i32) as i16;
+
+                    let bitsend = gb.get_bitsz(cbits) + 2;
+                    let shift_l = 32 - bitsend;
+                    let shift_r = 32 - lms.scaling - 2;
+                    for coef in lms.coefs[..coefsend].iter_mut() {
+                        *coef = ((gb.get_bits(bitsend) << shift_l) >> shift_r) as i16;
                     }
                 }
             }
+
+            for i in 0..self.cdlms_ttl[c] {
+                let lms = &mut self.cdlms[c][i];
+                let order = lms.order;
+                lms.coefs[order..order + COEFF_PAD].fill(0);
+            }
         }
-        Ok(())
+
+        Some(())
     }
 
-    /// `decode_channel_residues` (wmalosslessdec.c).
-    fn decode_channel_residues(&mut self, ch: usize, tile_size: usize) -> Result<()> {
-        let mut i = 0usize;
-        self.transient[ch] = self.gb.get_bits1()? != 0;
+    /// `decode_channel_residues`; false when the bits run out.
+    fn decode_channel_residues(&mut self, gb: &mut GetBits<'_>, ch: usize, tile_size: usize) -> bool {
+        let mut i = 0;
+        self.transient[ch] = gb.get_bits1() != 0;
         if self.transient[ch] {
-            self.transient_pos[ch] = self.gb.get_bits((32 - (tile_size as u32).leading_zeros() - 1) as usize)? as usize;
+            self.transient_pos[ch] = gb.get_bits(av_log2(tile_size as u32));
             if self.transient_pos[ch] != 0 {
                 self.transient[ch] = false;
             }
@@ -499,165 +489,173 @@ impl WmaLosslessDecoder {
         }
 
         if self.seekable_tile {
-            let ave_mean = self.gb.get_bits(self.bits_per_sample as usize)?;
+            let ave_mean = gb.get_bits(self.bits_per_sample);
             self.ave_sum[ch] = ave_mean << (self.movave_scaling + 1);
-            let first_bits = if self.do_inter_ch_decorr {
-                self.bits_per_sample as usize + 1
-            } else {
-                self.bits_per_sample as usize
-            };
-            self.channel_residues[ch][0] = self.gb.get_sbits(first_bits)?;
-            i = 1;
+        }
+
+        if self.seekable_tile {
+            let bits = if self.do_inter_ch_decorr { self.bits_per_sample + 1 } else { self.bits_per_sample };
+            self.channel_residues[ch][0] = gb.get_sbits(bits);
+            i += 1;
         }
         while i < tile_size {
             let mut quo = 0u32;
-            while self.gb.get_bits1()? != 0 {
-                quo += 1;
-                if self.gb.bits_left() == 0 {
-                    return Err(Error::invalid("wmall: residue overread"));
+            while gb.get_bits1() != 0 {
+                quo = quo.wrapping_add(1);
+                if gb.bits_left() <= 0 {
+                    return false;
                 }
             }
             if quo >= 32 {
-                let extra_bits = self.gb.get_bits(5)? + 1;
-                quo += self.gb.get_bits(extra_bits as usize)?;
+                let n = gb.get_bits(5) + 1;
+                quo = quo.wrapping_add(gb.get_bits(n));
             }
-            let ave_mean = (self.ave_sum[ch] + (1 << self.movave_scaling)) >> (self.movave_scaling + 1);
-            let residue: u32 = if ave_mean <= 1 {
+
+            let ave_mean =
+                self.ave_sum[ch].wrapping_add(1 << self.movave_scaling) >> (self.movave_scaling + 1);
+            let residue = if ave_mean <= 1 {
                 quo
             } else {
-                let rem_bits = ceil_log2(ave_mean as u32);
-                let rem = self.gb.get_bits(rem_bits)?;
-                (quo << rem_bits) + rem
+                let rem_bits = av_ceil_log2(ave_mean);
+                let rem = gb.get_bits(rem_bits);
+                (quo << rem_bits).wrapping_add(rem)
             };
-            self.ave_sum[ch] = self.ave_sum[ch]
-                .wrapping_add(residue)
-                .wrapping_sub(self.ave_sum[ch] >> self.movave_scaling);
-            let signed_res = ((residue >> 1) as i32) ^ -((residue & 1) as i32);
-            self.channel_residues[ch][i] = signed_res;
+
+            self.ave_sum[ch] =
+                residue.wrapping_add(self.ave_sum[ch]).wrapping_sub(self.ave_sum[ch] >> self.movave_scaling);
+
+            self.channel_residues[ch][i] = ((residue >> 1) ^ (residue & 1).wrapping_neg()) as i32;
             i += 1;
         }
-        Ok(())
+
+        true
     }
 
-    /// `decode_lpc` (wmalosslessdec.c).
-    fn decode_lpc(&mut self) -> Result<()> {
-        self.lpc_order = self.gb.get_bits(5)? as usize + 1;
-        self.lpc_scaling = self.gb.get_bits(4)? as i32;
-        self.lpc_intbits = self.gb.get_bits(3)? as i32 + 1;
-        let cbits = (self.lpc_scaling + self.lpc_intbits) as usize;
-        for ch in 0..self.channels {
+    /// `decode_lpc` (FFmpeg reads but does not apply the coefficients).
+    fn decode_lpc(&mut self, gb: &mut GetBits<'_>) {
+        self.lpc_order = gb.get_bits(5) as usize + 1;
+        let lpc_scaling = gb.get_bits(4);
+        let lpc_intbits = gb.get_bits(3) + 1;
+        let cbits = lpc_scaling + lpc_intbits;
+        for ch in 0..self.num_channels {
             for i in 0..self.lpc_order {
-                self.lpc_coefs[ch][i] = self.gb.get_sbits(cbits)?;
+                self.lpc_coefs[ch][i] = gb.get_sbits(cbits);
             }
         }
-        Ok(())
     }
 
-    /// `clear_codec_buffers` (wmalosslessdec.c).
+    /// `clear_codec_buffers`.
     fn clear_codec_buffers(&mut self) {
         self.acfilter_coeffs = [0; 16];
         self.acfilter_prevvalues = [[0; 16]; WMALL_MAX_CHANNELS];
         self.lpc_coefs = [[0; 40]; WMALL_MAX_CHANNELS];
-        self.mclms_coeffs.iter_mut().for_each(|v| *v = 0);
-        self.mclms_coeffs_cur.iter_mut().for_each(|v| *v = 0);
-        self.mclms_prevvalues.iter_mut().for_each(|v| *v = 0);
-        self.mclms_updates.iter_mut().for_each(|v| *v = 0);
-        for ich in 0..self.channels {
-            for ilms in 0..self.cdlms_ttl[ich] {
-                self.cdlms[ich][ilms].coefs = [0; MAX_ORDER + WMALL_COEFF_PAD];
-                self.cdlms[ich][ilms].lms_prevvalues = [0; MAX_ORDER * 2 + WMALL_COEFF_PAD];
-                self.cdlms[ich][ilms].lms_updates = [0; MAX_ORDER * 2 + WMALL_COEFF_PAD];
+
+        self.mclms_coeffs.fill(0);
+        self.mclms_coeffs_cur.fill(0);
+        self.mclms_prevvalues.fill(0);
+        self.mclms_updates.fill(0);
+
+        for ich in 0..self.num_channels {
+            for lms in self.cdlms[ich][..self.cdlms_ttl[ich]].iter_mut() {
+                lms.coefs.fill(0);
+                lms.lms_prevvalues.fill(0);
+                lms.lms_updates.fill(0);
             }
             self.ave_sum[ich] = 0;
         }
     }
 
-    /// `reset_codec` (wmalosslessdec.c).
+    /// `reset_codec`: filter parameters and transient area at a new
+    /// seekable tile.
     fn reset_codec(&mut self) {
-        self.mclms_recent = self.mclms_order * self.channels;
-        for ich in 0..self.channels {
-            for ilms in 0..self.cdlms_ttl[ich] {
-                self.cdlms[ich][ilms].recent = self.cdlms[ich][ilms].order;
+        self.mclms_recent = self.mclms_order * self.num_channels;
+        for ich in 0..self.num_channels {
+            for lms in self.cdlms[ich][..self.cdlms_ttl[ich]].iter_mut() {
+                lms.recent = lms.order;
             }
+            // first sample of a seekable subframe is considered as the
+            // starting of a transient area which is samples_per_frame
+            // samples long
             self.channel[ich].transient_counter = self.samples_per_frame as i32;
             self.transient[ich] = true;
             self.transient_pos[ich] = 0;
         }
     }
 
-    /// `mclms_update` (wmalosslessdec.c).
+    /// `mclms_update`.
     fn mclms_update(&mut self, icoef: usize, pred: &[i32; WMALL_MAX_CHANNELS]) {
         let order = self.mclms_order;
-        let num_channels = self.channels;
+        let nch = self.num_channels;
         let range = 1i32 << (self.bits_per_sample - 1);
+        let n = order * nch;
 
-        for ich in 0..num_channels {
+        for ich in 0..nch {
             let pred_error = self.channel_residues[ich][icoef].wrapping_sub(pred[ich]);
             if pred_error > 0 {
-                for i in 0..order * num_channels {
-                    self.mclms_coeffs[i + ich * order * num_channels] += self.mclms_updates[self.mclms_recent + i];
+                for i in 0..n {
+                    let c = &mut self.mclms_coeffs[i + ich * n];
+                    *c = (*c as i32).wrapping_add(self.mclms_updates[self.mclms_recent + i]) as i16;
                 }
                 for j in 0..ich {
-                    self.mclms_coeffs_cur[ich * num_channels + j] +=
-                        wmasign(self.channel_residues[j][icoef]) as i16;
+                    let c = &mut self.mclms_coeffs_cur[ich * nch + j];
+                    *c = (*c as i32 + wmasign(self.channel_residues[j][icoef])) as i16;
                 }
             } else if pred_error < 0 {
-                for i in 0..order * num_channels {
-                    self.mclms_coeffs[i + ich * order * num_channels] -= self.mclms_updates[self.mclms_recent + i];
+                for i in 0..n {
+                    let c = &mut self.mclms_coeffs[i + ich * n];
+                    *c = (*c as i32).wrapping_sub(self.mclms_updates[self.mclms_recent + i]) as i16;
                 }
                 for j in 0..ich {
-                    self.mclms_coeffs_cur[ich * num_channels + j] -=
-                        wmasign(self.channel_residues[j][icoef]) as i16;
+                    let c = &mut self.mclms_coeffs_cur[ich * nch + j];
+                    *c = (*c as i32 - wmasign(self.channel_residues[j][icoef])) as i16;
                 }
             }
         }
 
-        for ich in (0..num_channels).rev() {
+        for ich in (0..nch).rev() {
             self.mclms_recent -= 1;
-            self.mclms_prevvalues[self.mclms_recent] =
-                clip_i32(self.channel_residues[ich][icoef], -range, range - 1);
-            self.mclms_updates[self.mclms_recent] = wmasign(self.channel_residues[ich][icoef]) as i16;
+            self.mclms_prevvalues[self.mclms_recent] = av_clip(self.channel_residues[ich][icoef], -range, range - 1);
+            self.mclms_updates[self.mclms_recent] = wmasign(self.channel_residues[ich][icoef]);
         }
 
         if self.mclms_recent == 0 {
-            let n = order * num_channels;
-            for i in 0..n {
-                self.mclms_prevvalues[n + i] = self.mclms_prevvalues[i];
-                self.mclms_updates[n + i] = self.mclms_updates[i];
-            }
-            self.mclms_recent = num_channels * order;
+            self.mclms_prevvalues.copy_within(..n, n);
+            self.mclms_updates.copy_within(..n, n);
+            self.mclms_recent = n;
         }
     }
 
-    /// `mclms_predict` (wmalosslessdec.c).
+    /// `mclms_predict`.
     fn mclms_predict(&mut self, icoef: usize, pred: &mut [i32; WMALL_MAX_CHANNELS]) {
         let order = self.mclms_order;
-        let num_channels = self.channels;
-        for ich in 0..num_channels {
+        let nch = self.num_channels;
+        let n = order * nch;
+
+        for ich in 0..nch {
             pred[ich] = 0;
             if !self.is_channel_coded[ich] {
                 continue;
             }
-            for i in 0..order * num_channels {
-                pred[ich] = pred[ich]
-                    .wrapping_add(
-                        self.mclms_prevvalues[i + self.mclms_recent]
-                            .wrapping_mul(self.mclms_coeffs[i + order * num_channels * ich] as i32),
-                    );
-            }
-            for i in 0..ich {
-                pred[ich] = pred[ich].wrapping_add(
-                    self.channel_residues[i][icoef]
-                        .wrapping_mul(self.mclms_coeffs_cur[i + num_channels * ich] as i32),
+            let mut p = 0u32;
+            for i in 0..n {
+                p = p.wrapping_add(
+                    (self.mclms_prevvalues[i + self.mclms_recent] as u32)
+                        .wrapping_mul(self.mclms_coeffs[i + n * ich] as i32 as u32),
                 );
             }
-            pred[ich] = pred[ich].wrapping_add((1i32 << self.mclms_scaling) >> 1);
-            pred[ich] >>= self.mclms_scaling;
+            for i in 0..ich {
+                p = p.wrapping_add(
+                    (self.channel_residues[i][icoef] as u32)
+                        .wrapping_mul(self.mclms_coeffs_cur[i + nch * ich] as i32 as u32),
+                );
+            }
+            p = p.wrapping_add((1u32 << self.mclms_scaling) >> 1);
+            pred[ich] = (p as i32) >> self.mclms_scaling;
             self.channel_residues[ich][icoef] = self.channel_residues[ich][icoef].wrapping_add(pred[ich]);
         }
     }
 
-    /// `revert_mclms` (wmalosslessdec.c).
+    /// `revert_mclms`.
     fn revert_mclms(&mut self, tile_size: usize) {
         let mut pred = [0i32; WMALL_MAX_CHANNELS];
         for icoef in 0..tile_size {
@@ -666,273 +664,249 @@ impl WmaLosslessDecoder {
         }
     }
 
-    /// `use_high_update_speed` (wmalosslessdec.c).
+    /// `use_high_update_speed`.
     fn use_high_update_speed(&mut self, ich: usize) {
         for ilms in (0..self.cdlms_ttl[ich]).rev() {
+            let lms = &mut self.cdlms[ich][ilms];
+            let recent = lms.recent;
             if self.update_speed[ich] == 16 {
                 continue;
             }
-            let recent = self.cdlms[ich][ilms].recent;
-            if self.b_v3_rtm {
-                for icoef in 0..self.cdlms[ich][ilms].order {
-                    self.cdlms[ich][ilms].lms_updates[icoef + recent] =
-                        self.cdlms[ich][ilms].lms_updates[icoef + recent].wrapping_mul(2);
-                }
-            } else {
-                for icoef in 0..self.cdlms[ich][ilms].order {
-                    self.cdlms[ich][ilms].lms_updates[icoef] =
-                        self.cdlms[ich][ilms].lms_updates[icoef].wrapping_mul(2);
-                }
+            let base = if self.b_v3_rtm { recent } else { 0 };
+            for u in lms.lms_updates[base..base + lms.order].iter_mut() {
+                *u = u.wrapping_mul(2);
             }
         }
         self.update_speed[ich] = 16;
     }
 
-    /// `use_normal_update_speed` (wmalosslessdec.c).
+    /// `use_normal_update_speed`.
     fn use_normal_update_speed(&mut self, ich: usize) {
         for ilms in (0..self.cdlms_ttl[ich]).rev() {
+            let lms = &mut self.cdlms[ich][ilms];
+            let recent = lms.recent;
             if self.update_speed[ich] == 8 {
                 continue;
             }
-            let recent = self.cdlms[ich][ilms].recent;
-            if self.b_v3_rtm {
-                for icoef in 0..self.cdlms[ich][ilms].order {
-                    self.cdlms[ich][ilms].lms_updates[icoef + recent] =
-                        self.cdlms[ich][ilms].lms_updates[icoef + recent] / 2;
-                }
-            } else {
-                for icoef in 0..self.cdlms[ich][ilms].order {
-                    self.cdlms[ich][ilms].lms_updates[icoef] =
-                        self.cdlms[ich][ilms].lms_updates[icoef] / 2;
-                }
+            let base = if self.b_v3_rtm { recent } else { 0 };
+            for u in lms.lms_updates[base..base + lms.order].iter_mut() {
+                *u /= 2;
             }
         }
         self.update_speed[ich] = 8;
     }
 
-    /// `lms_update` (wmalosslessdec.c CD_LMS macro, 32-bit prevvalues path).
+    /// `lms_update16` / `lms_update32` (the 16-bit path's prevvalues fit
+    /// in int16 after the clip, so one element type serves both).
     fn lms_update(&mut self, ich: usize, ilms: usize, input: i32) {
         let range = 1i32 << (self.bits_per_sample - 1);
-        let order = self.cdlms[ich][ilms].order;
-        let mut recent = self.cdlms[ich][ilms].recent;
+        let speed = self.update_speed[ich];
+        let lms = &mut self.cdlms[ich][ilms];
+        let order = lms.order;
+        let mut recent = lms.recent;
+
         if recent != 0 {
             recent -= 1;
         } else {
-            for i in 0..order {
-                self.cdlms[ich][ilms].lms_prevvalues[order + i] = self.cdlms[ich][ilms].lms_prevvalues[i];
-                self.cdlms[ich][ilms].lms_updates[order + i] = self.cdlms[ich][ilms].lms_updates[i];
-            }
+            lms.lms_prevvalues.copy_within(..order, order);
+            lms.lms_updates.copy_within(..order, order);
             recent = order - 1;
         }
-        self.cdlms[ich][ilms].lms_prevvalues[recent] = clip_i32(input, -range, range - 1);
-        self.cdlms[ich][ilms].lms_updates[recent] =
-            (wmasign(input) * self.update_speed[ich]) as i16;
-        self.cdlms[ich][ilms].lms_updates[recent + (order >> 4)] >>= 2;
-        self.cdlms[ich][ilms].lms_updates[recent + (order >> 3)] >>= 1;
-        self.cdlms[ich][ilms].recent = recent;
-        for item in self.cdlms[ich][ilms].lms_updates[recent + order..].iter_mut() {
-            *item = 0;
-        }
+
+        lms.lms_prevvalues[recent] = av_clip(input, -range, range - 1);
+        lms.lms_updates[recent] = (wmasign(input) * speed) as i16;
+
+        lms.lms_updates[recent + (order >> 4)] >>= 2;
+        lms.lms_updates[recent + (order >> 3)] >>= 1;
+        lms.recent = recent;
+        lms.lms_updates[recent + order..].fill(0);
     }
 
-    /// `revert_cdlms` (wmalosslessdec.c, 32-bit variant; the 16-bit variant
-    /// differs only in the prevvalues element type).
+    /// `revert_cdlms16` / `revert_cdlms32`, with
+    /// `scalarproduct_and_madd_int16/32_c` over `FFALIGN(order, 16)` /
+    /// `FFALIGN(order, 8)` taps.
     fn revert_cdlms(&mut self, ch: usize, coef_begin: usize, coef_end: usize) {
-        let num_lms = self.cdlms_ttl[ch];
-        for ilms in (0..num_lms).rev() {
+        let round = if self.bits_per_sample > 16 { 8 } else { 16 };
+        for ilms in (0..self.cdlms_ttl[ch]).rev() {
             for icoef in coef_begin..coef_end {
-                let scaling = self.cdlms[ch][ilms].scaling;
-                let order = self.cdlms[ch][ilms].order;
-                let recent = self.cdlms[ch][ilms].recent;
                 let residue = self.channel_residues[ch][icoef];
-                // scalarproduct_and_madd_int32_c: res += v1[k]*v2[k];
-                // v1[k] += mul*v3[k], over FFALIGN(order, 8) elements (the
-                // arrays are zero-padded so the padded reads are zeros that
-                // also get updated).
-                let len = (order + 7) & !7;
-                let mut pred = (1i32 << scaling) >> 1;
+                let lms = &mut self.cdlms[ch][ilms];
+                let recent = lms.recent;
+                let len = ffalign(lms.order, round);
                 let mul = wmasign(residue);
-                {
-                    let g = &mut self.cdlms[ch][ilms];
-                    let mut res = 0i32;
-                    for k in 0..len {
-                        res = res.wrapping_add((g.coefs[k] as i32).wrapping_mul(g.lms_prevvalues[recent + k]));
-                        g.coefs[k] = (g.coefs[k] as i32).wrapping_add(mul * g.lms_updates[recent + k] as i32) as i16;
-                    }
-                    pred = pred.wrapping_add(res);
+                let mut pred = (1u32 << lms.scaling) >> 1;
+                let mut res = 0u32;
+                for k in 0..len {
+                    res = res
+                        .wrapping_add((lms.coefs[k] as i32 as u32).wrapping_mul(lms.lms_prevvalues[recent + k] as u32));
+                    lms.coefs[k] = (lms.coefs[k] as i32 + mul * lms.lms_updates[recent + k] as i32) as i16;
                 }
-                let input = residue.wrapping_add(pred >> scaling);
+                pred = pred.wrapping_add(res);
+                let input = residue.wrapping_add((pred as i32) >> lms.scaling);
                 self.lms_update(ch, ilms, input);
                 self.channel_residues[ch][icoef] = input;
             }
         }
     }
-}
 
-impl WmaLosslessDecoder {
-    /// `revert_inter_ch_decorr` (wmalosslessdec.c).
+    /// `revert_inter_ch_decorr`.
     fn revert_inter_ch_decorr(&mut self, tile_size: usize) {
-        if self.channels != 2 {
+        if self.num_channels != 2 {
             return;
         }
         if self.is_channel_coded[0] || self.is_channel_coded[1] {
-            for icoef in 0..tile_size {
-                let r1 = self.channel_residues[1][icoef];
-                let r0 = self.channel_residues[0][icoef];
-                self.channel_residues[0][icoef] = r0.wrapping_sub(r1 >> 1);
-                self.channel_residues[1][icoef] = r1.wrapping_add(self.channel_residues[0][icoef]);
+            let (r0, r1) = self.channel_residues.split_at_mut(1);
+            for (a, b) in r0[0][..tile_size].iter_mut().zip(r1[0][..tile_size].iter_mut()) {
+                *a = a.wrapping_sub(*b >> 1);
+                *b = b.wrapping_add(*a);
             }
         }
     }
 
-    /// `revert_acfilter` (wmalosslessdec.c).
+    /// `revert_acfilter`.
     fn revert_acfilter(&mut self, tile_size: usize) {
+        let filter_coeffs = self.acfilter_coeffs;
         let scaling = self.acfilter_scaling;
         let order = self.acfilter_order;
-        for ich in 0..self.channels {
+
+        for ich in 0..self.num_channels {
+            let prevvalues = &mut self.acfilter_prevvalues[ich];
+            let res = &mut self.channel_residues[ich];
             for i in 0..order {
-                let mut pred = 0i32;
+                let mut pred = 0u32;
                 for j in 0..order {
-                    if i <= j {
-                        pred = pred.wrapping_add(
-                            (self.acfilter_coeffs[j] as i32).wrapping_mul(self.acfilter_prevvalues[ich][j - i]),
-                        );
+                    let term = if i <= j {
+                        (filter_coeffs[j] as i32 as u32).wrapping_mul(prevvalues[j - i] as u32)
                     } else {
-                        pred = pred.wrapping_add(
-                            self.channel_residues[ich][i - j - 1].wrapping_mul(self.acfilter_coeffs[j] as i32),
-                        );
-                    }
+                        (res[i - j - 1] as u32).wrapping_mul(filter_coeffs[j] as i32 as u32)
+                    };
+                    pred = pred.wrapping_add(term);
                 }
-                pred >>= scaling;
-                self.channel_residues[ich][i] = self.channel_residues[ich][i].wrapping_add(pred);
+                res[i] = res[i].wrapping_add((pred as i32) >> scaling);
             }
             for i in order..tile_size {
-                let mut pred = 0i32;
+                let mut pred = 0u32;
                 for j in 0..order {
-                    pred = pred.wrapping_add(
-                        self.channel_residues[ich][i - j - 1].wrapping_mul(self.acfilter_coeffs[j] as i32),
-                    );
+                    pred = pred.wrapping_add((res[i - j - 1] as u32).wrapping_mul(filter_coeffs[j] as i32 as u32));
                 }
-                pred >>= scaling;
-                self.channel_residues[ich][i] = self.channel_residues[ich][i].wrapping_add(pred);
+                res[i] = res[i].wrapping_add((pred as i32) >> scaling);
             }
             for j in (0..order).rev() {
-                let pv = &mut self.acfilter_prevvalues[ich];
-                if tile_size <= j {
-                    pv[j] = pv[j - tile_size];
-                } else {
-                    pv[j] = self.channel_residues[ich][tile_size - j - 1];
-                }
+                prevvalues[j] = if tile_size <= j { prevvalues[j - tile_size] } else { res[tile_size - j - 1] };
             }
         }
     }
 
-    /// `decode_subframe` (wmalosslessdec.c).
-    fn decode_subframe(&mut self) -> Result<bool> {
+    /// `decode_subframe`; `None` is FFmpeg's negative return.
+    fn decode_subframe(&mut self, gb: &mut GetBits<'_>) -> Option<()> {
+        let nch = self.num_channels;
         let mut offset = self.samples_per_frame;
         let mut subframe_len = self.samples_per_frame;
-        let mut total_samples = self.samples_per_frame * self.channels;
+        let mut total_samples = (self.samples_per_frame * nch) as i64;
 
-        self.subframe_offset = self.gb.bit_pos();
-
-        for i in 0..self.channels {
-            if offset > self.channel[i].decoded_samples {
-                offset = self.channel[i].decoded_samples;
-                subframe_len = self.channel[i].subframe_len[self.channel[i].cur_subframe];
+        // find the next block offset and size: the next block of the
+        // channel with the smallest number of decoded samples
+        for ch in &self.channel[..nch] {
+            if offset > ch.decoded_samples {
+                offset = ch.decoded_samples;
+                subframe_len = ch.len_at(ch.cur_subframe);
             }
         }
 
+        // get a list of all channels that contain the estimated block
         self.channels_for_cur_subframe = 0;
-        for i in 0..self.channels {
-            let cur_subframe = self.channel[i].cur_subframe;
-            total_samples -= self.channel[i].decoded_samples;
-            if offset == self.channel[i].decoded_samples
-                && subframe_len == self.channel[i].subframe_len[cur_subframe]
-            {
-                total_samples -= self.channel[i].subframe_len[cur_subframe];
-                self.channel[i].decoded_samples += self.channel[i].subframe_len[cur_subframe];
+        for i in 0..nch {
+            let ch = &mut self.channel[i];
+            // subtract already processed samples
+            total_samples -= ch.decoded_samples as i64;
+
+            // and count if there are multiple subframes that match our profile
+            if offset == ch.decoded_samples && subframe_len == ch.len_at(ch.cur_subframe) {
+                let len = ch.len_at(ch.cur_subframe);
+                total_samples -= len as i64;
+                ch.decoded_samples += len;
                 self.channel_indexes_for_cur_subframe[self.channels_for_cur_subframe] = i;
                 self.channels_for_cur_subframe += 1;
             }
         }
+
+        // check if the frame will be complete after processing the
+        // estimated block
         if total_samples == 0 {
             self.parsed_all_subframes = true;
         }
 
-        self.seekable_tile = self.gb.get_bits1()? != 0;
+        self.seekable_tile = gb.get_bits1() != 0;
         if self.seekable_tile {
             self.clear_codec_buffers();
-            self.do_arith_coding = self.gb.get_bits1()? != 0;
-            if self.do_arith_coding {
-                return Err(Error::unsupported("wmall: arithmetic coding"));
+
+            if gb.get_bits1() != 0 {
+                // arithmetic coding: FFmpeg asks for a sample
+                return None;
             }
-            self.do_ac_filter = self.gb.get_bits1()? != 0;
-            self.do_inter_ch_decorr = self.gb.get_bits1()? != 0;
-            self.do_mclms = self.gb.get_bits1()? != 0;
+            self.do_ac_filter = gb.get_bits1() != 0;
+            self.do_inter_ch_decorr = gb.get_bits1() != 0;
+            self.do_mclms = gb.get_bits1() != 0;
 
             if self.do_ac_filter {
-                self.decode_ac_filter()?;
+                self.decode_ac_filter(gb);
             }
+
             if self.do_mclms {
-                self.decode_mclms()?;
+                self.decode_mclms(gb);
             }
-            self.decode_cdlms()?;
-            self.movave_scaling = self.gb.get_bits(3)? as i32;
-            self.quant_stepsize = self.gb.get_bits(8)? as i32 + 1;
+
+            self.decode_cdlms(gb)?;
+            self.movave_scaling = gb.get_bits(3);
+            self.quant_stepsize = gb.get_bits(8) + 1;
+
             self.reset_codec();
         }
 
-        let rawpcm_tile = self.gb.get_bits1()? != 0;
+        let rawpcm_tile = gb.get_bits1() != 0;
+
         if !rawpcm_tile && self.cdlms[0][0].order == 0 {
-            // waiting for seekable tile: FFmpeg returns an error and drops
-            // the frame; the stream resyncs at the next seekable tile.
-            return Err(Error::invalid("wmall: waiting for seekable tile"));
+            // waiting for seekable tile
+            self.nb_samples = 0;
+            return None;
         }
 
-        for i in 0..self.channels {
-            self.is_channel_coded[i] = true;
-        }
+        self.is_channel_coded[..nch].fill(true);
 
         if !rawpcm_tile {
-            for i in 0..self.channels {
-                self.is_channel_coded[i] = self.gb.get_bits1()? != 0;
+            for coded in self.is_channel_coded[..nch].iter_mut() {
+                *coded = gb.get_bits1() != 0;
             }
-            self.do_lpc = false;
-            if self.b_v3_rtm {
-                self.do_lpc = self.gb.get_bits1()? != 0;
-                if self.do_lpc {
-                    self.decode_lpc()?;
-                }
+
+            if self.b_v3_rtm && gb.get_bits1() != 0 {
+                self.decode_lpc(gb);
             }
         }
 
-        if self.gb.bits_left() < 1 {
-            return Err(Error::invalid("wmall: no bits left"));
+        if gb.bits_left() < 1 {
+            return None;
         }
 
-        let padding_zeroes = if self.gb.get_bits1()? != 0 {
-            self.gb.get_bits(5)? as u32
-        } else {
-            0
-        };
+        let padding_zeroes = if gb.get_bits1() != 0 { gb.get_bits(5) } else { 0 };
 
         if rawpcm_tile {
-            let bits = self.bits_per_sample.saturating_sub(padding_zeroes);
-            if bits == 0 {
-                return Err(Error::invalid("wmall: invalid padding bits in raw PCM tile"));
+            let bits = self.bits_per_sample as i32 - padding_zeroes as i32;
+            if bits <= 0 {
+                return None;
             }
-            for i in 0..self.channels {
+            for i in 0..nch {
                 for j in 0..subframe_len {
-                    self.channel_residues[i][j] = self.gb.get_sbits(bits as usize)?;
+                    self.channel_residues[i][j] = gb.get_sbits(bits as u32);
                 }
             }
         } else {
             if self.bits_per_sample < padding_zeroes {
-                return Err(Error::invalid("wmall: padding_zeroes > bits_per_sample"));
+                return None;
             }
-            for i in 0..self.channels {
+            for i in 0..nch {
                 if self.is_channel_coded[i] {
-                    let _ = self.decode_channel_residues(i, subframe_len);
+                    // FFmpeg ignores running out of bits here
+                    self.decode_channel_residues(gb, i, subframe_len);
                     if self.seekable_tile {
                         self.use_high_update_speed(i);
                     } else {
@@ -940,9 +914,7 @@ impl WmaLosslessDecoder {
                     }
                     self.revert_cdlms(i, 0, subframe_len);
                 } else {
-                    for v in self.channel_residues[i][..subframe_len].iter_mut() {
-                        *v = 0;
-                    }
+                    self.channel_residues[i][..subframe_len].fill(0);
                 }
             }
 
@@ -956,305 +928,365 @@ impl WmaLosslessDecoder {
                 self.revert_acfilter(subframe_len);
             }
 
+            // Dequantize
             if self.quant_stepsize != 1 {
-                for i in 0..self.channels {
-                    for v in self.channel_residues[i][..subframe_len].iter_mut() {
-                        *v = v.wrapping_mul(self.quant_stepsize);
+                for res in self.channel_residues[..nch].iter_mut() {
+                    for v in res[..subframe_len].iter_mut() {
+                        *v = (*v as u32).wrapping_mul(self.quant_stepsize) as i32;
                     }
                 }
             }
         }
 
-        // Write to the output buffer depending on bit depth
+        // Write to proper output buffer depending on bit-depth
         for i in 0..self.channels_for_cur_subframe {
             let c = self.channel_indexes_for_cur_subframe[i];
-            let sl = self.channel[c].subframe_len[self.channel[c].cur_subframe];
-            let base = self.channel[c].subframe_offsets[self.channel[c].cur_subframe];
-            for j in 0..sl {
+            let len = self.channel[c].len_at(self.channel[c].cur_subframe);
+            let out = &mut self.out[c];
+            for j in 0..len {
                 let v = if self.bits_per_sample == 16 {
-                    ((self.channel_residues[c][j] as i16 as i32) << padding_zeroes) as i32
+                    (self.channel_residues[c][j] as i16 as i32).wrapping_mul(1i32 << padding_zeroes)
                 } else {
-                    self.channel_residues[c][j].wrapping_mul((256u32 << padding_zeroes) as i32)
+                    (self.channel_residues[c][j] as u32).wrapping_mul(256u32 << padding_zeroes) as i32
                 };
-                self.out[c][base + j] = v;
+                if let Some(o) = out.get_mut(self.out_pos[c]) {
+                    *o = v;
+                }
+                self.out_pos[c] += 1;
             }
         }
 
+        // handled one subframe
         for i in 0..self.channels_for_cur_subframe {
-            let c = self.channel_indexes_for_cur_subframe[i];
-            if self.channel[c].cur_subframe >= self.channel[c].num_subframes {
-                return Err(Error::invalid("wmall: broken subframe"));
+            let ch = &mut self.channel[self.channel_indexes_for_cur_subframe[i]];
+            if ch.cur_subframe >= ch.num_subframes {
+                return None;
             }
-            self.channel[c].cur_subframe += 1;
+            ch.cur_subframe += 1;
         }
-        Ok(true)
+        Some(())
     }
 
-    /// `decode_frame` (wmalosslessdec.c). Returns `more_frames`.
-    fn decode_frame(&mut self) -> Result<bool> {
-        self.trim_end = 0;
-        let mut len = 0usize;
+    /// `decode_frame` on the reservoir reader: 1 when more frames follow,
+    /// 0 for the last frame or a damaged subframe, negative on errors.
+    fn decode_frame(&mut self) -> i32 {
+        let data = std::mem::take(&mut self.frame_data);
+        let mut gb = GetBits::with_state(&data, self.gb);
+        let ret = self.decode_frame_inner(&mut gb);
+        self.gb = gb.state();
+        self.frame_data = data;
+        ret
+    }
 
-        if self.len_prefix {
-            len = self.gb.get_bits(self.log2_frame_size as usize)? as usize;
+    fn decode_frame_inner(&mut self, gb: &mut GetBits<'_>) -> i32 {
+        let spf = self.samples_per_frame;
+        // ff_get_buffer
+        self.nb_samples = spf as i64;
+        for out in self.out.iter_mut() {
+            out.fill(0);
         }
+        self.out_pos = [0; WMALL_MAX_CHANNELS];
 
-        if self.decode_tilehdr().is_err() {
+        // get frame length
+        let len = if self.len_prefix { gb.get_bits(self.log2_frame_size) as i64 } else { 0 };
+
+        // decode tile information
+        if self.decode_tilehdr(gb).is_none() {
             self.packet_loss = true;
-            return Ok(false);
+            self.nb_samples = 0;
+            return -1;
         }
 
+        // read drc info
         if self.dynamic_range_compression {
-            self.drc_gain = self.gb.get_bits(8)? as u8;
+            gb.get_bits(8);
         }
 
-        if self.gb.get_bits1()? != 0 {
-            let bits = 32 - ((self.samples_per_frame * 2) as u32).leading_zeros() - 1;
-            if self.gb.get_bits1()? != 0 {
-                let _start_skip = self.gb.get_bits(bits as usize)?;
+        // skip counts at the start (usually the first frame) and end
+        // (sometimes the last frame) of the stream
+        if gb.get_bits1() != 0 {
+            if gb.get_bits1() != 0 {
+                gb.get_bits(av_log2(spf as u32 * 2));
             }
-            if self.gb.get_bits1()? != 0 {
-                let end_skip = self.gb.get_bits(bits as usize)? as usize;
-                if end_skip >= self.samples_per_frame {
-                    return Err(Error::invalid("wmall: end skip >= frame"));
+            if gb.get_bits1() != 0 {
+                let skip = gb.get_bits(av_log2(spf as u32 * 2));
+                self.nb_samples -= skip as i64;
+                if self.nb_samples <= 0 {
+                    return -1;
                 }
-                // handled at output time below
-                self.trim_end = end_skip;
             }
         }
 
+        // reset subframe states
         self.parsed_all_subframes = false;
-        for i in 0..self.channels {
-            self.channel[i].decoded_samples = 0;
-            self.channel[i].cur_subframe = 0;
+        for ch in self.channel[..self.num_channels].iter_mut() {
+            ch.decoded_samples = 0;
+            ch.cur_subframe = 0;
         }
 
+        // decode all subframes
         while !self.parsed_all_subframes {
-            match self.decode_subframe() {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok(false);
-                }
-                Err(_) => {
-                    self.packet_loss = true;
-                    return Ok(false);
-                }
-            }
-        }
-        self.skip_frame = false;
-        if self.len_prefix {
-            if len != (self.gb.bit_pos() - self.frame_offset) + 2 {
+            let decoded_samples = self.channel[0].decoded_samples;
+            if self.decode_subframe(gb).is_none() {
                 self.packet_loss = true;
-            }
-            let skip = len - (self.gb.bit_pos() - self.frame_offset) - 1;
-            if skip > 0 {
-                let _ = self.gb.skip_bits(skip);
+                if self.nb_samples != 0 {
+                    self.nb_samples = decoded_samples as i64;
+                }
+                return 0;
             }
         }
 
-        // decode trailer bit (more_frames)
-        let more_frames = self.gb.get_bits1().unwrap_or(0) != 0;
-
-        // assemble the output frame (planar)
-        let trim_end = self.trim_end.min(self.samples_per_frame);
-        let mut frame = AudioFrame {
-            samples: (self.samples_per_frame - trim_end) as u32,
-            pts: None,
-            data: Vec::with_capacity(self.channels),
-        };
-        for c in 0..self.channels {
-            let samples = self.samples_per_frame - trim_end;
-            if self.bits_per_sample == 16 {
-                let mut plane = Vec::with_capacity(samples * 2);
-                for &v in &self.out[c][..samples] {
-                    plane.extend_from_slice(&(v as i16).to_le_bytes());
-                }
-                frame.data.push(plane);
-            } else {
-                let mut plane = Vec::with_capacity(samples * 4);
-                for &v in &self.out[c][..samples] {
-                    plane.extend_from_slice(&v.to_le_bytes());
-                }
-                frame.data.push(plane);
+        if self.len_prefix {
+            let read = gb.bits_count() as i64 - self.frame_offset as i64;
+            if len != read + 2 {
+                self.packet_loss = true;
+                return 0;
             }
+
+            // skip the rest of the frame data
+            gb.skip_bits_long(len - read - 1);
         }
-        if self.skip_frame {
-            // consumed by packet logic; frame not emitted
-        } else {
-            self.pending.push(frame);
-        }
-        Ok(more_frames)
+
+        // decode trailer bit
+        gb.get_bits1() as i32
     }
 
-    /// Bit reservoir: append-only. `gb` keeps the read cursor across saves;
-    /// consumed prefix bytes are compacted when large.
-    fn save_bits(&mut self, gb: &mut BitReader<'_>, len: usize, append: bool) {
-        if len == 0 {
-            return;
-        }
+    /// `remaining_bits` of the packet reader.
+    fn remaining_bits(&self, gb: &GetBits<'_>) -> i64 {
+        self.buf_bit_size - gb.bits_count() as i64
+    }
+
+    /// `save_bits`: fill the bit reservoir with a (partial) frame.
+    fn save_bits(&mut self, gb: &mut GetBits<'_>, len: i64, append: bool) {
+        let mut len = len;
+        // when the frame data does not need to be concatenated, the input
+        // buffer is reset and additional bits from the previous frame are
+        // copied and skipped later so that a fast byte copy is possible
         if !append {
             self.frame_offset = gb.bits_count() & 7;
             self.num_saved_bits = self.frame_offset;
-            self.frame_data.clear();
+            self.pb.reset();
         }
-        let buflen = (self.num_saved_bits + len + 8) >> 3;
-        if buflen > self.max_frame_size {
+
+        let buflen = (self.num_saved_bits as i64 + len + 8) >> 3;
+
+        if len <= 0 || buflen > self.max_frame_size as i64 {
             self.packet_loss = true;
             self.num_saved_bits = 0;
             return;
         }
-        let start_bit = self.num_saved_bits;
-        let new_bytes = ((start_bit + len + 7) >> 3).max(1);
-        if self.frame_data.len() < new_bytes {
-            self.frame_data.resize(new_bytes, 0);
+
+        self.num_saved_bits += len as usize;
+        if !append {
+            let src = gb.buffer().get(gb.bits_count() >> 3..).unwrap_or(&[]);
+            self.pb.copy_bits(&mut self.frame_data, src, self.num_saved_bits);
+        } else {
+            let align = (8 - (gb.bits_count() & 7) as i64).min(len);
+            let v = gb.get_bits(align as u32);
+            self.pb.put_bits(&mut self.frame_data, align as u32, v);
+            len -= align;
+            let src = gb.buffer().get(gb.bits_count() >> 3..).unwrap_or(&[]);
+            self.pb.copy_bits(&mut self.frame_data, src, len as usize);
         }
-        for i in 0..len {
-            let bit = gb.get_bits1().unwrap_or(0);
-            let idx = start_bit + i;
-            let byte = idx / 8;
-            let off = idx % 8;
-            if bit != 0 {
-                self.frame_data[byte] |= 1 << (7 - off);
-            } else {
-                self.frame_data[byte] &= !(1 << (7 - off));
-            }
-        }
-        self.num_saved_bits += len;
-        self.gb = OwnedBitReader::from_bits(self.frame_data.clone(), self.num_saved_bits);
-        let _ = self.gb.skip_bits(self.frame_offset);
+        gb.skip_bits_long(len);
+
+        self.pb.flush(&mut self.frame_data);
+
+        let mut fgb = GetBits::new(&self.frame_data, self.num_saved_bits);
+        fgb.skip_bits(self.frame_offset as u32);
+        self.gb = fgb.state();
     }
 
-
-    /// `decode_packet` (wmalosslessdec.c). Each ASF packet carries exactly
-    /// one codec packet of `block_align` bytes with its own 23-bit header:
-    /// seq, splicing flag, and the number of bits of the previous frame
-    /// spilled into this packet. The reservoir is append-only; `gb` keeps
-    /// the read cursor so frames decode sequentially across packets.
-    fn decode_packet_chunk(&mut self, cur_data: &[u8]) -> Result<usize> {
-        let mut buf_size = cur_data.len();
-        if buf_size == 0 {
-            self.packet_done = false;
-            if self.num_saved_bits <= self.gb.bit_pos() {
-                return Ok(0);
-            }
-            if !self.decode_frame()? {
-                self.num_saved_bits = 0;
-            }
-            return Ok(0);
-        }
+    /// `decode_packet` on the unread rest `buf` of a demuxer packet (empty
+    /// when draining): the bytes consumed, or `None` for FFmpeg's error
+    /// return, which drops the frame decoded in the call. The frame, if
+    /// any, is left in `self.out` / `self.nb_samples`.
+    fn decode_packet(&mut self, buf: &[u8]) -> Option<usize> {
+        self.nb_samples = 0;
 
         let mut gb;
-        if self.packet_done || self.packet_loss {
+        if buf.is_empty() {
+            self.packet_done = false;
+            if self.num_saved_bits <= self.gb.bits_count() {
+                return Some(0);
+            }
+            if self.decode_frame() == 0 {
+                self.num_saved_bits = 0;
+            }
+            // the packet reader keeps its position from the last packet
+            gb = GetBits::with_state(&[], self.pgb);
+        } else if self.packet_done || self.packet_loss {
             self.packet_done = false;
 
-            self.next_packet_start = buf_size - block_align(self).min(buf_size);
-            buf_size = block_align(self).min(buf_size);
-            self.buf_bit_size = buf_size << 3;
+            let buf_size = self.block_align.min(buf.len());
+            self.next_packet_start = buf.len() - buf_size;
+            self.buf_bit_size = (buf_size << 3) as i64;
 
-            gb = BitReader::with_bit_len(&cur_data[..buf_size], self.buf_bit_size);
-            let packet_sequence_number = gb.get_bits(4)? as u8;
-            gb.skip_bits(1)?; // seekable_frame_in_packet
-            let spliced_packet = gb.get_bits1()? != 0;
-            if spliced_packet {
-                return Err(Error::unsupported("wmall: bitstream splicing"));
-            }
+            // parse packet header
+            gb = GetBits::new(buf, buf_size << 3);
+            let packet_sequence_number = gb.get_bits(4);
+            gb.skip_bits(1); // seekable_frame_in_packet, currently unused
+            gb.get_bits1(); // spliced packet: FFmpeg asks for a sample and goes on
 
-            let num_bits_prev_frame = gb.get_bits(self.log2_frame_size as usize)? as usize;
+            // get number of bits that need to be added to the previous frame
+            let mut num_bits_prev_frame = gb.get_bits(self.log2_frame_size) as i64;
 
-            if !self.packet_loss
-                && ((self.packet_sequence_number as u32 + 1) & 0xF) != packet_sequence_number as u32
-            {
+            // check for packet loss
+            if !self.packet_loss && (self.packet_sequence_number + 1) & 0xF != packet_sequence_number {
                 self.packet_loss = true;
             }
             self.packet_sequence_number = packet_sequence_number;
 
             if num_bits_prev_frame > 0 {
-                let remaining_packet_bits = self.buf_bit_size - gb.bits_count();
-                let mut nb = num_bits_prev_frame;
-                if nb >= remaining_packet_bits {
-                    nb = remaining_packet_bits;
+                let remaining_packet_bits = self.buf_bit_size - gb.bits_count() as i64;
+                if num_bits_prev_frame >= remaining_packet_bits {
+                    num_bits_prev_frame = remaining_packet_bits;
                     self.packet_done = true;
                 }
-                self.save_bits(&mut gb, nb, true);
-                if nb < remaining_packet_bits && !self.packet_loss {
-                    self.decode_frame()?;
+
+                // Append the previous frame data to the remaining data from
+                // the previous packet to create a full frame.
+                self.save_bits(&mut gb, num_bits_prev_frame, true);
+
+                // decode the cross packet frame if it is valid
+                if num_bits_prev_frame < remaining_packet_bits && !self.packet_loss {
+                    self.decode_frame();
                 }
-            } else if self.num_saved_bits > self.frame_offset {
-                // ignoring previously saved bits
             }
 
             if self.packet_loss {
+                // Reset number of saved bits so that the decoder does not
+                // start to decode incomplete frames in the len_prefix == 0
+                // case.
                 self.num_saved_bits = 0;
                 self.packet_loss = false;
-                self.frame_data.clear();
+                self.pb.reset();
             }
         } else {
-            if cur_data.len() < self.next_packet_start {
-                self.packet_loss = true;
-                return Err(Error::invalid("wmall: packet too small"));
-            }
-            self.buf_bit_size = (cur_data.len() - self.next_packet_start) << 3;
-            gb = BitReader::with_bit_len(&cur_data[self.next_packet_start..], self.buf_bit_size);
-            gb.skip_bits(self.packet_offset)?;
+            let size = buf.len() as i64 - self.next_packet_start as i64;
+            self.buf_bit_size = size.max(0) << 3;
+            gb = GetBits::new(buf, self.buf_bit_size as usize);
+            gb.skip_bits(self.packet_offset as u32);
 
-            let remaining = self.buf_bit_size.saturating_sub(gb.bits_count());
-            if self.len_prefix && remaining > self.log2_frame_size as usize {
-                let frame_size = gb.show_bits(self.log2_frame_size as usize)? as usize;
-                if frame_size > 0 && frame_size <= remaining {
-                    self.save_bits(&mut gb, frame_size, false);
-                    if !self.packet_loss {
-                        let more = self.decode_frame()?;
-                        self.packet_done = !more;
-                    }
-                } else {
-                    self.packet_done = true;
+            let remaining = self.remaining_bits(&gb);
+            let frame_size = if self.len_prefix && remaining > self.log2_frame_size as i64 {
+                gb.show_bits(self.log2_frame_size) as i64
+            } else {
+                0
+            };
+            if frame_size != 0 && frame_size <= remaining {
+                self.save_bits(&mut gb, frame_size, false);
+
+                if !self.packet_loss {
+                    self.packet_done = self.decode_frame() == 0;
                 }
-            } else if !self.len_prefix && self.num_saved_bits > self.gb.bit_pos() {
-                let more = self.decode_frame()?;
-                self.packet_done = !more;
+            } else if !self.len_prefix && self.num_saved_bits > self.gb.bits_count() {
+                // Without length prefixes the frame lengths are unknown, but
+                // the part of a new packet that belongs to the previous frame
+                // is: save the packet first and append the "previous frame"
+                // data from the next packet, so the buffer holds only full
+                // frames.
+                self.packet_done = self.decode_frame() == 0;
             } else {
                 self.packet_done = true;
             }
         }
 
-        let remaining = self.buf_bit_size as i64 - gb.bits_count() as i64;
-        if remaining < 0 {
+        if self.remaining_bits(&gb) < 0 {
             self.packet_loss = true;
         }
 
-        if self.packet_done && !self.packet_loss && remaining > 0 {
-            self.save_bits(&mut gb, remaining as usize, false);
+        if self.packet_done && !self.packet_loss && self.remaining_bits(&gb) > 0 {
+            // save the rest of the data so that it can be decoded with the
+            // next packet
+            let rest = self.remaining_bits(&gb);
+            self.save_bits(&mut gb, rest, false);
         }
 
+        self.pgb = gb.state();
         self.packet_offset = gb.bits_count() & 7;
-        if self.packet_loss {
-            return Err(Error::invalid("wmall: packet loss"));
+
+        (!self.packet_loss).then_some(gb.bits_count() >> 3)
+    }
+
+    /// The frame `decode_packet` left behind, if it has samples.
+    fn take_frame(&mut self) -> Option<AudioFrame> {
+        if self.nb_samples <= 0 {
+            return None;
         }
-        let consumed = (gb.bits_count() >> 3) + self.next_packet_start;
+        let n = (self.nb_samples as usize).min(self.samples_per_frame);
+        self.nb_samples = 0;
+        let data = self
+            .out
+            .iter()
+            .map(|out| {
+                if self.bits_per_sample == 16 {
+                    out[..n].iter().flat_map(|&v| (v as i16).to_le_bytes()).collect()
+                } else {
+                    out[..n].iter().flat_map(|&v| v.to_le_bytes()).collect()
+                }
+            })
+            .collect();
+        Some(AudioFrame { samples: n as u32, pts: None, data })
+    }
+
+    /// FFmpeg's decode loop over one demuxer packet: decode from the unread
+    /// rest until it is consumed; an error drops the call's frame and what
+    /// is left of the packet.
+    fn decode_avpacket(&mut self, data: &[u8]) {
+        let mut data = data;
+        let mut stalls = 0;
+        while !data.is_empty() {
+            let Some(consumed) = self.decode_packet(data) else { break };
+            // FFmpeg calls again on the same bytes while frames come out of
+            // the reservoir (each one advances its reader); a call that
+            // neither consumes nor decodes would loop forever.
+            stalls = match self.take_frame() {
+                Some(frame) => {
+                    self.pending.push_back(frame);
+                    0
+                }
+                None if consumed == 0 => stalls + 1,
+                None => 0,
+            };
+            if consumed >= data.len() || stalls > 2 {
+                break;
+            }
+            data = &data[consumed..];
+        }
+    }
+
+    /// Draining (`AV_CODEC_CAP_DELAY`): empty packets until no frame comes
+    /// out; FFmpeg tolerates up to 21 errors on the way.
+    fn drain(&mut self) {
+        let mut errors = 0;
+        loop {
+            match self.decode_packet(&[]) {
+                Some(_) => match self.take_frame() {
+                    Some(frame) => self.pending.push_back(frame),
+                    None => break,
+                },
+                None => {
+                    errors += 1;
+                    if errors > 21 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// FFmpeg's `flush` (seek).
+    fn flush_state(&mut self) {
+        self.packet_loss = true;
+        self.packet_done = false;
+        self.num_saved_bits = 0;
+        self.frame_offset = 0;
         self.next_packet_start = 0;
-        Ok(consumed)
+        self.cdlms[0][0].order = 0;
+        self.nb_samples = 0;
+        self.pb.reset();
     }
-
-    fn decode_packet_impl(&mut self, data: &[u8]) -> Result<()> {
-        let mut cur = data;
-        while !cur.is_empty() {
-            let consumed = self.decode_packet_chunk(cur)?;
-            if consumed >= cur.len() {
-                break;
-            }
-            if consumed > 0 {
-                cur = &cur[consumed..];
-            } else if self.packet_done {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-}
-
-fn block_align(s: &WmaLosslessDecoder) -> usize {
-    s.block_align_stored
 }
 
 impl Decoder for WmaLosslessDecoder {
@@ -1263,40 +1295,40 @@ impl Decoder for WmaLosslessDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.decode_packet_impl(&packet.data)
+        self.decode_avpacket(&packet.data);
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        if !self.pending.is_empty() {
-            return Ok(Frame::Audio(self.pending.remove(0)));
+        match self.pending.pop_front() {
+            Some(f) => Ok(Frame::Audio(f)),
+            None if self.eof => Err(Error::Eof),
+            None => Err(Error::NeedMore),
         }
-        Err(Error::NeedMore)
     }
 
+    /// End of stream: drain the frames still in the reservoir.
     fn flush(&mut self) -> Result<()> {
-        while self.num_saved_bits > self.gb.bit_pos() {
-            match self.decode_frame() {
-                Ok(true) => {}
-                Ok(false) | Err(_) => break,
-            }
+        if !self.eof {
+            self.drain();
+            self.eof = true;
         }
         Ok(())
     }
 
+    /// Seek: FFmpeg's `flush`.
     fn reset(&mut self) -> Result<()> {
-        self.flush()
+        self.flush_state();
+        self.pending.clear();
+        self.eof = false;
+        Ok(())
     }
 
     fn output_audio_format(&self) -> Option<oxideav_core::AudioFormat> {
-        let sample_format = if self.bits_per_sample == 16 {
-            SampleFormat::S16P
-        } else {
-            SampleFormat::S32P
-        };
         Some(oxideav_core::AudioFormat {
-            sample_format,
+            sample_format: if self.bits_per_sample == 16 { SampleFormat::S16P } else { SampleFormat::S32P },
             sample_rate: self.sample_rate,
-            channels: self.channels as u16,
+            channels: self.num_channels as u16,
         })
     }
 }

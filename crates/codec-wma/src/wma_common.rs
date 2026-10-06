@@ -35,6 +35,12 @@ pub fn av_log2(v: u32) -> u32 {
     (v | 1).ilog2()
 }
 
+/// `av_ceil_log2` (libavutil/common.h): ceil(log2(x)), 0 for x <= 1.
+#[inline]
+pub fn av_ceil_log2(x: u32) -> u32 {
+    av_log2(x.wrapping_sub(1) << 1)
+}
+
 /// The leading-sample discard of `discard_samples` (libavcodec/decode.c) for
 /// decoders that set `avctx->delay` / `internal->skip_samples`: frames that
 /// `skip` covers are dropped whole, the next one loses its head. Returns

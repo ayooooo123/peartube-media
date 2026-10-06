@@ -6,8 +6,11 @@
 //   FFmpeg's own FATE tests use).
 // - wmav1/v2, wmapro are float decoders: SNR >= 90 dB against FFmpeg's
 //   interleaved f32 output, sample count within one frame.
-// - wmavoice uses the codec's own noise/QMF paths; FFmpeg's FATE compares
-//   stddev against reference PCM; we compare SNR against FFmpeg's decode.
+// - wmavoice is compared with FFmpeg's C path (`-cpuflags 0`, the audio
+//   analogue of contract.md's `-idct simple` rule): FFmpeg's NEON av_tx
+//   codelets round differently, and the 19K sample's postfilter amplifies
+//   that to 82 dB between FFmpeg's own NEON and C decodes. Floor 90 dB;
+//   measured: bit-exact (SNR infinite) on 7K, 11K and 19K.
 
 use oxideav_core::{MediaType, ProbeData, RuntimeContext};
 use refcheck::{decode, fate, snr_db};
@@ -26,6 +29,19 @@ fn samples_f32(decoded: &refcheck::Decoded) -> Vec<f32> {
 /// FFmpeg's interleaved f32 decode of stream `0:a:nth`.
 fn ffmpeg_f32(path: &std::path::Path, nth: usize) -> Vec<f32> {
     refcheck::ffmpeg_audio_f32(path, nth)
+}
+
+/// FFmpeg's interleaved f32 decode of stream `0:a:nth` through its C code
+/// only (`-cpuflags 0`).
+fn ffmpeg_f32_c_path(path: &std::path::Path, nth: usize) -> Vec<f32> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-cpuflags", "0", "-i"])
+        .arg(path)
+        .args(["-map", &format!("0:a:{nth}"), "-f", "f32le", "-c:a", "pcm_f32le", "-"])
+        .output()
+        .expect("ffmpeg must be on PATH");
+    assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
+    out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 /// FFmpeg's PCM md5 of stream `0:a:nth` at `bytes` bytes per sample.
@@ -205,16 +221,15 @@ fn wmapro_51_snr() {
     );
 }
 
-// ───────────────────────── wmavoice (SNR >= 90 dB) ─────────────────────────
+// ─────────────── wmavoice (SNR >= 90 dB against FFmpeg's C path) ───────────────
 
 fn wmavoice_snr(sample: &str) {
     let path = fate(sample);
     let decoded = decode(&path, &registrars(), MediaType::Audio, 0);
     assert_eq!(decoded.params.channels, Some(1), "channel count");
     let ours = samples_f32(&decoded);
-    let ff = ffmpeg_f32(&path, 0);
-    // Voice codecs have large DC/transient regions; align to the shorter
-    // stream and allow one superframe (480 samples) of length slack.
+    let ff = ffmpeg_f32_c_path(&path, 0);
+    // Sample counts may differ by one superframe (480 samples).
     let snr = snr_db(&ff, &ours, 480);
     assert!(
         snr >= 90.0,
