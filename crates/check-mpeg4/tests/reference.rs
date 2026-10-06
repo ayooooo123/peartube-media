@@ -27,9 +27,48 @@ fn registrars() -> Vec<refcheck::Registrar> {
 }
 
 /// The FFmpeg reference MD5 list for one video stream, decoded with the
-/// C integer IDCT (`-idct simple`) and codec-side cropping.
+/// C integer IDCT (`-idct simple`) and codec-side cropping. Local copy of
+/// refcheck's helper: refcheck's argv has no `-idct simple`, and this
+/// host's default `AUTO` resolves to the NEON IDCT whose PARTTRANS
+/// scantable permutation decodes some blocks ±1 differently from the C.
 fn ff_md5s(path: &std::path::Path, pix_fmt: &str) -> Vec<String> {
-    refcheck::ffmpeg_video_md5s(path, 0, pix_fmt)
+    let out = ff_run(&[
+        "-idct",
+        "simple",
+        "-apply_cropping",
+        "codec",
+        "-i",
+        path.to_str().unwrap(),
+        "-map",
+        "0:v:0",
+        "-fps_mode",
+        "passthrough",
+        "-pix_fmt",
+        pix_fmt,
+        "-f",
+        "framemd5",
+        "-",
+    ]);
+    String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.rsplit(',').next().unwrap().trim().to_string())
+        .collect()
+}
+
+fn ff_run(args: &[&str]) -> Vec<u8> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin"])
+        .args(args)
+        .output()
+        .expect("ffmpeg must be on PATH");
+    assert!(
+        out.status.success(),
+        "ffmpeg {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
 }
 
 /// Decode a raw MPEG-4 elementary stream (.m4v / .h263: start-code
@@ -103,16 +142,17 @@ fn fate_mpeg4(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn fate_m4v_demo() {
-    // KNOWN GAP: this FATE sample's VOP layer trips the fork's
-    // marker-bit validation (VOP header: marker_bit was 0) — FFmpeg
-    // decodes it, so the fork's VOP-header marker handling has a bug.
-    // Pinned so a fix is visible.
+    // PARTIAL GAP: the I-VOP now decodes (advisory VOP/GOV marker bits +
+    // FFmpeg's time_increment_bits heuristic are implemented), but the
+    // first P-VOP's derived time_increment width is wrong →
+    // ForbiddenFcode. FFmpeg decodes 787 frames. Pinned so a fix is
+    // visible.
     let path = fate_mpeg4("demo.m4v");
     let data = std::fs::read(&path).unwrap();
     let mut dec = oxideav_mpeg4video::decoder::Mpeg4VideoDecoder::new();
     let err = dec
         .decode(&data)
-        .expect_err("demo.m4v must still fail until the marker handling is fixed");
+        .expect_err("demo.m4v: expected the P-VOP tinc-width failure");
     assert!(
         matches!(err, oxideav_mpeg4video::StreamDecodeError::Vop(_)),
         "demo.m4v: unexpected error {err:?}"
