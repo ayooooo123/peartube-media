@@ -10,6 +10,7 @@ publish.workspace = true
 oxideav-core.workspace = true
 
 [dev-dependencies]
+codecs = { path = "../codecs" }
 refcheck.workspace = true
 oxideav-mkv.workspace = true
 oxideav-mp4.workspace = true

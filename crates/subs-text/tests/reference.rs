@@ -23,6 +23,10 @@ fn ffmpeg_srt_cues(path: &Path) -> Vec<(String, String)> {
 }
 
 fn ffmpeg_srt_cues_with_options(path: &Path, options: &[&str]) -> Vec<(String, String)> {
+    ffmpeg_cues(path, options, "srt")
+}
+
+fn ffmpeg_cues(path: &Path, options: &[&str], encoder: &str) -> Vec<(String, String)> {
     let output = Command::new("ffmpeg")
         .args(["-nostdin", "-v", "error"])
         .args(options)
@@ -32,7 +36,7 @@ fn ffmpeg_srt_cues_with_options(path: &Path, options: &[&str]) -> Vec<(String, S
             "-map",
             "0:s:0",
             "-c:s",
-            "srt",
+            encoder,
             "-f",
             "srt",
             "-",
@@ -315,19 +319,53 @@ fn test_sami_reference() {
     }
 }
 
-fn assert_standalone_cues(sample: &str, options: &[&str]) {
+fn visible_text(segments: &[oxideav_core::subtitle::Segment], out: &mut String) {
+    use oxideav_core::subtitle::Segment;
+    for segment in segments {
+        match segment {
+            // Raw segments are rendered literally by the compositor. Stripping
+            // their markup here would conceal decoder errors.
+            Segment::Text(text) | Segment::Raw(text) => out.push_str(text),
+            Segment::LineBreak => out.push('\n'),
+            Segment::Voice { name, children } => {
+                out.push_str(name);
+                out.push_str(": ");
+                visible_text(children, out);
+            }
+            Segment::Bold(children) | Segment::Italic(children)
+            | Segment::Underline(children) | Segment::Strike(children)
+            | Segment::Color { children, .. } | Segment::Font { children, .. }
+            | Segment::Class { children, .. } | Segment::Karaoke { children, .. } => {
+                visible_text(children, out);
+            }
+            Segment::Timestamp { .. } => {}
+        }
+    }
+}
+
+fn assert_standalone_cues(sample: &str, options: &[&str], encoder: &str) {
     let sample = fate(sample);
-    let reference = ffmpeg_srt_cues_with_options(&sample, options);
+    let reference = ffmpeg_cues(&sample, options, encoder);
     assert!(!reference.is_empty(), "FFmpeg must produce reference cues");
-    let decoded = refcheck::decode(&sample, &[subs_text::register], MediaType::Subtitle, 0);
+    let decoded = refcheck::decode(&sample, &[codecs::register_all], MediaType::Subtitle, 0);
     let actual: Vec<_> = decoded.frames.iter().map(|frame| {
         let Frame::Subtitle(cue) = frame else { panic!("expected subtitle frame") };
+        let body = if encoder == "text" {
+            let mut text = String::new();
+            visible_text(&cue.segments, &mut text);
+            text
+        } else {
+            oxideav_subtitle::srt::render_segments(&cue.segments)
+        };
         (
             format!("{} --> {}", format_srt_time(cue.start_us), format_srt_time(cue.end_us)),
-            oxideav_subtitle::srt::render_segments(&cue.segments).trim().to_string(),
+            body.trim().to_string(),
         )
     }).collect();
-    assert_eq!(actual, reference, "complete cue text, timing and count for {}", sample.display());
+    assert_eq!(actual.len(), reference.len(), "cue count for {}", sample.display());
+    for (index, (actual, reference)) in actual.iter().zip(&reference).enumerate() {
+        assert_eq!(actual, reference, "cue {index} text and timing for {}", sample.display());
+    }
 }
 
 #[test]
@@ -335,12 +373,13 @@ fn test_subviewer1_reference() {
     assert_standalone_cues(
         "sub/SubViewer1_capability_tester.sub",
         &["-sub_charenc", "windows-1250"],
+        "srt",
     );
 }
 
 #[test]
 fn test_vplayer_reference() {
-    assert_standalone_cues("sub/VPlayer_capability_tester.txt", &[]);
+    assert_standalone_cues("sub/VPlayer_capability_tester.txt", &[], "srt");
 }
 
 #[test]
@@ -457,61 +496,28 @@ fn test_untrusted_input_robustness() {
     }
 }
 
-#[test]
-fn test_verify_oxideav_standalone_subtitles() {
-    let fate_samples = [
-        ("SubRip", "sub/SubRip_capability_tester.srt"),
-        ("SubRip", "sub/badsyntax.srt"),
-        ("SubRip", "sub/empty-events-2167.srt"),
-        ("SubRip", "sub/madness.srt"),
-        ("SubRip", "sub/ticket5032-rrn.srt"),
-        ("MicroDVD", "sub/MicroDVD_capability_tester.sub"),
-        ("MicroDVD", "sub/MicroDVD_capability_tester.srt"),
-        ("SubViewer", "sub/SubViewer_capability_tester.sub"),
-        ("SubViewer", "sub/SubViewer1_capability_tester.sub"),
-        ("SAMI", "sub/SAMI_capability_tester.smi"),
-        ("SAMI", "sub/SAMI_multilang_tweak_tester.smi"),
-        ("VPlayer", "sub/VPlayer_capability_tester.txt"),
-        ("MPL2", "sub/MPL2_capability_tester.txt"),
-        ("WebVTT", "sub/WebVTT_capability_tester.vtt"),
-        ("WebVTT", "sub/WebVTT_extended_tester.vtt"),
-        ("SSA/ASS", "sub/1ededcbd7b.ass"),
-        ("SSA/ASS", "sub/a9-misc.ssa"),
-    ];
-
-    println!("\n=== OxideAV Standalone Subtitle Verification ===");
-    for (format, sample_rel) in fate_samples {
-        let sample_path = fate(sample_rel);
-        let registrars: &[refcheck::Registrar] = &[
-            oxideav_subtitle::register,
-            oxideav_ass::register,
-        ];
-
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refcheck::decode(&sample_path, registrars, MediaType::Subtitle, 0)
-        }));
-
-        match res {
-            Ok(decoded) => {
-                println!(
-                    "PASS: [{}] {} => {} cues decoded (params: {:?})",
-                    format,
-                    sample_rel,
-                    decoded.frames.len(),
-                    decoded.params.codec_id
-                );
-            }
-            Err(e) => {
-                let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "panic".to_string()
-                };
-                println!("FAIL: [{}] {} => {}", format, sample_rel, msg);
-            }
+// SAMI, SubViewer1 and VPlayer have complete reference cases above.
+// Compare visible text, not incidental SRT tag serialization (for example
+// uppercase versus lowercase color hex). This does not assert style parity.
+macro_rules! standalone_reference {
+    ($name:ident, $sample:literal) => {
+        #[test]
+        fn $name() {
+            assert_standalone_cues($sample, &[], "text");
         }
-    }
-    println!("================================================\n");
+    };
 }
+
+standalone_reference!(standalone_subrip, "sub/SubRip_capability_tester.srt");
+standalone_reference!(standalone_badsyntax, "sub/badsyntax.srt");
+standalone_reference!(standalone_empty_events, "sub/empty-events-2167.srt");
+standalone_reference!(standalone_madness, "sub/madness.srt");
+standalone_reference!(standalone_rrn, "sub/ticket5032-rrn.srt");
+standalone_reference!(standalone_microdvd, "sub/MicroDVD_capability_tester.sub");
+standalone_reference!(standalone_microdvd_srt, "sub/MicroDVD_capability_tester.srt");
+standalone_reference!(standalone_subviewer, "sub/SubViewer_capability_tester.sub");
+standalone_reference!(standalone_mpl2, "sub/MPL2_capability_tester.txt");
+standalone_reference!(standalone_webvtt, "sub/WebVTT_capability_tester.vtt");
+standalone_reference!(standalone_webvtt_extended, "sub/WebVTT_extended_tester.vtt");
+standalone_reference!(standalone_ass, "sub/1ededcbd7b.ass");
+standalone_reference!(standalone_ssa, "sub/a9-misc.ssa");
