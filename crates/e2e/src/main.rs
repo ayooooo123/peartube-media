@@ -7,6 +7,7 @@
 //! ```
 
 mod compare;
+mod coverage;
 mod http;
 mod manifest;
 mod oracle;
@@ -73,6 +74,9 @@ struct StreamResult {
     /// The FFmpeg stream the comparison used (`0:<index>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     ffmpeg: Option<String>,
+    /// That stream's container tag as FFmpeg reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     frames: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,6 +111,17 @@ struct EntryResult {
     /// the selected track of each kind plays, so the rest are unchecked.
     tracks: Vec<TrackReport>,
     streams: Vec<StreamResult>,
+    /// How the entry stands on each row it claims.
+    claims: Vec<ClaimResult>,
+}
+
+#[derive(Serialize)]
+struct ClaimResult {
+    row: Row,
+    /// `VERIFIED`, `UNVERIFIED` (FFmpeg cannot decode the format) or `FAIL`.
+    standing: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -125,7 +140,14 @@ struct TrackReport {
 #[derive(Serialize, Default, Clone)]
 struct RowResult {
     row: Row,
-    passing_entries: Vec<String>,
+    /// `VERIFIED` (an entry passed against FFmpeg), `UNVERIFIED` (only
+    /// decodes-only entries, for formats FFmpeg cannot decode), `FAIL`
+    /// (claimed, nothing passed), `UNCOVERED` (no entry claims it) or
+    /// `NOT RUN` (claimed only by entries a --filter left out).
+    status: &'static str,
+    verified_entries: Vec<String>,
+    unverified_entries: Vec<String>,
+    /// `<entry>: <reason>`.
     failing_entries: Vec<String>,
 }
 
@@ -151,27 +173,49 @@ impl FuzzReport {
     }
 }
 
-/// Whether `result` credits a row of `kind` (`video`, `audio`, `subtitle`,
-/// or `container`): a stream of the kind passed its comparison and the HTTP
-/// pass agreed (a stream whose HTTP capture differed, or an entry whose HTTP
-/// pass failed outright, credits nothing); containers need every stream and
-/// the entry itself free of failures.
-fn accepted(result: &EntryResult, kind: &str) -> bool {
-    let http_failed = result.streams.iter().any(|s| s.kind == "http" && s.verdict == "FAIL");
-    let stream_ok = |s: &StreamResult| (s.verdict == "PASS" || s.verdict == "DECODES") && s.http != Some("FAIL");
-    if http_failed {
-        return false;
+/// What an entry's results establish for row attribution: the demuxer and
+/// codecs that actually ran, their verdicts, and the failures that withdraw
+/// rows (any entry-level failure withdraws container rows; a tracks,
+/// selection or outright HTTP failure withdraws codec rows too, since the
+/// comparisons can no longer be trusted to describe the stream).
+fn entry_facts(result: &EntryResult, path: &Path) -> coverage::EntryFacts {
+    let failure = |kinds: &[&str]| {
+        result
+            .streams
+            .iter()
+            .find(|s| kinds.contains(&s.kind.as_str()) && s.verdict == "FAIL")
+            .map(|s| format!("{}: {}", s.kind, s.error.as_deref().unwrap_or("failed")))
+    };
+    coverage::EntryFacts {
+        demuxer: result.demuxer.clone(),
+        ogm: result.demuxer.as_deref() == Some("ogg") && coverage::is_ogm(path),
+        entry_failure: failure(&["open", "engine", "tracks", "selection", "http"]),
+        stream_failure: failure(&["tracks", "selection", "http"]),
+        streams: result
+            .streams
+            .iter()
+            .filter_map(|s| {
+                let kind = match s.kind.as_str() {
+                    "video" => Kind::Video,
+                    "audio" => Kind::Audio,
+                    "subtitle" => Kind::Subtitle,
+                    _ => return None,
+                };
+                Some(coverage::StreamFacts {
+                    kind,
+                    codec: s.codec.clone(),
+                    tag: s.tag.clone(),
+                    verdict: s.verdict.clone(),
+                    http_ok: s.http != Some("FAIL"),
+                })
+            })
+            .collect(),
     }
-    if kind == "container" {
-        let entry_failed = result.streams.iter().any(|s| matches!(s.kind.as_str(), "open" | "engine") && s.verdict == "FAIL");
-        let stream_failed = result.streams.iter().any(|s| s.http == Some("FAIL"));
-        return !entry_failed && !stream_failed;
-    }
-    result.streams.iter().any(|s| s.kind == kind && stream_ok(s))
 }
 
-/// The process exit code: 1 when a judged row has no passing entry or the
-/// fuzz pass ran and failed.
+/// The process exit code: 1 when a judged row has no passing entry (neither
+/// verified nor, for formats FFmpeg cannot decode, decodes-only) or the fuzz
+/// pass ran and failed.
 fn exit_code(rows_without_pass: usize, fuzz: Option<&FuzzReport>) -> i32 {
     i32::from(rows_without_pass > 0 || fuzz.is_some_and(|f| !f.passed))
 }
@@ -500,6 +544,7 @@ impl StreamResult {
             codec: String::new(),
             decoder: String::new(),
             ffmpeg: None,
+            tag: None,
             frames: None,
             samples: None,
             cues: None,
@@ -520,6 +565,7 @@ impl StreamResult {
             codec: codec.into(),
             decoder: "software".into(),
             ffmpeg: None,
+            tag: None,
             frames: None,
             samples: None,
             cues: None,
@@ -640,6 +686,7 @@ fn judge_track(
         }
     };
     r.ffmpeg = ff.as_ref().ok().map(oracle::FfStream::map);
+    r.tag = ff.as_ref().ok().map(|ff| ff.codec_tag.clone());
     r
 }
 
@@ -693,7 +740,8 @@ fn same_capture(file: &Played, http: &Played, track: &TrackInfo) -> Result<(), S
 /// entry is played a second time over HTTP from a Range-capable local server
 /// and the same digests are compared.
 fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult {
-    let mut result = EntryResult { path: entry.path.clone(), demuxer: None, tracks: Vec::new(), streams: Vec::new() };
+    let mut result =
+        EntryResult { path: entry.path.clone(), demuxer: None, tracks: Vec::new(), streams: Vec::new(), claims: Vec::new() };
 
     let disc = match discover(path) {
         Ok(d) => d,
@@ -798,23 +846,6 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
             }
         })
         .collect();
-
-    // Rows the entry declares whose kind never produced any stream are
-    // failures (a kind that ran but failed already shows its own FAIL).
-    for row in &entry.rows {
-        let kind = match row.split_once(':') {
-            Some(("video", _)) => "video",
-            Some(("audio", _)) => "audio",
-            Some(("sub", _)) => "subtitle",
-            _ => "",
-        };
-        if !kind.is_empty() && !result.streams.iter().any(|s| s.kind == kind) {
-            let already = result.streams.iter().any(|s| s.kind == "row" && s.metric.as_deref() == Some(row.as_str()));
-            if !already {
-                result.streams.push(StreamResult::entry_level("row", u32::MAX, Some(row.clone()), "stream never captured"));
-            }
-        }
-    }
 
     // HTTP pass: the server must serve the very bytes the file run read,
     // and playing them over HTTP must capture exactly what the file run did,
@@ -1042,11 +1073,13 @@ fn main() {
     // Records naming the same sample and stream selection merge per kind;
     // contradictory policies, unknown tokens and sub-contract floors stop
     // the run before anything plays.
-    let entries: Vec<Entry> = match manifest::parse(&manifest_text, &yardstick.rows) {
-        Ok(entries) => entries
-            .into_iter()
-            .filter(|e| filter.as_ref().map(|f| e.path.contains(f)).unwrap_or(true))
-            .collect(),
+    let missing_rules = coverage::missing_rules(&yardstick.rows);
+    if !missing_rules.is_empty() {
+        eprintln!("yardstick rows without an attribution rule: {}", missing_rules.join(", "));
+        std::process::exit(2);
+    }
+    let all_entries = match manifest::parse(&manifest_text, &yardstick.rows) {
+        Ok(entries) => entries,
         Err(errors) => {
             for e in &errors {
                 eprintln!("corpus/manifest.toml: {e}");
@@ -1054,6 +1087,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let manifest_rows: Vec<String> = all_entries.iter().flat_map(|e| e.rows.iter().cloned()).collect();
+    let entries: Vec<Entry> = all_entries
+        .into_iter()
+        .filter(|e| filter.as_ref().map(|f| e.path.contains(f)).unwrap_or(true))
+        .collect();
 
     let http_base = http.then(|| http::start(resolve));
 
@@ -1076,6 +1114,11 @@ fn main() {
                 path: entry.path.clone(),
                 demuxer: None,
                 tracks: Vec::new(),
+                claims: entry
+                    .rows
+                    .iter()
+                    .map(|row| ClaimResult { row: row.clone(), standing: "FAIL", reason: Some("sample missing".into()) })
+                    .collect(),
                 streams: vec![StreamResult::entry_level(
                     "open",
                     0,
@@ -1087,47 +1130,81 @@ fn main() {
             continue;
         };
 
-        let result = run_entry(entry, &path, http_base.as_deref());
-        let pass = |kind: &str| accepted(&result, kind);
-        let v = if pass("video") { "ok" } else { "-" };
-        let a = if pass("audio") { "ok" } else { "-" };
-        let s = if pass("subtitle") { "ok" } else { "-" };
-        println!("{:<44} {:>9} {:>9} {:>7}", entry.path, v, a, s);
-
-        // Attribute entry result to rows: an entry passes a row when the row's
-        // kind passed on this entry.
-        for row in &entry.rows {
-            let Some(rr) = row_map.get_mut(row) else { continue };
-            let kind = match row.split_once(':') {
-                Some(("video", _)) => "video",
-                Some(("audio", _)) => "audio",
-                Some(("sub", _)) => "subtitle",
-                Some(("container", _)) => "container",
-                _ => "",
-            };
-            let ok = !kind.is_empty() && pass(kind);
-            if ok {
-                rr.passing_entries.push(entry.path.clone());
-            } else {
-                rr.failing_entries.push(entry.path.clone());
-            }
-        }
+        let mut result = run_entry(entry, &path, http_base.as_deref());
+        let facts = entry_facts(&result, &path);
+        result.claims = entry
+            .rows
+            .iter()
+            .map(|row| {
+                let (standing, reason) = match coverage::claim(row, &facts) {
+                    coverage::Claim::Verified => ("VERIFIED", None),
+                    coverage::Claim::Unverified => ("UNVERIFIED", None),
+                    coverage::Claim::Failed(why) => ("FAIL", Some(why)),
+                };
+                ClaimResult { row: row.clone(), standing, reason }
+            })
+            .collect();
+        let verdict = |kind: &str| {
+            result.streams.iter().find(|s| s.kind == kind).map_or("-", |s| match (s.verdict.as_str(), s.http) {
+                (_, Some("FAIL")) => "HTTP",
+                ("PASS", _) => "ok",
+                ("DECODES", _) => "dec",
+                _ => "FAIL",
+            })
+        };
+        let checked = result.tracks.iter().filter(|t| t.checked).count();
+        let entry_fail = result.streams.iter().find(|s| !matches!(s.kind.as_str(), "video" | "audio" | "subtitle"));
+        println!(
+            "{:<44} {:>6} {:>6} {:>6} {:>4}/{:<3} {}",
+            entry.path,
+            verdict("video"),
+            verdict("audio"),
+            verdict("subtitle"),
+            checked,
+            result.tracks.len(),
+            entry_fail.map(|s| s.kind.as_str()).unwrap_or("")
+        );
         entry_results.push(result);
     }
 
+    // Rows: verified by an FFmpeg-checked pass, unverified by decodes-only
+    // passes (formats FFmpeg cannot decode), else failing or uncovered.
+    for result in &entry_results {
+        for c in &result.claims {
+            let Some(rr) = row_map.get_mut(&c.row) else { continue };
+            match c.standing {
+                "VERIFIED" => rr.verified_entries.push(result.path.clone()),
+                "UNVERIFIED" => rr.unverified_entries.push(result.path.clone()),
+                _ => rr.failing_entries.push(format!("{}: {}", result.path, c.reason.as_deref().unwrap_or(""))),
+            }
+        }
+    }
+    let claimed_anywhere = |row: &str| manifest_rows.iter().any(|r| r == row);
+    for rr in row_map.values_mut() {
+        rr.status = if !rr.verified_entries.is_empty() {
+            "VERIFIED"
+        } else if !rr.unverified_entries.is_empty() {
+            "UNVERIFIED"
+        } else if !rr.failing_entries.is_empty() {
+            "FAIL"
+        } else if claimed_anywhere(&rr.row) {
+            "NOT RUN"
+        } else {
+            "UNCOVERED"
+        };
+    }
+
     println!("{}", "-".repeat(74));
-    println!(
-        "{:<22} {:>8} {:>8} {}",
-        "row", "pass", "fail", "first failing entry"
-    );
+    println!("{:<22} {:<10} {:>4} {:>4} {:>4}  {}", "row", "status", "ver", "unv", "fail", "first failing entry");
     println!("{}", "-".repeat(74));
-    let mut rows: Vec<RowResult> = row_map.values().cloned().collect();
-    rows.sort_by(|a, b| a.row.cmp(&b.row));
+    let rows: Vec<RowResult> = row_map.values().cloned().collect();
     for rr in &rows {
         println!(
-            "{:<22} {:>8} {:>8} {}",
+            "{:<22} {:<10} {:>4} {:>4} {:>4}  {}",
             rr.row,
-            rr.passing_entries.len(),
+            rr.status,
+            rr.verified_entries.len(),
+            rr.unverified_entries.len(),
             rr.failing_entries.len(),
             rr.failing_entries.first().cloned().unwrap_or_default()
         );
@@ -1170,8 +1247,12 @@ fn main() {
     let empty_rows: Vec<String> = report
         .rows
         .iter()
-        .filter(|r| r.passing_entries.is_empty())
-        .filter(|r| filter.is_none() || !r.failing_entries.is_empty())
+        .filter(|r| match r.status {
+            "FAIL" => true,
+            // Without --filter every row must be claimed and run.
+            "UNCOVERED" | "NOT RUN" => filter.is_none(),
+            _ => false,
+        })
         .map(|r| r.row.clone())
         .collect();
     if !empty_rows.is_empty() {
@@ -1253,32 +1334,6 @@ mod tests {
         let (disc, mut ff) = two_audio_tracks();
         ff.pop();
         assert!(map_to_ffmpeg(&disc.tracks[2], &disc, &ff).is_err(), "FFmpeg lists one audio stream, the player two");
-    }
-
-    fn stream(kind: &str, verdict: &str, http: Option<&'static str>) -> StreamResult {
-        let mut s = StreamResult::entry_level(kind, 0, None, "");
-        s.verdict = verdict.into();
-        s.error = None;
-        s.http = http;
-        s
-    }
-
-    fn entry_result(streams: Vec<StreamResult>) -> EntryResult {
-        EntryResult { path: "gen:x.mkv".into(), demuxer: None, tracks: Vec::new(), streams }
-    }
-
-    #[test]
-    fn an_http_disagreement_withdraws_the_entrys_coverage() {
-        let ok = entry_result(vec![stream("video", "PASS", Some("PASS")), stream("audio", "PASS", Some("PASS"))]);
-        assert!(accepted(&ok, "video") && accepted(&ok, "audio") && accepted(&ok, "container"));
-        // The old attribution credited a local PASS whatever the HTTP pass
-        // appended.
-        let differs = entry_result(vec![stream("video", "PASS", Some("FAIL")), stream("audio", "PASS", Some("PASS"))]);
-        assert!(!accepted(&differs, "video"));
-        assert!(accepted(&differs, "audio"));
-        assert!(!accepted(&differs, "container"));
-        let broken = entry_result(vec![stream("video", "PASS", None), stream("http", "FAIL", None)]);
-        assert!(!accepted(&broken, "video") && !accepted(&broken, "container"));
     }
 
     #[test]
