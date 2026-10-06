@@ -61,7 +61,16 @@ fn decode_buffer(ctx: &RuntimeContext, data: &[u8], asc_hint: Option<&[u8]>) {
 
 #[test]
 fn mutations_do_not_panic() {
-    const SEED: u64 = 0x5EED_AAC0_F00D_0001;
+    exercise_mutations(MUTATION_SAMPLES, 0x5EED_AAC0_F00D_0001);
+}
+
+#[test]
+fn usac_mutations_do_not_panic() {
+    let samples: Vec<_> = check_aac::USAC_SAMPLES.iter().map(|s| s.0).collect();
+    exercise_mutations(&samples, 0x5EED_AAC4_2000_0001);
+}
+
+fn exercise_mutations(samples: &[&str], seed: u64) {
     const RUNS: usize = 2000;
 
     let mut ctx = RuntimeContext::new();
@@ -72,7 +81,7 @@ fn mutations_do_not_panic() {
 
     // The packet bytes and the (optional) ASC of each sample, decoded
     // once unmutated so the mutations target real stream structure.
-    let corpora: Vec<(String, Vec<Vec<u8>>, Option<Vec<u8>>)> = MUTATION_SAMPLES
+    let corpora: Vec<(String, Vec<Vec<u8>>, Option<Vec<u8>>)> = samples
         .iter()
         .map(|rel| {
             let (_pcm, path, _ch) = decoded_f32(rel);
@@ -100,7 +109,7 @@ fn mutations_do_not_panic() {
         })
         .collect();
 
-    let mut state = SEED;
+    let mut state = seed;
     for run in 0..RUNS {
         let (rel, packets, asc) = &corpora[(xorshift(&mut state) as usize) % corpora.len()];
         let packet_idx = (xorshift(&mut state) as usize) % packets.len();
