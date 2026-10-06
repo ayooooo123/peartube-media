@@ -205,14 +205,6 @@ impl Geometry {
         }
     }
 
-    pub fn h_edge_pos(&self) -> usize {
-        self.mb_width * 16
-    }
-
-    pub fn v_edge_pos(&self) -> usize {
-        self.mb_height * 16
-    }
-
     /// `y_size + 2 * c_size`: entries of the DC/AC prediction arrays.
     fn yc_size(&self) -> usize {
         self.b8_stride * (2 * self.mb_height + 1) + 2 * self.mb_stride * (self.mb_height + 1)
@@ -307,7 +299,7 @@ enum HeaderError {
 
 impl Rv1020Decoder {
     pub fn new(params: &CodecParameters, rv20: bool) -> Result<Self> {
-        let extradata = params.extradata.clone();
+        let extradata = crate::real_extradata(&params.extradata);
         if extradata.len() < 8 {
             return Err(Error::invalid("rv10: extradata is too small"));
         }
@@ -560,10 +552,10 @@ impl Rv1020Decoder {
 
         seq |= (self.time & !0x7FFF) as i32;
         if (seq as i64) - self.time > 0x4000 {
-            seq -= 0x8000;
+            seq = seq.wrapping_sub(0x8000);
         }
         if (seq as i64) - self.time < -0x4000 {
-            seq += 0x8000;
+            seq = seq.wrapping_add(0x8000);
         }
         if seq as i64 != self.time {
             if self.pict_type != PICT_B {

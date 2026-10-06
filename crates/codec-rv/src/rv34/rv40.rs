@@ -65,7 +65,7 @@ fn get_dimension(gb: &mut BitReader, dim: &[i32]) -> i32 {
                 return -1;
             }
             let t = gb.get_bits(8) as i32;
-            val += t << 2;
+            val = val.wrapping_add(t << 2);
             if t != 0xFF {
                 break;
             }

@@ -22,6 +22,18 @@ pub mod rv10;
 pub mod rv34;
 pub mod vlc;
 
+/// The codec extradata of a RealVideo stream. RealMedia demuxers pass the
+/// bytes after the stream's 26-byte `VIDO` header; Matroska `V_REAL/*`
+/// tracks carry the whole header in CodecPrivate, which FFmpeg's Matroska
+/// demuxer skips (`extradata_offset = 26`). Accept both.
+pub(crate) fn real_extradata(extradata: &[u8]) -> Vec<u8> {
+    if extradata.len() >= 26 && &extradata[4..8] == b"VIDO" {
+        extradata[26..].to_vec()
+    } else {
+        extradata.to_vec()
+    }
+}
+
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, PixelFormat, RuntimeContext,
 };

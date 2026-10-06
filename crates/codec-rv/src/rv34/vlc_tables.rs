@@ -20,7 +20,7 @@ pub const COEFF_VLC_SIZE: usize = 32;
 
 
 
-pub static RV34_TABLE_INTRA_CBPPAT: [[[u8; 1296]; 2]; 5] = [
+pub static RV34_TABLE_INTRA_CBPPAT: [[[u8; CBPPAT_VLC_SIZE]; 2]; NUM_INTRA_TABLES] = [
     [
         [
             8, 10, 10, 10, 10, 10, 11, 10, 10, 11, 10, 10, 10, 10, 10, 6, 12, 12, 13, 12, 13, 12, 13, 11,
@@ -593,7 +593,7 @@ pub static RV34_TABLE_INTRA_CBPPAT: [[[u8; 1296]; 2]; 5] = [
     ],
 ];
 
-pub static RV34_TABLE_INTRA_CBP: [[[u8; 16]; 8]; 5] = [
+pub static RV34_TABLE_INTRA_CBP: [[[u8; CBP_VLC_SIZE]; 8]; NUM_INTRA_TABLES] = [
     [
         [
             0, 3, 3, 4, 3, 5, 5, 5, 2, 5, 4, 6, 4, 6, 6, 6,
@@ -726,7 +726,7 @@ pub static RV34_TABLE_INTRA_CBP: [[[u8; 16]; 8]; 5] = [
     ],
 ];
 
-pub static RV34_TABLE_INTRA_FIRSTPAT: [[[u8; 864]; 4]; 5] = [
+pub static RV34_TABLE_INTRA_FIRSTPAT: [[[u8; FIRSTBLK_VLC_SIZE]; 4]; NUM_INTRA_TABLES] = [
     [
         [
             0, 10, 5, 10, 7, 12, 9, 11, 8, 13, 9, 12, 10, 13, 11, 12, 16, 16, 14, 15, 15, 16, 13, 14,
@@ -1499,7 +1499,7 @@ pub static RV34_TABLE_INTRA_FIRSTPAT: [[[u8; 864]; 4]; 5] = [
     ],
 ];
 
-pub static RV34_TABLE_INTRA_SECONDPAT: [[[u8; 108]; 2]; 5] = [
+pub static RV34_TABLE_INTRA_SECONDPAT: [[[u8; OTHERBLK_VLC_SIZE]; 2]; NUM_INTRA_TABLES] = [
     [
         [
             0, 5, 10, 3, 6, 10, 7, 8, 9, 4, 6, 10, 6, 7, 9, 8, 8, 9, 8, 8, 9, 8, 9, 9,
@@ -1582,7 +1582,7 @@ pub static RV34_TABLE_INTRA_SECONDPAT: [[[u8; 108]; 2]; 5] = [
     ],
 ];
 
-pub static RV34_TABLE_INTRA_THIRDPAT: [[[u8; 108]; 2]; 5] = [
+pub static RV34_TABLE_INTRA_THIRDPAT: [[[u8; OTHERBLK_VLC_SIZE]; 2]; NUM_INTRA_TABLES] = [
     [
         [
             0, 5, 10, 3, 6, 10, 7, 8, 10, 4, 7, 10, 6, 7, 10, 8, 8, 10, 8, 9, 10, 9, 9, 10,
@@ -1665,7 +1665,7 @@ pub static RV34_TABLE_INTRA_THIRDPAT: [[[u8; 108]; 2]; 5] = [
     ],
 ];
 
-pub static RV34_INTRA_COEFF: [[u8; 32]; 5] = [
+pub static RV34_INTRA_COEFF: [[u8; COEFF_VLC_SIZE]; NUM_INTRA_TABLES] = [
     [
         1, 3, 3, 4, 4, 5, 6, 6, 6, 7, 7, 7, 8, 8, 9, 9, 9, 9, 10, 10, 10, 11, 11, 11,
         10, 10, 10, 12, 13, 14, 15, 15,
@@ -1688,7 +1688,7 @@ pub static RV34_INTRA_COEFF: [[u8; 32]; 5] = [
     ],
 ];
 
-pub static RV34_INTER_CBPPAT: [[u8; 1296]; 7] = [
+pub static RV34_INTER_CBPPAT: [[u8; CBPPAT_VLC_SIZE]; NUM_INTER_TABLES] = [
     [
         7, 9, 9, 8, 9, 8, 9, 8, 9, 9, 8, 8, 8, 8, 8, 4, 7, 10, 11, 10, 11, 10, 12, 10,
         12, 11, 11, 10, 11, 10, 10, 7, 10, 11, 15, 12, 15, 12, 15, 12, 15, 14, 14, 12, 14, 12, 14, 9,
@@ -2083,7 +2083,7 @@ pub static RV34_INTER_CBPPAT: [[u8; 1296]; 7] = [
     ],
 ];
 
-pub static RV34_INTER_CBP: [[[u8; 16]; 4]; 7] = [
+pub static RV34_INTER_CBP: [[[u8; CBP_VLC_SIZE]; 4]; NUM_INTER_TABLES] = [
     [
         [
             0, 6, 6, 3, 6, 4, 5, 3, 6, 5, 4, 3, 3, 4, 4, 3,
@@ -2184,7 +2184,7 @@ pub static RV34_INTER_CBP: [[[u8; 16]; 4]; 7] = [
     ],
 ];
 
-pub static RV34_TABLE_INTER_FIRSTPAT: [[[u8; 864]; 2]; 7] = [
+pub static RV34_TABLE_INTER_FIRSTPAT: [[[u8; FIRSTBLK_VLC_SIZE]; 2]; NUM_INTER_TABLES] = [
     [
         [
             0, 7, 5, 7, 5, 7, 6, 6, 7, 10, 7, 9, 8, 9, 8, 7, 12, 14, 11, 12, 12, 12, 11, 9,
@@ -2733,7 +2733,7 @@ pub static RV34_TABLE_INTER_FIRSTPAT: [[[u8; 864]; 2]; 7] = [
     ],
 ];
 
-pub static RV34_TABLE_INTER_SECONDPAT: [[[u8; 108]; 2]; 7] = [
+pub static RV34_TABLE_INTER_SECONDPAT: [[[u8; OTHERBLK_VLC_SIZE]; 2]; NUM_INTER_TABLES] = [
     [
         [
             0, 4, 8, 3, 6, 8, 6, 7, 8, 4, 6, 8, 6, 7, 8, 7, 8, 8, 7, 8, 8, 8, 8, 8,
@@ -2848,7 +2848,7 @@ pub static RV34_TABLE_INTER_SECONDPAT: [[[u8; 108]; 2]; 7] = [
     ],
 ];
 
-pub static RV34_TABLE_INTER_THIRDPAT: [[[u8; 108]; 2]; 7] = [
+pub static RV34_TABLE_INTER_THIRDPAT: [[[u8; OTHERBLK_VLC_SIZE]; 2]; NUM_INTER_TABLES] = [
     [
         [
             0, 5, 8, 3, 6, 9, 6, 7, 9, 4, 6, 9, 6, 7, 9, 8, 8, 9, 7, 8, 9, 8, 9, 9,
@@ -2963,7 +2963,7 @@ pub static RV34_TABLE_INTER_THIRDPAT: [[[u8; 108]; 2]; 7] = [
     ],
 ];
 
-pub static RV34_INTER_COEFF: [[u8; 32]; 7] = [
+pub static RV34_INTER_COEFF: [[u8; COEFF_VLC_SIZE]; NUM_INTER_TABLES] = [
     [
         1, 2, 4, 4, 5, 5, 6, 7, 7, 7, 8, 8, 8, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11, 12,
         11, 11, 11, 13, 14, 15, 16, 16,

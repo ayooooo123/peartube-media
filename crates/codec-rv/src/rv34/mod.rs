@@ -463,7 +463,7 @@ enum SliceEnd {
 
 impl Rv34Decoder {
     pub fn new(params: &CodecParameters, rv30: bool) -> Result<Self> {
-        let extradata = params.extradata.clone();
+        let extradata = crate::real_extradata(&params.extradata);
         let width = params.width.unwrap_or(0) as usize;
         let height = params.height.unwrap_or(0) as usize;
         let mut max_rpr = 0;
@@ -1640,7 +1640,9 @@ impl Rv34Decoder {
             self.set_dimensions(w, h);
         }
         if faulty_b {
-            return Err(Error::invalid("rv34: B-frame without reference data"));
+            // FFmpeg drops a B-frame with no reference (e.g. right after a
+            // seek) without output; it is not stream corruption.
+            return Ok(());
         }
         // A picture left unfinished by a previous packet ends here.
         self.abandon_current();

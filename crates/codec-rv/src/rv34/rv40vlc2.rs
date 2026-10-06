@@ -36,12 +36,12 @@ pub const BTYPE_VLC_BITS: usize = 6;
 
 
 
-pub static RV40_AIC_TOP_VLC_TAB: [[u8; 2]; 16] = [
+pub static RV40_AIC_TOP_VLC_TAB: [[u8; 2]; AIC_TOP_SIZE] = [
     [3, 5], [2, 5], [7, 5], [4, 5], [15, 3], [8, 4], [1, 4], [14, 5],
     [12, 5], [11, 6], [6, 6], [9, 7], [5, 7], [13, 7], [10, 7], [0, 1],
 ];
 
-pub static AIC_MODE2_VLC_SYMS: [[u8; 81]; 20] = [
+pub static AIC_MODE2_VLC_SYMS: [[u8; AIC_MODE2_SIZE]; AIC_MODE2_NUM] = [
     [
         6, 1, 40, 17, 34, 32, 4, 7, 5, 22, 8, 96, 2, 102, 97, 35, 21, 49, 38, 119, 18, 16, 66, 33,
         114, 80, 136, 130, 39, 36, 68, 64, 98, 85, 24, 19, 83, 82, 100, 70, 65, 81, 71, 51, 50, 116, 103, 20,
@@ -164,7 +164,7 @@ pub static AIC_MODE2_VLC_SYMS: [[u8; 81]; 20] = [
     ],
 ];
 
-pub static AIC_MODE2_VLC_BITS: [[u8; 81]; 20] = [
+pub static AIC_MODE2_VLC_BITS: [[u8; AIC_MODE2_SIZE]; AIC_MODE2_NUM] = [
     [
         5, 5, 5, 5, 3, 6, 6, 8, 8, 8, 8, 6, 4, 7, 7, 9, 9, 9, 9, 7, 7, 7, 7, 7,
         8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 11, 11, 11, 11, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10,
@@ -287,7 +287,7 @@ pub static AIC_MODE2_VLC_BITS: [[u8; 81]; 20] = [
     ],
 ];
 
-pub static AIC_MODE1_VLC_TABS: [[[u8; 2]; 9]; 90] = [
+pub static AIC_MODE1_VLC_TABS: [[[u8; 2]; AIC_MODE1_SIZE]; AIC_MODE1_NUM] = [
     [
         [4, 4], [1, 4], [7, 7], [3, 7], [5, 6], [8, 5], [6, 4], [2, 2],
         [0, 1],
@@ -650,7 +650,7 @@ pub static AIC_MODE1_VLC_TABS: [[[u8; 2]; 9]; 90] = [
     ],
 ];
 
-pub static PTYPE_VLC_TABS: [[[u8; 2]; 8]; 7] = [
+pub static PTYPE_VLC_TABS: [[[u8; 2]; PTYPE_VLC_SIZE]; NUM_PTYPE_VLCS] = [
     [
         [255, 7], [11, 7], [3, 6], [8, 5], [9, 4], [2, 3], [1, 2], [0, 1],
     ],
@@ -678,7 +678,7 @@ pub static BLOCK_NUM_TO_PTYPE_VLC_NUM: [u8; 12] = [
     0, 1, 2, 3, 0, 0, 2, 0, 4, 5, 0, 6,
 ];
 
-pub static BTYPE_VLC_TABS: [[[u8; 2]; 7]; 6] = [
+pub static BTYPE_VLC_TABS: [[[u8; 2]; BTYPE_VLC_SIZE]; NUM_BTYPE_VLCS] = [
     [
         [4, 2], [0, 2], [255, 5], [10, 5], [7, 4], [1, 3], [5, 2],
     ],
