@@ -53,7 +53,7 @@ pub struct WmaDecoder {
 
     #[allow(dead_code)]
     exponent_sizes: [usize; BLOCK_NB_SIZES],
-    exponent_bands: [[u8; 25]; BLOCK_NB_SIZES],
+    exponent_bands: [[u16; 25]; BLOCK_NB_SIZES],
     high_band_start: [usize; BLOCK_NB_SIZES],
     coefs_start: usize,
     coefs_end: [usize; BLOCK_NB_SIZES],
@@ -244,7 +244,7 @@ impl WmaDecoder {
         // scale factor band sizes
         let coefs_start = if version == 1 { 3 } else { 0 };
         let mut exponent_sizes = [0usize; BLOCK_NB_SIZES];
-        let mut exponent_bands = [[0u8; 25]; BLOCK_NB_SIZES];
+        let mut exponent_bands = [[0u16; 25]; BLOCK_NB_SIZES];
         let mut coefs_end = [0usize; BLOCK_NB_SIZES];
         let mut high_band_start = [0usize; BLOCK_NB_SIZES];
         let mut exponent_high_sizes = [0usize; BLOCK_NB_SIZES];
@@ -261,7 +261,7 @@ impl WmaDecoder {
                     if pos > block_len as i64 {
                         pos = block_len as i64;
                     }
-                    exponent_bands[k][i] = (pos - lpos) as u8;
+                    exponent_bands[k][i] = (pos - lpos) as u16;
                     if pos >= block_len as i64 {
                         i += 1;
                         break;
@@ -288,7 +288,7 @@ impl WmaDecoder {
                 if let Some(table) = table {
                     let n = table[0] as usize;
                     for i in 0..n {
-                        exponent_bands[k][i] = table[1 + i];
+                        exponent_bands[k][i] = table[1 + i] as u16;
                     }
                     exponent_sizes[k] = n;
                 } else {
@@ -303,7 +303,7 @@ impl WmaDecoder {
                             pos = block_len as i64;
                         }
                         if pos > lpos {
-                            exponent_bands[k][j] = (pos - lpos) as u8;
+                            exponent_bands[k][j] = (pos - lpos) as u16;
                             j += 1;
                         }
                         if pos >= block_len as i64 {
@@ -756,7 +756,7 @@ impl WmaDecoder {
                 }
                 let run = self.run_table[tindex].clone();
                 let level = self.level_table[tindex].clone();
-                self.run_level_decode(gb, tindex, &run, &level, 0, nb_coefs[ch], coef_nb_bits)?;
+                self.run_level_decode(gb, ch, tindex, &run, &level, 0, nb_coefs[ch], coef_nb_bits)?;
             }
             if self.version == 1 && channels >= 2 {
                 gb.align_to_byte();
@@ -914,6 +914,7 @@ impl WmaDecoder {
     fn run_level_decode(
         &mut self,
         gb: &mut BitReader<'_>,
+        ch: usize,
         tindex: usize,
         run_table: &[u16],
         level_table: &[f32],
@@ -931,7 +932,7 @@ impl WmaDecoder {
                 offset += run_table[code as usize] as usize;
                 let sign = gb.get_bits1()? as i32 - 1;
                 let level = level_table[code as usize];
-                self.coefs1_ch_mut(ch_of(tindex))[offset & coef_mask] =
+                self.coefs1[ch][offset & coef_mask] =
                     if sign != 0 { -level } else { level };
             } else if code == 1 {
                 break;
@@ -940,17 +941,13 @@ impl WmaDecoder {
                 offset += gb.get_bits(frame_len_bits)? as usize;
                 let sign = gb.get_bits1()? as i32 - 1;
                 let signed = if sign != 0 { -level } else { level };
-                self.coefs1_ch_mut(ch_of(tindex))[offset & coef_mask] = signed as f32;
+                self.coefs1[ch][offset & coef_mask] = signed as f32;
             }
         }
         if offset > num_coefs {
             return Err(Error::invalid("wma: overflow in spectral RLE"));
         }
         Ok(())
-    }
-
-    fn coefs1_ch_mut(&mut self, ch: usize) -> &mut [f32; BLOCK_MAX_SIZE] {
-        &mut self.coefs1[ch]
     }
 
     /// `wma_decode_frame` (wmadec.c): appends one frame to `pending`.
@@ -1006,18 +1003,19 @@ impl WmaDecoder {
             return Ok(());
         }
         if buf.len() < self.block_align_bytes() {
-            return Err(Error::invalid("wma: input packet size too small"));
+            return Ok(());
         }
         buf = &buf[..self.block_align_bytes()];
-
         let mut gb = BitReader::new(buf);
         let mut nb_frames = 1usize;
         if self.use_bit_reservoir {
             gb.skip_bits(4)?;
-            nb_frames = (gb.get_bits(4)? as i32 - (self.last_superframe_len > 0) as i32) as usize;
-            if (nb_frames as i32) <= 0 {
+            let raw_nb = gb.get_bits(4)? as i32;
+            let sub = if self.last_superframe_len <= 0 { 1 } else { 0 };
+            let nb = raw_nb - sub;
+            if nb <= 0 {
                 let bits_left_now = gb.bits_left();
-                let is_error = (nb_frames as i32) < 0 || bits_left_now <= 8;
+                let is_error = nb < 0 || bits_left_now <= 8;
                 if is_error {
                     return Err(Error::invalid("wma: nb_frames is 0"));
                 }
@@ -1035,6 +1033,7 @@ impl WmaDecoder {
                 self.last_superframe_len += 8 * buf.len() - 8;
                 return Ok(());
             }
+            nb_frames = nb as usize;
         }
 
         if self.use_bit_reservoir {
@@ -1122,11 +1121,6 @@ fn wma_total_gain_to_bits(total_gain: i32) -> usize {
     }
 }
 
-/// run/level tables are per-VLC-table, but the destination channel is ch 1
-/// when the ms-stereo table is in use (tindex == 1 implies ch == 1).
-fn ch_of(tindex: usize) -> usize {
-    tindex
-}
 
 impl Decoder for WmaDecoder {
     fn codec_id(&self) -> &CodecId {

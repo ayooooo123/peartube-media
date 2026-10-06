@@ -161,7 +161,7 @@ pub struct WmaLosslessDecoder {
     lpc_scaling: i32,
     lpc_intbits: i32,
 
-    pending: Option<AudioFrame>,
+    pending: Vec<AudioFrame>,
 }
 
 impl WmaLosslessDecoder {
@@ -292,7 +292,7 @@ impl WmaLosslessDecoder {
             lpc_order: 0,
             lpc_scaling: 0,
             lpc_intbits: 0,
-            pending: None,
+            pending: Vec::new(),
         })
     }
 }
@@ -995,7 +995,6 @@ impl WmaLosslessDecoder {
             Ok(()) => {}
             Err(_) => {
                 self.packet_loss = true;
-                return Ok(false);
             }
         }
 
@@ -1032,7 +1031,6 @@ impl WmaLosslessDecoder {
                 }
                 Err(_) => {
                     self.packet_loss = true;
-                    return Ok(false);
                 }
             }
         }
@@ -1041,7 +1039,6 @@ impl WmaLosslessDecoder {
         if self.len_prefix {
             if len != (self.gb.bit_pos() - self.frame_offset) + 2 {
                 self.packet_loss = true;
-                return Ok(false);
             }
             let skip = len - (self.gb.bit_pos() - self.frame_offset) - 1;
             if skip > 0 {
@@ -1050,7 +1047,7 @@ impl WmaLosslessDecoder {
         }
 
         // decode trailer bit (more_frames)
-        let _more_frames = self.gb.get_bits1()? != 0;
+        let more_frames = self.gb.get_bits1()? != 0;
 
         // assemble the output frame (planar)
         let trim_end = self.trim_end.min(self.samples_per_frame);
@@ -1069,125 +1066,169 @@ impl WmaLosslessDecoder {
         if self.skip_frame {
             // consumed by packet logic; frame not emitted
         } else {
-            self.pending = Some(frame);
+            self.pending.push(frame);
         }
-        Ok(true)
+        Ok(more_frames)
     }
 
     /// Bit reservoir: append-only. `gb` keeps the read cursor across saves;
     /// consumed prefix bytes are compacted when large.
-    fn save_bits(&mut self, gb: &mut BitReader<'_>, len: usize, _append: bool) {
+    fn save_bits(&mut self, gb: &mut BitReader<'_>, len: usize, append: bool) {
         if len == 0 {
             return;
         }
-        let start_bit = self.num_saved_bits;
-        if start_bit + len > self.max_frame_size * 8 {
+        if !append {
+            self.frame_offset = gb.bits_count() & 7;
+            self.num_saved_bits = self.frame_offset;
+            self.frame_data.clear();
+        }
+        let buflen = (self.num_saved_bits + len + 8) >> 3;
+        if buflen > self.max_frame_size {
             self.packet_loss = true;
+            self.num_saved_bits = 0;
             return;
         }
-        let old_bytes = ((start_bit + 7) >> 3).max(1);
+        let start_bit = self.num_saved_bits;
         let new_bytes = ((start_bit + len + 7) >> 3).max(1);
         if self.frame_data.len() < new_bytes {
             self.frame_data.resize(new_bytes, 0);
         }
-        let mut written = 0usize;
-        while written < len {
-            let chunk = (len - written).min(32);
-            let v = gb.get_bits(chunk).unwrap_or(0) as u64;
-            self.put_bits(start_bit + written, chunk, v);
-            written += chunk;
-        }
-        self.num_saved_bits = start_bit + len;
-        let _ = old_bytes;
-        // keep self.gb as-is: its buffer grew; refresh the reader view
-        self.gb.refresh_view(self.frame_data.clone(), self.num_saved_bits);
-    }
-
-    fn put_bits(&mut self, bit_pos: usize, nbits: usize, val: u64) {
-        for b in 0..nbits {
-            let bit = ((val >> (nbits - 1 - b)) & 1) as u8;
-            let idx = bit_pos + b;
+        for i in 0..len {
+            let bit = gb.get_bits1().unwrap_or(0);
+            let idx = start_bit + i;
             let byte = idx / 8;
             let off = idx % 8;
-            if byte < self.frame_data.len() {
-                if bit != 0 {
-                    self.frame_data[byte] |= 1 << (7 - off);
-                } else {
-                    self.frame_data[byte] &= !(1 << (7 - off));
-                }
+            if bit != 0 {
+                self.frame_data[byte] |= 1 << (7 - off);
+            } else {
+                self.frame_data[byte] &= !(1 << (7 - off));
             }
         }
+        self.num_saved_bits += len;
+        self.gb = OwnedBitReader::from_bits(self.frame_data.clone(), self.num_saved_bits);
+        let _ = self.gb.skip_bits(self.frame_offset);
     }
+
 
     /// `decode_packet` (wmalosslessdec.c). Each ASF packet carries exactly
     /// one codec packet of `block_align` bytes with its own 23-bit header:
     /// seq, splicing flag, and the number of bits of the previous frame
     /// spilled into this packet. The reservoir is append-only; `gb` keeps
     /// the read cursor so frames decode sequentially across packets.
-    fn decode_packet_impl(&mut self, data: &[u8]) -> Result<()> {
-        self.pending = None;
-        if data.is_empty() {
+    fn decode_packet_chunk(&mut self, cur_data: &[u8]) -> Result<usize> {
+        let mut buf_size = cur_data.len();
+        if buf_size == 0 {
             self.packet_done = false;
             if self.num_saved_bits <= self.gb.bit_pos() {
-                return Ok(());
+                return Ok(0);
             }
-            let more = self.decode_frame()?;
-            if !more {
+            if !self.decode_frame()? {
                 self.num_saved_bits = 0;
             }
-            return Ok(());
+            return Ok(0);
         }
 
-        let buf = &data[..data.len().min(block_align(self))];
-        self.next_packet_start = data.len() - buf.len();
-        self.buf_bit_size = buf.len() << 3;
+        let mut gb;
+        if self.packet_done || self.packet_loss {
+            self.packet_done = false;
 
-        let mut pgb = OwnedBitReader::from_bits(buf.to_vec(), self.buf_bit_size);
-        let packet_sequence_number = pgb.get_bits(4)? as u8;
-        pgb.skip_bits(1)?;
-        let spliced_packet = pgb.get_bits1()? != 0;
-        if spliced_packet {
-            return Err(Error::unsupported("wmall: bitstream splicing"));
-        }
-        let num_bits_prev_frame = pgb.get_bits(self.log2_frame_size as usize)? as usize;
+            self.next_packet_start = buf_size - block_align(self).min(buf_size);
+            buf_size = block_align(self).min(buf_size);
+            self.buf_bit_size = buf_size << 3;
 
-        if !self.packet_loss
-            && ((self.packet_sequence_number as u32 + 1) & 0xF) != packet_sequence_number as u32
-        {
-            self.packet_loss = true;
-        }
-        self.packet_sequence_number = packet_sequence_number;
+            gb = BitReader::with_bit_len(&cur_data[..buf_size], self.buf_bit_size);
+            let packet_sequence_number = gb.get_bits(4)? as u8;
+            gb.skip_bits(1)?; // seekable_frame_in_packet
+            let spliced_packet = gb.get_bits1()? != 0;
+            if spliced_packet {
+                return Err(Error::unsupported("wmall: bitstream splicing"));
+            }
 
-        if num_bits_prev_frame > 0 {
-            let remaining_packet_bits = self.buf_bit_size - pgb.bit_pos();
-            let mut nb = num_bits_prev_frame;
-            if nb >= remaining_packet_bits {
-                nb = remaining_packet_bits;
+            let num_bits_prev_frame = gb.get_bits(self.log2_frame_size as usize)? as usize;
+
+            if !self.packet_loss
+                && ((self.packet_sequence_number as u32 + 1) & 0xF) != packet_sequence_number as u32
+            {
+                self.packet_loss = true;
+            }
+            self.packet_sequence_number = packet_sequence_number;
+
+            if num_bits_prev_frame > 0 {
+                let remaining_packet_bits = self.buf_bit_size - gb.bits_count();
+                let mut nb = num_bits_prev_frame;
+                if nb >= remaining_packet_bits {
+                    nb = remaining_packet_bits;
+                    self.packet_done = true;
+                }
+                self.save_bits(&mut gb, nb, true);
+                if nb < remaining_packet_bits && !self.packet_loss {
+                    self.decode_frame()?;
+                }
+            } else if self.num_saved_bits > self.frame_offset {
+                // ignoring previously saved bits
+            }
+
+            if self.packet_loss {
+                self.num_saved_bits = 0;
+                self.packet_loss = false;
+                self.frame_data.clear();
+            }
+        } else {
+            if cur_data.len() < self.next_packet_start {
+                self.packet_loss = true;
+                return Err(Error::invalid("wmall: packet too small"));
+            }
+            self.buf_bit_size = (cur_data.len() - self.next_packet_start) << 3;
+            gb = BitReader::with_bit_len(&cur_data[self.next_packet_start..], self.buf_bit_size);
+            gb.skip_bits(self.packet_offset)?;
+
+            let remaining = self.buf_bit_size.saturating_sub(gb.bits_count());
+            if self.len_prefix && remaining > self.log2_frame_size as usize {
+                let frame_size = gb.show_bits(self.log2_frame_size as usize)? as usize;
+                if frame_size > 0 && frame_size <= remaining {
+                    self.save_bits(&mut gb, frame_size, false);
+                    if !self.packet_loss {
+                        let more = self.decode_frame()?;
+                        self.packet_done = !more;
+                    }
+                } else {
+                    self.packet_done = true;
+                }
+            } else if !self.len_prefix && self.num_saved_bits > self.gb.bit_pos() {
+                let more = self.decode_frame()?;
+                self.packet_done = !more;
+            } else {
                 self.packet_done = true;
             }
-            {
-                let mut r = pgb.as_reader_at();
-                self.save_bits(&mut r, nb, false);
-            }
-            if !self.packet_loss {
-                self.decode_frame()?;
-            }
         }
 
+        let remaining = self.buf_bit_size as i64 - gb.bits_count() as i64;
+        if remaining < 0 {
+            self.packet_loss = true;
+        }
+
+        if self.packet_done && !self.packet_loss && remaining > 0 {
+            self.save_bits(&mut gb, remaining as usize, false);
+        }
+
+        self.packet_offset = gb.bits_count() & 7;
         if self.packet_loss {
-            // resync: drop the reservoir, restart from this packet's body
-            self.num_saved_bits = 0;
-            self.packet_loss = false;
-            self.gb = OwnedBitReader::new();
+            return Err(Error::invalid("wmall: packet loss"));
         }
+        let consumed = (gb.bits_count() >> 3) + self.next_packet_start;
+        self.next_packet_start = 0;
+        Ok(consumed)
+    }
 
-        // trailing: append the packet tail to the reservoir
-        if pgb.bits_left() > 0 {
-            let rest = pgb.bits_left();
-            let mut r = pgb.as_reader_at();
-            self.save_bits(&mut r, rest, false);
+    fn decode_packet_impl(&mut self, data: &[u8]) -> Result<()> {
+        let mut cur = data;
+        while !cur.is_empty() {
+            let consumed = self.decode_packet_chunk(cur)?;
+            if consumed == 0 || consumed >= cur.len() {
+                break;
+            }
+            cur = &cur[consumed..];
         }
-        self.packet_offset = pgb.bit_pos() & 7;
         Ok(())
     }
 
@@ -1207,10 +1248,10 @@ impl Decoder for WmaLosslessDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.pending.take() {
-            Some(f) => Ok(Frame::Audio(f)),
-            None => Err(Error::NeedMore),
+        if !self.pending.is_empty() {
+            return Ok(Frame::Audio(self.pending.remove(0)));
         }
+        Err(Error::NeedMore)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -1220,7 +1261,7 @@ impl Decoder for WmaLosslessDecoder {
         self.frame_offset = 0;
         self.next_packet_start = 0;
         self.cdlms[0][0].order = 0;
-        self.pending = None;
+        self.pending.clear();
         Ok(())
     }
 
