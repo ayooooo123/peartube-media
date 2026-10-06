@@ -14,6 +14,9 @@ pub fn context() -> RuntimeContext {
 
 /// Installs every container and decoder into `ctx`.
 pub fn register_all(ctx: &mut RuntimeContext) {
+    // The player uses first_decoder, not the priority-walking pipeline.
+    // Install container-aware subtitle factories before standalone ones.
+    subs_text::register(ctx);
     for register in [
         // Containers
         oxideav_avi::__oxideav_entry,
@@ -78,7 +81,7 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     oxideav_midi::register_codecs(&mut ctx.codecs);
 
     // This workspace's crates, after OxideAV so their priorities win.
-    for register in [demux_asf::register, codec_mlp::register, demux_misc::register, demux_rm::register, codec_dca::register, subs_text::register, codec_ra::register, codec_rv::register, codec_wmv::register, codec_wma::register] {
+    for register in [demux_asf::register, codec_mlp::register, demux_misc::register, demux_rm::register, codec_dca::register, codec_ra::register, codec_rv::register, codec_wmv::register, codec_wma::register] {
         register(ctx);
     }
 }
