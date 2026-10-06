@@ -2,6 +2,7 @@
 //!
 //! Ported to safe Rust from FFmpeg's:
 //! - `libavformat/subviewer1dec.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
+//! - `libavformat/subtitles.c` (same commit/license; queue ordering and duplicates)
 //! - `libavcodec/textdec.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
 //!
 //! SubViewer 1 structure:
@@ -84,6 +85,7 @@ pub fn open_demuxer(
 
 struct RawSub {
     pts: i64,
+    order: usize,
     duration: i64,
     data: String,
 }
@@ -99,8 +101,8 @@ fn demux_subviewer1_text(text: &str) -> Result<VecDeque<Packet>> {
         if line.starts_with("[DELAY]") {
             i += 1;
             if i < lines.len() {
-                if let Ok(d) = lines[i].trim().parse::<i64>() {
-                    delay = d;
+                if let Ok(d) = lines[i].trim().parse::<i32>() {
+                    delay = i64::from(d);
                 }
             }
             i += 1;
@@ -125,6 +127,7 @@ fn demux_subviewer1_text(text: &str) -> Result<VecDeque<Packet>> {
                     }
                     raw_subs.push(RawSub {
                         pts: pts_start,
+                        order: i,
                         duration: -1,
                         data: sub_line.to_string(),
                     });
@@ -134,6 +137,8 @@ fn demux_subviewer1_text(text: &str) -> Result<VecDeque<Packet>> {
         i += 1;
     }
 
+    raw_subs.sort_unstable_by_key(|s| (s.pts, s.order));
+
     // Finalize durations
     let len = raw_subs.len();
     for idx in 0..len {
@@ -141,6 +146,7 @@ fn demux_subviewer1_text(text: &str) -> Result<VecDeque<Packet>> {
             raw_subs[idx].duration = raw_subs[idx + 1].pts - raw_subs[idx].pts;
         }
     }
+    raw_subs.dedup_by(|a, b| a.pts == b.pts && a.duration == b.duration && a.data == b.data);
 
     let time_base = TimeBase::new(1, 1);
     let mut packets = VecDeque::with_capacity(raw_subs.len());
@@ -161,13 +167,13 @@ fn parse_timestamp_tag(s: &str) -> Option<(i64, i64, i64)> {
         return None;
     }
     let inner = &s[1..s.len() - 1];
-    let parts: Vec<&str> = inner.split(':').collect();
-    if parts.len() != 3 {
+    let mut parts = inner.split(':');
+    let hh = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    let mm = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    let ss = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    if parts.next().is_some() {
         return None;
     }
-    let hh = parts[0].trim().parse::<i64>().ok()?;
-    let mm = parts[1].trim().parse::<i64>().ok()?;
-    let ss = parts[2].trim().parse::<i64>().ok()?;
     Some((hh, mm, ss))
 }
 

@@ -2,6 +2,7 @@
 //!
 //! Ported to safe Rust from FFmpeg's:
 //! - `libavformat/samidec.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
+//! - `libavformat/subtitles.c` (same commit/license; queue ordering and duplicates)
 //! - `libavcodec/samidec.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
 //! - `libavcodec/htmlsubtitles.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
 //! - `libavcodec/srtenc.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
@@ -143,7 +144,7 @@ fn demux_sami_text(text: &str) -> Result<VecDeque<Packet>> {
     }
 
     // Sort by pts ascending, then pos ascending (FFmpeg SUB_SORT_TS_POS)
-    raw_packets.sort_by(|a, b| a.pts.cmp(&b.pts).then(a.pos.cmp(&b.pos)));
+    raw_packets.sort_unstable_by_key(|p| (p.pts, p.pos));
 
     // Calculate durations from subsequent packet PTS
     let len = raw_packets.len();
@@ -154,6 +155,7 @@ fn demux_sami_text(text: &str) -> Result<VecDeque<Packet>> {
             raw_packets[i].duration = -1;
         }
     }
+    raw_packets.dedup_by(|a, b| a.pts == b.pts && a.duration == b.duration && a.data == b.data);
 
     let time_base = TimeBase::new(1, 1_000);
     let mut packets = VecDeque::with_capacity(raw_packets.len());

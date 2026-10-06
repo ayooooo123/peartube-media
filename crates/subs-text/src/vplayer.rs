@@ -2,6 +2,7 @@
 //!
 //! Ported to safe Rust from FFmpeg's:
 //! - `libavformat/vplayerdec.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
+//! - `libavformat/subtitles.c` (same commit/license; queue ordering and duplicates)
 //! - `libavcodec/textdec.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
 //!
 //! VPlayer structure:
@@ -88,6 +89,7 @@ pub fn open_demuxer(
 
 struct RawVpSub {
     pts: i64,
+    order: usize,
     duration: i64,
     data: String,
 }
@@ -95,7 +97,7 @@ struct RawVpSub {
 fn demux_vplayer_text(text: &str) -> Result<VecDeque<Packet>> {
     let mut raw_subs: Vec<RawVpSub> = Vec::new();
 
-    for line in text.lines() {
+    for (order, line) in text.lines().enumerate() {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.trim().is_empty() {
             continue;
@@ -106,11 +108,14 @@ fn demux_vplayer_text(text: &str) -> Result<VecDeque<Packet>> {
             }
             raw_subs.push(RawVpSub {
                 pts: pts_start,
+                order,
                 duration: -1,
                 data: body.to_string(),
             });
         }
     }
+
+    raw_subs.sort_unstable_by_key(|s| (s.pts, s.order));
 
     // Finalize durations
     let len = raw_subs.len();
@@ -119,6 +124,7 @@ fn demux_vplayer_text(text: &str) -> Result<VecDeque<Packet>> {
             raw_subs[idx].duration = raw_subs[idx + 1].pts - raw_subs[idx].pts;
         }
     }
+    raw_subs.dedup_by(|a, b| a.pts == b.pts && a.duration == b.duration && a.data == b.data);
 
     let time_base = TimeBase::new(1, 100); // 10ms centiseconds
     let mut packets = VecDeque::with_capacity(raw_subs.len());
@@ -168,16 +174,16 @@ fn parse_vplayer_line(line: &str) -> Option<(i64, &str)> {
         None => (ts_str, None),
     };
 
-    let parts: Vec<&str> = hms.split(':').collect();
-    if parts.len() != 3 {
+    let mut parts = hms.split(':');
+    let hh = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    let mm = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    let ss = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    if parts.next().is_some() {
         return None;
     }
-    let hh = parts[0].trim().parse::<i64>().ok()?;
-    let mm = parts[1].trim().parse::<i64>().ok()?;
-    let ss = parts[2].trim().parse::<i64>().ok()?;
 
     let cs = if let Some(cs_part) = cs_str {
-        cs_part.trim().parse::<i64>().ok()?
+        i64::from(cs_part.trim().parse::<i32>().ok()?)
     } else {
         0
     };
