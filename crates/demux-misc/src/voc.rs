@@ -73,6 +73,8 @@ pub fn probe_voc(probe: &ProbeData) -> ProbeScore {
 struct VocDemuxer {
     input: Box<dyn ReadSeek>,
     stream: Option<StreamInfo>,
+    /// The first block, read at open to create the stream.
+    first: Option<Packet>,
     remaining_size: i64,
     pts: i64,
     /// None until the codec is known (FFmpeg's AV_CODEC_ID_NONE).
@@ -322,6 +324,9 @@ impl Demuxer for VocDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
+        if let Some(pkt) = self.first.take() {
+            return Ok(pkt);
+        }
         match self.next_block()? {
             Some(pkt) => Ok(pkt),
             None => Err(Error::Eof),
@@ -353,16 +358,26 @@ pub fn open_voc(
         input.seek(SeekFrom::Current(i64::from(header_size) - 26))?;
     }
 
-    Ok(Box::new(VocDemuxer {
+    // FFmpeg creates the stream in the first read_packet (vocdec.c,
+    // AVFMTCTX_NOHEADER) and avformat_find_stream_info reads that packet
+    // before anyone sees the stream; read the first block here so the
+    // stream and its parameters exist from open on.
+    let mut demuxer = VocDemuxer {
         input,
         stream: None,
+        first: None,
         remaining_size: 0,
         pts: 0,
         codec: None,
         sample_rate: 0,
         channels: 1,
         sample_format: None,
-    }))
+    };
+    demuxer.first = demuxer.next_block()?;
+    if demuxer.first.is_none() {
+        return Err(Error::invalid("voc: no audio data"));
+    }
+    Ok(Box::new(demuxer))
 }
 
 pub fn register(reg: &mut ContainerRegistry) {

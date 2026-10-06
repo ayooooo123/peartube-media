@@ -121,6 +121,14 @@ fn check(case: &Case) {
         .open_demuxer(case.format, Box::new(file), &ctx.codecs)
         .unwrap_or_else(|e| panic!("{}: open {}: {e}", case.sample, case.format));
 
+    // The player reads the stream list right after open (the Demuxer
+    // contract: streams are known at open and never change).
+    let at_open: Vec<(String, String)> = demuxer
+        .streams()
+        .iter()
+        .map(|st| (format!("{:?}", st.params.media_type).to_lowercase(), st.params.codec_id.as_str().to_string()))
+        .collect();
+
     let mut seq: Vec<(u32, i64)> = Vec::new();
     let mut sizes: Vec<usize> = Vec::new();
     loop {
@@ -134,14 +142,10 @@ fn check(case: &Case) {
         }
     }
 
-    // Streams (created on the fly for NOHEADER formats — hence after demux).
+    let expected: Vec<(String, String)> = case.streams.iter().map(|&(ty, id)| (ty.to_string(), id.to_string())).collect();
+    assert_eq!(at_open, expected, "{}: streams at open", case.sample);
     let streams = demuxer.streams();
-    assert_eq!(
-        streams.len(),
-        case.streams.len(),
-        "{}: stream count",
-        case.sample
-    );
+    assert_eq!(streams.len(), case.streams.len(), "{}: stream count after demuxing", case.sample);
     for (st, &(ty, id)) in streams.iter().zip(case.streams) {
         let got_ty = format!("{:?}", st.params.media_type).to_lowercase();
         assert_eq!(got_ty, ty, "{}: stream {} media type", case.sample, st.index);
