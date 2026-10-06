@@ -44,10 +44,22 @@ OxideAV crates are used at pinned git revisions; their crates.io releases lag th
 
 ### Matroska packet compatibility
 
-The MKV fork follows nested SeekHeads, recovers complete packets from damaged
-Cluster tails, reconstructs ProRes/WavPack payloads, and derives lace timing,
-TrackTimestampScale and H.264/HEVC decode timestamps. H.264 startup analysis is
-bounded to 512 KiB of queued payload plus the current Block.
+The MKV fork follows at most two SeekHeads (one target per other master),
+recovers complete packets from damaged Cluster tails, reconstructs ProRes/WavPack
+payloads, and derives lace timing, TrackTimestampScale and H.264/HEVC decode
+timestamps. Untrusted input is bounded: 256 tracks, 4 MiB per CodecPrivate and
+16 MiB in total, 32 MiB retained per Block (laces, header stripping, copies and
+side data), and H.264 startup analysis holds at most 1024 packets / 512 KiB
+plus the current Block. Transport errors are returned rather than treated as
+end of stream.
+
+Two playback gaps remain at this boundary. Packets keep FFmpeg's parser keyframe
+flags, so a non-IDR I-frame that the container marks as a random-access point
+(no recovery-point SEI, several reference frames) is not a key packet. The
+engine's post-seek keyframe gate needs the Block's own keyframe signal through
+the shared packet-metadata integration. Separately, later laces of AAC, MP3,
+AC-3 and DTS Blocks without DefaultDuration still lack the PTS that FFmpeg
+derives from codec frame durations.
 
 Matroska/WebM WebVTT packets carry raw cue text to the registered subtitle
 adapter, which uses the packet timestamps rather than requiring an in-band
