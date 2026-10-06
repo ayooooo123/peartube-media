@@ -79,45 +79,37 @@ impl CanonicalVlc {
 
     /// Decode one symbol (exact prefix match over all entries).
     pub fn decode(&self, br: &mut BitReader) -> Result<u16> {
-        let avail = br.bits_left().clamp(0, self.max_bits as i64) as u32;
+        let avail = br.bits_left().max(0) as u32;
         let peeked = br.peek(self.max_bits.min(32));
-        let peek_full = if avail < self.max_bits {
-            peeked << (self.max_bits - avail)
-        } else {
-            peeked
-        };
         for &(l, c, s) in &self.entries {
             if (l as u32) <= avail {
                 let shift = self.max_bits - l as u32;
-                if (peek_full >> shift) == c {
+                if (peeked >> shift) == c {
                     br.skip(l as u32);
                     return Ok(s);
                 }
             }
         }
         Err(Error::InvalidData(format!(
-            "codec-wmv: no VLC codeword matches (next bits 0x{peeked:x}, avail {avail})"
+            "codec-wmv: no VLC codeword matches (entries {}, max_bits {}, next bits 0x{peeked:x}, avail {avail})",
+            self.entries.len(), self.max_bits
         )))
     }
 }
 
 /// RL table + precomputed RL-VLC (FFmpeg `RLTable` + `ff_init_vlc_rl`).
-struct RlTable {
-    n: usize,
-    last: usize,
-    vlc: CanonicalVlc,
-    run: Vec<i32>,
-    level: Vec<i32>,
-    /// max_level[last][run] (escape level extension).
-    max_level: Vec<[i8; 64]>,
-    /// max_run[last][level] (escape run extension).
-    max_run: Vec<[i8; 128]>,
-    /// rl_vlc[q] for q in 0..=31.
-    rl_vlc: Vec<Vec<(i32, i32)>>, // (run, level) indexed by VLC symbol
+pub(crate) struct RlTable {
+    pub(crate) n: usize,
+    pub(crate) last: usize,
+    pub(crate) vlc: CanonicalVlc,
+    pub(crate) run: Vec<i32>,
+    pub(crate) level: Vec<i32>,
+    pub(crate) max_level: Vec<[i8; 64]>,
+    pub(crate) max_run: Vec<[i8; 128]>,
+    pub(crate) rl_vlc: Vec<Vec<(i32, i32)>>,
 }
-
 impl RlTable {
-    fn new(vlc_pairs: &[(u32, u8)], run: &[i8], level: &[i8], n: usize, last: usize) -> Self {
+    pub(crate) fn new(vlc_pairs: &[(u32, u8)], run: &[i8], level: &[i8], n: usize, last: usize) -> Self {
         let vlc = CanonicalVlc::from_pairs(vlc_pairs);
         let mut max_level = vec![[0i8; 64]; 2];
         let mut max_run = vec![[0i8; 128]; 2];
@@ -179,7 +171,7 @@ impl RlTable {
     /// `GET_RL_VLC`: returns (level, run); run >= 192 marks last=1 (encoded
     /// as run+192 by `ff_init_vlc_rl`), 66 with level 0 = escape.
     #[inline]
-    fn get(&self, q: usize, br: &mut BitReader) -> Result<(i32, i32)> {
+    pub(crate) fn get(&self, q: usize, br: &mut BitReader) -> Result<(i32, i32)> {
         let sym = self.vlc.decode(br)? as usize;
         let (run, level) = self.rl_vlc[q.min(31)][sym.min(self.n)];
         Ok((level, run))
@@ -189,20 +181,20 @@ impl RlTable {
 // ───────────────────────── DC scale tables ─────────────────────────
 
 #[inline]
-fn y_dc_scale(version: MsVersion, q: usize) -> i32 {
+pub(crate) fn y_dc_scale(version: MsVersion, q: usize) -> i32 {
     match version {
         MsVersion::V1 | MsVersion::V2 => 8,
         MsVersion::V3 => MPEG4_Y_DC_SCALE[q.min(31)] as i32,
-        MsVersion::Wmv1 => WMV1_Y_DC_SCALE_TABLE[q.min(31)] as i32,
+        MsVersion::Wmv1 | MsVersion::Wmv2 => WMV1_Y_DC_SCALE_TABLE[q.min(31)] as i32,
     }
 }
 
 #[inline]
-fn c_dc_scale(version: MsVersion, q: usize) -> i32 {
+pub(crate) fn c_dc_scale(version: MsVersion, q: usize) -> i32 {
     match version {
         MsVersion::V1 | MsVersion::V2 => 8,
         MsVersion::V3 => MPEG4_C_DC_SCALE[q.min(31)] as i32,
-        MsVersion::Wmv1 => WMV1_C_DC_SCALE_TABLE[q.min(31)] as i32,
+        MsVersion::Wmv1 | MsVersion::Wmv2 => WMV1_C_DC_SCALE_TABLE[q.min(31)] as i32,
     }
 }
 
@@ -214,19 +206,24 @@ pub enum MsVersion {
     V2,
     V3,
     Wmv1,
+    Wmv2,
 }
 
 /// One 4:2:0 picture.
-struct Picture {
-    width: usize,
-    height: usize,
-    y: Vec<u8>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
+pub(crate) struct Picture {
+    pub width: usize,
+    pub height: usize,
+    pub mb_width: usize,
+    pub mb_height: usize,
+    pub y_stride: usize,
+    pub c_stride: usize,
+    pub y: Vec<u8>,
+    pub cb: Vec<u8>,
+    pub cr: Vec<u8>,
 }
 
 impl Picture {
-    fn alloc(width: usize, height: usize) -> Result<Self> {
+    pub(crate) fn alloc(width: usize, height: usize) -> Result<Self> {
         if width == 0
             || height == 0
             || width > crate::MAX_DIM as usize
@@ -237,12 +234,20 @@ impl Picture {
                 "codec-wmv msmpeg4: refusing frame {width}x{height}"
             )));
         }
+        let mb_width = width.div_ceil(16);
+        let mb_height = height.div_ceil(16);
+        let y_stride = mb_width * 16;
+        let c_stride = mb_width * 8;
         Ok(Self {
             width,
             height,
-            y: vec![128; width * height],
-            cb: vec![128; (width / 2) * (height / 2)],
-            cr: vec![128; (width / 2) * (height / 2)],
+            mb_width,
+            mb_height,
+            y_stride,
+            c_stride,
+            y: vec![128; y_stride * (mb_height * 16)],
+            cb: vec![128; c_stride * (mb_height * 8)],
+            cr: vec![128; c_stride * (mb_height * 8)],
         })
     }
 }
@@ -253,29 +258,35 @@ impl Picture {
 ///   a 1-block border (`block_index` = 1 + 2*mb_x + 2*mb_y*b8_stride).
 /// - AC values: per block position, 16 entries (left column + top row).
 /// - coded_block: one u8 per 8×8 block position (b8 grid, luma only).
-struct PredContext {
-    b8_stride: usize,
-    /// Per-plane DC grids: 0 = luma, 1 = cb, 2 = cr. Luma is b8-sized;
-    /// chroma grids are mb-sized with the same border convention
-    /// (block_index offset by plane).
-    dc_val: [Vec<i16>; 3],
-    /// AC prediction store per block position (16 values: [0..8) = left col,
-    /// [8..16) = top row).
-    ac_val: [Vec<[i16; 16]>; 3],
-    coded_block: Vec<u8>,
-    mb_width: usize,
-    mb_height: usize,
+#[inline]
+pub fn rounded_div(a: i32, b: i32) -> i32 {
+    if a > 0 {
+        (a + (b >> 1)) / b
+    } else {
+        (a - (b >> 1)) / b
+    }
+}
+
+pub struct PredContext {
+    pub b8_stride: usize,
+    pub mb_stride: usize,
+    pub dc_val: [Vec<i16>; 3],
+    pub ac_val: [Vec<[i16; 16]>; 3],
+    pub coded_block: Vec<u8>,
+    pub mb_width: usize,
+    pub mb_height: usize,
 }
 
 impl PredContext {
-    fn new(mb_width: usize, mb_height: usize) -> Self {
-        let b8_stride = 2 * mb_width + 1;
-        let b8_size = b8_stride * (2 * mb_height + 1);
-        let mb_stride = mb_width + 1;
-        let mb_size = mb_stride * (mb_height + 1);
+    pub fn new(mb_width: usize, mb_height: usize) -> Self {
+        let b8_stride = 2 * mb_width + 2;
+        let b8_size = b8_stride * (2 * mb_height + 2);
+        let mb_stride = mb_width + 2;
+        let mb_size = mb_stride * (mb_height + 2);
         Self {
             b8_stride,
-            dc_val: [vec![0; b8_size], vec![0; mb_size], vec![0; mb_size]],
+            mb_stride,
+            dc_val: [vec![1024; b8_size], vec![1024; mb_size], vec![1024; mb_size]],
             ac_val: [
                 vec![[0i16; 16]; b8_size],
                 vec![[0i16; 16]; mb_size],
@@ -287,91 +298,78 @@ impl PredContext {
         }
     }
 
-    /// FFmpeg's `block_index[n]` for macroblock (mb_x, mb_y):
-    /// luma n in 0..4 → b8 grid; chroma n = 4/5 → cb/cr mb grid.
+    pub fn reset(&mut self) {
+        for plane in &mut self.dc_val {
+            plane.fill(1024);
+        }
+        for plane in &mut self.ac_val {
+            plane.fill([0i16; 16]);
+        }
+        self.coded_block.fill(0);
+    }
+
     #[inline]
-    fn block_index(&self, n: usize, mb_x: usize, mb_y: usize) -> (usize, usize) {
+    pub fn block_index(&self, n: usize, mb_x: usize, mb_y: usize) -> (usize, usize) {
         if n < 4 {
             let bx = 2 * mb_x + (n & 1);
             let by = 2 * mb_y + (n >> 1);
-            (0, 1 + bx + by * self.b8_stride)
+            (0, (by + 1) * self.b8_stride + 1 + bx)
         } else {
             let plane = n - 3; // 1 => cb, 2 => cr
-            let mb_stride = self.mb_width + 1;
-            (plane, 1 + mb_x + mb_y * mb_stride)
+            (plane, (mb_y + 1) * self.mb_stride + 1 + mb_x)
         }
     }
 
     #[inline]
-    fn dc(&self, n: usize, mb_x: usize, mb_y: usize) -> i16 {
+    pub fn dc(&self, n: usize, mb_x: usize, mb_y: usize) -> i16 {
         let (p, i) = self.block_index(n, mb_x, mb_y);
         self.dc_val[p][i]
     }
 
     #[inline]
-    fn set_dc(&mut self, n: usize, mb_x: usize, mb_y: usize, v: i16) {
+    pub fn set_dc(&mut self, n: usize, mb_x: usize, mb_y: usize, v: i16) {
         let (p, i) = self.block_index(n, mb_x, mb_y);
         self.dc_val[p][i] = v;
     }
 
-    /// `ff_msmpeg4_pred_dc` (msmpeg4.c): returns (pred, dir) where dir is
-    /// 0 = left, 1 = top; also writes the updated DC into `dc_store`.
-    fn msmpeg4_pred_dc(
-        &mut self,
+    pub fn msmpeg4_pred_dc(
+        &self,
         n: usize,
         mb_x: usize,
         mb_y: usize,
         first_slice_line: bool,
         scale: i32,
-        level: i32,
         is_wmv1: bool,
     ) -> (i32, i32) {
         let (p, i) = self.block_index(n, mb_x, mb_y);
-        let stride = if n < 4 { self.b8_stride } else { self.mb_width + 1 };
+        let stride = if n < 4 { self.b8_stride } else { self.mb_stride };
         let mut a = self.dc_val[p][i - 1] as i32;
         let mut b = self.dc_val[p][i - 1 - stride] as i32;
         let mut c = self.dc_val[p][i - stride] as i32;
 
-        // first_slice_line && !(n & 2) && version < WMV1 → b = c = 1024.
         if first_slice_line && (n & 2) == 0 && !is_wmv1 {
             b = 1024;
             c = 1024;
         }
 
-        // Divisions with rounding (the asm fast path is `(a + scale/2)/scale`).
         a = (a + (scale >> 1)) / scale;
         b = (b + (scale >> 1)) / scale;
         c = (c + (scale >> 1)) / scale;
 
-        // WARNING: different test than MPEG-4.
         if is_wmv1 {
-            // inter_intra_pred is always 0 for WMV1 decode (msmpeg4dec.c sets
-            // h->c.inter_intra_pred = 0 on I-frames and 0 on P-frames), so
-            // fall through to the generic branch.
             if (a - b).abs() < (b - c).abs() {
-                let pred = c;
-                self.dc_val[p][i] = (level * scale) as i16;
-                return (pred, 1);
+                (c, 1)
             } else {
-                let pred = a;
-                self.dc_val[p][i] = (level * scale) as i16;
-                return (pred, 0);
+                (a, 0)
             }
         } else if (a - b).abs() <= (b - c).abs() {
-            let pred = c;
-            self.dc_val[p][i] = (level * scale) as i16;
-            (pred, 1)
+            (c, 1)
         } else {
-            let pred = a;
-            self.dc_val[p][i] = (level * scale) as i16;
-            (pred, 0)
+            (a, 0)
         }
     }
 
-    /// `ff_mpeg4_pred_ac` for the msmpeg4 family: add the left column / top
-    /// row of the neighbour's AC store when ac_pred is set, then store this
-    /// block's first row/column.
-    fn pred_ac(
+    pub fn pred_ac(
         &mut self,
         n: usize,
         mb_x: usize,
@@ -380,47 +378,46 @@ impl PredContext {
         dir: i32,
         ac_pred: bool,
         qscale: usize,
-        qscale_table: &mut Vec<i32>,
-        qscale_pos: usize,
+        qscale_table: &[i32],
     ) {
         let (p, i) = self.block_index(n, mb_x, mb_y);
-        let stride = if n < 4 { self.b8_stride } else { self.mb_width + 1 };
+        let stride = if n < 4 { self.b8_stride } else { self.mb_stride };
         let use_left = dir == 0;
-        // qscale of the prediction-source MB.
-        let src_pos = if use_left {
-            qscale_pos.saturating_sub(1)
-        } else {
-            qscale_pos.saturating_sub(self.mb_width + 1)
-        };
-        let mut rescale = false;
-        let src_q: i32;
+
         if ac_pred {
-            src_q = qscale_table[src_pos];
-            rescale = src_q != qscale as i32 && !(n == 1 || n == 3) && !(n == 2 && !use_left);
-            // FFmpeg condition: mb_x == 0 || same q || n==1 || n==3 (left);
-            // mb_y == 0 || same q || n==2 || n==3 (top).
+            let rescale;
+            let src_q;
             if use_left {
-                rescale = !(mb_x == 0 || src_q == qscale as i32 || n == 1 || n == 3)
-                    && src_q != 0;
-            } else {
-                rescale = !(mb_y == 0 || src_q == qscale as i32 || n == 2 || n == 3)
-                    && src_q != 0;
-            }
-            if use_left {
+                if n == 1 || n == 3 || mb_x == 0 {
+                    rescale = false;
+                    src_q = qscale as i32;
+                } else {
+                    src_q = qscale_table[mb_y * self.mb_width + mb_x - 1];
+                    rescale = src_q != qscale as i32 && src_q != 0;
+                }
+                let neighbor = i - 1;
                 for k in 1..8 {
-                    let av = self.ac_val[p][i][k] as i32;
+                    let av = self.ac_val[p][neighbor][k] as i32;
                     let av = if rescale {
-                        (av * src_q + qscale as i32 / 2) / qscale as i32
+                        rounded_div(av * src_q, qscale as i32)
                     } else {
                         av
                     };
                     block[k << 3] += av as i16;
                 }
             } else {
+                if n == 2 || n == 3 || mb_y == 0 {
+                    rescale = false;
+                    src_q = qscale as i32;
+                } else {
+                    src_q = qscale_table[(mb_y - 1) * self.mb_width + mb_x];
+                    rescale = src_q != qscale as i32 && src_q != 0;
+                }
+                let neighbor = i - stride;
                 for k in 1..8 {
-                    let av = self.ac_val[p][i][8 + k] as i32;
+                    let av = self.ac_val[p][neighbor][8 + k] as i32;
                     let av = if rescale {
-                        (av * src_q + qscale as i32 / 2) / qscale as i32
+                        rounded_div(av * src_q, qscale as i32)
                     } else {
                         av
                     };
@@ -437,9 +434,8 @@ impl PredContext {
         }
     }
 
-    /// `ff_msmpeg4_coded_block_pred`: predict + store one luma coded bit.
-    fn coded_block_pred(&mut self, n: usize, mb_x: usize, mb_y: usize, diff: u8) -> u8 {
-        let (p, i) = self.block_index(n, mb_x, mb_y);
+    pub fn coded_block_pred(&mut self, n: usize, mb_x: usize, mb_y: usize, diff: u8) -> u8 {
+        let (_p, i) = self.block_index(n, mb_x, mb_y);
         let stride = self.b8_stride;
         let a = self.coded_block[i - 1];
         let b = self.coded_block[i - 1 - stride];
@@ -457,21 +453,21 @@ impl PredContext {
 static MV_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
 static MSMP4_MV_VLC: [std::sync::OnceLock<CanonicalVlc>; 2] =
     [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
-static MB_NON_INTRA_VLC: [std::sync::OnceLock<CanonicalVlc>; 4] = [
+pub(crate) static MB_NON_INTRA_VLC: [std::sync::OnceLock<CanonicalVlc>; 4] = [
     std::sync::OnceLock::new(),
     std::sync::OnceLock::new(),
     std::sync::OnceLock::new(),
     std::sync::OnceLock::new(),
 ];
-static MB_I_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
-static DC_VLC: [[std::sync::OnceLock<CanonicalVlc>; 2]; 2] =
+pub(crate) static MB_I_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
+pub(crate) static DC_VLC: [[std::sync::OnceLock<CanonicalVlc>; 2]; 2] =
     [[std::sync::OnceLock::new(), std::sync::OnceLock::new()], [std::sync::OnceLock::new(), std::sync::OnceLock::new()]];
 static V2_DC_LUM_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
 static V2_DC_CHROMA_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
 static V2_INTRA_CBPC_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
 static V2_MB_TYPE_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
-static INTER_INTRA_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
-static RL_TABLES: std::sync::OnceLock<[RlTable; 6]> = std::sync::OnceLock::new();
+pub(crate) static INTER_INTRA_VLC: std::sync::OnceLock<CanonicalVlc> = std::sync::OnceLock::new();
+pub(crate) static RL_TABLES: std::sync::OnceLock<[RlTable; 6]> = std::sync::OnceLock::new();
 
 fn v2_dc_lum_table() -> Vec<(u32, u8)> {
     // msmpeg4.c init_h263_dc_for_msmpeg4: generated table for v2.
@@ -526,7 +522,7 @@ fn v2_dc_chroma_table() -> Vec<(u32, u8)> {
     t
 }
 
-fn init_tables() {
+pub(crate) fn init_tables() {
     let _ = MV_VLC.set(CanonicalVlc::from_pairs(&MV_TAB));
     for i in 0..2 {
         let pairs: Vec<(u32, u8)> = MSMP4_MV0_LENS
@@ -620,21 +616,20 @@ pub struct MsMpeg4Decoder {
     dc_pred_dir: i32,
 }
 
-fn make_frame(pic: Picture, pts: Option<i64>) -> Frame {
-    let cw = pic.width / 2;
+pub(crate) fn make_frame(pic: Picture, pts: Option<i64>) -> Frame {
     Frame::Video(VideoFrame {
         pts,
         planes: vec![
             VideoPlane {
-                stride: pic.width,
+                stride: pic.y_stride,
                 data: pic.y,
             },
             VideoPlane {
-                stride: cw,
+                stride: pic.c_stride,
                 data: pic.cb,
             },
             VideoPlane {
-                stride: cw,
+                stride: pic.c_stride,
                 data: pic.cr,
             },
         ],
@@ -772,7 +767,7 @@ impl MsMpeg4Decoder {
                     self.rl_table_index = br.decode012()? as usize;
                     self.dc_table_index = br.read_bit() as usize;
                 }
-                MsVersion::Wmv1 => {
+                MsVersion::Wmv1 | MsVersion::Wmv2 => {
                     self.decode_ext_header(br);
                     if self.bit_rate > MBAC_BITRATE {
                         self.per_mb_rl_table = br.read_bit() != 0;
@@ -808,7 +803,7 @@ impl MsMpeg4Decoder {
                     self.dc_table_index = br.read_bit() as usize;
                     self.mv_table_index = br.read_bit() as usize;
                 }
-                MsVersion::Wmv1 => {
+                MsVersion::Wmv1 | MsVersion::Wmv2 => {
                     self.use_skip_mb_code = br.read_bit() != 0;
                     if self.bit_rate > MBAC_BITRATE {
                         self.per_mb_rl_table = br.read_bit() != 0;
@@ -837,8 +832,8 @@ impl MsMpeg4Decoder {
     }
 
     /// `msmpeg4_decode_dc`.
-    fn decode_dc(&mut self, br: &mut BitReader, n: usize) -> Result<i32> {
-        let level;
+    fn decode_dc(&mut self, br: &mut BitReader, n: usize, mb_x: usize, mb_y: usize) -> Result<i32> {
+        let diff: i32;
         if self.version <= MsVersion::V2 {
             let vlc = if n < 4 {
                 V2_DC_LUM_VLC.get().unwrap()
@@ -846,7 +841,7 @@ impl MsMpeg4Decoder {
                 V2_DC_CHROMA_VLC.get().unwrap()
             };
             let l = vlc.decode(br)? as i32;
-            level = l - 256;
+            diff = l - 256;
         } else {
             let vlc = &DC_VLC[self.dc_table_index][if n >= 4 { 1 } else { 0 }];
             let mut l = vlc.get().unwrap().decode(br)? as i32;
@@ -858,8 +853,27 @@ impl MsMpeg4Decoder {
             } else if l != 0 && br.read_bit() != 0 {
                 l = -l;
             }
-            level = l;
+            diff = l;
         }
+
+        let scale = if n < 4 {
+            y_dc_scale(self.version, self.qscale)
+        } else {
+            c_dc_scale(self.version, self.qscale)
+        };
+
+        let is_wmv1 = self.version >= MsVersion::Wmv1;
+        let (pred, dir) = self.pred.msmpeg4_pred_dc(
+            n,
+            mb_x,
+            mb_y,
+            self.first_slice_line,
+            scale,
+            is_wmv1,
+        );
+        self.dc_pred_dir = dir;
+        let level = diff + pred;
+        self.pred.set_dc(n, mb_x, mb_y, (level * scale) as i16);
         Ok(level)
     }
 
@@ -875,15 +889,14 @@ impl MsMpeg4Decoder {
         mb_y: usize,
     ) -> Result<()> {
         let q = self.qscale;
-        let mut i: i32;
-        let mut qmul;
-        let mut qadd;
+        let qmul;
+        let qadd;
         let run_diff;
         let rl_idx;
         if self.is_intra_mb {
             qmul = 1;
             qadd = 0;
-            let mut level = self.decode_dc(br, n)?;
+            let mut level = self.decode_dc(br, n, mb_x, mb_y)?;
             if level < 0 && self.inter_intra_pred {
                 level = 0;
             }
@@ -900,187 +913,70 @@ impl MsMpeg4Decoder {
             }
             block[0] = level as i16;
             run_diff = self.version >= MsVersion::Wmv1;
-            i = 0;
-            if !coded {
-                // AC prediction + store (msmpeg4 pred_ac path).
-                let scale = if n < 4 {
-                    y_dc_scale(self.version, q)
+            if coded {
+                let scan_tbl: &[u8; 64] = if self.ac_pred {
+                    if self.dc_pred_dir == 0 {
+                        &INTRA_V_SCAN
+                    } else {
+                        &INTRA_H_SCAN
+                    }
                 } else {
-                    c_dc_scale(self.version, q)
+                    &INTRA_SCAN
                 };
-                self.pred.pred_ac(
-                    n,
-                    mb_x,
-                    mb_y,
+                let rl = &RL_TABLES.get().unwrap()[rl_idx];
+                rl_decode_loop(
+                    br,
                     block,
-                    self.dc_pred_dir,
-                    self.ac_pred,
-                    q,
-                    &mut self.qscale_table,
-                    mb_y * self.mb_width + mb_x,
-                );
-                let _ = scale;
-                return Ok(());
+                    rl,
+                    0,
+                    scan_tbl,
+                    0,
+                    run_diff,
+                    qmul,
+                    qadd,
+                    &mut self.esc3_level_length,
+                    &mut self.esc3_run_length,
+                    self.qscale,
+                    self.version == MsVersion::V1,
+                    self.version <= MsVersion::V3,
+                )?;
             }
-            let scan_tbl: &[u8; 64] = if self.ac_pred {
-                if self.dc_pred_dir == 0 {
-                    INTRA_V_SCAN.get_or_init(|| WMV1_SCANTABLE3)
-                } else {
-                    INTRA_H_SCAN.get_or_init(|| WMV1_SCANTABLE2)
-                }
-            } else {
-                INTRA_SCAN.get_or_init(|| WMV1_SCANTABLE0)
-            };
-            let rl = &RL_TABLES.get().unwrap()[rl_idx];
-            let (mut level, mut run) = rl.get(0, br)?;
-            let _ = (&mut level, &mut run, qmul, qadd);
-            self.rl_decode_loop(
-                br,
-                block,
-                rl,
-                0,
-                scan_tbl,
-                i,
-                run_diff,
-                qmul,
-                qadd,
+            self.pred.pred_ac(
+                n,
                 mb_x,
                 mb_y,
-                n,
-            )
+                block,
+                self.dc_pred_dir,
+                self.ac_pred,
+                q,
+                &self.qscale_table,
+            );
         } else {
             qmul = (q << 1) as i32;
             qadd = ((q as i32) - 1) | 1;
-            i = -1;
+            let i = -1;
             rl_idx = 3 + self.rl_table_index;
             run_diff = self.version != MsVersion::V2;
             if !coded {
                 return Ok(());
             }
             let rl = &RL_TABLES.get().unwrap()[rl_idx];
-            self.rl_decode_loop(br, block, rl, q, scan, i, run_diff, qmul, qadd, mb_x, mb_y, n)
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn rl_decode_loop(
-        &mut self,
-        br: &mut BitReader,
-        block: &mut [i16; 64],
-        rl: &RlTable,
-        q: usize,
-        scan: &[u8; 64],
-        mut i: i32,
-        run_diff: bool,
-        qmul: i32,
-        qadd: i32,
-        _mb_x: usize,
-        _mb_y: usize,
-        _n: usize,
-    ) -> Result<()> {
-        loop {
-            let (mut level, mut run) = rl.get(q, br)?;
-            if level == 0 {
-                // escape
-                let cache = br.peek(2) << 30; // top two bits
-                let _ = cache;
-                // FFmpeg reads the two cache bits: (cache & 0x8000_0000) and
-                // (cache & 0x4000_0000). We re-peek explicitly.
-                let b0 = br.peek(1);
-                let b1 = br.peek(2) & 1;
-                if self.version == MsVersion::V1 || b0 == 0 {
-                    if self.version == MsVersion::V1 || b1 == 0 {
-                        // third escape
-                        if self.version != MsVersion::V1 {
-                            br.skip(2);
-                        }
-                        if self.version <= MsVersion::V3 {
-                            let last = br.read(1);
-                            let r = br.read(6) as i32;
-                            let l = br.read_signed(8);
-                            run = r;
-                            level = l as i32;
-                            if last != 0 {
-                                run += 192; // encode "last" via the i>62 path
-                            }
-                        } else {
-                            let last = br.read(1);
-                            if self.esc3_level_length == 0 {
-                                let mut ll;
-                                if (self.qscale as i32) < 8 {
-                                    ll = br.read(3) as i32;
-                                    if ll == 0 {
-                                        ll = 8 + br.read(1) as i32;
-                                    }
-                                } else {
-                                    ll = 2;
-                                    while ll < 8 && br.read(1) == 0 {
-                                        ll += 1;
-                                    }
-                                    if ll < 8 {
-                                        br.skip(1);
-                                    }
-                                }
-                                self.esc3_level_length = ll as usize;
-                                self.esc3_run_length = (br.read(2) + 3) as usize;
-                            }
-                            run = br.read(self.esc3_run_length as u32) as i32;
-                            let sign = br.read(1);
-                            level = br.read(self.esc3_level_length as u32) as i32;
-                            if sign != 0 {
-                                level = -level;
-                            }
-                            if last != 0 {
-                                run += 192;
-                            }
-                        }
-                        if level > 0 {
-                            level = level * qmul + qadd;
-                        } else {
-                            level = level * qmul - qadd;
-                        }
-                        i += run + 1;
-                    } else {
-                        // second escape
-                        br.skip(2);
-                        let (l2, r2) = rl.get(q, br)?;
-                        let level2 = l2;
-                        let mut r = r2;
-                        r += rl.max_run[0][(level2 / qmul).clamp(0, 127) as usize] as i32 + run_diff as i32;
-                        i += r;
-                        let sign = br.read(1);
-                        level = if sign != 0 { -level2 } else { level2 };
-                    }
-                } else {
-                    // first escape
-                    br.skip(1);
-                    let (l2, r2) = rl.get(q, br)?;
-                    i += r2;
-                    level = l2 + rl.max_level[0][(r2 - 1).clamp(0, 63) as usize] as i32 * qmul;
-                    let sign = br.read(1);
-                    if sign != 0 {
-                        level = -level;
-                    }
-                }
-            } else {
-                i += run;
-                let sign = br.read(1);
-                if sign != 0 {
-                    level = -level;
-                }
-            }
-            if i > 62 {
-                i -= 192;
-                if i < 0 || i > 63 {
-                    // FFmpeg: "(i + 192 == 64 && level / qmul == -1) || default"
-                    // err_recognition unset → tolerate and stop at i = 63.
-                    i = 63;
-                    break;
-                }
-                block[scan[i as usize] as usize] = level as i16;
-                break;
-            }
-            block[scan[i as usize] as usize] = level as i16;
+            rl_decode_loop(
+                br,
+                block,
+                rl,
+                q,
+                scan,
+                i,
+                run_diff,
+                qmul,
+                qadd,
+                &mut self.esc3_level_length,
+                &mut self.esc3_run_length,
+                self.qscale,
+                self.version == MsVersion::V1,
+                self.version <= MsVersion::V3,
+            )?;
         }
         Ok(())
     }
@@ -1113,8 +1009,125 @@ impl MsMpeg4Decoder {
         *my = my2;
         Ok(())
     }
+}
 
-    // ── per-macroblock decode ──
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rl_decode_loop(
+    br: &mut BitReader,
+    block: &mut [i16; 64],
+    rl: &RlTable,
+    q: usize,
+    scan: &[u8; 64],
+    mut i: i32,
+    run_diff: bool,
+    qmul: i32,
+    qadd: i32,
+    esc3_level_length: &mut usize,
+    esc3_run_length: &mut usize,
+    qscale: usize,
+    is_v1: bool,
+    is_v2_v3: bool,
+) -> Result<()> {
+    loop {
+        let (mut level, mut run) = rl.get(q, br)?;
+        if level == 0 {
+            // escape
+            let b0 = br.peek(1);
+            let b1 = br.peek(2) & 1;
+            if is_v1 || b0 == 0 {
+                if is_v1 || b1 == 0 {
+                    // third escape
+                    if !is_v1 {
+                        br.skip(2);
+                    }
+                    if is_v2_v3 {
+                        let last = br.read(1);
+                        let r = br.read(6) as i32;
+                        let l = br.read_signed(8);
+                        run = r;
+                        level = l as i32;
+                        if last != 0 {
+                            run += 192;
+                        }
+                    } else {
+                        let last = br.read(1);
+                        if *esc3_level_length == 0 {
+                            let mut ll;
+                            if (qscale as i32) < 8 {
+                                ll = br.read(3) as i32;
+                                if ll == 0 {
+                                    ll = 8 + br.read(1) as i32;
+                                }
+                            } else {
+                                ll = 2;
+                                while ll < 8 && br.read(1) == 0 {
+                                    ll += 1;
+                                }
+                                if ll < 8 {
+                                    br.skip(1);
+                                }
+                            }
+                            *esc3_level_length = ll as usize;
+                            *esc3_run_length = (br.read(2) + 3) as usize;
+                        }
+                        run = br.read(*esc3_run_length as u32) as i32;
+                        let sign = br.read(1);
+                        level = br.read(*esc3_level_length as u32) as i32;
+                        if sign != 0 {
+                            level = -level;
+                        }
+                        if last != 0 {
+                            run += 192;
+                        }
+                    }
+                    if level > 0 {
+                        level = level * qmul + qadd;
+                    } else {
+                        level = level * qmul - qadd;
+                    }
+                    i += run + 1;
+                } else {
+                    // second escape
+                    br.skip(2);
+                    let (l2, r2) = rl.get(q, br)?;
+                    let level2 = l2;
+                    let last_idx = (r2 >= 192) as usize;
+                    i += r2 + rl.max_run[last_idx][(level2 / qmul).clamp(0, 127) as usize] as i32 + run_diff as i32;
+                    let sign = br.read(1);
+                    level = if sign != 0 { -level2 } else { level2 };
+                }
+            } else {
+                // first escape
+                br.skip(1);
+                let (l2, r2) = rl.get(q, br)?;
+                let last_idx = (r2 >= 192) as usize;
+                let clean_r = if r2 >= 192 { r2 - 192 } else { r2 };
+                i += r2;
+                level = l2 + rl.max_level[last_idx][((clean_r - 1) & 63) as usize] as i32 * qmul;
+                let sign = br.read(1);
+                if sign != 0 {
+                    level = -level;
+                }
+            }
+        } else {
+            i += run;
+            let sign = br.read(1);
+            if sign != 0 {
+                level = -level;
+            }
+        }
+        if i > 62 {
+            i -= 192;
+            if i < 0 || i > 63 {
+                i = 63;
+                break;
+            }
+            block[scan[i as usize] as usize] = level as i16;
+            break;
+        }
+        block[scan[i as usize] as usize] = level as i16;
+    }
+    Ok(())
 }
 
 impl Decoder for MsMpeg4Decoder {
@@ -1122,10 +1135,84 @@ impl Decoder for MsMpeg4Decoder {
         &self.codec_id
     }
 
-    fn send_packet(&mut self, _packet: &Packet) -> Result<()> {
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        let data = &packet.data;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut br = BitReader::new(data);
+        self.decode_picture_header(&mut br)?;
+
+        let mut pic = Picture::alloc(self.width, self.height)?;
+
+        if self.pict_type == 1 {
+            self.pred.reset();
+            self.qscale_table.fill(self.qscale as i32);
+
+            for mb_y in 0..self.mb_height {
+                self.first_slice_line = mb_y == 0;
+                for mb_x in 0..self.mb_width {
+                    self.is_intra_mb = true;
+                    let code = MB_I_VLC.get().unwrap().decode(&mut br)? as usize;
+                    let mut cbp = 0usize;
+                    for i in 0..6 {
+                        let mut val = (code >> (5 - i)) & 1;
+                        if i < 4 {
+                            val = self.pred.coded_block_pred(i, mb_x, mb_y, val as u8) as usize;
+                        }
+                        cbp |= val << (5 - i);
+                    }
+                    self.ac_pred = br.read_bit() != 0;
+                    if self.inter_intra_pred {
+                        self.h263_aic_dir = INTER_INTRA_VLC.get().unwrap().decode(&mut br)? as usize;
+                    }
+                    if self.per_mb_rl_table && cbp != 0 {
+                        self.rl_table_index = br.decode012()? as usize;
+                        self.rl_chroma_table_index = self.rl_table_index;
+                    }
+
+                    for i in 0..6 {
+                        let mut block = [0i16; 64];
+                        let coded = ((cbp >> (5 - i)) & 1) != 0;
+                        self.decode_block(&mut br, &mut block, i, coded, &INTRA_SCAN, mb_x, mb_y)?;
+
+                        let bx = mb_x * 16 + (if (i & 1) != 0 { 8 } else { 0 });
+                        let by = mb_y * 16 + (if (i & 2) != 0 { 8 } else { 0 });
+
+                        match i {
+                            0..=3 => {
+                                idct::simple_idct_put(&mut pic.y[by * pic.y_stride + bx..], pic.y_stride, &mut block);
+                            }
+                            4 => {
+                                let cx = mb_x * 8;
+                                let cy = mb_y * 8;
+                                idct::simple_idct_put(&mut pic.cb[cy * pic.c_stride + cx..], pic.c_stride, &mut block);
+                            }
+                            5 => {
+                                let cx = mb_x * 8;
+                                let cy = mb_y * 8;
+                                idct::simple_idct_put(&mut pic.cr[cy * pic.c_stride + cx..], pic.c_stride, &mut block);
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            self.last_picture = Some(Picture {
+                width: pic.width,
+                height: pic.height,
+                mb_width: pic.mb_width,
+                mb_height: pic.mb_height,
+                y_stride: pic.y_stride,
+                c_stride: pic.c_stride,
+                y: pic.y.clone(),
+                cb: pic.cb.clone(),
+                cr: pic.cr.clone(),
+            });
+        }
+        self.pending = Some(make_frame(pic, packet.pts));
         Ok(())
     }
-
     fn receive_frame(&mut self) -> Result<Frame> {
         if let Some(f) = self.pending.take() {
             Ok(f)
@@ -1141,11 +1228,11 @@ impl Decoder for MsMpeg4Decoder {
 
 const MBAC_BITRATE: u32 = (30 * 16 * 1024 / 8) * 2; // dummy, replaced below
 const II_BITRATE: u32 = 1024 * 300;
-const DC_MAX: i32 = 119;
+pub(crate) const DC_MAX: i32 = 119;
 
 /// FFmpeg's permutated intra scantable (idct_permutation = FF_IDCT_PERM_NONE
 /// for our simple IDCT): the zigzag table itself.
-static INTRA_SCAN: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
+pub(crate) static INTRA_SCAN: std::sync::LazyLock<[u8; 64]> = std::sync::LazyLock::new(|| WMV1_SCANTABLE1);
 /// Permutated intra h/v scantables (ff_wmv1_scantable[2]/[3]).
-static INTRA_H_SCAN: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
-static INTRA_V_SCAN: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
+pub(crate) static INTRA_H_SCAN: std::sync::LazyLock<[u8; 64]> = std::sync::LazyLock::new(|| WMV1_SCANTABLE2);
+pub(crate) static INTRA_V_SCAN: std::sync::LazyLock<[u8; 64]> = std::sync::LazyLock::new(|| WMV1_SCANTABLE3);

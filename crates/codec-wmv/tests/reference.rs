@@ -156,3 +156,40 @@ fn test_demux_ilaced_twomv_vc1() {
     }
     assert_eq!(pkts, 13, "ilaced_twomv.vc1 packet count must be 13");
 }
+
+#[test]
+fn test_demux_wmv8_x8intra() {
+    let mut ctx = RuntimeContext::new();
+    codec_wmv::register(&mut ctx);
+    demux_asf::register(&mut ctx);
+
+    let path = fate("wmv8/wmv8_x8intra.wmv");
+    let file = File::open(&path).expect("open wmv8_x8intra.wmv");
+    let mut demuxer = ctx.containers.open_demuxer("asf", Box::new(file), &ctx.codecs).expect("open demuxer");
+    let video_st = demuxer.streams().iter().find(|s| s.params.codec_id.as_str() == "wmv2").expect("video stream").clone();
+    assert_eq!(video_st.params.width, Some(320));
+    assert_eq!(video_st.params.height, Some(240));
+    assert_eq!(video_st.params.extradata.len(), 4);
+
+    let mut pkts = 0;
+    while let Ok(pkt) = demuxer.next_packet() {
+        if pkt.stream_index == video_st.index {
+            pkts += 1;
+        }
+    }
+    assert!(pkts > 0, "must find wmv2 video packets");
+}
+
+#[test]
+fn test_wmv2_first_iframe() {
+    let path = fate("wmv8/wmv8_x8intra.wmv");
+    let decoded = refcheck::decode(&path, &[codec_wmv::register, demux_asf::register], oxideav_core::MediaType::Video, 0);
+    assert!(!decoded.frames.is_empty(), "must decode at least 1 frame");
+    if let oxideav_core::Frame::Video(vf) = &decoded.frames[0] {
+        let packed = refcheck::pack(vf, &[(320, 240), (160, 120), (160, 120)]);
+        std::fs::write("/tmp/our_frame0.yuv", &packed).unwrap();
+        let md5 = refcheck::md5_hex(&packed);
+        let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &["-idct", "simple"]);
+        assert_eq!(md5, expected[0], "first frame MD5 must match FFmpeg");
+    }
+}
