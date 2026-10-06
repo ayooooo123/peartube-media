@@ -97,23 +97,19 @@ pub struct RmDemuxer {
 /// zero-fill the rest and report `false` (the caller keeps the data —
 /// truncated trailing packets are surfaced with the corrupt flag).
 fn read_full(io: &mut Box<dyn ReadSeek>, dst: &mut [u8]) -> bool {
-    match io.read_exact(dst) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            let n = io.read(dst).unwrap_or(0);
-            for b in &mut dst[n..] {
-                *b = 0;
-            }
-            false
-        }
-        Err(e) => {
-            let _ = e;
-            for b in dst.iter_mut() {
-                *b = 0;
-            }
-            false
+    // Count what arrives: read_exact would consume a partial tail and then
+    // leave its contents unspecified.
+    let mut n = 0;
+    while n < dst.len() {
+        match io.read(&mut dst[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
         }
     }
+    dst[n..].fill(0);
+    n == dst.len()
 }
 
 fn get_num<R: Read + ?Sized>(reader: &mut R, len: &mut usize) -> Result<usize> {

@@ -150,6 +150,7 @@ version = "0.1.0"
 dependencies = [
  "codec-dca",
  "codec-mlp",
+ "codec-ra",
  "demux-asf",
  "demux-misc",
  "demux-rm",
