@@ -4,6 +4,9 @@
 use crate::bits::BitReader;
 use oxideav_core::{Error, Result};
 
+/// Lookup-entry marker for a prefix that is not part of any code.
+const INVALID_NODE: u32 = u32::MAX;
+
 #[derive(Clone, Debug)]
 enum VlcEntry {
     Empty,
@@ -178,9 +181,11 @@ impl VlcTable {
                 entry.symbol = sym;
                 entry.node_idx = 0;
             } else {
+                // A walk that stopped early hit a missing branch: the
+                // prefix is not a valid code.
                 entry.bits = 0;
                 entry.symbol = 0;
-                entry.node_idx = curr as u32;
+                entry.node_idx = if bits_used < lookup_bits { INVALID_NODE } else { curr as u32 };
             }
         }
 
@@ -199,6 +204,9 @@ impl VlcTable {
                 return Ok(entry.symbol);
             }
             // Fall back to walking from entry.node_idx
+            if entry.node_idx == INVALID_NODE {
+                return Err(Error::invalid("invalid VLC code"));
+            }
             reader.skip_bits(self.lookup_bits)?;
             let mut curr = entry.node_idx as usize;
             loop {
@@ -231,6 +239,44 @@ impl VlcTable {
                     curr = next as usize;
                 }
                 VlcEntry::Empty => return Err(Error::invalid("empty VLC node")),
+            }
+        }
+    }
+
+    /// Decode one symbol from the next 32 bits of input (MSB first).
+    /// Returns `(symbol, code length)`; an invalid code returns `(-1, 0)`,
+    /// as FFmpeg's `get_vlc2` does for a missing first-level entry.
+    #[inline]
+    pub fn decode_peek(&self, peek: u32) -> (i32, u32) {
+        let mut used = 0u32;
+        let mut curr = 0usize;
+        if self.lookup_bits > 0 {
+            let entry = self.lookup[(peek >> (32 - self.lookup_bits)) as usize];
+            if entry.bits > 0 {
+                return (entry.symbol, entry.bits as u32);
+            }
+            if entry.node_idx == INVALID_NODE {
+                return (-1, 0);
+            }
+            curr = entry.node_idx as usize;
+            used = self.lookup_bits as u32;
+        }
+        loop {
+            match self.nodes[curr] {
+                VlcEntry::Leaf(sym) => return (sym, used),
+                VlcEntry::Branch(left, right) => {
+                    if used >= 32 {
+                        return (-1, 0);
+                    }
+                    let bit = (peek >> (31 - used)) & 1;
+                    let next = if bit == 0 { left } else { right };
+                    if next == 0 {
+                        return (-1, 0);
+                    }
+                    curr = next as usize;
+                    used += 1;
+                }
+                VlcEntry::Empty => return (-1, 0),
             }
         }
     }

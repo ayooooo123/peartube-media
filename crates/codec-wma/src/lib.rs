@@ -8,6 +8,7 @@
 pub mod bits;
 pub mod dsp;
 pub mod fft;
+pub mod getbits;
 pub mod tables;
 pub mod vlc;
 pub mod wma;
