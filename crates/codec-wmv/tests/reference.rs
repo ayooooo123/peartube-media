@@ -180,16 +180,36 @@ fn test_demux_wmv8_x8intra() {
     assert!(pkts > 0, "must find wmv2 video packets");
 }
 
-#[test]
-fn test_wmv2_first_iframe() {
-    let path = fate("wmv8/wmv8_x8intra.wmv");
-    let decoded = refcheck::decode(&path, &[codec_wmv::register, demux_asf::register], oxideav_core::MediaType::Video, 0);
-    assert!(!decoded.frames.is_empty(), "must decode at least 1 frame");
-    if let oxideav_core::Frame::Video(vf) = &decoded.frames[0] {
-        let packed = refcheck::pack(vf, &[(320, 240), (160, 120), (160, 120)]);
-        std::fs::write("/tmp/our_frame0.yuv", &packed).unwrap();
-        let md5 = refcheck::md5_hex(&packed);
-        let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &["-idct", "simple"]);
-        assert_eq!(md5, expected[0], "first frame MD5 must match FFmpeg");
+/// Decodes `sample` with our crates and compares every frame's MD5 with
+/// FFmpeg's (`input_args` go before `-i`, e.g. `-idct simple`).
+fn check_video(sample: &str, registrars: &[refcheck::Registrar], input_args: &[&str]) {
+    let path = fate(sample);
+    let decoded = refcheck::decode(&path, registrars, oxideav_core::MediaType::Video, 0);
+    let w = decoded.params.width.expect("width") as usize;
+    let h = decoded.params.height.expect("height") as usize;
+    let dims = [(w, h), (w.div_ceil(2), h.div_ceil(2)), (w.div_ceil(2), h.div_ceil(2))];
+    let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", input_args);
+    let mut mismatched = Vec::new();
+    for (i, frame) in decoded.frames.iter().enumerate() {
+        let oxideav_core::Frame::Video(vf) = frame else { panic!("{sample}: frame {i} is not video") };
+        let md5 = refcheck::md5_hex(&refcheck::pack(vf, &dims));
+        if expected.get(i) != Some(&md5) {
+            mismatched.push(i);
+        }
     }
+    assert!(
+        mismatched.is_empty(),
+        "{sample}: {} of {} frames differ from FFmpeg (first: {:?})",
+        mismatched.len(),
+        decoded.frames.len(),
+        &mismatched[..mismatched.len().min(16)]
+    );
+    assert_eq!(decoded.frames.len(), expected.len(), "{sample}: frame count");
+}
+
+/// WMV2 I/P pictures, IntraX8 (J-type) pictures, ABT, mspel MC and the
+/// in-loop filter: `fate-wmv8-x8intra`.
+#[test]
+fn wmv8_x8intra_matches_ffmpeg() {
+    check_video("wmv8/wmv8_x8intra.wmv", &[codec_wmv::register, demux_asf::register], &["-idct", "simple", "-flags", "+bitexact"]);
 }

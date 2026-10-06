@@ -1,495 +1,479 @@
-//! WMV2 video decoder ported from libavcodec/wmv2dec.c, wmv2.c, wmv2dsp.c.
+//! WMV2 (Windows Media Video 8) specifics on top of the MS-MPEG-4 core.
+//!
+//! Ported from FFmpeg commit 2da55bf `libavcodec/wmv2dec.c` (picture
+//! headers, MB skip map, macroblock layer, adaptive block transform, the
+//! quarter-pel "mspel" motion compensation) and `wmv2.h`. LGPL-2.1-or-later.
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result};
+use oxideav_core::{Error, Result};
+
 use crate::bits::BitReader;
 use crate::idct;
-use crate::msmpeg4::{self, Picture, PredContext, MsVersion, make_frame, y_dc_scale, c_dc_scale, rl_decode_loop, MB_I_VLC, DC_VLC, RL_TABLES, INTRA_SCAN, INTRA_H_SCAN, INTRA_V_SCAN, DC_MAX};
-use crate::tables::*;
+use crate::mpv::{self, SrcBlock};
+use crate::msmpeg4::{decode_ms_motion, Header, MsDecoder, MB_TYPE_SKIP, PICT_I, PICT_P, TABLES};
+use crate::tables::{WMV2_SCANTABLE_A, WMV2_SCANTABLE_B};
 
-pub const CODEC_ID_WMV2: &str = "wmv2";
+const SKIP_TYPE_NONE: u32 = 0;
+const SKIP_TYPE_MPEG: u32 = 1;
+const SKIP_TYPE_ROW: u32 = 2;
+const SKIP_TYPE_COL: u32 = 3;
 
-pub struct Wmv2Decoder {
-    codec_id: CodecId,
-    width: usize,
-    height: usize,
-    mb_width: usize,
-    mb_height: usize,
-    pred: PredContext,
-    qscale_table: Vec<i32>,
-    pending: Option<Frame>,
-    last_picture: Option<Picture>,
-    // extradata flags:
-    fps: u32,
-    bit_rate: u32,
-    mspel_bit: bool,
-    loop_filter: bool,
-    abt_flag: bool,
-    j_type_bit: bool,
-    top_left_mv_flag: bool,
-    per_mb_rl_bit: bool,
-    slice_height: usize,
-    // per-frame state:
-    pict_type: u8,
-    qscale: usize,
-    j_type: bool,
-    rl_table_index: usize,
-    rl_chroma_table_index: usize,
-    dc_table_index: usize,
-    per_mb_rl_table: bool,
-    ac_pred: bool,
-    dc_pred_dir: i32,
-    esc3_level_length: usize,
-    esc3_run_length: usize,
+/// `wmv2_get_cbp_table_index`.
+fn cbp_table_index(qscale: i32, cbp_index: usize) -> usize {
+    const MAP: [[usize; 3]; 3] = [[0, 2, 1], [1, 0, 2], [2, 1, 0]];
+    MAP[(qscale > 10) as usize + (qscale > 20) as usize][cbp_index]
 }
 
-impl Wmv2Decoder {
-    pub fn new(params: &CodecParameters) -> Result<Self> {
-        msmpeg4::init_tables();
-        let (w, h) = match (params.width, params.height) {
-            (Some(w), Some(h)) => (w as usize, h as usize),
-            _ => return Err(Error::invalid("wmv2: width/height required")),
-        };
-        let mb_width = w.div_ceil(16);
-        let mb_height = h.div_ceil(16);
-
-        let mut fps = 15;
-        let mut bit_rate = 0;
-        let mut mspel_bit = false;
-        let mut loop_filter = false;
-        let mut abt_flag = false;
-        let mut j_type_bit = false;
-        let mut top_left_mv_flag = false;
-        let mut per_mb_rl_bit = false;
-        let mut slice_height = mb_height;
-
-        if params.extradata.len() >= 4 {
-            let mut br = BitReader::new(&params.extradata);
-            fps = br.read(5);
-            bit_rate = br.read(11) * 1024;
-            mspel_bit = br.read_bit() != 0;
-            loop_filter = br.read_bit() != 0;
-            abt_flag = br.read_bit() != 0;
-            j_type_bit = br.read_bit() != 0;
-            top_left_mv_flag = br.read_bit() != 0;
-            per_mb_rl_bit = br.read_bit() != 0;
-            let code = br.read(3) as usize;
-            if code != 0 {
-                slice_height = mb_height / code;
-            }
+impl MsDecoder {
+    /// `decode_ext_header` (32-bit extradata).
+    pub(crate) fn wmv2_decode_ext_header(&mut self, extradata: &[u8]) {
+        if extradata.len() < 4 {
+            return;
         }
-
-        Ok(Self {
-            codec_id: CodecId::new(CODEC_ID_WMV2),
-            width: w,
-            height: h,
-            mb_width,
-            mb_height,
-            pred: PredContext::new(mb_width, mb_height),
-            qscale_table: vec![0; mb_width * mb_height],
-            pending: None,
-            last_picture: None,
-            fps,
-            bit_rate,
-            mspel_bit,
-            loop_filter,
-            abt_flag,
-            j_type_bit,
-            top_left_mv_flag,
-            per_mb_rl_bit,
-            slice_height,
-            pict_type: 0,
-            qscale: 0,
-            j_type: false,
-            rl_table_index: 0,
-            rl_chroma_table_index: 0,
-            dc_table_index: 0,
-            per_mb_rl_table: false,
-            ac_pred: false,
-            dc_pred_dir: 0,
-            esc3_level_length: 0,
-            esc3_run_length: 0,
-        })
+        let mut gb = BitReader::new(&extradata[..4]);
+        let _fps = gb.read(5);
+        self.bit_rate = gb.read(11) * 1024;
+        self.w2.mspel_bit = gb.read_bit() != 0;
+        self.loop_filter = gb.read_bit() != 0;
+        self.w2.abt_flag = gb.read_bit() != 0;
+        self.w2.j_type_bit = gb.read_bit() != 0;
+        self.w2.top_left_mv_flag = gb.read_bit() != 0;
+        self.w2.per_mb_rl_bit = gb.read_bit() != 0;
+        let code = gb.read(3) as usize;
+        if code == 0 {
+            return;
+        }
+        self.slice_height = self.mb_height / code;
     }
 
-    fn decode_dc(&mut self, br: &mut BitReader, n: usize, mb_x: usize, mb_y: usize) -> Result<i32> {
-        let vlc = &DC_VLC[self.dc_table_index][if n >= 4 { 1 } else { 0 }];
-        let mut l = vlc.get().unwrap().decode(br)? as i32;
-        if l == DC_MAX {
-            l = br.read(8) as i32;
-            if br.read_bit() != 0 {
-                l = -l;
-            }
-        } else if l != 0 && br.read_bit() != 0 {
-            l = -l;
+    /// `wmv2_decode_picture_header`.
+    pub(crate) fn wmv2_decode_picture_header(&mut self, br: &mut BitReader) -> Result<Header> {
+        let pict_type = br.read_bit() as u8 + 1;
+        if pict_type == PICT_I {
+            let _code = br.read(7);
         }
-        let diff = l;
+        let q = br.read(5) as i32;
+        if q <= 0 {
+            return Err(Error::invalid("wmv2: invalid qscale"));
+        }
+        self.pict_type = pict_type;
+        self.qscale = q;
 
-        let scale = if n < 4 {
-            y_dc_scale(MsVersion::Wmv2, self.qscale)
-        } else {
-            c_dc_scale(MsVersion::Wmv2, self.qscale)
-        };
-
-        let (pred, dir) = self.pred.msmpeg4_pred_dc(
-            n,
-            mb_x,
-            mb_y,
-            mb_y == 0,
-            scale,
-            true,
-        );
-        self.dc_pred_dir = dir;
-        let level = diff + pred;
-        self.pred.set_dc(n, mb_x, mb_y, (level * scale) as i16);
-        Ok(level)
-    }
-
-    fn decode_block(
-        &mut self,
-        br: &mut BitReader,
-        block: &mut [i16; 64],
-        n: usize,
-        coded: bool,
-        mb_x: usize,
-        mb_y: usize,
-    ) -> Result<()> {
-        let q = self.qscale;
-        let level = self.decode_dc(br, n, mb_x, mb_y)?;
-        let rl_idx = if n < 4 {
-            self.rl_table_index
-        } else {
-            3 + self.rl_chroma_table_index
-        };
-        block[0] = level as i16;
-        if coded {
-            let scan_tbl: &[u8; 64] = if self.ac_pred {
-                if self.dc_pred_dir == 0 {
-                    &INTRA_V_SCAN
-                } else {
-                    &INTRA_H_SCAN
+        if pict_type != PICT_I && br.peek(1) != 0 {
+            let mut gb = br.clone();
+            let skip_type = gb.read(2);
+            let mut run = if skip_type == SKIP_TYPE_COL { self.mb_width } else { self.mb_height } as i64;
+            while run > 0 {
+                let block = run.min(25) as u32;
+                if gb.read(block) as u64 + 1 != 1u64 << block {
+                    break;
                 }
-            } else {
-                &INTRA_SCAN
-            };
-            let rl = &RL_TABLES.get().unwrap()[rl_idx];
-            rl_decode_loop(
-                br,
-                block,
-                rl,
-                0,
-                scan_tbl,
-                0,
-                true,
-                1,
-                0,
-                &mut self.esc3_level_length,
-                &mut self.esc3_run_length,
-                self.qscale,
-                false,
-                false,
-            )?;
-        }
-        self.pred.pred_ac(
-            n,
-            mb_x,
-            mb_y,
-            block,
-            self.dc_pred_dir,
-            self.ac_pred,
-            q,
-            &self.qscale_table,
-        );
-
-        let scale = if n < 4 {
-            y_dc_scale(MsVersion::Wmv2, q)
-        } else {
-            c_dc_scale(MsVersion::Wmv2, q)
-        };
-        block[0] = (block[0] as i32 * scale) as i16;
-        let qmul = (q << 1) as i32;
-        let qadd = ((q as i32) - 1) | 1;
-        for k in 1..64 {
-            let level = block[k] as i32;
-            if level != 0 {
-                block[k] = if level < 0 {
-                    (level * qmul - qadd) as i16
-                } else {
-                    (level * qmul + qadd) as i16
-                };
+                run -= block as i64;
             }
+            if run == 0 {
+                return Ok(Header::Skipped);
+            }
+        }
+        Ok(Header::Ok)
+    }
+
+    /// `parse_mb_skip`.
+    fn parse_mb_skip(&mut self, br: &mut BitReader) -> Result<()> {
+        let (w, h, st) = (self.mb_width, self.mb_height, self.mb_stride);
+        let skip_type = br.read(2);
+        match skip_type {
+            SKIP_TYPE_NONE => {
+                for y in 0..h {
+                    for x in 0..w {
+                        self.mb_type[y * st + x] = 0;
+                    }
+                }
+            }
+            SKIP_TYPE_MPEG => {
+                if br.bits_left() < (h * w) as i64 {
+                    return Err(Error::invalid("wmv2: skip map truncated"));
+                }
+                for y in 0..h {
+                    for x in 0..w {
+                        self.mb_type[y * st + x] = if br.read_bit() != 0 { MB_TYPE_SKIP } else { 0 };
+                    }
+                }
+            }
+            SKIP_TYPE_ROW => {
+                for y in 0..h {
+                    if br.bits_left() < 1 {
+                        return Err(Error::invalid("wmv2: skip map truncated"));
+                    }
+                    if br.read_bit() != 0 {
+                        for x in 0..w {
+                            self.mb_type[y * st + x] = MB_TYPE_SKIP;
+                        }
+                    } else {
+                        if br.bits_left() < w as i64 {
+                            return Err(Error::invalid("wmv2: skip map truncated"));
+                        }
+                        for x in 0..w {
+                            self.mb_type[y * st + x] = if br.read_bit() != 0 { MB_TYPE_SKIP } else { 0 };
+                        }
+                    }
+                }
+            }
+            _ => {
+                for x in 0..w {
+                    if br.bits_left() < 1 {
+                        return Err(Error::invalid("wmv2: skip map truncated"));
+                    }
+                    if br.read_bit() != 0 {
+                        for y in 0..h {
+                            self.mb_type[y * st + x] = MB_TYPE_SKIP;
+                        }
+                    } else {
+                        if br.bits_left() < h as i64 {
+                            return Err(Error::invalid("wmv2: skip map truncated"));
+                        }
+                        for y in 0..h {
+                            self.mb_type[y * st + x] = if br.read_bit() != 0 { MB_TYPE_SKIP } else { 0 };
+                        }
+                    }
+                }
+            }
+        }
+        let mut coded = 0i64;
+        for y in 0..h {
+            for x in 0..w {
+                coded += (self.mb_type[y * st + x] & MB_TYPE_SKIP == 0) as i64;
+            }
+        }
+        if coded > br.bits_left() {
+            return Err(Error::invalid("wmv2: skip map exceeds the packet"));
         }
         Ok(())
     }
-}
-const H263_LOOP_FILTER_STRENGTH: [u8; 32] = [
-    0, 1, 1, 2, 2, 3, 3,  4,  4,  4,  5,  5,  6,  6,  7, 7,
-    7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11, 12, 12, 12,
-];
 
-fn h263_v_loop_filter(src: &mut [u8], offset: usize, stride: usize, qscale: usize) {
-    let strength = H263_LOOP_FILTER_STRENGTH[qscale.min(31)] as i32;
-    if strength == 0 {
-        return;
-    }
-    for x in 0..8 {
-        let p0 = src[offset + x - 2 * stride] as i32;
-        let mut p1 = src[offset + x - stride] as i32;
-        let mut p2 = src[offset + x] as i32;
-        let p3 = src[offset + x + stride] as i32;
-        let d = (p0 - p3 + 4 * (p2 - p1)) / 8;
-        let d1 = if d < -2 * strength {
-            0
-        } else if d < -strength {
-            -2 * strength - d
-        } else if d < strength {
-            d
-        } else if d < 2 * strength {
-            2 * strength - d
-        } else {
-            0
-        };
-        p1 += d1;
-        p2 -= d1;
-        src[offset + x - stride] = p1.clamp(0, 255) as u8;
-        src[offset + x] = p2.clamp(0, 255) as u8;
-        let ad1 = d1.abs() >> 1;
-        let d2 = ((p0 - p3) / 4).clamp(-ad1, ad1);
-        src[offset + x - 2 * stride] = (p0 - d2).clamp(0, 255) as u8;
-        src[offset + x + stride] = (p3 + d2).clamp(0, 255) as u8;
-    }
-}
-
-fn h263_h_loop_filter(src: &mut [u8], offset: usize, stride: usize, qscale: usize) {
-    let strength = H263_LOOP_FILTER_STRENGTH[qscale.min(31)] as i32;
-    if strength == 0 {
-        return;
-    }
-    for y in 0..8 {
-        let base = offset + y * stride;
-        let p0 = src[base - 2] as i32;
-        let mut p1 = src[base - 1] as i32;
-        let mut p2 = src[base] as i32;
-        let p3 = src[base + 1] as i32;
-        let d = (p0 - p3 + 4 * (p2 - p1)) / 8;
-        let d1 = if d < -2 * strength {
-            0
-        } else if d < -strength {
-            -2 * strength - d
-        } else if d < strength {
-            d
-        } else if d < 2 * strength {
-            2 * strength - d
-        } else {
-            0
-        };
-        p1 += d1;
-        p2 -= d1;
-        src[base - 1] = p1.clamp(0, 255) as u8;
-        src[base] = p2.clamp(0, 255) as u8;
-        let ad1 = d1.abs() >> 1;
-        let d2 = ((p0 - p3) / 4).clamp(-ad1, ad1);
-        src[base - 2] = (p0 - d2).clamp(0, 255) as u8;
-        src[base + 1] = (p3 + d2).clamp(0, 255) as u8;
-    }
-}
-
-fn apply_loop_filter(
-    pic: &mut Picture,
-    mb_x: usize,
-    mb_y: usize,
-    mb_width: usize,
-    mb_height: usize,
-    qscale: usize,
-    qscale_table: &[i32],
-) {
-    let linesize = pic.y_stride;
-    let uvlinesize = pic.c_stride;
-    let xy = mb_y * mb_width + mb_x;
-    let dest_y = mb_y * 16 * linesize + mb_x * 16;
-    let dest_cb = mb_y * 8 * uvlinesize + mb_x * 8;
-    let dest_cr = mb_y * 8 * uvlinesize + mb_x * 8;
-
-    let qp_c = qscale;
-    h263_v_loop_filter(&mut pic.y, dest_y + 8 * linesize, linesize, qp_c);
-    h263_v_loop_filter(&mut pic.y, dest_y + 8 * linesize + 8, linesize, qp_c);
-
-    if mb_y > 0 {
-        let qp_tt = qscale_table[xy - mb_width] as usize;
-        let qp_tc = if qp_c != 0 { qp_c } else { qp_tt };
-        if qp_tc != 0 {
-            let chroma_qp = qp_tc;
-            h263_v_loop_filter(&mut pic.y, dest_y, linesize, qp_tc);
-            h263_v_loop_filter(&mut pic.y, dest_y + 8, linesize, qp_tc);
-            h263_v_loop_filter(&mut pic.cb, dest_cb, uvlinesize, chroma_qp);
-            h263_v_loop_filter(&mut pic.cr, dest_cr, uvlinesize, chroma_qp);
-        }
-        if qp_tt != 0 {
-            h263_h_loop_filter(&mut pic.y, dest_y.wrapping_sub(8 * linesize) + 8, linesize, qp_tt);
-        }
-        if mb_x > 0 {
-            let qp_dt = if qp_tt != 0 { qp_tt } else { qscale_table[xy - 1 - mb_width] as usize };
-            if qp_dt != 0 {
-                let chroma_qp = qp_dt;
-                h263_h_loop_filter(&mut pic.y, dest_y.wrapping_sub(8 * linesize), linesize, qp_dt);
-                h263_h_loop_filter(&mut pic.cb, dest_cb.wrapping_sub(8 * uvlinesize), uvlinesize, chroma_qp);
-                h263_h_loop_filter(&mut pic.cr, dest_cr.wrapping_sub(8 * uvlinesize), uvlinesize, chroma_qp);
+    /// `ff_wmv2_decode_secondary_picture_header`; returns true for an
+    /// IntraX8 (J-type) picture, which it decodes completely.
+    pub(crate) fn wmv2_decode_secondary_picture_header(&mut self, br: &mut BitReader) -> Result<bool> {
+        if self.pict_type == PICT_I {
+            for v in self.mb_type.iter_mut() {
+                *v = 0;
             }
-        }
-    }
-
-    if qp_c != 0 {
-        h263_h_loop_filter(&mut pic.y, dest_y + 8, linesize, qp_c);
-        if mb_y + 1 == mb_height {
-            h263_h_loop_filter(&mut pic.y, dest_y + 8 * linesize + 8, linesize, qp_c);
-        }
-    }
-
-    if mb_x > 0 {
-        let qp_lc = if qp_c != 0 { qp_c } else { qscale_table[xy - 1] as usize };
-        if qp_lc != 0 {
-            h263_h_loop_filter(&mut pic.y, dest_y, linesize, qp_lc);
-            if mb_y + 1 == mb_height {
-                let chroma_qp = qp_lc;
-                h263_h_loop_filter(&mut pic.y, dest_y + 8 * linesize, linesize, qp_lc);
-                h263_h_loop_filter(&mut pic.cb, dest_cb, uvlinesize, chroma_qp);
-                h263_h_loop_filter(&mut pic.cr, dest_cr, uvlinesize, chroma_qp);
-            }
-        }
-    }
-}
-
-impl Decoder for Wmv2Decoder {
-    fn codec_id(&self) -> &CodecId {
-        &self.codec_id
-    }
-
-    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let data = &packet.data;
-        if data.is_empty() {
-            return Ok(());
-        }
-        let mut br = BitReader::new(data);
-
-        // Picture header (wmv2_decode_picture_header)
-        let pict_type = br.read_bit() as u8 + 1; // 1 = I, 2 = P
-        self.pict_type = pict_type;
-        if pict_type == 1 {
-            let _code = br.read(7); // I7
-        }
-        let qscale = br.read(5) as usize;
-        if qscale == 0 {
-            return Err(Error::InvalidData("wmv2: invalid qscale".into()));
-        }
-        self.qscale = qscale;
-
-        // Secondary picture header
-        if pict_type == 1 {
-            if self.j_type_bit {
-                self.j_type = br.read_bit() != 0;
-            } else {
-                self.j_type = false;
-            }
-            if !self.j_type {
-                if self.per_mb_rl_bit {
-                    self.per_mb_rl_table = br.read_bit() != 0;
-                } else {
-                    self.per_mb_rl_table = false;
-                }
+            self.w2.j_type = if self.w2.j_type_bit { br.read_bit() != 0 } else { false };
+            if !self.w2.j_type {
+                self.per_mb_rl_table = if self.w2.per_mb_rl_bit { br.read_bit() != 0 } else { false };
                 if !self.per_mb_rl_table {
-                    self.rl_chroma_table_index = br.decode012()? as usize;
-                    self.rl_table_index = br.decode012()? as usize;
+                    self.rl_chroma_table_index = br.decode012() as usize;
+                    self.rl_table_index = br.decode012() as usize;
                 }
                 self.dc_table_index = br.read_bit() as usize;
+                if br.bits_left() * 8 < (self.mb_width * self.mb_height) as i64 {
+                    return Err(Error::invalid("wmv2: frame too small"));
+                }
             }
+            self.no_rounding = true;
         } else {
-            // P frame (skipped or inter)
-            return Ok(());
+            self.w2.j_type = false;
+            self.parse_mb_skip(br)?;
+            let cbp_index = br.decode012() as usize;
+            self.w2.cbp_table_index = cbp_table_index(self.qscale, cbp_index);
+            self.mspel = if self.w2.mspel_bit { br.read_bit() != 0 } else { false };
+            if self.w2.abt_flag {
+                self.w2.per_mb_abt = br.read_bit() == 0;
+                if !self.w2.per_mb_abt {
+                    self.w2.abt_type = br.decode012() as usize;
+                }
+            }
+            self.per_mb_rl_table = if self.w2.per_mb_rl_bit { br.read_bit() != 0 } else { false };
+            if !self.per_mb_rl_table {
+                self.rl_table_index = br.decode012() as usize;
+                self.rl_chroma_table_index = self.rl_table_index;
+            }
+            if br.bits_left() < 2 {
+                return Err(Error::invalid("wmv2: header truncated"));
+            }
+            self.dc_table_index = br.read_bit() as usize;
+            self.mv_table_index = br.read_bit() as usize;
+            self.no_rounding = !self.no_rounding;
         }
         self.esc3_level_length = 0;
         self.esc3_run_length = 0;
 
-        let mut pic = Picture::alloc(self.width, self.height)?;
+        if self.w2.j_type {
+            let q = self.qscale;
+            let loop_filter = self.loop_filter;
+            if let Some(x8) = self.x8.as_mut() {
+                x8.decode_picture(&mut self.cur, br, 2 * q, (q - 1) | 1, loop_filter, &mut self.qscale_table);
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
 
-        if self.pict_type == 1 && !self.j_type {
-            self.pred.reset();
-            self.qscale_table.fill(self.qscale as i32);
+    /// `wmv2_decode_inter_block`.
+    fn wmv2_decode_inter_block(&mut self, br: &mut BitReader, n: usize, cbp: bool) -> bool {
+        const SUB_CBP_TABLE: [u32; 3] = [2, 3, 1];
+        if !cbp {
+            self.block_last_index[n] = -1;
+            return true;
+        }
+        if self.w2.per_block_abt {
+            self.w2.abt_type = br.decode012() as usize;
+        }
+        self.w2.abt_type_table[n] = self.w2.abt_type;
+        if self.w2.abt_type != 0 {
+            let scantable = if self.w2.abt_type == 1 { &WMV2_SCANTABLE_A } else { &WMV2_SCANTABLE_B };
+            let sub_cbp = SUB_CBP_TABLE[br.decode012() as usize];
+            if sub_cbp & 1 != 0 && !self.decode_block_into(br, n, true, Some(scantable), false) {
+                return false;
+            }
+            if sub_cbp & 2 != 0 && !self.decode_block_into(br, n, true, Some(scantable), true) {
+                return false;
+            }
+            self.block_last_index[n] = 63;
+            true
+        } else {
+            let scan = self.inter_scantable;
+            self.decode_block_into(br, n, true, Some(&scan), false)
+        }
+    }
 
-            for mb_y in 0..self.mb_height {
-                for mb_x in 0..self.mb_width {
-                    // eprintln!("MB ({mb_x}, {mb_y}) bits left: {}", br.bits_left());
-                    let code = MB_I_VLC.get().unwrap().decode(&mut br)? as usize;
-                    let mut cbp = 0usize;
-                    for i in 0..6 {
-                        let mut val = (code >> (5 - i)) & 1;
-                        if i < 4 {
-                            val = self.pred.coded_block_pred(i, mb_x, mb_y, val as u8) as usize;
-                        }
-                        cbp |= val << (5 - i);
+    /// `wmv2_decode_mb`.
+    pub(crate) fn wmv2_decode_mb(&mut self, br: &mut BitReader) -> bool {
+        let t = &*TABLES;
+        let mb_xy = self.mb_y * self.mb_stride + self.mb_x;
+        let cbp: i32;
+        if self.pict_type == PICT_P {
+            if self.mb_type[mb_xy] & MB_TYPE_SKIP != 0 {
+                self.mb_intra = false;
+                self.block_last_index = [-1; 6];
+                self.mv = [0, 0];
+                self.w2.hshift = 0;
+                return true;
+            }
+            if br.bits_left() <= 0 {
+                return false;
+            }
+            let code = t.mb_non_intra[self.w2.cbp_table_index].get(br);
+            self.mb_intra = (!code & 0x40) >> 6 != 0;
+            cbp = code & 0x3f;
+        } else {
+            self.mb_intra = true;
+            if br.bits_left() <= 0 {
+                return false;
+            }
+            let code = t.mb_i.get(br);
+            let mut c = 0;
+            for i in 0..6 {
+                let mut val = (code >> (5 - i)) & 1;
+                if i < 4 {
+                    let (pred, idx) = self.coded_block_pred(i);
+                    val ^= pred;
+                    self.coded_block[idx] = val as u8;
+                }
+                c |= val << (5 - i);
+            }
+            cbp = c;
+        }
+
+        if !self.mb_intra {
+            let (mut mx, mut my) = self.wmv2_pred_motion(br);
+            if cbp != 0 {
+                self.block = [[0; 64]; 6];
+                if self.per_mb_rl_table {
+                    self.rl_table_index = br.decode012() as usize;
+                    self.rl_chroma_table_index = self.rl_table_index;
+                }
+                if self.w2.abt_flag && self.w2.per_mb_abt {
+                    self.w2.per_block_abt = br.read_bit() != 0;
+                    if !self.w2.per_block_abt {
+                        self.w2.abt_type = br.decode012() as usize;
                     }
-                    self.ac_pred = br.read_bit() != 0;
-                    if self.per_mb_rl_table && cbp != 0 {
-                        self.rl_table_index = br.decode012()? as usize;
-                        self.rl_chroma_table_index = self.rl_table_index;
-                    }
-
-                    for i in 0..6 {
-                        let mut block = [0i16; 64];
-                        let coded = ((cbp >> (5 - i)) & 1) != 0;
-                        self.decode_block(&mut br, &mut block, i, coded, mb_x, mb_y)?;
-
-                        let bx = mb_x * 16 + (if (i & 1) != 0 { 8 } else { 0 });
-                        let by = mb_y * 16 + (if (i & 2) != 0 { 8 } else { 0 });
-
-                        match i {
-                            0..=3 => {
-                                idct::wmv2_idct_put(&mut pic.y[by * pic.y_stride + bx..], pic.y_stride, &mut block);
-                            }
-                            4 => {
-                                let cx = mb_x * 8;
-                                let cy = mb_y * 8;
-                                idct::wmv2_idct_put(&mut pic.cb[cy * pic.c_stride + cx..], pic.c_stride, &mut block);
-                            }
-                            5 => {
-                                let cx = mb_x * 8;
-                                let cy = mb_y * 8;
-                                idct::wmv2_idct_put(&mut pic.cr[cy * pic.c_stride + cx..], pic.c_stride, &mut block);
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    if self.loop_filter {
-                        apply_loop_filter(&mut pic, mb_x, mb_y, self.mb_width, self.mb_height, self.qscale, &self.qscale_table);
-                    }
+                } else {
+                    self.w2.per_block_abt = false;
                 }
             }
-            self.last_picture = Some(Picture {
-                width: pic.width,
-                height: pic.height,
-                mb_width: pic.mb_width,
-                mb_height: pic.mb_height,
-                y_stride: pic.y_stride,
-                c_stride: pic.c_stride,
-                y: pic.y.clone(),
-                cb: pic.cb.clone(),
-                cr: pic.cr.clone(),
-            });
-            self.pending = Some(make_frame(pic, packet.pts));
-        }
-
-        Ok(())
-    }
-
-    fn receive_frame(&mut self) -> Result<Frame> {
-        if let Some(f) = self.pending.take() {
-            Ok(f)
+            // wmv2_decode_motion
+            decode_ms_motion(br, self.mv_table_index, &mut mx, &mut my);
+            self.w2.hshift = if ((mx | my) & 1) != 0 && self.mspel { br.read_bit() as usize } else { 0 };
+            self.mv = [mx, my];
+            for i in 0..6 {
+                if !self.wmv2_decode_inter_block(br, i, (cbp >> (5 - i)) & 1 != 0) {
+                    return false;
+                }
+            }
         } else {
-            Err(Error::NeedMore)
+            self.ac_pred = br.read_bit() != 0;
+            if self.per_mb_rl_table && cbp != 0 {
+                self.rl_table_index = br.decode012() as usize;
+                self.rl_chroma_table_index = self.rl_table_index;
+            }
+            self.block = [[0; 64]; 6];
+            for i in 0..6 {
+                if !self.decode_block(br, i, (cbp >> (5 - i)) & 1 != 0, None) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// `ff_mspel_motion`.
+    pub(crate) fn mspel_motion(&mut self) {
+        let Some(refp) = self.last.as_ref() else { return };
+        let (motion_x, motion_y) = (self.mv[0], self.mv[1]);
+        let mut dxy = (((motion_y & 1) << 1) | (motion_x & 1)) as usize;
+        dxy = 2 * dxy + self.w2.hshift;
+        let mut src_x = self.mb_x as i32 * 16 + (motion_x >> 1);
+        let mut src_y = self.mb_y as i32 * 16 + (motion_y >> 1);
+        let (w, h) = (self.width as i32, self.height as i32);
+        src_x = src_x.clamp(-16, w);
+        src_y = src_y.clamp(-16, h);
+        if src_x <= -16 || src_x >= w {
+            dxy &= !3;
+        }
+        if src_y <= -16 || src_y >= h {
+            dxy &= !4;
+        }
+        let ls = self.cur.linesize[0];
+        let uvls = self.cur.linesize[1];
+        let dest_y = self.mb_y * 16 * ls + self.mb_x * 16;
+        let dest_c = self.mb_y * 8 * uvls + self.mb_x * 8;
+        let (hep, vep) = (self.h_edge_pos, self.v_edge_pos);
+        let no_rnd = self.no_rounding;
+
+        // Luma: a 19x19 area starting one pixel up-left of the block.
+        let mut ebuf = [0u8; 19 * 19];
+        let src = mpv::src_block(&refp.data[0], refp.linesize[0], hep, vep, src_x - 1, src_y - 1, 19, 19, &mut ebuf);
+        let base = src.off + src.stride + 1;
+        for (bx, by) in [(0usize, 0usize), (8, 0), (0, 8), (8, 8)] {
+            put_mspel8(
+                &mut self.cur.data[0],
+                dest_y + by * ls + bx,
+                ls,
+                src.data,
+                base + by * src.stride + bx,
+                src.stride,
+                dxy,
+            );
+        }
+
+        let mut cdxy = 0usize;
+        if motion_x & 3 != 0 {
+            cdxy |= 1;
+        }
+        if motion_y & 3 != 0 {
+            cdxy |= 2;
+        }
+        let mx = motion_x >> 2;
+        let my = motion_y >> 2;
+        let mut csx = self.mb_x as i32 * 8 + mx;
+        let mut csy = self.mb_y as i32 * 8 + my;
+        csx = csx.clamp(-8, w >> 1);
+        if csx == (w >> 1) {
+            cdxy &= !1;
+        }
+        csy = csy.clamp(-8, h >> 1);
+        if csy == (h >> 1) {
+            cdxy &= !2;
+        }
+        for p in 1..3 {
+            let mut cbuf = [0u8; 9 * 9];
+            let src: SrcBlock =
+                mpv::src_block(&refp.data[p], refp.linesize[p], hep >> 1, vep >> 1, csx, csy, 9, 9, &mut cbuf);
+            mpv::put_hpel(&mut self.cur.data[p], dest_c, uvls, &src, 8, 8, cdxy, no_rnd);
         }
     }
 
-    fn flush(&mut self) -> Result<()> {
-        self.pending = None;
-        self.last_picture = None;
-        Ok(())
+    /// `ff_wmv2_add_mb`.
+    pub(crate) fn wmv2_add_mb(&mut self, dest_y: usize, dest_c: usize) {
+        for n in 0..6 {
+            if self.block_last_index[n] < 0 {
+                continue;
+            }
+            let (p, off, stride) = self.block_dest(n, dest_y, dest_c);
+            match self.w2.abt_type_table[n] {
+                0 => idct::wmv2_idct_add(&mut self.cur.data[p], off, stride, &mut self.block[n]),
+                1 => {
+                    idct::simple_idct84_add(&mut self.cur.data[p], off, stride, &mut self.block[n]);
+                    idct::simple_idct84_add(&mut self.cur.data[p], off + 4 * stride, stride, &mut self.w2.abt_block2[n]);
+                    self.w2.abt_block2[n] = [0; 64];
+                }
+                _ => {
+                    idct::simple_idct48_add(&mut self.cur.data[p], off, stride, &mut self.block[n]);
+                    idct::simple_idct48_add(&mut self.cur.data[p], off + 4, stride, &mut self.w2.abt_block2[n]);
+                    self.w2.abt_block2[n] = [0; 64];
+                }
+            }
+        }
+    }
+}
+
+/// `wmv2_mspel8_h_lowpass`: `h` rows of 8 from `src` (needs src[-1..9]).
+fn mspel_h(dst: &mut [u8], doff: usize, dstride: usize, src: &[u8], soff: usize, sstride: usize, h: usize) {
+    for i in 0..h {
+        let s = soff + i * sstride;
+        let d = doff + i * dstride;
+        for x in 0..8 {
+            let v = 9 * (src[s + x] as i32 + src[s + x + 1] as i32) - (src[s + x - 1] as i32 + src[s + x + 2] as i32);
+            dst[d + x] = ((v + 8) >> 4).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// `wmv2_mspel8_v_lowpass`: 8 rows, `w` columns (needs rows -1..9).
+fn mspel_v(dst: &mut [u8], doff: usize, dstride: usize, src: &[u8], soff: usize, sstride: usize, w: usize) {
+    for x in 0..w {
+        let g = |r: isize| src[(soff as isize + x as isize + r * sstride as isize) as usize] as i32;
+        for y in 0..8isize {
+            let v = 9 * (g(y) + g(y + 1)) - (g(y - 1) + g(y + 2));
+            dst[doff + x + y as usize * dstride] = ((v + 8) >> 4).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// `ff_put_pixels8_l2_8`: average of two 8-wide sources (rounding up).
+fn put_l2(dst: &mut [u8], doff: usize, dstride: usize, a: &[u8], aoff: usize, astride: usize, b: &[u8], boff: usize, bstride: usize) {
+    for y in 0..8 {
+        for x in 0..8 {
+            let va = a[aoff + y * astride + x] as u32;
+            let vb = b[boff + y * bstride + x] as u32;
+            dst[doff + y * dstride + x] = ((va + vb + 1) >> 1) as u8;
+        }
+    }
+}
+
+/// `put_mspel_pixels_tab[dxy]` for one 8x8 block at `soff` of `src`.
+fn put_mspel8(dst: &mut [u8], doff: usize, dstride: usize, src: &[u8], soff: usize, stride: usize, dxy: usize) {
+    match dxy {
+        0 => {
+            for y in 0..8 {
+                dst[doff + y * dstride..doff + y * dstride + 8].copy_from_slice(&src[soff + y * stride..soff + y * stride + 8]);
+            }
+        }
+        1 => {
+            let mut half = [0u8; 64];
+            mspel_h(&mut half, 0, 8, src, soff, stride, 8);
+            put_l2(dst, doff, dstride, src, soff, stride, &half, 0, 8);
+        }
+        2 => mspel_h(dst, doff, dstride, src, soff, stride, 8),
+        3 => {
+            let mut half = [0u8; 64];
+            mspel_h(&mut half, 0, 8, src, soff, stride, 8);
+            put_l2(dst, doff, dstride, src, soff + 1, stride, &half, 0, 8);
+        }
+        4 => mspel_v(dst, doff, dstride, src, soff, stride, 8),
+        5 | 7 => {
+            let mut half_h = [0u8; 88];
+            let mut half_v = [0u8; 64];
+            let mut half_hv = [0u8; 64];
+            mspel_h(&mut half_h, 0, 8, src, soff - stride, stride, 11);
+            let voff = if dxy == 5 { soff } else { soff + 1 };
+            mspel_v(&mut half_v, 0, 8, src, voff, stride, 8);
+            mspel_v(&mut half_hv, 0, 8, &half_h, 8, 8, 8);
+            put_l2(dst, doff, dstride, &half_v, 0, 8, &half_hv, 0, 8);
+        }
+        _ => {
+            let mut half_h = [0u8; 88];
+            mspel_h(&mut half_h, 0, 8, src, soff - stride, stride, 11);
+            mspel_v(dst, doff, dstride, &half_h, 8, 8, 8);
+        }
     }
 }

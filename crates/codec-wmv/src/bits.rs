@@ -1,73 +1,54 @@
-//! MSB-first bit reader mirroring FFmpeg's `GetBitContext` semantics for the
-//! WMV/VC-1 family: reads may overshoot the end (FFmpeg pads with zeros past
-//! the end via `AV_INPUT_BUFFER_PADDING_SIZE`), so reads past the end return 0
-//! bits and track overread instead of erroring. Decoders check
-//! [`BitReader::overread`] at frame boundaries like FFmpeg checks
-//! `get_bits_left < 0`.
+//! MSB-first bit reader with FFmpeg `GetBitContext` semantics: reads past
+//! the end of the buffer return zero bits (FFmpeg's zeroed input padding)
+//! while the position keeps advancing, so `bits_left()` goes negative
+//! exactly like `get_bits_left()`.
 
-use oxideav_core::{Error, Result};
-
+#[derive(Clone)]
 pub struct BitReader<'a> {
     data: &'a [u8],
-    /// Next byte to load.
+    /// Next byte to load into the cache.
     pos: usize,
-    /// Bit position within the stream (consumed bits).
+    /// Bits consumed so far.
     bit: i64,
-    /// One 64-bit cache; high `valid` bits are meaningful, MSB-first.
+    /// MSB-first cache; the top `valid` bits are meaningful.
     cache: u64,
     valid: u32,
 }
 
 impl<'a> BitReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            pos: 0,
-            bit: 0,
-            cache: 0,
-            valid: 0,
-        }
+        Self { data, pos: 0, bit: 0, cache: 0, valid: 0 }
     }
 
     #[inline]
     fn fill(&mut self) {
         while self.valid <= 56 {
-            let b = if self.pos < self.data.len() {
-                self.data[self.pos]
-            } else {
-                0
-            };
+            let b = if self.pos < self.data.len() { self.data[self.pos] } else { 0 };
             self.pos += 1;
             self.cache |= (b as u64) << (56 - self.valid);
             self.valid += 8;
         }
     }
 
-    /// Bits consumed so far.
+    /// Bits consumed so far (`get_bits_count`).
     #[inline]
     pub fn position(&self) -> i64 {
         self.bit
     }
 
-    /// Bits remaining in the underlying buffer (may go negative on overread).
+    /// Size of the buffer in bits.
+    #[inline]
+    pub fn size_in_bits(&self) -> i64 {
+        self.data.len() as i64 * 8
+    }
+
+    /// `get_bits_left` (negative after an overread).
     #[inline]
     pub fn bits_left(&self) -> i64 {
         self.data.len() as i64 * 8 - self.bit
     }
 
-    /// Whether reads have passed the end of the buffer.
-    #[inline]
-    pub fn overread(&self) -> bool {
-        self.bit > self.data.len() as i64 * 8
-    }
-
-    /// True when fewer than `n` real bits remain.
-    #[inline]
-    pub fn short(&self, n: i64) -> bool {
-        self.bits_left() < n
-    }
-
-    /// Read `n` bits (n <= 32) as unsigned, zero-padded past the end.
+    /// `get_bits(n)` for n <= 32.
     #[inline]
     pub fn read(&mut self, n: u32) -> u32 {
         if n == 0 {
@@ -83,14 +64,14 @@ impl<'a> BitReader<'a> {
         v
     }
 
-    /// Read `n` bits signed (sign-extended from bit n-1).
+    /// `get_sbits(n)`: `n` bits sign-extended.
     #[inline]
     pub fn read_signed(&mut self, n: u32) -> i32 {
         if n == 0 {
             return 0;
         }
         let v = self.read(n) as i32;
-        v << (32 - n) >> (32 - n)
+        (v << (32 - n)) >> (32 - n)
     }
 
     #[inline]
@@ -98,7 +79,7 @@ impl<'a> BitReader<'a> {
         self.read(1)
     }
 
-    /// Peek `n` bits (n <= 32) without consuming.
+    /// `show_bits(n)` for n <= 32.
     #[inline]
     pub fn peek(&mut self, n: u32) -> u32 {
         if n == 0 {
@@ -110,7 +91,7 @@ impl<'a> BitReader<'a> {
         (self.cache >> (64 - n)) as u32
     }
 
-    /// Skip `n` bits (tracks position past the end like FFmpeg).
+    /// `skip_bits_long`.
     #[inline]
     pub fn skip(&mut self, n: u32) {
         let mut left = n;
@@ -121,52 +102,42 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Read a unary code of leading zeros terminated by a 1, capped at
-    /// `max` (returns `max` when the cap is reached without the terminator,
-    /// matching FFmpeg's `get_unary(gb, stop, len)` with stop==0).
-    pub fn read_unary(&mut self, max: u32) -> u32 {
-        let mut n = 0;
-        loop {
-            if self.read_bit() == 1 {
-                return n;
-            }
-            n += 1;
-            if n >= max {
-                return max;
-            }
-        }
-    }
-
-    /// FFmpeg's `decode012`: 0 -> 0, 10 -> 1, 11 -> 2.
+    /// `decode012`: 0 -> 0, 10 -> 1, 11 -> 2.
     #[inline]
-    pub fn decode012(&mut self) -> Result<u32> {
+    pub fn decode012(&mut self) -> u32 {
         if self.read_bit() == 0 {
-            return Ok(0);
+            0
+        } else {
+            1 + self.read_bit()
         }
-        Ok(1 + self.read_bit())
     }
 
-    /// FFmpeg's `decode210`: 1 -> 0, 01 -> 1, 00 -> 2.
+    /// `decode210`: 1 -> 0, 01 -> 1, 00 -> 2.
     #[inline]
     pub fn decode210(&mut self) -> u32 {
         if self.read_bit() != 0 {
-            return 0;
+            0
+        } else {
+            2 - self.read_bit()
         }
-        2 - self.read_bit()
     }
 
-    /// FFmpeg's `get_ue_golomb`-free signed VLC used by VC-1 MVDATA with
-    /// `k_x`-bit extension: `(value << 1 | sign)` semantics handled by the
-    /// caller; this helper reads `n` bits and applies `-` when the top bit
-    /// of the pair is set.
+    /// `get_unary(gb, stop, len)`: counts bits until one equal to `stop`
+    /// (consumed) or until `len` bits were read.
     #[inline]
-    pub fn check(&self, n: i64) -> Result<()> {
-        if self.bits_left() < n {
-            return Err(Error::InvalidData(format!(
-                "codec-wmv: bitstream overread ({n} bits needed, {} left)",
-                self.bits_left()
-            )));
+    pub fn get_unary(&mut self, stop: u32, len: u32) -> u32 {
+        let mut i = 0;
+        while i < len && self.read_bit() != stop {
+            i += 1;
         }
-        Ok(())
+        i
+    }
+
+    /// `align_get_bits`.
+    pub fn align(&mut self) {
+        let r = (self.bit & 7) as u32;
+        if r != 0 {
+            self.skip(8 - r);
+        }
     }
 }
