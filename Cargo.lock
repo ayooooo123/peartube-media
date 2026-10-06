@@ -110,7 +110,7 @@ dependencies = [
  "codec-mlp",
  "demux-asf",
  "demux-misc",
- "oxideav-aac 0.1.7 (git+https://github.com/ayooooo123/oxideav-aac?rev=6e06708ebc76c25d6db5c309762fa248325ab64e)",
+ "oxideav-aac 0.1.7 (git+https://github.com/ayooooo123/oxideav-aac?rev=7bac83b832ea44e4e60468513c5fde6bd00f5264)",
  "oxideav-ac3",
  "oxideav-adpcm",
  "oxideav-ape",
@@ -323,7 +323,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "oxideav-aac"
 version = "0.1.7"
-source = "git+https://github.com/ayooooo123/oxideav-aac?branch=peartube#6e06708ebc76c25d6db5c309762fa248325ab64e"
+source = "git+https://github.com/ayooooo123/oxideav-aac?branch=peartube#7bac83b832ea44e4e60468513c5fde6bd00f5264"
 dependencies = [
  "oxideav-core",
 ]
@@ -331,7 +331,7 @@ dependencies = [
 [[package]]
 name = "oxideav-aac"
 version = "0.1.7"
-source = "git+https://github.com/ayooooo123/oxideav-aac?rev=6e06708ebc76c25d6db5c309762fa248325ab64e#6e06708ebc76c25d6db5c309762fa248325ab64e"
+source = "git+https://github.com/ayooooo123/oxideav-aac?rev=7bac83b832ea44e4e60468513c5fde6bd00f5264#7bac83b832ea44e4e60468513c5fde6bd00f5264"
 dependencies = [
  "oxideav-core",
 ]
