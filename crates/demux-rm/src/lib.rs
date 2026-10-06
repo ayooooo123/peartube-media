@@ -5,6 +5,7 @@
 
 pub mod demuxer;
 pub mod rm_tags;
+pub mod rv34;
 pub mod rmsipr;
 
 pub use demuxer::{open, RmDemuxer};

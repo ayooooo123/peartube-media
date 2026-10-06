@@ -14,6 +14,7 @@ use crate::rm_tags::{
     DEINT_ID_VBRF, DEINT_ID_VBRS, RM_METADATA_KEYS,
 };
 use crate::rmsipr;
+use crate::rv34::Rv34ParserState;
 
 const RAW_PACKET_SIZE: usize = 1000;
 const MAX_DIMENSION: u32 = 16384;
@@ -44,6 +45,7 @@ struct AudioStreamState {
 
 #[derive(Default)]
 struct VideoStreamState {
+    rv34: Rv34ParserState,
     slices: usize,
     cur_slice: usize,
     curpic_num: i32,
@@ -82,6 +84,9 @@ pub struct RmDemuxer {
 
     // Rolling state for rm_sync
     sync_state: u32,
+
+    // Last emitted pts per audio stream index (parser grid fill)
+    last_audio_pts: HashMap<u32, i64>,
 
     // File position of the next DATA chunk header (multiple-DATA files), if any
     next_data_pos: Option<u64>,
@@ -681,6 +686,7 @@ pub fn open(
         stream_id_to_index,
         index_entries,
         sync_state: 0xFFFFFFFF,
+        last_audio_pts: HashMap::new(),
         next_data_pos,
     }))
 }
@@ -871,7 +877,10 @@ impl RmDemuxer {
                 Some(&i) => i,
                 None => return Ok(None),
             };
-            return Ok(Some((s_idx, len, 0, 0)));
+            // rmdec.c: a continuation carries AV_NOPTS_VALUE — the frame's pts
+            // comes from the chunk that started it, except for type-3 frames
+            // where the in-payload pos overwrites it.
+            return Ok(Some((s_idx, len, i64::MIN, 0)));
         }
 
         let mut b1 = [0u8; 1];
@@ -985,6 +994,9 @@ impl RmDemuxer {
                 }
             };
 
+            if std::env::var("RM_DEBUG").is_ok() {
+                eprintln!("chunk stream={s_idx} len={len} ts={timestamp} flags={flags:#x}");
+            }
             return Ok(Some((s_idx, len, timestamp, flags)));
         }
 
@@ -1053,8 +1065,16 @@ impl RmDemuxer {
                 return Err(Error::Eof);
             }
 
+            // rv34 parser pts correction (FFmpeg attaches the parser to
+            // rv30/rv40 streams; see rv34.rs).
+            let codec_id = self.streams[stream_idx].params.codec_id.as_str().to_owned();
+            let pts = vst
+                .rv34
+                .correct_pts(&codec_id, Some(timestamp), &data);
             let mut pkt = Packet::new(stream_idx as u32, TimeBase::MILLIS, data);
-            pkt = pkt.with_pts(timestamp);
+            if let Some(pts) = pts {
+                pkt = pkt.with_pts(pts);
+            }
             pkt = pkt.with_keyframe((flags & 2) != 0);
             return Ok(Some(pkt));
         }
@@ -1126,9 +1146,21 @@ impl RmDemuxer {
             }
 
             let data = std::mem::take(&mut vst.videobuf);
-            let ts = vst.timestamp.unwrap_or(timestamp);
+            // rmdec.c: rm_assemble_video_frame sets pkt->pts = AV_NOPTS_VALUE,
+            // then ff_rm_parse_packet falls through and overwrites it with the
+            // current chunk's timestamp (the completing slice's, or `pos` for
+            // type-3 frames). Slices arriving later in one DATA chunk still
+            // complete the frame immediately, matching FFmpeg's packet order.
+            // rv34 parser pts correction (FFmpeg attaches the parser to
+            // rv30/rv40 streams; see rv34.rs).
+            let codec_id = self.streams[stream_idx].params.codec_id.as_str().to_owned();
+            let pts = vst
+                .rv34
+                .correct_pts(&codec_id, Some(timestamp), &data);
             let mut pkt = Packet::new(stream_idx as u32, TimeBase::MILLIS, data);
-            pkt = pkt.with_pts(ts);
+            if let Some(pts) = pts {
+                pkt = pkt.with_pts(pts);
+            }
             pkt = pkt.with_keyframe((flags & 2) != 0);
             vst.slices = 0;
             return Ok(Some(pkt));
@@ -1214,52 +1246,105 @@ impl RmDemuxer {
             }
 
             let num_pkts = (h * w) / block_align;
-            let (pkt_duration, initial_delay) = match ast.deint_id {
-                DEINT_ID_INT4 => (20i64, 0i64),
-                DEINT_ID_GENR => {
-                    let dur = if ast.sample_rate > 0 {
-                        (1024 * 1000) / ast.sample_rate as i64
-                    } else {
-                        23
-                    };
-                    (dur, 0i64)
-                }
-                DEINT_ID_SIPR => {
-                    let dur = match block_align {
-                        20 => 10,
-                        19 | 29 => 20,
-                        37 => 60,
-                        _ => 20,
-                    };
-                    let delay = if block_align == 37 && ast.blocks_emitted == 0 {
-                        -6
-                    } else {
-                        0
-                    };
-                    (dur, delay)
-                }
-                _ => (0, 0),
+            // Frame duration in samples, from av_get_audio_frame_duration:
+            // int4 (ra_288) 160, genr (cook) 1024, sipr per block_align
+            // (20→160, 19→144, 29→288, 37→480). Rescaled into the stream's
+            // time base so .rm (1/1000) and .ra (1/90000) both match ffprobe.
+            let pkt_samples: i64 = match ast.deint_id {
+                DEINT_ID_INT4 => 160,
+                DEINT_ID_GENR => 1024,
+                DEINT_ID_SIPR => match block_align {
+                    20 => 160,
+                    19 => 144,
+                    29 => 288,
+                    37 => 480,
+                    _ => 160,
+                },
+                _ => 0,
             };
+            let pkt_duration = if pkt_samples > 0 && ast.sample_rate > 0 {
+                TimeBase::from_rate(ast.sample_rate).rescale(pkt_samples, time_base)
+            } else {
+                0
+            };
+            // ff_rm_retrieve_cache keeps the audiotimestamp as-is; the
+            // negative first pts on sipr 8k5/5k0 files comes from the file's
+            // chunk timestamps themselves.
+            let initial_delay: i64 = 0;
 
             let base_ts = ast.audiotimestamp.unwrap_or(timestamp) + initial_delay;
             ast.blocks_emitted += 1;
 
-            for i in 0..num_pkts {
-                let start = i * block_align;
-                let end = start + block_align;
-                if end <= ast.audio_buf.len() {
+            if ast.deint_id == DEINT_ID_SIPR {
+                // FFmpeg attaches the sipr parser (AVSTREAM_PARSE_FULL_RAW,
+                // rmdec.c) to sipr audio: each frame's pts is the chunk
+                // timestamp only when the frame starts a DATA chunk
+                // (ff_fetch_timestamp's window rule); frames inside a block
+                // carry no fresh ts and land on the duration grid
+                // (compute_pkt_fields: pts = prev + duration). The first
+                // block is shifted back by the decoder primer (32 samples
+                // for the 19-byte flavor, 48 for 37-byte, verified against
+                // ffprobe on the FATE sipr files); later blocks whose chunk
+                // ts disagrees with the carried grid re-anchor on it.
+                let primer: i64 = match block_align {
+                    19 => 32,
+                    37 => 48,
+                    _ => 0,
+                };
+                for i in 0..num_pkts {
+                    let start = i * block_align;
+                    let end = start + block_align;
+                    if end > ast.audio_buf.len() {
+                        continue;
+                    }
                     let slice = &ast.audio_buf[start..end];
-                    let pkt_pts = base_ts + (i as i64) * pkt_duration;
-                    let mut pkt = Packet::new(stream_idx as u32, time_base, slice.to_vec());
-                    pkt = pkt.with_pts(pkt_pts);
-                    pkt = pkt.with_duration(pkt_duration);
-                    pkt = pkt.with_keyframe(i == 0);
-                    pkt = pkt.with_corrupt(ast.partial);
+                    let pkt = Packet::new(stream_idx as u32, time_base, slice.to_vec());
+                    let pts = if i == 0 {
+                        if ast.blocks_emitted == 1 {
+                            Some(base_ts - TimeBase::from_rate(ast.sample_rate).rescale(primer, time_base))
+                        } else {
+                            Some(base_ts)
+                        }
+                    } else {
+                        None
+                    };
+                    let mut pkt = pkt
+                        .with_duration(pkt_duration)
+                        .with_keyframe(i == 0)
+                        .with_corrupt(ast.partial);
+                    pkt.pts = pts;
                     self.packet_queue.push_back(pkt);
+                }
+            } else {
+                for i in 0..num_pkts {
+                    let start = i * block_align;
+                    let end = start + block_align;
+                    if end <= ast.audio_buf.len() {
+                        let slice = &ast.audio_buf[start..end];
+                        let pkt_pts = base_ts + (i as i64) * pkt_duration;
+                        let mut pkt = Packet::new(stream_idx as u32, time_base, slice.to_vec());
+                        pkt = pkt.with_pts(pkt_pts);
+                        pkt = pkt.with_duration(pkt_duration);
+                        pkt = pkt.with_keyframe(i == 0);
+                        pkt = pkt.with_corrupt(ast.partial);
+                        self.packet_queue.push_back(pkt);
+                    }
                 }
             }
 
-            Ok(self.packet_queue.pop_front())
+            // Pop the front frame; a pts-less frame continues the duration
+            // grid from the previously emitted frame of this stream
+            // (compute_pkt_fields' no-fresh-timestamp branch).
+            let mut pkt = self.packet_queue.pop_front().ok_or(Error::Eof)?;
+            if pkt.pts.is_none() {
+                if let Some(prev) = self.last_audio_pts.get(&pkt.stream_index) {
+                    pkt.pts = Some(prev.saturating_add(pkt.duration.unwrap_or(0)));
+                }
+            }
+            if let Some(pts) = pkt.pts {
+                self.last_audio_pts.insert(pkt.stream_index, pts);
+            }
+            Ok(Some(pkt))
         } else if ast.deint_id == DEINT_ID_VBRF || ast.deint_id == DEINT_ID_VBRS {
             let mut b2 = [0u8; 2];
             self.io.read_exact(&mut b2)?;
@@ -1327,11 +1412,24 @@ impl Demuxer for RmDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        if let Some(pkt) = self.packet_queue.pop_front() {
-            return Ok(pkt);
-        }
+        loop {
+            if let Some(mut pkt) = self.packet_queue.pop_front() {
+                // compute_pkt_fields' no-fresh-timestamp branch: an audio frame
+                // without its own pts continues the duration grid from the
+                // previous packet of the stream.
+                if pkt.pts.is_none() {
+                    if let Some(prev) = self.last_audio_pts.get(&pkt.stream_index) {
+                        let dur = pkt.duration.unwrap_or(0);
+                        pkt.pts = Some(prev.saturating_add(dur));
+                    }
+                }
+                if let Some(pts) = pkt.pts {
+                    self.last_audio_pts.insert(pkt.stream_index, pts);
+                }
+                return Ok(pkt);
+            }
 
-        if self.old_format {
+            if self.old_format {
             let ast = match self.audio_states.get_mut(&0) {
                 Some(a) => a,
                 None => return Err(Error::Eof),
@@ -1356,11 +1454,33 @@ impl Demuxer for RmDemuxer {
             }
 
             let tb = self.streams[0].time_base;
-            if ast.deint_id == DEINT_ID_INT4 {
-                let res = self.parse_audio_packet(0, read_len, 0, 2)?;
-                if let Some(pkt) = res {
+            if self.audio_states.get(&0).is_some_and(|a| a.deint_id == DEINT_ID_INT4) {
+                // rm_read_packet: the old .ra format has one interleaved
+                // block per RAW chunk; only the first chunk of each block
+                // group is flagged KEY (seq), so pass 2 once and 0 after —
+                // the int4 interlever needs the counter to advance.
+                let first_sub = self.audio_states.get(&0).is_some_and(|a| a.sub_packet_cnt == 0);
+                let res = self.parse_audio_packet(0, read_len, 0, u8::from(first_sub))?;
+                if let Some(mut pkt) = res {
+                    // 28_8 frames are 160 samples; pts/duration in the
+                    // 1/90000 old-format time base, like compute_pkt_fields
+                    // (frame_size 160 @ 8 kHz → 20 ms → 1800 ticks).
+                    let sample_rate = self.audio_states.get(&0).map_or(8000, |a| a.sample_rate);
+                    let blocks = self.audio_states.get(&0).map_or(0, |a| a.blocks_emitted);
+                    let dur_ticks = tb.rescale(160, TimeBase::from_rate(sample_rate));
+                    let pts = (blocks.saturating_sub(1) as i64)
+                        .checked_mul(dur_ticks)
+                        .unwrap_or(0)
+                        + pkt.pts.unwrap_or(0);
+                    pkt.pts = Some(pts);
+                    pkt.duration = Some(dur_ticks);
                     return Ok(pkt);
                 }
+                // Block still incomplete: rm_read_packet loops for the next
+                // RAW chunk (`if (res) continue;`) instead of emitting a
+                // raw packet on top of the bytes the interleaver consumed.
+                // Iterative: the caller (next_packet loop) re-enters.
+                continue;
             }
 
             let mut buf = vec![0u8; read_len];
@@ -1369,44 +1489,49 @@ impl Demuxer for RmDemuxer {
             pkt = pkt.with_pts(0);
             pkt = pkt.with_keyframe(true);
             return Ok(pkt);
-        }
+            }
 
-        loop {
-            let (stream_idx, len, timestamp, flags) = match self.sync_next_packet()? {
-                Some(p) => p,
-                None => return Err(Error::Eof),
-            };
+        let (stream_idx, len, timestamp, flags) = match self.sync_next_packet()? {
+            Some(p) => p,
+            None => return Err(Error::Eof),
+        };
 
-            let media_type = self.streams[stream_idx].params.media_type;
-            match media_type {
-                MediaType::Video => {
-                    self.current_stream = self
-                        .stream_id_to_index
-                        .iter()
-                        .find(|(_, i)| **i == stream_idx)
-                        .map_or(0, |(k, _)| *k as u16);
-                    if let Some(pkt) = self.assemble_video_frame(stream_idx, len, timestamp, flags)? {
-                        return Ok(pkt);
-                    }
-                }
-                MediaType::Audio => {
-                    if let Some(pkt) = self.parse_audio_packet(stream_idx, len, timestamp, flags)? {
-                        return Ok(pkt);
-                    }
-                }
-                _ => {
-                    if len > MAX_BUFFER_SIZE {
-                        return Err(Error::invalid("data packet exceeds limits"));
-                    }
-                    let mut buf = vec![0u8; len];
-                    let whole = read_full(&mut self.io, &mut buf);
-                    let mut pkt = Packet::new(stream_idx as u32, self.streams[stream_idx].time_base, buf);
-                    pkt = pkt.with_pts(timestamp);
-                    pkt = pkt.with_keyframe((flags & 2) != 0);
-                    pkt = pkt.with_corrupt(!whole);
+        let media_type = self.streams[stream_idx].params.media_type;
+        match media_type {
+            MediaType::Video => {
+                self.current_stream = self
+                    .stream_id_to_index
+                    .iter()
+                    .find(|(_, i)| **i == stream_idx)
+                    .map_or(0, |(k, _)| *k as u16);
+                if let Some(pkt) = self.assemble_video_frame(stream_idx, len, timestamp, flags)? {
                     return Ok(pkt);
                 }
+                // Incomplete frame: loop for the next chunk.
+                continue;
             }
+            MediaType::Audio => {
+                if let Some(pkt) = self.parse_audio_packet(stream_idx, len, timestamp, flags)? {
+                    return Ok(pkt);
+                }
+                continue;
+            }
+            _ => {
+                if len > MAX_BUFFER_SIZE {
+                    return Err(Error::invalid("data packet exceeds limits"));
+                }
+                let mut buf = vec![0u8; len];
+                // rmdec.c: av_get_packet on a truncated final packet fails
+                // with AVERROR_INVALIDDATA, ending the stream.
+                if self.io.read_exact(&mut buf).is_err() {
+                    return Err(Error::Eof);
+                }
+                let mut pkt = Packet::new(stream_idx as u32, self.streams[stream_idx].time_base, buf);
+                pkt = pkt.with_pts(timestamp);
+                pkt = pkt.with_keyframe((flags & 2) != 0);
+                return Ok(pkt);
+            }
+        }
         }
     }
 
@@ -1436,6 +1561,7 @@ impl Demuxer for RmDemuxer {
         self.packet_queue.clear();
         self.remaining_len = 0;
         self.sync_state = 0xFFFFFFFF;
+        self.last_audio_pts.clear();
         for ast in self.audio_states.values_mut() {
             ast.sub_packet_cnt = 0;
             ast.audiotimestamp = None;
