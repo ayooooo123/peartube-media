@@ -9,13 +9,14 @@
 mod compare;
 mod manifest;
 mod oracle;
+mod tap;
 mod tool;
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use compare::{Compare, Verdict};
@@ -76,6 +77,8 @@ struct StreamResult {
     frames: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     samples: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cues: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     policy: Option<String>,
     verdict: String,
@@ -141,13 +144,28 @@ struct FuzzReport {
 /// final state. Non-realtime, so it runs as fast as the decoders do. A hung
 /// pipeline (a demuxer or decoder waiting forever) aborts after `secs` and is
 /// reported as a timeout; the leaked threads die with the process.
-fn play(
-    url: &str,
-    options: PlayerOptions,
-    secs: u64,
-) -> Result<(player::Capture, player::State), String> {
+/// One playback's outcome: the headless capture, the final state, and the
+/// cues the subtitle decoder handed the pipeline.
+struct Played {
+    capture: player::Capture,
+    state: player::State,
+    cues: Vec<tap::Cue>,
+    /// Codec ids of the subtitle decoders the player built.
+    subtitle_decoders: Vec<String>,
+}
+
+/// The player's registry behind decoder taps ([`tap::context`]), shared by
+/// every playback.
+static TAPPED: LazyLock<Arc<RuntimeContext>> = LazyLock::new(|| Arc::new(tap::context()));
+
+/// Plays `url` to the end. A hung pipeline (a demuxer or decoder waiting
+/// forever) aborts after `secs` and is reported as a timeout; the leaked
+/// threads die with the process.
+fn play(url: &str, options: PlayerOptions, secs: u64) -> Result<Played, String> {
     let backend = Headless::new();
-    let ctx = Arc::new(codecs::context());
+    let ctx = Arc::clone(&TAPPED);
+    let recorder = Arc::new(tap::Recorder::default());
+    tap::record_into(Arc::clone(&recorder));
     let url = url.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -158,16 +176,11 @@ fn play(
         let _ = tx.send((capture, state));
     });
     match rx.recv_timeout(Duration::from_secs(secs)) {
-        Ok((capture, state)) => Ok((capture, state)),
+        Ok((capture, state)) => {
+            Ok(Played { capture, state, cues: recorder.cues(), subtitle_decoders: recorder.decoders() })
+        }
         Err(_) => Err(format!("playback hung past the {secs}s watchdog")),
     }
-}
-
-/// The registry the player plays with, for discovering streams the way the
-/// player does.
-fn registry() -> &'static RuntimeContext {
-    static CTX: OnceLock<RuntimeContext> = OnceLock::new();
-    CTX.get_or_init(codecs::context)
 }
 
 /// One track the player offers.
@@ -187,7 +200,7 @@ struct Discovery {
 }
 
 fn discover(path: &Path) -> Result<Discovery, String> {
-    let ctx = registry();
+    let ctx = &*tap::PLAIN;
     let demuxer = refcheck::probe_container(ctx, path)?;
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -276,24 +289,6 @@ fn map_to_ffmpeg(track: &TrackInfo, disc: &Discovery, ff: &[oracle::FfStream]) -
     }
     let nth = ours.iter().position(|&s| s == track.stream).ok_or(format!("stream {} not offered", track.stream))?;
     Ok(theirs[nth].clone())
-}
-
-/// Subtitle packet count of FFmpeg's stream `index` by `ffprobe
-/// -count_packets`, bounded by [`tool::ffprobe`] (stdin closed, 30 s kill
-/// timeout: ffmpeg's subtitle parsers can spin on malformed samples).
-fn ffprobe_subtitle_packets(path: &Path, index: u32) -> Result<usize, String> {
-    let args: Vec<String> = [
-        "-select_streams", &index.to_string(), "-count_packets", "-show_entries", "stream=nb_read_packets",
-        "-of", "csv=p=0", path.to_str().ok_or("path not utf8")?,
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    let out = tool::ffprobe(&args, Duration::from_secs(30))?;
-    String::from_utf8_lossy(&out)
-        .trim()
-        .parse::<usize>()
-        .map_err(|e| format!("ffprobe output: {e}"))
 }
 
 fn compare_video(path: &Path, cap: &player::VideoCapture, ff: &oracle::FfStream) -> Compare {
@@ -386,19 +381,37 @@ fn audio_diagnostics(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStr
         .collect()
 }
 
-fn compare_subtitles(path: &Path, cap: &player::SubtitleCapture, ff: &oracle::FfStream) -> Compare {
-    let expect = match ffprobe_subtitle_packets(path, ff.index) {
-        Ok(n) => n,
-        Err(e) => return Compare::fail(format!("shows={}", cap.shows.len()), e),
+/// The decoded cues of one subtitle stream against FFmpeg's decode of `ff`,
+/// under `policy`; `shown` is how many images the pipeline put on screen.
+fn compare_subtitles(
+    path: &Path,
+    played: &Played,
+    codec: &str,
+    shown: usize,
+    ff: &oracle::FfStream,
+    policy: Policy,
+) -> Compare {
+    let cues = &played.cues;
+    let output = format!("cues={}", cues.len());
+    if played.subtitle_decoders.is_empty() {
+        return Compare::fail(output, format!("the player built no subtitle decoder for codec {codec}"));
+    }
+    if cues.is_empty() {
+        return Compare::fail(output, format!("the {} decoder emitted no cue", played.subtitle_decoders.join("+")));
+    }
+    let verdict = match policy {
+        Policy::SubText => {
+            oracle::subtitle_srt(path, &ff.map()).and_then(|reference| compare::text_cues(cues, shown, &reference))
+        }
+        Policy::SubBitmap => oracle::subtitle_events(path, ff.index).and_then(|events| {
+            let (dims, canvases) = oracle::subtitle_canvases(path, ff.index)?;
+            Ok((compare::bitmap_cues(cues, shown, &events, dims, &canvases)?, Vec::new()))
+        }),
+        other => return misapplied(other, Kind::Subtitle),
     };
-    // The pipeline shows each cue then clears it, so `shows` counts cleared
-    // events too; the cue count is the number of non-empty shows.
-    let cues = cap.shows.iter().filter(|(_, n)| *n > 0).count();
-    let metric = format!("shows={} ffmpeg_packets={expect}, cues={cues}", cap.shows.len());
-    if cues == expect {
-        Compare::pass(metric)
-    } else {
-        Compare::fail(metric, format!("cue count {cues} != ffprobe {expect}"))
+    match verdict {
+        Ok((metric, diagnostics)) => Compare { diagnostics, ..Compare::pass(metric) },
+        Err(e) => Compare::fail(output, e),
     }
 }
 
@@ -451,6 +464,7 @@ impl StreamResult {
             ffmpeg: None,
             frames: None,
             samples: None,
+            cues: None,
             policy: None,
             verdict: Verdict::Fail.as_str().into(),
             metric,
@@ -468,11 +482,12 @@ impl StreamResult {
             ffmpeg: None,
             frames: None,
             samples: None,
+            cues: None,
             policy: policy.map(Policy::token),
             verdict: cmp.verdict.as_str().into(),
             metric: Some(cmp.metric),
             error: cmp.error,
-            diagnostics: Vec::new(),
+            diagnostics: cmp.diagnostics,
         }
     }
 }
@@ -483,9 +498,9 @@ fn judge_track(
     path: &Path,
     sel: &Selected,
     ff: &Result<oracle::FfStream, String>,
-    capture: &player::Capture,
-    state: &player::State,
+    played: &Played,
 ) -> StreamResult {
+    let (capture, state, cues) = (&played.capture, &played.state, &played.cues[..]);
     let t = &sel.track;
     let missing = || {
         let why = state.error.as_deref().map(|e| format!(" (engine: {e})")).unwrap_or_default();
@@ -548,30 +563,38 @@ fn judge_track(
             let mut r = StreamResult::judged(t.stream, Kind::Audio, &t.codec, policy, cmp);
             r.samples = Some(samples);
             if let (Some(cap), Ok(ff)) = (cap, ff) {
-                r.diagnostics = audio_diagnostics(path, cap, ff, &entry.diagnostics);
+                r.diagnostics.extend(audio_diagnostics(path, cap, ff, &entry.diagnostics));
             }
             r
         }
         Kind::Subtitle => {
+            // The capture of a subtitle stream exists from its first show.
             let cap = capture.subtitles.iter().find(|c| c.stream == t.stream);
             let shown = cap.map_or(0, |c| c.shows.iter().filter(|(_, n)| *n > 0).count());
-            let output = format!("cues={shown}");
+            let output = format!("cues={}", cues.len());
             let (policy, cmp) = judge(
                 entry,
                 path,
                 Kind::Subtitle,
                 ff,
                 &output,
-                |policy, ff| match (policy, cap) {
-                    (Policy::SubCount, Some(cap)) => compare_subtitles(path, cap, ff),
-                    (Policy::SubCount, None) => Compare::fail(output.clone(), missing()),
-                    (other, _) => misapplied(other, Kind::Subtitle),
+                |policy, ff| match policy {
+                    Policy::SubText | Policy::SubBitmap => compare_subtitles(path, played, &t.codec, shown, ff, policy),
+                    other => misapplied(other, Kind::Subtitle),
                 },
                 || {
-                    if shown > 0 { Compare::decodes(output.clone()) } else { Compare::fail(output.clone(), missing()) }
+                    if shown > 0 && shown == cues.len() {
+                        Compare::decodes(output.clone())
+                    } else if shown != cues.len() {
+                        Compare::fail(output.clone(), format!("the pipeline showed {shown} of the {} decoded cues", cues.len()))
+                    } else {
+                        Compare::fail(output.clone(), missing())
+                    }
                 },
             );
-            StreamResult::judged(t.stream, Kind::Subtitle, &t.codec, policy, cmp)
+            let mut r = StreamResult::judged(t.stream, Kind::Subtitle, &t.codec, policy, cmp);
+            r.cues = Some(cues.len());
+            r
         }
     };
     r.ffmpeg = ff.as_ref().ok().map(oracle::FfStream::map);
@@ -610,13 +633,14 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
     };
     let ff_streams = oracle::streams(path);
 
-    let (capture, state) = match play(&path.to_string_lossy(), options.clone(), 300) {
-        Ok(r) => r,
+    let played = match play(&path.to_string_lossy(), options.clone(), 300) {
+        Ok(p) => p,
         Err(e) => {
             result.streams.push(StreamResult::entry_level("open", 0, None, e));
             return result;
         }
     };
+    let (capture, state) = (&played.capture, &played.state);
     if !state.ended {
         let error = state.error.clone().unwrap_or_else(|| "playback did not reach Ended".into());
         let metric = Some(format!("ended=false position={:?}", state.position));
@@ -661,7 +685,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
 
     for sel in &selected {
         let ff = ff_streams.as_ref().map_err(Clone::clone).and_then(|ff| map_to_ffmpeg(&sel.track, &disc, ff));
-        result.streams.push(judge_track(entry, path, sel, &ff, &capture, &state));
+        result.streams.push(judge_track(entry, path, sel, &ff, &played));
     }
     let selected_stream = |s: u32| selected.iter().any(|sel| sel.track.stream == s);
     for s in capture
@@ -714,7 +738,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
     if let Some(base) = http_base {
         let url = format!("{base}/{}", http_path(&entry.path));
         match play(&url, options, 300) {
-            Ok((hcap, hstate)) => {
+            Ok(Played { capture: hcap, state: hstate, .. }) => {
                 if hstate.error != state.error {
                     let error = format!("http playback error {:?} vs file {:?}", hstate.error, state.error);
                     result.streams.push(StreamResult::entry_level("http", u32::MAX - 1, None, error));
@@ -1326,10 +1350,4 @@ mod tests {
         assert!(select(&entry(wrong), &disc).is_err(), "stream 0 is video");
     }
 
-    #[test]
-    fn ffprobe_subtitle_packets_counts_a_fate_sample() {
-        // ffprobe -select_streams s:0 -count_packets on the SubRip tester: 37.
-        let path = refcheck::fate("sub/SubRip_capability_tester.srt");
-        assert_eq!(ffprobe_subtitle_packets(&path, 0), Ok(37));
-    }
 }

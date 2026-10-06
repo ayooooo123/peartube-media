@@ -2,7 +2,8 @@
 
 use serde::Serialize;
 
-use crate::oracle::{AudioFrameInfo, Pcm};
+use crate::oracle::{AudioFrameInfo, Pcm, SrtCue, SubEvent};
+use crate::tap::Cue;
 
 /// A stream's verdict. `Decodes` is not a pass: FFmpeg cannot decode the
 /// format, so the stream played to the end with output but nothing
@@ -33,19 +34,21 @@ pub struct Compare {
     pub verdict: Verdict,
     pub metric: String,
     pub error: Option<String>,
+    /// Non-accepting observations, reported beside the verdict.
+    pub diagnostics: Vec<String>,
 }
 
 impl Compare {
     pub fn pass(metric: impl Into<String>) -> Self {
-        Compare { verdict: Verdict::Pass, metric: metric.into(), error: None }
+        Compare { verdict: Verdict::Pass, metric: metric.into(), error: None, diagnostics: Vec::new() }
     }
 
     pub fn decodes(metric: impl Into<String>) -> Self {
-        Compare { verdict: Verdict::Decodes, metric: metric.into(), error: None }
+        Compare { verdict: Verdict::Decodes, metric: metric.into(), error: None, diagnostics: Vec::new() }
     }
 
     pub fn fail(metric: impl Into<String>, error: impl Into<String>) -> Self {
-        Compare { verdict: Verdict::Fail, metric: metric.into(), error: Some(error.into()) }
+        Compare { verdict: Verdict::Fail, metric: metric.into(), error: Some(error.into()), diagnostics: Vec::new() }
     }
 }
 
@@ -159,6 +162,161 @@ pub fn snr_pcm(ours: &[f32], reference: &[f32], slack: usize, floor: f64) -> Com
     }
 }
 
+// ---------------------------------------------------------------- subtitles
+
+/// A time as SubRip writes it: `hh:mm:ss,mmm`, truncated to the millisecond.
+pub fn srt_time(us: i64) -> String {
+    let ms = (us / 1000).max(0);
+    let s = ms / 1000;
+    format!("{:02}:{:02}:{:02},{:03}", s / 3600, s / 60 % 60, s % 60, ms % 1000)
+}
+
+/// Every cue the decoder handed the pipeline was shown: the headless
+/// capture's non-empty shows must number the decoded cues.
+fn shown_all(cues: &[Cue], shown: usize) -> Result<(), String> {
+    if shown != cues.len() {
+        return Err(format!("the pipeline showed {shown} of the {} decoded cues", cues.len()));
+    }
+    Ok(())
+}
+
+/// A SubRip body's text without markup: SubRip tags (`<...>`) and ASS
+/// override blocks (`{...}`) removed, each line trimmed, empty lines
+/// dropped. Markup conventions differ between renderers (`#0000FF` against
+/// FFmpeg's `#0000ff`, ASS styles FFmpeg's `srt` encoder turns into `<font>`
+/// tags), the words on screen do not.
+pub fn plain_text(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        let close = match c {
+            '<' => '>',
+            '{' => '}',
+            _ => {
+                out.push(c);
+                continue;
+            }
+        };
+        // Only a closed tag is markup; a lone `<` is text.
+        let rest: String = chars.clone().collect();
+        match rest.find(close) {
+            Some(end) => {
+                for _ in 0..rest[..=end].chars().count() {
+                    chars.next();
+                }
+            }
+            None => out.push(c),
+        }
+    }
+    out.replace("\r\n", "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `sub:text`: the decoded cues, in order, against FFmpeg's decode
+/// re-encoded as SubRip: same count, same timing to the millisecond, same
+/// text ([`plain_text`]). Bodies whose markup differs from FFmpeg's are
+/// reported as a non-accepting diagnostic.
+pub fn text_cues(cues: &[Cue], shown: usize, reference: &[SrtCue]) -> Result<(String, Vec<String>), String> {
+    shown_all(cues, shown)?;
+    let mut ours = Vec::with_capacity(cues.len());
+    for (i, cue) in cues.iter().enumerate() {
+        match cue {
+            Cue::Text { start_us, end_us, text } => ours.push(SrtCue {
+                timing: format!("{} --> {}", srt_time(*start_us), srt_time(*end_us)),
+                body: text.replace("\r\n", "\n").trim().to_string(),
+            }),
+            Cue::Bitmap { .. } => return Err(format!("cue {i} is a bitmap; the policy expects text")),
+        }
+    }
+    for (i, (o, r)) in ours.iter().zip(reference).enumerate() {
+        if o.timing != r.timing || plain_text(&o.body) != plain_text(&r.body) {
+            return Err(format!("cue {i}: {:?} {:?} vs FFmpeg {:?} {:?}", o.timing, o.body, r.timing, r.body));
+        }
+    }
+    if ours.len() != reference.len() {
+        return Err(format!("{} cues vs FFmpeg {} (the common ones match)", ours.len(), reference.len()));
+    }
+    let restyled: Vec<usize> = (0..ours.len()).filter(|&i| ours[i].body != reference[i].body).collect();
+    let diagnostics = restyled
+        .first()
+        .map(|&i| {
+            format!(
+                "markup differs from FFmpeg's SubRip rendering in {} of {} cues (non-accepting), first cue {i}: {:?} vs {:?}",
+                restyled.len(),
+                ours.len(),
+                ours[i].body,
+                reference[i].body
+            )
+        })
+        .into_iter()
+        .collect();
+    Ok((format!("cues={} text+timing match", ours.len()), diagnostics))
+}
+
+/// The distinct states of a canvas sequence, blank ones dropped:
+/// consecutive repeats are one state.
+fn states(md5s: impl IntoIterator<Item = String>, blank: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for m in md5s {
+        if m != blank && out.last() != Some(&m) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// `sub:bitmap`: the decoded bitmaps against FFmpeg's decode: as many shown
+/// subtitles as FFmpeg's decoder emits with bitmaps, starting at the same
+/// millisecond (ending too where FFmpeg's has an end), and the same canvas
+/// states as FFmpeg composes them (sub2video, RGBA).
+pub fn bitmap_cues(
+    cues: &[Cue],
+    shown: usize,
+    events: &[SubEvent],
+    (width, height): (usize, usize),
+    canvases: &[String],
+) -> Result<String, String> {
+    shown_all(cues, shown)?;
+    let mut ours = Vec::new();
+    for (i, cue) in cues.iter().enumerate() {
+        match cue {
+            Cue::Bitmap { blank: true, .. } => {}
+            Cue::Bitmap { start_us, end_us, width: w, height: h, md5, .. } => {
+                if (*w, *h) != (width, height) {
+                    return Err(format!("cue {i} is {w}x{h}, FFmpeg's canvas {width}x{height}"));
+                }
+                ours.push((*start_us, *end_us, md5.clone()));
+            }
+            Cue::Text { .. } => return Err(format!("cue {i} is text; the policy expects bitmaps")),
+        }
+    }
+    let shown_events: Vec<&SubEvent> = events.iter().filter(|e| e.rects > 0).collect();
+    if ours.len() != shown_events.len() {
+        return Err(format!("{} non-blank bitmaps vs FFmpeg {} subtitles with bitmaps", ours.len(), shown_events.len()));
+    }
+    for (i, ((start, end, _), e)) in ours.iter().zip(&shown_events).enumerate() {
+        if start / 1000 != e.start_us / 1000 {
+            return Err(format!("bitmap {i} starts at {} vs FFmpeg {}", srt_time(*start), srt_time(e.start_us)));
+        }
+        if let (Some(end), Some(want)) = (end, e.end_us) {
+            if end / 1000 != want / 1000 {
+                return Err(format!("bitmap {i} ends at {} vs FFmpeg {}", srt_time(*end), srt_time(want)));
+            }
+        }
+    }
+    let blank = refcheck::md5_hex(&vec![0u8; width * height * 4]);
+    let got = states(ours.iter().map(|(_, _, m)| m.clone()), &blank);
+    let want = states(canvases.iter().cloned(), &blank);
+    if got != want {
+        return Err(format!("canvas states {got:?} vs FFmpeg {want:?}"));
+    }
+    Ok(format!("bitmaps={} timing+raster match", ours.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +402,66 @@ mod tests {
         assert_eq!(snr_pcm(&silence, &silence, 0, 90.0).verdict, Verdict::Pass);
         assert_eq!(snr_pcm(&[], &silence, 64, 90.0).verdict, Verdict::Fail, "empty decode");
         assert_eq!(snr_pcm(&silence, &[], 64, 90.0).verdict, Verdict::Fail, "empty reference");
+    }
+
+    fn text(start_ms: i64, end_ms: i64, body: &str) -> Cue {
+        Cue::Text { start_us: start_ms * 1000, end_us: end_ms * 1000, text: body.into() }
+    }
+
+    fn srt(timing: &str, body: &str) -> SrtCue {
+        SrtCue { timing: timing.into(), body: body.into() }
+    }
+
+    #[test]
+    fn text_cues_compare_count_timing_and_body() {
+        let reference = [srt("00:00:01,000 --> 00:00:02,500", "Hello"), srt("00:01:00,000 --> 00:01:01,000", "<i>Bye</i>")];
+        let ours = [text(1000, 2500, "Hello"), text(60_000, 61_000, "<i>Bye</i>")];
+        assert_eq!(text_cues(&ours, 2, &reference).unwrap().1, Vec::<String>::new());
+        // Same words, other markup: passes, reported as a diagnostic.
+        let restyled = [text(1000, 2500, "Hello"), text(60_000, 61_000, "Bye")];
+        let (_, diagnostics) = text_cues(&restyled, 2, &reference).unwrap();
+        assert!(diagnostics[0].contains("1 of 2 cues"), "{diagnostics:?}");
+        // The old check counted shows against packets: any text passed.
+        let garbled = [text(1000, 2500, "Hello"), text(60_000, 61_000, "<i>By</i>")];
+        assert!(text_cues(&garbled, 2, &reference).unwrap_err().contains("cue 1"));
+        let late = [text(1000, 2500, "Hello"), text(60_040, 61_000, "<i>Bye</i>")];
+        assert!(text_cues(&late, 2, &reference).unwrap_err().contains("00:01:00,040"));
+        assert!(text_cues(&ours[..1], 1, &reference).unwrap_err().contains("1 cues vs FFmpeg 2"));
+        assert!(text_cues(&ours, 1, &reference).unwrap_err().contains("showed 1 of the 2"));
+    }
+
+    fn bitmap(start_ms: i64, md5: &str, blank: bool) -> Cue {
+        Cue::Bitmap { start_us: start_ms * 1000, end_us: None, width: 2, height: 1, md5: md5.into(), blank }
+    }
+
+    #[test]
+    fn bitmap_cues_compare_timing_and_raster_states() {
+        let blank = refcheck::md5_hex(&[0u8; 8]);
+        let events = [
+            SubEvent { start_us: 67_467, end_us: None, rects: 2 },
+            SubEvent { start_us: 900_000, end_us: None, rects: 0 },
+        ];
+        let canvases = [blank.clone(), "aa".to_string(), "aa".to_string(), blank.clone()];
+        let ours = [bitmap(67, "aa", false), bitmap(900, &blank, true)];
+        assert!(bitmap_cues(&ours, 2, &events, (2, 1), &canvases).is_ok());
+        let wrong_pixels = [bitmap(67, "bb", false), bitmap(900, &blank, true)];
+        assert!(bitmap_cues(&wrong_pixels, 2, &events, (2, 1), &canvases).unwrap_err().contains("canvas states"));
+        let late = [bitmap(167, "aa", false), bitmap(900, &blank, true)];
+        assert!(bitmap_cues(&late, 2, &events, (2, 1), &canvases).unwrap_err().contains("starts at"));
+    }
+
+    #[test]
+    fn plain_text_drops_markup_but_keeps_words() {
+        assert_eq!(plain_text("<font color=\"#0000FF\">blue</font>"), plain_text("<font color=\"#0000ff\">blue</font>"));
+        assert_eq!(plain_text("{\\an8}<b>top</b>\n second "), "top\nsecond");
+        assert_eq!(plain_text("a < b"), "a < b");
+        assert_eq!(plain_text("[SIZE]20"), "[SIZE]20");
+    }
+
+    #[test]
+    fn srt_time_truncates_to_the_millisecond() {
+        assert_eq!(srt_time(3_723_456_789), "01:02:03,456");
+        assert_eq!(srt_time(-5), "00:00:00,000");
     }
 
     #[test]

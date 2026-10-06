@@ -10,7 +10,10 @@
 #                    format, same sample count (integer/lossless decoders)
 #   audio:snr:<dB>   SNR >= floor, lengths within one decoder frame (float
 #                    decoders; the contract's floor is 90 dB, lower is refused)
-#   sub:count        as many cues shown as FFmpeg reads subtitle packets
+#   sub:text         every cue's timing (ms) and body equal FFmpeg's decode
+#                    re-encoded as SubRip, same count, every cue shown
+#   sub:bitmap       as many bitmaps as FFmpeg's decoder emits, same start
+#                    (and end) times, same canvas states as FFmpeg's sub2video
 #   <kind>:decodes   plays to the end with output; only for formats FFmpeg
 #                    cannot decode (the runner fails it when FFmpeg can), and
 #                    never a verified pass
@@ -513,87 +516,87 @@ streams = { audio = 1 }
 [[entry]]
 path = "fate:sub/vobsub.idx"
 rows = ["sub:dvd"]
-compare = ["sub:count"]
+compare = ["sub:bitmap"]
 
 [[entry]]
 path = "fate:sub/SubRip_capability_tester.srt"
 rows = ["sub:subrip"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/MicroDVD_capability_tester.sub"
 rows = ["sub:microdvd"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/SubViewer_capability_tester.sub"
 rows = ["sub:subviewer"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/1ededcbd7b.ass"
 rows = ["sub:ass"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/SAMI_capability_tester.smi"
 rows = ["sub:sami"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/VPlayer_capability_tester.txt"
 rows = ["sub:vplayer"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/MPL2_capability_tester.txt"
 rows = ["sub:mpl2"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/Closedcaption_rollup.m2v"
 rows = ["sub:eia608"]
-compare = ["video:md5", "sub:count"]
+compare = ["video:md5", "sub:text"]
 
 [[entry]]
 path = "fate:sub/witch.scc"
 rows = ["sub:cea708"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "gen:h264_aac_usf.mkv"
 rows = ["sub:usf"]
-compare = ["video:md5", "audio:snr:90", "sub:count"]
+compare = ["video:md5", "audio:snr:90", "sub:decodes"]
 
 [[entry]]
 path = "fate:sub/dvbsubtest_filter.ts"
 rows = ["sub:dvb", "container:mpeg_ts"]
-compare = ["video:md5", "audio:snr:90", "sub:count"]
+compare = ["video:md5", "audio:snr:90", "sub:bitmap"]
 
 [[entry]]
 path = "gen:h264_aac_srt.mkv"
 rows = ["sub:ogm"]
-compare = ["video:md5", "audio:snr:90", "sub:count"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
 
 [[entry]]
 path = "fate:sub/MovText_capability_tester.mp4"
 rows = ["sub:tx3g"]
-compare = ["sub:count"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "gen:vp9_opus_vtt.webm"
 rows = ["sub:webvtt"]
-compare = ["video:md5", "audio:snr:90", "sub:count"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
 
 [[entry]]
 path = "fate:sub/pgs_sub.sup"
 rows = ["sub:pgs"]
-compare = ["sub:count"]
+compare = ["sub:bitmap"]
 
 [[entry]]
 path = "gen:h264_aac_pgs.mkv"
 rows = ["sub:pgs", "container:mkv"]
-compare = ["video:md5", "sub:count"]
+compare = ["video:md5", "sub:bitmap"]
 
 # SVCD / CMML / Kate: no FATE samples and no ffmpeg encoders. SVCD OGT is
 # covered by the subs-bitmap worker's FATE-less row via psx-str; CMML and

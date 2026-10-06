@@ -334,6 +334,8 @@ dependencies = [
  "libc",
  "md5",
  "oxideav-core",
+ "oxideav-subtitle",
+ "parking_lot",
  "player",
  "refcheck",
  "serde",

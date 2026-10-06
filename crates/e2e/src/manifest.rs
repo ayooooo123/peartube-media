@@ -58,8 +58,13 @@ pub enum Policy {
     /// `audio:snr:<dB>`: SNR at or above the floor (never below the
     /// contract's 90 dB), lengths within one decoder frame (float decoders).
     AudioSnr(f64),
-    /// `sub:count`: as many cues shown as FFmpeg reads packets.
-    SubCount,
+    /// `sub:text`: every decoded cue's timing (to the millisecond) and body
+    /// equal FFmpeg's decode re-encoded as SubRip, same cue count, and every
+    /// cue shown.
+    SubText,
+    /// `sub:bitmap`: as many bitmaps as FFmpeg's decoder emits, at the same
+    /// times, with the same canvas states as FFmpeg composes them.
+    SubBitmap,
     /// `<kind>:decodes`: FFmpeg cannot decode the format, so playing to the
     /// end with output is all that can be checked; never a verified pass.
     Decodes(Kind),
@@ -70,7 +75,7 @@ impl Policy {
         match self {
             Policy::VideoMd5 => Kind::Video,
             Policy::AudioMd5 | Policy::AudioSnr(_) => Kind::Audio,
-            Policy::SubCount => Kind::Subtitle,
+            Policy::SubText | Policy::SubBitmap => Kind::Subtitle,
             Policy::Decodes(kind) => kind,
         }
     }
@@ -80,7 +85,8 @@ impl Policy {
             Policy::VideoMd5 => "video:md5".into(),
             Policy::AudioMd5 => "audio:md5".into(),
             Policy::AudioSnr(db) => format!("audio:snr:{db}"),
-            Policy::SubCount => "sub:count".into(),
+            Policy::SubText => "sub:text".into(),
+            Policy::SubBitmap => "sub:bitmap".into(),
             Policy::Decodes(kind) => format!("{}:decodes", kind.prefix()),
         }
     }
@@ -106,7 +112,8 @@ fn parse_token(token: &str) -> Result<Token, String> {
     Ok(Token::Policy(match token {
         "video:md5" => Policy::VideoMd5,
         "audio:md5" => Policy::AudioMd5,
-        "sub:count" => Policy::SubCount,
+        "sub:text" => Policy::SubText,
+        "sub:bitmap" => Policy::SubBitmap,
         "video:decodes" => Policy::Decodes(Kind::Video),
         "audio:decodes" => Policy::Decodes(Kind::Audio),
         "sub:decodes" => Policy::Decodes(Kind::Subtitle),
@@ -126,7 +133,7 @@ fn parse_token(token: &str) -> Result<Token, String> {
             } else {
                 return Err(format!(
                     "unknown compare token `{token}` (policies are per kind: video:md5, video:decodes, audio:md5, \
-                     audio:snr:<dB>, audio:decodes, sub:count, sub:decodes; diagnostics: diag:audio:snr:<dB>)"
+                     audio:snr:<dB>, audio:decodes, sub:text, sub:bitmap, sub:decodes; diagnostics: diag:audio:snr:<dB>)"
                 ));
             }
         }
