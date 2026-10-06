@@ -100,7 +100,7 @@ oxideav-avi = { git = "https://github.com/OxideAV/oxideav-avi", rev = "2a5aa9fc7
 oxideav-basic = { git = "https://github.com/OxideAV/oxideav-basic", rev = "c44bb55f9f94e18ede7e9267493b0b6776a8e1c4" }
 oxideav-cinepak = { git = "https://github.com/OxideAV/oxideav-cinepak", rev = "4dae215ff7509dfd7e2e7d1bae72128630ccce7d" }
 oxideav-cook = { git = "https://github.com/OxideAV/oxideav-cook", rev = "f8584e427c6f87de24e2f2de124e0242824f7006" }
-oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "80948860b817c416ca405430e890a8f8cda9d6a3" }
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "e24973d1013270a02a6c8fd0a00736fcc23634f3" }
 oxideav-dirac = { git = "https://github.com/OxideAV/oxideav-dirac", rev = "1315f66f5f222dcafa5594bee401c797e5f5a769" }
 oxideav-dts = { git = "https://github.com/OxideAV/oxideav-dts", rev = "9a7c128366aa4914331825e3b5d40a3d3304c090" }
 oxideav-dvd = { git = "https://github.com/OxideAV/oxideav-dvd", rev = "f237f8c05fb3a70d0d9c7e7c99c56110c570d849" }

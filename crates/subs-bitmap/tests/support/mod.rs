@@ -19,18 +19,19 @@
 //! that stream and checks that every other frame is such a heartbeat.
 //!
 //! Decoders here follow `oxideav-sub-image`'s model: one RGBA canvas
-//! `VideoFrame` per displayed state. [`timeline`] turns FFmpeg's subtitle
-//! list into the frames such a decoder must emit: each subtitle's canvas at
-//! its start, and a blank canvas at its end when it ends before the next
-//! subtitle starts.
+//! `VideoFrame` per `AVSubtitle`, at its start, with a display duration when
+//! the subtitle has an end. [`reference_cues`] and [`decoded_cues`] put both
+//! sides in that form and [`cue_diffs`] compares them.
 
 #![allow(dead_code)]
 
+use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use oxideav_core::{Frame, TimeBase};
+use oxideav_core::{Error, Frame, MediaType, PROBE_SCORE_EXTENSION, ProbeData, RuntimeContext, StreamInfo, TimeBase};
+use refcheck::Registrar;
 
 /// One `AVSubtitle` as `ffprobe -show_frames` reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,10 +68,12 @@ pub struct Reference {
     pub cues: Vec<RefCue>,
 }
 
-/// One displayed state: the canvas shown from `at_us` on.
+/// One subtitle as a player shows it: the canvas from `start_us`, for
+/// `duration_us` when it has an end (else until the next one).
 #[derive(Clone)]
-pub struct Shown {
-    pub at_us: i64,
+pub struct Cue {
+    pub start_us: i64,
+    pub duration_us: Option<i64>,
     pub canvas: Vec<u8>,
 }
 
@@ -139,7 +142,9 @@ pub fn ffprobe_time_base(path: &Path, nth: usize) -> TimeBase {
         &["-v", "error", "-select_streams", &stream, "-show_entries", "stream=time_base", "-of", "csv=p=0", path.to_str().unwrap()],
     );
     let text = String::from_utf8(text).unwrap();
-    let (num, den) = text.trim().split_once('/').expect("time_base");
+    // MPEG-TS lists the stream again under its program: take the first.
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty()).expect("time_base");
+    let (num, den) = line.split_once('/').expect("time_base");
     TimeBase::new(num.parse().unwrap(), den.parse().unwrap())
 }
 
@@ -209,96 +214,155 @@ fn sub2video_args(path: &Path, nth: usize, format: &str) -> Vec<String> {
     .collect()
 }
 
-/// `(width, height, pts_us of every frame)` of FFmpeg's sub2video output.
-fn sub2video_times(path: &Path, nth: usize) -> (usize, usize, Vec<i64>) {
+/// `(width, height, frame count)` of FFmpeg's sub2video output.
+fn sub2video_shape(path: &Path, nth: usize) -> (usize, usize, usize) {
     let args = sub2video_args(path, nth, "framecrc");
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let text = String::from_utf8(run("ffmpeg", &args)).unwrap();
     let mut dims = None;
-    let mut times = Vec::new();
+    let mut count = 0;
     for line in text.lines() {
         if let Some(d) = line.strip_prefix("#dimensions 0:") {
             let (w, h) = d.trim().split_once('x').expect("dimensions");
             dims = Some((w.parse().unwrap(), h.parse().unwrap()));
         } else if !line.starts_with('#') {
-            let f: Vec<&str> = line.split(',').map(str::trim).collect();
-            assert_eq!(f.len(), 6, "framecrc line {line:?}");
-            times.push(f[2].parse().unwrap());
+            count += 1;
         }
     }
     let (w, h) = dims.expect("framecrc dimensions");
-    (w, h, times)
+    (w, h, count)
 }
 
-/// Which sub2video frames are subtitle canvases: the frame of a subtitle
-/// is the last one of its start time, after the heartbeats the same
-/// packet produced. Returns one frame index per subtitle.
-fn pick_subtitle_frames(times: &[i64], subs: &[FfSubtitle]) -> Vec<usize> {
-    let mut picks = Vec::with_capacity(subs.len());
-    let mut next = 0;
-    let mut i = 0;
-    while i < times.len() {
-        let t = times[i];
-        let mut run_end = i;
-        while run_end < times.len() && times[run_end] == t {
-            run_end += 1;
+/// What ffprobe sees on stream `s:nth`, in processing order: each packet's
+/// pts, followed by the subtitles decoding it returned.
+enum Event {
+    Packet(Option<i64>),
+    Subtitle(FfSubtitle),
+}
+
+fn ffprobe_events(path: &Path, nth: usize) -> Vec<Event> {
+    let stream = format!("s:{nth}");
+    let text = run(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-select_streams",
+            &stream,
+            "-show_packets",
+            "-show_frames",
+            "-show_entries",
+            "packet=pts:subtitle=pts,start_display_time,end_display_time,num_rects",
+            "-of",
+            "csv",
+            path.to_str().unwrap(),
+        ],
+    );
+    String::from_utf8(text)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            let f: Vec<&str> = line.trim().split(',').collect();
+            let num = |s: &str| s.parse::<i64>().unwrap_or_else(|_| panic!("ffprobe field {s:?} in {line:?}"));
+            match f[0] {
+                "packet" => Event::Packet((f[1] != "N/A").then(|| num(f[1]))),
+                "subtitle" => Event::Subtitle(FfSubtitle {
+                    pts_us: num(f[1]),
+                    start_display_ms: num(f[2]) as u32,
+                    end_display_ms: num(f[3]) as u32,
+                    num_rects: num(f[4]) as u32,
+                }),
+                _ => panic!("ffprobe line {line:?}"),
+            }
+        })
+        .collect()
+}
+
+/// One frame sub2video pushes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sub2VideoFrame {
+    /// `sub2video_update(NULL)`: a blank canvas.
+    Blank,
+    /// `sub2video_push_ref` from a heartbeat: the current canvas again.
+    Repeat,
+    /// `sub2video_update(sub)` for the n-th subtitle.
+    Subtitle(usize),
+}
+
+/// The frames sub2video pushes for these events (`fftools/ffmpeg_filter.c:
+/// sub2video_heartbeat` / `sub2video_update`, with the heartbeat
+/// `fftools/ffmpeg_demux.c` sends ahead of every packet of the input). The
+/// output timestamps are not modelled: the muxer clamps them to be
+/// monotonic, so frames are matched by position.
+fn sub2video_frames(events: &[Event], time_base: TimeBase) -> Vec<Sub2VideoFrame> {
+    let mut out = Vec::new();
+    let (mut last_pts, mut end_pts, mut initialize) = (i64::MIN, i64::MIN, true);
+    let mut subs = 0;
+    for event in events {
+        match event {
+            Event::Packet(Some(pts)) => {
+                let pts2 = to_us(*pts, time_base) - 1;
+                if pts2 <= last_pts {
+                    continue;
+                }
+                if pts2 >= end_pts || initialize {
+                    last_pts = if initialize { pts2 + 1 } else { end_pts };
+                    end_pts = i64::MAX;
+                    initialize = false;
+                    out.push(Sub2VideoFrame::Blank);
+                } else {
+                    last_pts = pts2;
+                    out.push(Sub2VideoFrame::Repeat);
+                }
+            }
+            Event::Packet(None) => {}
+            Event::Subtitle(sub) => {
+                last_pts = sub.start_us();
+                end_pts = sub.pts_us + i64::from(sub.end_display_ms) * 1000;
+                initialize = false;
+                out.push(Sub2VideoFrame::Subtitle(subs));
+                subs += 1;
+            }
         }
-        let mut k = 0;
-        while next + k < subs.len() && subs[next + k].start_us() == t {
-            k += 1;
-        }
-        assert!(
-            k <= run_end - i,
-            "sub2video shows {} frames at {t} µs, ffprobe lists {k} subtitles there",
-            run_end - i
-        );
-        picks.extend(run_end - k..run_end);
-        next += k;
-        assert!(
-            next == subs.len() || subs[next].start_us() > t,
-            "subtitle #{next} at {} µs has no sub2video frame",
-            subs[next].start_us()
-        );
-        i = run_end;
     }
-    assert_eq!(next, subs.len(), "sub2video showed {} of {} subtitles", next, subs.len());
-    picks
+    if end_pts < i64::MAX {
+        out.push(Sub2VideoFrame::Blank);
+    }
+    out
 }
 
 /// FFmpeg's decode of subtitle stream `s:nth`: every `AVSubtitle` with the
 /// canvas sub2video paints for it.
 pub fn ffmpeg_reference(path: &Path, nth: usize) -> Reference {
-    let subs = ffprobe_subtitles(path, nth);
-    let (width, height, times) = sub2video_times(path, nth);
-    let picks = pick_subtitle_frames(&times, &subs);
+    let events = ffprobe_events(path, nth);
+    let expected = sub2video_frames(&events, ffprobe_time_base(path, nth));
+    let subs: Vec<FfSubtitle> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Subtitle(s) => Some(s),
+            Event::Packet(_) => None,
+        })
+        .collect();
+    let (width, height, count) = sub2video_shape(path, nth);
+    assert_eq!(count, expected.len(), "sub2video frames: {expected:?}");
 
     let args = sub2video_args(path, nth, "rawvideo");
-    let mut child = Command::new("ffmpeg")
-        .args(&args)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("run ffmpeg");
+    let mut child = Command::new("ffmpeg").args(&args).stdout(Stdio::piped()).spawn().expect("run ffmpeg");
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let size = width * height * 4;
-    let mut canvases = Vec::with_capacity(picks.len());
+    let mut canvases = Vec::with_capacity(subs.len());
     let mut shown = vec![0u8; size];
     let mut frame = vec![0u8; size];
-    let mut pick = picks.iter().peekable();
-    for (i, &t) in times.iter().enumerate() {
+    for (i, kind) in expected.iter().enumerate() {
         out.read_exact(&mut frame).unwrap_or_else(|e| panic!("sub2video frame {i}: {e}"));
         bgra_to_rgba(&mut frame);
-        if pick.peek() == Some(&&i) {
-            pick.next();
-            canvases.push(frame.clone());
-            shown.copy_from_slice(&frame);
-        } else {
-            // A heartbeat: a blank canvas or the shown one again.
-            let blank = frame.iter().all(|&b| b == 0);
-            assert!(blank || frame == shown, "sub2video frame {i} at {t} µs is neither a subtitle nor a heartbeat");
-            if blank {
-                shown.fill(0);
-            }
+        match kind {
+            Sub2VideoFrame::Subtitle(_) => canvases.push(frame.clone()),
+            Sub2VideoFrame::Blank => assert!(frame.iter().all(|&b| b == 0), "sub2video frame {i} is not blank"),
+            Sub2VideoFrame::Repeat => assert!(frame == shown, "sub2video frame {i} does not repeat the shown canvas"),
         }
+        shown.copy_from_slice(&frame);
     }
     let mut rest = Vec::new();
     out.read_to_end(&mut rest).unwrap();
@@ -317,22 +381,17 @@ fn bgra_to_rgba(px: &mut [u8]) {
     }
 }
 
-/// The frames a canvas decoder must emit for FFmpeg's subtitles: each
-/// subtitle's canvas at its start, then a blank canvas at its end when it
-/// ends before the next subtitle starts (or is the last one).
-pub fn timeline(reference: &Reference) -> Vec<Shown> {
-    let blank = vec![0u8; reference.width * reference.height * 4];
-    let mut out = Vec::new();
-    for (i, cue) in reference.cues.iter().enumerate() {
-        out.push(Shown { at_us: cue.sub.start_us(), canvas: cue.canvas.clone() });
-        if let Some(end) = cue.sub.end_us() {
-            let next = reference.cues.get(i + 1).map(|c| c.sub.start_us());
-            if next.is_none_or(|n| end < n) {
-                out.push(Shown { at_us: end, canvas: blank.clone() });
-            }
-        }
-    }
-    out
+/// FFmpeg's subtitles as cues.
+pub fn reference_cues(reference: &Reference) -> Vec<Cue> {
+    reference
+        .cues
+        .iter()
+        .map(|c| Cue {
+            start_us: c.sub.start_us(),
+            duration_us: c.sub.end_us().map(|e| (e - c.sub.start_us()).max(0)),
+            canvas: c.canvas.clone(),
+        })
+        .collect()
 }
 
 /// `pts` in `time_base` to microseconds, rounding like FFmpeg's
@@ -345,23 +404,25 @@ pub fn to_us(pts: i64, time_base: TimeBase) -> i64 {
     (if num >= 0 { (num + half) / den } else { (num - half) / den }) as i64
 }
 
-/// Every decoded frame as a shown state: its pts in microseconds and its
-/// RGBA canvas packed to `width * 4` bytes per row. Panics when a frame is
-/// not a `width x height` RGBA canvas.
-pub fn shown_states(frames: &[Frame], time_base: TimeBase, width: usize, height: usize) -> Vec<Shown> {
+/// Every decoded frame as a cue: its pts and display duration in
+/// microseconds and its RGBA canvas packed to `width * 4` bytes per row.
+/// Panics when a frame is not a `width x height` RGBA canvas.
+pub fn decoded_cues(frames: &[Frame], time_base: TimeBase, width: usize, height: usize) -> Vec<Cue> {
     frames
         .iter()
         .enumerate()
         .map(|(i, frame)| {
             let Frame::Video(v) = frame else { panic!("frame {i} is not a bitmap canvas") };
-            let plane = &v.planes[0];
-            assert!(plane.stride >= width * 4, "frame {i}: stride {} for a {width}-pixel canvas", plane.stride);
-            assert_eq!(plane.data.len() / plane.stride, height, "frame {i}: canvas height");
-            let mut canvas = Vec::with_capacity(width * height * 4);
-            for row in plane.data.chunks(plane.stride).take(height) {
-                canvas.extend_from_slice(&row[..width * 4]);
+            let planes = v.image_planes();
+            assert_eq!(planes.len(), 1, "frame {i}: one RGBA plane");
+            let plane = &planes[0];
+            assert_eq!(plane.stride, width * 4, "frame {i}: stride for a {width}-pixel canvas");
+            assert_eq!(plane.data.len(), width * height * 4, "frame {i}: {width}x{height} canvas");
+            Cue {
+                start_us: to_us(v.pts.expect("frame pts"), time_base),
+                duration_us: v.display_duration().map(|d| d.as_micros() as i64),
+                canvas: plane.data.clone(),
             }
-            Shown { at_us: to_us(v.pts.expect("frame pts"), time_base), canvas }
         })
         .collect()
 }
@@ -409,20 +470,111 @@ pub fn canvas_diff(want: &[u8], got: &[u8], width: usize, rule: Match) -> Option
     })
 }
 
-/// Compares decoded states with the expected ones: same count, same times,
-/// canvases agreeing under `rule`. Returns every difference found.
-pub fn timeline_diffs(want: &[Shown], got: &[Shown], width: usize, rule: Match) -> Vec<String> {
+/// Compares decoded cues with FFmpeg's: same count, same starts and
+/// durations, canvases agreeing under `rule`. Returns every difference.
+pub fn cue_diffs(want: &[Cue], got: &[Cue], width: usize, rule: Match) -> Vec<String> {
     let mut diffs = Vec::new();
     if want.len() != got.len() {
-        diffs.push(format!("{} states shown, FFmpeg shows {}", got.len(), want.len()));
+        diffs.push(format!("{} cues decoded, FFmpeg decodes {}", got.len(), want.len()));
     }
     for (i, (w, g)) in want.iter().zip(got).enumerate() {
-        if w.at_us != g.at_us {
-            diffs.push(format!("state {i}: shown at {} µs, FFmpeg at {} µs", g.at_us, w.at_us));
+        if (w.start_us, w.duration_us) != (g.start_us, g.duration_us) {
+            diffs.push(format!(
+                "cue {i}: shown at {} µs for {:?} µs, FFmpeg at {} µs for {:?} µs",
+                g.start_us, g.duration_us, w.start_us, w.duration_us
+            ));
         }
         if let Some(d) = canvas_diff(&w.canvas, &g.canvas, width, rule) {
-            diffs.push(format!("state {i} at {} µs: {d}", w.at_us));
+            diffs.push(format!("cue {i} at {} µs: {d}", w.start_us));
         }
     }
     diffs
+}
+
+/// One subtitle stream decoded through OxideAV registries.
+pub struct Decoded {
+    pub stream: StreamInfo,
+    pub frames: Vec<Frame>,
+    /// `send_packet` errors, as (packet index, message): FFmpeg logs a
+    /// decode error and goes on, and so does this.
+    pub errors: Vec<(usize, String)>,
+}
+
+/// Opens `path` with what `registrars` install (probing like
+/// `refcheck::decode`), picks subtitle stream `nth` and decodes all of it.
+pub fn decode_subtitles(path: &Path, registrars: &[Registrar], nth: usize) -> Decoded {
+    let mut ctx = RuntimeContext::new();
+    for register in registrars {
+        register(&mut ctx);
+    }
+    let mut head = vec![0; 256 * 1024];
+    let n = File::open(path).and_then(|mut f| f.read(&mut head)).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let probe = ProbeData { buf: &head[..n], ext: ext.as_deref() };
+    let candidates = ctx.containers.probe_candidates(&probe);
+    let by_extension = ext.as_deref().and_then(|e| ctx.containers.container_for_extension(e));
+    let format = match (candidates.first(), by_extension) {
+        (Some(c), _) if c.score >= PROBE_SCORE_EXTENSION => c.name.to_string(),
+        (_, Some(name)) => name.to_string(),
+        _ => panic!("{}: no container claims it", path.display()),
+    };
+    let file = File::open(path).unwrap();
+    let mut demuxer = ctx.containers.open_demuxer(&format, Box::new(file), &ctx.codecs).unwrap_or_else(|e| panic!("open {format}: {e}"));
+    let stream = demuxer
+        .streams()
+        .iter()
+        .filter(|s| s.params.media_type == MediaType::Subtitle)
+        .nth(nth)
+        .unwrap_or_else(|| panic!("{}: no subtitle stream #{nth}", path.display()))
+        .clone();
+    let mut decoder = ctx.codecs.first_decoder(&stream.params).unwrap_or_else(|e| panic!("no decoder for {}: {e}", stream.params.codec_id));
+    let mut frames = Vec::new();
+    let mut errors = Vec::new();
+    let mut index = 0;
+    loop {
+        match demuxer.next_packet() {
+            Ok(packet) if packet.stream_index == stream.index => {
+                if let Err(e) = decoder.send_packet(&packet) {
+                    errors.push((index, e.to_string()));
+                }
+                index += 1;
+                loop {
+                    match decoder.receive_frame() {
+                        Ok(frame) => frames.push(frame),
+                        Err(Error::NeedMore) | Err(Error::Eof) => break,
+                        Err(e) => panic!("receive_frame: {e}"),
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux {}: {e}", path.display()),
+        }
+    }
+    decoder.flush().unwrap();
+    loop {
+        match decoder.receive_frame() {
+            Ok(frame) => frames.push(frame),
+            Err(Error::NeedMore) | Err(Error::Eof) => break,
+            Err(e) => panic!("receive_frame: {e}"),
+        }
+    }
+    Decoded { stream, frames, errors }
+}
+
+/// `ffmpeg -c copy` remux of subtitle stream `s:nth` of `path` into a
+/// scratch file named `name`, with extra muxer arguments.
+pub fn remux(path: &Path, nth: usize, name: &str, muxer: &[&str]) -> PathBuf {
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let map = format!("0:s:{nth}");
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-copyts", "-i"])
+        .arg(path)
+        .args(["-map", map.as_str(), "-c:s", "copy"])
+        .args(muxer)
+        .arg(&out)
+        .status()
+        .expect("run ffmpeg");
+    assert!(status.success(), "ffmpeg remux to {name}");
+    out
 }
