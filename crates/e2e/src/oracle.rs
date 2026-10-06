@@ -169,6 +169,13 @@ pub fn audio_frames(path: &Path, index: u32) -> Result<Vec<AudioFrameInfo>, Stri
         .collect()
 }
 
+/// Whether FFmpeg decodes stream `map` without error: a `decodes` policy is
+/// only for streams FFmpeg cannot produce a reference for.
+pub fn decodes(path: &Path, map: &str) -> bool {
+    let Ok(p) = path_arg(path) else { return false };
+    tool::ffmpeg(&strings(&["-i", &p, "-map", map, "-f", "null", "-"]), TIMEOUT).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
