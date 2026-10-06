@@ -1,5 +1,5 @@
-//! Pure-Rust **MS-MPEG-4 v1/v2/v3 / WMV1 / WMV2** video decoders and the raw
-//! VC-1 (`vc1`) / RCV (`vc1test`) demuxers.
+//! Pure-Rust **MS-MPEG-4 v1/v2/v3 / WMV1 / WMV2 / WMV3 / VC-1** video
+//! decoders and the raw VC-1 (`vc1`) / RCV (`vc1test`) demuxers.
 //!
 //! Ported from FFmpeg commit 2da55bf (libavcodec): `wmv2dec.c`, `wmv2dsp.c`,
 //! `intrax8.c`, `intrax8dsp.c`, `intrax8huf.h`, `msmpeg4dec.c`, `msmpeg4.c`,
@@ -7,7 +7,9 @@
 //! `h263dsp.c`, `ituh263dec.c`, `mpeg4videodec.c`, `mpegvideo.c`,
 //! `mpegvideo_dec.c`, `mpegvideo_motion.c`, `hpeldsp.c`,
 //! `simple_idct_template.c`, `simple_idct.c`, `vlc.c`, `rl.c`,
-//! `get_bits.h`, `vc1_parser.c`; (libavformat) `vc1dec.c`, `vc1test.c`.
+//! `get_bits.h`, `vc1dec.c`, `vc1.c`, `vc1_block.c`, `vc1_loopfilter.c`,
+//! `vc1_mc.c`, `vc1_pred.c`, `vc1dsp.c`, `vc1data.c`, `vc1acdata.h`,
+//! `vc1_parser.c`; (libavformat) `vc1dec.c`, `vc1test.c`.
 //! LGPL-2.1-or-later; see LICENSE.
 //!
 //! Every byte comes from untrusted peers: `#![forbid(unsafe_code)]`, checked
@@ -22,6 +24,8 @@ mod bits;
 mod idct;
 mod mpv;
 mod msmpeg4;
+mod vc1;
+mod vc1_tables;
 mod vlc;
 mod wmv2;
 mod x8;
@@ -100,6 +104,23 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         video_info(CODEC_ID_WMV2, "wmv2_sw")
             .decoder(|p| Ok(Box::new(MsDecoder::new(p, MsVersion::Wmv2)?)))
             .tags([CodecTag::fourcc(b"WMV2"), CodecTag::fourcc(b"GXVE")]),
+    );
+    // WMV3 (VC-1 Simple/Main): FourCC 'WMV3'; extradata = sequence header.
+    reg.register(
+        video_info(CODEC_ID_WMV3, "wmv3_sw")
+            .decoder(|p| Ok(Box::new(vc1::Vc1Decoder::new_wmv3(p)?)))
+            .tag(CodecTag::fourcc(b"WMV3")),
+    );
+    // VC-1 Advanced: FourCC 'WVC1'/'WMVA', MP4/TS 'vc-1', MP4 OTI 0xA3.
+    reg.register(
+        video_info(CODEC_ID_VC1, "vc1_sw")
+            .decoder(|p| Ok(Box::new(vc1::Vc1Decoder::new_vc1(p)?)))
+            .tags([
+                CodecTag::fourcc(b"WVC1"),
+                CodecTag::fourcc(b"WMVA"),
+                CodecTag::fourcc(b"VC-1"),
+                CodecTag::mp4_object_type(0xA3),
+            ]),
     );
 }
 

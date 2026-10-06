@@ -259,6 +259,55 @@ fn wmv1_packets_never_panic() {
 }
 
 #[test]
+fn wmv3_packets_never_panic() {
+    let (params, packets) = video_packets(&fate("vc1/SMM0005.rcv"), "vc1test", &[codec_wmv::register]);
+    fuzz_packets("wmv3 packets", params, packets, 0x5747_0003_0000_0001);
+}
+
+/// The WMV3 sequence header travels as extradata.
+#[test]
+fn wmv3_extradata_never_panics() {
+    let (params, packets) = video_packets(&fate("vc1/SMM0005.rcv"), "vc1test", &[codec_wmv::register]);
+    fuzz_params("wmv3 extradata", params, packets, 0x5747_0003_0000_0002);
+}
+
+/// Advanced profile, progressive; the sequence header and entry point are
+/// in-band, in the first packet.
+#[test]
+fn vc1_progressive_packets_never_panic() {
+    let (params, packets) = video_packets(&fate("vc1/SA00040.vc1"), "vc1", &[codec_wmv::register]);
+    fuzz_packets("vc1 progressive packets", params, packets, 0x5643_0001_0000_0001);
+}
+
+#[test]
+fn vc1_slice_packets_never_panic() {
+    let (params, packets) = video_packets(&fate("vc1/SA10091.vc1"), "vc1", &[codec_wmv::register]);
+    fuzz_packets("vc1 slice packets", params, packets, 0x5643_0001_0000_0002);
+}
+
+#[test]
+fn vc1_field_packets_never_panic() {
+    let (params, packets) = video_packets(&fate("vc1/SA10143.vc1"), "vc1", &[codec_wmv::register]);
+    fuzz_packets("vc1 field packets", params, packets, 0x5643_0001_0000_0003);
+}
+
+#[test]
+fn vc1_interlaced_frame_packets_never_panic() {
+    let (params, packets) = video_packets(&fate("vc1/ilaced_twomv.vc1"), "vc1", &[codec_wmv::register]);
+    fuzz_packets("vc1 interlaced frame packets", params, packets, 0x5643_0001_0000_0004);
+}
+
+/// VC-1 in MP4: OxideAV's mov demuxer hands over the `dvc1` box, whose
+/// sequence header and entry point the decoder parses at open.
+#[test]
+fn vc1_extradata_never_panics() {
+    let (params, packets) =
+        video_packets(&fate("isom/vc1-wmapro.ism"), "mov", &[codec_wmv::register, oxideav_mov::registry::register]);
+    assert!(!params.extradata.is_empty(), "vc1-wmapro.ism: no dvc1 extradata");
+    fuzz_params("vc1 extradata", params, packets, 0x5643_0001_0000_0005);
+}
+
+#[test]
 fn vc1test_container_never_panics() {
     fuzz_container("vc1test container", "vc1/SMM0005.rcv", "vc1test", 0x1234_5678_9ABC_DEF0);
 }

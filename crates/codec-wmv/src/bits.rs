@@ -108,4 +108,25 @@ impl<'a> BitReader<'a> {
             1 + self.read_bit()
         }
     }
+
+    /// `decode210`: 1 -> 0, 01 -> 1, 00 -> 2.
+    #[inline]
+    pub fn decode210(&mut self) -> u32 {
+        if self.read_bit() != 0 {
+            0
+        } else {
+            2 - self.read_bit()
+        }
+    }
+
+    /// `get_unary(gb, stop, len)`: counts bits until one equal to `stop`
+    /// (consumed) or until `len` bits were read.
+    #[inline]
+    pub fn get_unary(&mut self, stop: u32, len: u32) -> u32 {
+        let mut i = 0;
+        while i < len && self.read_bit() != stop {
+            i += 1;
+        }
+        i
+    }
 }

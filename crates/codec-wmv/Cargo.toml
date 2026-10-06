@@ -14,3 +14,5 @@ oxideav-core.workspace = true
 refcheck.workspace = true
 demux-asf = { path = "../demux-asf" }
 oxideav-avi.workspace = true
+oxideav-mov.workspace = true
+oxideav-mp4.workspace = true
