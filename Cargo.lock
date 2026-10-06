@@ -104,6 +104,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-dca"
+version = "0.1.0"
+dependencies = [
+ "oxideav-basic",
+ "oxideav-core",
+ "oxideav-mpegts",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-mlp"
 version = "0.1.0"
 dependencies = [
@@ -117,6 +127,7 @@ dependencies = [
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "codec-dca",
  "codec-mlp",
  "demux-asf",
  "demux-misc",
