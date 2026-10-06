@@ -183,7 +183,12 @@ fn test_demux_wmv8_x8intra() {
 /// Decodes `sample` with our crates and compares every frame's MD5 with
 /// FFmpeg's (`input_args` go before `-i`, e.g. `-idct simple`).
 fn check_video(sample: &str, registrars: &[refcheck::Registrar], input_args: &[&str]) {
-    let path = fate(sample);
+    check_video_path(&fate(sample), registrars, input_args);
+}
+
+fn check_video_path(path: &std::path::Path, registrars: &[refcheck::Registrar], input_args: &[&str]) {
+    let path = path.to_path_buf();
+    let sample = path.display().to_string();
     let decoded = refcheck::decode(&path, registrars, oxideav_core::MediaType::Video, 0);
     let w = decoded.params.width.expect("width") as usize;
     let h = decoded.params.height.expect("height") as usize;
@@ -212,4 +217,69 @@ fn check_video(sample: &str, registrars: &[refcheck::Registrar], input_args: &[&
 #[test]
 fn wmv8_x8intra_matches_ffmpeg() {
     check_video("wmv8/wmv8_x8intra.wmv", &[codec_wmv::register, demux_asf::register], &["-idct", "simple", "-flags", "+bitexact"]);
+}
+
+/// MS-MPEG-4 v1 in AVI: `fate-msmpeg4v1`.
+#[test]
+fn msmpeg4v1_mpg4_avi_matches_ffmpeg() {
+    check_video("msmpeg4v1/mpg4.avi", &[codec_wmv::register, oxideav_avi::__oxideav_entry], &["-idct", "simple", "-flags", "+bitexact"]);
+}
+
+/// MS-MPEG-4 v3 ('MP43') in ASF (the `fate-asf-repldata` sample).
+#[test]
+fn msmpeg4v3_asf_matches_ffmpeg() {
+    check_video("asf/bug821-2.asf", &[codec_wmv::register, demux_asf::register], &["-idct", "simple"]);
+}
+
+/// Encodes a moving test pattern with FFmpeg's own encoder into AVI, the way
+/// FATE's `vsynth` tests produce their WMV1 / MS-MPEG-4 v2 samples (the FATE
+/// suite has no such files). Returns the path of the encoded sample.
+fn encoded_sample(name: &str, size: &str, codec_args: &[&str]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("codec-wmv-reference");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let out = dir.join(format!("{name}.avi"));
+    let src = format!("testsrc2=size={size}:rate=25");
+    let mut args = vec!["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", &src, "-frames:v", "40"];
+    args.extend_from_slice(codec_args);
+    args.extend_from_slice(&["-flags", "+bitexact", "-fflags", "+bitexact", out.to_str().unwrap()]);
+    let st = std::process::Command::new("ffmpeg").args(&args).status().expect("ffmpeg must be on PATH");
+    assert!(st.success(), "ffmpeg encode of {name} failed");
+    out
+}
+
+/// WMV1, CIF, fixed quantiser (`fate-vsynth*-wmv1` settings).
+#[test]
+fn wmv1_vsynth_matches_ffmpeg() {
+    let path = encoded_sample("wmv1_cif", "352x288", &["-c:v", "wmv1", "-qscale:v", "10"]);
+    check_video_path(&path, &[codec_wmv::register, oxideav_avi::__oxideav_entry], &["-idct", "simple"]);
+}
+
+/// WMV1, QCIF at 100 kbit/s: the low-rate, small-picture mode with
+/// inter-intra DC prediction in P-pictures.
+#[test]
+fn wmv1_inter_intra_matches_ffmpeg() {
+    let path = encoded_sample("wmv1_qcif", "176x144", &["-c:v", "wmv1", "-b:v", "100k"]);
+    check_video_path(&path, &[codec_wmv::register, oxideav_avi::__oxideav_entry], &["-idct", "simple"]);
+}
+
+/// MS-MPEG-4 v2 (`fate-vsynth*-msmpeg4v2` settings).
+#[test]
+fn msmpeg4v2_vsynth_matches_ffmpeg() {
+    let path = encoded_sample("msmpeg4v2_cif", "352x288", &["-c:v", "msmpeg4v2", "-qscale:v", "10"]);
+    check_video_path(&path, &[codec_wmv::register, oxideav_avi::__oxideav_entry], &["-idct", "simple"]);
+}
+
+/// MS-MPEG-4 v3 (`fate-vsynth*-msmpeg4` settings), odd macroblock grid.
+#[test]
+fn msmpeg4v3_vsynth_matches_ffmpeg() {
+    let path = encoded_sample("msmpeg4v3_odd", "200x152", &["-c:v", "msmpeg4", "-qscale:v", "10"]);
+    check_video_path(&path, &[codec_wmv::register, oxideav_avi::__oxideav_entry], &["-idct", "simple"]);
+}
+
+/// WMV2 from FFmpeg's encoder (`fate-vsynth*-wmv2` settings) with the
+/// in-loop filter enabled.
+#[test]
+fn wmv2_vsynth_matches_ffmpeg() {
+    let path = encoded_sample("wmv2_cif", "352x288", &["-c:v", "wmv2", "-qscale:v", "10"]);
+    check_video_path(&path, &[codec_wmv::register, oxideav_avi::__oxideav_entry], &["-idct", "simple"]);
 }
