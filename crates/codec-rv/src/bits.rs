@@ -162,6 +162,30 @@ impl<'a> BitReader<'a> {
         code
     }
 
+    /// `GET_RL_VLC`: returns `(level, run)`.
+    #[inline]
+    pub fn get_rl_vlc(&mut self, table: &[crate::vlc::RlVlcElem], bits: u32, max_depth: u32) -> (i32, i32) {
+        let mut e = table[self.show_bits(bits) as usize];
+        let mut level = e.level as i32;
+        let mut n = e.len as i32;
+        if max_depth > 1 && n < 0 {
+            self.skip_bits(bits);
+            let nb_bits = (-n) as u32;
+            e = table[(self.show_bits(nb_bits) as i32 + level) as usize];
+            level = e.level as i32;
+            n = e.len as i32;
+            if max_depth > 2 && n < 0 {
+                self.skip_bits(nb_bits);
+                let nb_bits = (-n) as u32;
+                e = table[(self.show_bits(nb_bits) as i32 + level) as usize];
+                level = e.level as i32;
+                n = e.len as i32;
+            }
+        }
+        self.skip_bits_signed(n);
+        (level, e.run as i32)
+    }
+
     /// `get_interleaved_ue_golomb` (non-cached reader variant).
     pub fn get_interleaved_ue_golomb(&mut self) -> u32 {
         let mut buf = self.cache32();
