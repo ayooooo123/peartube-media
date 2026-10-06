@@ -1,5 +1,8 @@
-//! Reference tests: decode every FATE DTS sample through this crate's
-//! decoder and the `dtshd` / `dts` demuxers, and compare against FFmpeg.
+//! Reference tests: decode every FATE DTS sample of FFmpeg's dca.mak and
+//! compare against FFmpeg. The DTS-HD suite and the raw master go
+//! through this crate's decoder and its `dtshd` / `dts` demuxers;
+//! fate-dca-core (dts/dts.ts) and fate-dts_es (dts/dts_es.dts) go
+//! through the player's whole registry, container probe included.
 //!
 //! The XLL (DTS-HD MA) path is an integer port, so the lossless samples
 //! compare bit-exact: the interleaved PCM stream MD5 must equal FFmpeg's
@@ -13,7 +16,7 @@ use oxideav_core::{Frame, MediaType};
 use refcheck::{decode, fate};
 
 fn registrars() -> Vec<refcheck::Registrar> {
-    vec![codec_dca::register, oxideav_mpegts::register]
+    vec![codec_dca::register]
 }
 
 /// Interleaved PCM bytes of every decoded audio frame (one `data[0]`
@@ -277,10 +280,58 @@ fn lossy_xxch_71_24_48_2046() {
     lossy_suite_sample("xxch_71_24_48_2046");
 }
 
-// fate-dca-core (dts.ts via MPEG-TS): the TS carries DTS as stream type
-// 0x06 (private data) with no registration descriptor, which
-// oxideav-mpegts drops. Queued as an oxideav-mpegts fix; the dts.ts
-// sample is intentionally not tested in this crate until that lands.
+// ─────────────── fate-dca-core and fate-dts_es, through the player ───────────────
+//
+// dts/dts.ts carries DTS as MPEG-TS stream type 0x06 (private PES) with no
+// ES_info descriptor at all; the TS demuxer identifies it from the payload
+// the way FFmpeg probes such streams. dts/dts_es.dts is raw core + XCh.
+// Both open with the production registry: the probe picks the container,
+// the registry resolves the decoder, and every decoded sample is compared
+// with FFmpeg's decode of the same file.
+
+/// The channel count FFmpeg's decoder reports for stream `0:a:0` (MPEG-TS
+/// input prints the stream once more inside its program).
+fn ffprobe_channels(path: &std::path::Path) -> usize {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    assert!(out.status.success(), "ffprobe {} failed", path.display());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().find(|l| !l.trim().is_empty()).expect("ffprobe reported no audio stream");
+    first.trim().parse().expect("ffprobe channel count")
+}
+
+fn production_decode_matches_ffmpeg(rel: &str, container: &str) {
+    let path = fate(rel);
+    let ctx = codecs::context();
+    assert_eq!(refcheck::probe_container(&ctx, &path).as_deref(), Ok(container), "{rel}: container");
+    let decoded = decode(&path, &[codecs::register_all], MediaType::Audio, 0);
+    assert_eq!(decoded.params.codec_id.as_str(), "dts", "{rel}: codec");
+    let ours = refcheck::interleaved_f32(&decoded);
+    let reference = refcheck::ffmpeg_audio_f32(&path, 0);
+    let channels = decoded.audio_format.map(|f| usize::from(f.channels));
+    assert_eq!(
+        (ours.len(), channels),
+        (reference.len(), Some(ffprobe_channels(&path))),
+        "{rel}: decoded samples and channels vs FFmpeg"
+    );
+    let snr = refcheck::snr_db(&reference, &ours, 0);
+    assert!(snr >= 90.0, "{rel}: SNR {snr:.2} dB < 90 dB vs FFmpeg");
+}
+
+/// dca.mak fate-dca-core: `pcm -i dts/dts.ts`.
+#[test]
+fn dca_core_mpegts() {
+    production_decode_matches_ffmpeg("dts/dts.ts", "mpegts");
+}
+
+/// dca.mak fate-dts_es: `pcm -i dts/dts_es.dts`.
+#[test]
+fn dts_es_raw() {
+    production_decode_matches_ffmpeg("dts/dts_es.dts", "dts");
+}
 
 // ───────────────────────── demuxer packet layout ─────────────────────────
 

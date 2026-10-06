@@ -110,6 +110,8 @@ pub struct DcaDecoderImpl {
     emitted: u64,
     /// Absolute decoded-sample position (trim window reference).
     decoded: u64,
+    /// Decoded frames not yet received.
+    ready: std::collections::VecDeque<Frame>,
 }
 
 impl DcaDecoderImpl {
@@ -124,6 +126,7 @@ impl DcaDecoderImpl {
             keep,
             emitted: 0,
             decoded: 0,
+            ready: std::collections::VecDeque::new(),
         }
     }
 
@@ -154,17 +157,69 @@ impl Decoder for DcaDecoderImpl {
         &self.codec_id
     }
 
+    /// A packet can carry several frames (an MPEG-TS PES does); FFmpeg's
+    /// dca parser cuts them apart before its decoder sees them, so each is
+    /// decoded here in turn, the later ones timed after the earlier.
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
-        match self.inner.decode_packet(&packet.data, packet.pts) {
-            Ok(_produced) => Ok(()),
-            Err(e) => Err(CoreError::InvalidData(format!("dca: {e}"))),
+        let mut pts = packet.pts;
+        let mut first_error = None;
+        let mut decoded_any = false;
+        for frame in demuxer::split_frames(&packet.data) {
+            match self.inner.decode_packet(frame, pts) {
+                Ok(_) => {
+                    decoded_any = true;
+                    let Some(pending) = self.inner.pending.take() else { continue };
+                    let (rate, samples) = (pending.sample_rate, pending_samples(&pending));
+                    if let Some(frame) = self.convert(pending) {
+                        self.ready.push_back(frame);
+                    }
+                    // samples at `rate` in the packet's time base
+                    let tb = packet.time_base;
+                    pts = pts.zip(i64::try_from(u128::from(samples) * tb.den() as u128 / (tb.num().max(1) as u128 * u128::from(rate.max(1)))).ok())
+                        .map(|(p, d)| p + d);
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        match first_error {
+            Some(e) if !decoded_any => Err(CoreError::InvalidData(format!("dca: {e}"))),
+            _ => Ok(()),
         }
     }
 
     fn receive_frame(&mut self) -> CoreResult<Frame> {
-        let Some(frame) = self.inner.pending.take() else {
-            return Err(CoreError::NeedMore);
-        };
+        self.ready.pop_front().ok_or(CoreError::NeedMore)
+    }
+
+    fn output_audio_format(&self) -> Option<oxideav_core::AudioFormat> {
+        self.audio_format()
+    }
+
+    fn flush(&mut self) -> CoreResult<()> {
+        self.inner.flush();
+        Ok(())
+    }
+
+    fn reset(&mut self) -> CoreResult<()> {
+        self.ready.clear();
+        self.flush()
+    }
+}
+
+/// Samples per channel of a decoded frame.
+fn pending_samples(frame: &decoder::PendingFrame) -> u64 {
+    fn shortest<T>(planes: &[Vec<T>]) -> usize {
+        planes.iter().map(Vec::len).min().unwrap_or(0)
+    }
+    shortest(&frame.planes_f32).max(shortest(&frame.planes_s32)) as u64
+}
+
+impl DcaDecoderImpl {
+    /// One decoded frame in the decoder's output layout, trimmed to the
+    /// dtshd sample window; `None` when nothing of it remains.
+    fn convert(&mut self, frame: decoder::PendingFrame) -> Option<Frame> {
         self.channels = frame.planes_f32.len().max(frame.planes_s32.len()) as u16;
         self.sample_rate = frame.sample_rate;
         self.bits = frame.bits_per_sample;
@@ -251,7 +306,7 @@ impl Decoder for DcaDecoderImpl {
         self.decoded += decoded_samples as u64;
         self.emitted += samples as u64;
         if samples == 0 {
-            return Err(CoreError::NeedMore);
+            return None;
         }
 
         // Emit ONE interleaved plane in the decoder's native format.
@@ -287,19 +342,7 @@ impl Decoder for DcaDecoderImpl {
             pts: frame.pts.map(|p| p + (self.trim_head as i64)),
             data: vec![interleaved],
         };
-        Ok(Frame::Audio(audio))
-    }
-
-    fn output_audio_format(&self) -> Option<oxideav_core::AudioFormat> {
-        self.audio_format()
-    }
-
-    fn flush(&mut self) -> CoreResult<()> {
-        self.inner.flush();
-        Ok(())
-    }
-
-    fn reset(&mut self) -> CoreResult<()> {
-        self.flush()
+        Some(Frame::Audio(audio))
     }
 }
+
