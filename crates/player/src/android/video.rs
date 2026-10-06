@@ -563,7 +563,7 @@ impl VideoSink for AndroidVideoSink {
         // only give up (and allow the software-decoder retry) when NO output
         // was ever dequeued and the wait exceeds the stall budget.
         let start_dequeue = Instant::now();
-        let stall_budget = Duration::from_secs(150);
+        let stall_budget = Duration::from_secs(30);
         let mut buf = loop {
             let err_opt = self.midstream_error.lock().take();
             if let Some(err) = err_opt {

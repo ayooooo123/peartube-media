@@ -865,6 +865,7 @@ dependencies = [
  "libc",
  "ndk",
  "oxideav-core",
+ "oxideav-h264",
  "oxideav-mp4",
  "oxideav-pixfmt",
  "parking_lot",

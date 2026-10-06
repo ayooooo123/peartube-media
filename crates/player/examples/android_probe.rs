@@ -28,28 +28,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn main() {
-    // Warm-up: the first MediaCodec created in a process races the codec
-    // service's startup on the emulator and wedges; open and close a
-    // decoder once so the real probes see a warm service.
-    if let Some(c) = ndk::media::media_codec::MediaCodec::from_codec_name(
-        "c2.android.avc.decoder",
-    ) {
-        let mut f = ndk::media::media_format::MediaFormat::new();
-        f.set_str("mime", "video/avc");
-        f.set_i32("width", 16);
-        f.set_i32("height", 16);
-        if c.configure(&f, None, ndk::media::media_codec::MediaCodecDirection::Decoder)
-            .is_ok()
-        {
-            let _ = c.start();
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        drop(c);
- std::thread::sleep(Duration::from_millis(300));
-    }
-    // The two deliverable probes. The experiment probes (`sw_first_probe`,
-    // `nosurface_probe`) stay for debugging behind `--all`.
-    let mut code = video_probe();
+    // One attempt per process: the emulator's codec transport wedges a
+    // process after its first MediaCodec error, and a fresh process
+    // recovers. `--mode=software` runs the stream through the sink's
+    // software path (OxideAV decode -> RGBA -> ANativeWindow post onto the
+    // same AImageReader window).
+    let mode = if std::env::args().any(|a| a == "--mode=software") {
+        Mode::SoftwareFrames
+    } else {
+        Mode::Compressed
+    };
+    let mut code = video_probe(mode);
     code |= audio_probe();
     if std::env::args().any(|a| a == "--all") {
         code |= sw_first_probe();
@@ -63,7 +52,7 @@ fn main() {
 /// Sample duration ~3.2 s at 59.94 fps = 192 frames; keyframes every 30.
 const EXPECTED_FRAMES: usize = 192;
 
-fn video_probe() -> i32 {
+fn video_probe(mode: Mode) -> i32 {
     println!("[video] starting h264 probe with mid-decode window swap");
     let path = "/data/local/tmp/peartube_probe.mp4";
     let (packets, params, time_base) = match load_h264(path) {
@@ -86,7 +75,7 @@ fn video_probe() -> i32 {
 
     // One reader up front; the swap/fallback windows are created lazily
     // (a fresh reader is exactly what the swap path needs).
-    let reader_a = make_reader();
+    let reader_a = make_reader(mode);
     let frames_a = reader_a.1.clone();
     let window_a = reader_a
         .0
@@ -124,42 +113,18 @@ fn video_probe() -> i32 {
 
     // Push inline (single thread): the sink's output thread handles
     // presentation; the swap is driven from this thread between packets.
-    // The emulator's codec service wedges non-deterministically on newly
-    // created decoders (its AIDL transport drops work-done notifications);
-    // a fresh decoder after a settle delay recovers, so retry the stream
-    // run up to three times before reporting failure.
-    let mut swap_result: Result<(), SinkError> = Err(SinkError::Fatal("not run".into()));
-    for attempt in 1..=3 {
-        println!("[video] attempt {attempt}");
-        swap_result = run_stream(
-            &backend,
-            &sink_video,
-            &params,
-            packets.as_ref(),
-            time_base,
-            swap_at,
-            &swap_state,
-            &frames_b_slot,
-            &frames_c_slot,
-        );
-        match &swap_result {
-            Ok(()) => break,
-            Err(SinkError::Fatal(e)) if e.contains("declined") => break,
-            Err(_) => {
-                backend.suspend();
-                std::thread::sleep(Duration::from_secs(30));
-                // Fresh reader for the next attempt.
-                let (reader, counter) = make_reader();
-                frames_a.store(counter.load(Ordering::SeqCst), Ordering::SeqCst);
-                let w = reader
-                    .window()
-                    .map_err(|e| format!("reader window: {e:?}"))
-                    .unwrap();
-                std::mem::forget(reader);
-                backend.set_video_window(Some(w));
-            }
-        }
-    }
+    let swap_result = run_stream(
+        &backend,
+        &sink_video,
+        &params,
+        packets.as_ref(),
+        time_base,
+        swap_at,
+        &swap_state,
+        &frames_b_slot,
+        &frames_c_slot,
+        mode,
+    );
     if let Err(e) = &swap_result {
         println!("[video] push error: {e}");
         backend.suspend();
@@ -210,9 +175,76 @@ enum Swap {
 /// One AImageReader (352x288 YUV, 8 slots) with a counting, draining
 /// listener: `(reader, frames-received)`.
 
+/// Re-opens the stream for `mode` after a window change.
+fn reopen_mode(
+    sink_video: &Arc<parking_lot::Mutex<player::android::AndroidVideoSink>>,
+    mode: Mode,
+    params: &oxideav_core::CodecParameters,
+) -> Result<(), SinkError> {
+    let mut sink = sink_video.lock();
+    match mode {
+        Mode::Compressed => {
+            sink.prefer_software_decoder(true);
+            if !sink.open_compressed(params) {
+                return Err(SinkError::Fatal("re-open declined".into()));
+            }
+        }
+        Mode::SoftwareFrames => {
+            sink.teardown_codec();
+            sink.open_frames(params)?;
+        }
+    }
+    Ok(())
+}
+
+/// Decodes one packet with OxideAV's software H.264 decoder and pushes the
+/// resulting frames through the sink's software path.
+fn decode_and_push_frame(
+    sink_video: &Arc<parking_lot::Mutex<player::android::AndroidVideoSink>>,
+    decoder: &mut Option<Box<dyn oxideav_core::Decoder>>,
+    params: &oxideav_core::CodecParameters,
+    pkt: &Packet,
+    pts: Duration,
+) -> Result<(), SinkError> {
+    let decoder = decoder.get_or_insert_with(|| {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        oxideav_h264::register_codecs(&mut ctx.codecs);
+        // The stream's own parameters carry the avcC extradata: without it
+        // the decoder cannot parse the AVCC length-prefixed packets.
+        ctx.codecs
+            .first_decoder(params)
+            .expect("software h264 decoder")
+    });
+    decoder.send_packet(pkt).map_err(|e| {
+        SinkError::Fallback(format!("software decode send: {e}"))
+    })?;
+    loop {
+        match decoder.receive_frame() {
+            Ok(oxideav_core::Frame::Video(frame)) => {
+                let mut sink = sink_video.lock();
+                sink.push_frame(&frame, pts)?;
+            }
+            Ok(_) => {}
+            Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
+            Err(e) => return Err(SinkError::Fallback(format!("software decode: {e}"))),
+        }
+    }
+    Ok(())
+}
+
 /// One full stream run: open the codec on the current window, push every
 /// packet, exercise the window swap at `swap_at`, and drain. Errors leave
 /// the sink torn down so the caller can retry.
+/// How the stream is decoded for one attempt: MediaCodec with the window
+/// (the platform path), or OxideAV's software H.264 decoder with frames
+/// pushed through the sink's software path (the emulator-transport
+/// fallback; same AImageReader, same window-swap semantics).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Mode {
+    Compressed,
+    SoftwareFrames,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_stream(
     backend: &Arc<AndroidBackend>,
@@ -224,16 +256,28 @@ fn run_stream(
     swap_state: &Arc<parking_lot::Mutex<Swap>>,
     frames_b_slot: &Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>>,
     frames_c_slot: &Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>>,
+    mode: Mode,
 ) -> Result<(), SinkError> {
-    {
-        let mut sink = sink_video.lock();
-        sink.prefer_software_decoder(true);
-        if !sink.open_compressed(params) {
-            return Err(SinkError::Fatal("open_compressed declined".into()));
+    match mode {
+        Mode::Compressed => {
+            let mut sink = sink_video.lock();
+            sink.prefer_software_decoder(true);
+            if !sink.open_compressed(params) {
+                return Err(SinkError::Fatal("open_compressed declined".into()));
+            }
+        }
+        Mode::SoftwareFrames => {
+            let mut sink = sink_video.lock();
+            sink.teardown_codec();
+            if let Err(e) = sink.open_frames(params) {
+                return Err(e);
+            }
         }
     }
-    println!("[video] open_compressed accepted");
+    println!("[video] open accepted (mode {mode:?})");
+    let mut sw_decoder: Option<Box<dyn oxideav_core::Decoder>> = None;
     let mut pushed = 0usize;
+    let mut fallbacks = 0usize;
     for pkt in packets.iter() {
         if pushed == swap_at {
             println!(
@@ -249,7 +293,9 @@ fn run_stream(
             *swap_state.lock() = Swap::WindowCleared;
         }
         let pts = packet_media_time(pkt, time_base);
-        let r = {
+        let r = if mode == Mode::SoftwareFrames {
+            decode_and_push_frame(sink_video, &mut sw_decoder, params, pkt, pts)
+        } else {
             let mut sink = sink_video.lock();
             sink.push_packet(pkt, pts)
         };
@@ -259,7 +305,7 @@ fn run_stream(
             // re-opens the codec via on_window_available), then retry.
             Err(SinkError::Unavailable) if pushed >= swap_at => {
                 if matches!(*swap_state.lock(), Swap::WindowCleared) {
-                    let (reader, counter) = make_reader();
+                    let (reader, counter) = make_reader(mode);
                     frames_b_slot.lock().replace(counter);
                     let w = reader
                         .window()
@@ -269,6 +315,7 @@ fn run_stream(
                     *swap_state.lock() = Swap::NewWindowSet;
                     println!("[video] swap: new window set at packet {pushed}");
                     let mut sink = sink_video.lock();
+                    reopen_mode(sink_video, mode, params)?;
                     sink.push_packet(pkt, pts)?;
                 } else {
                     return Err(SinkError::Unavailable);
@@ -278,9 +325,15 @@ fn run_stream(
             // reader and re-open.
             Err(SinkError::Fallback(e)) => {
                 println!("[video] fallback at packet {pushed}: {e}");
+                fallbacks += 1;
+                if fallbacks > 1 {
+                    return Err(SinkError::Fallback(format!(
+                        "{e} (after {fallbacks} fallbacks)"
+                    )));
+                }
                 std::thread::sleep(Duration::from_secs(20));
                 backend.set_video_window(None);
-                let (reader, counter) = make_reader();
+                let (reader, counter) = make_reader(mode);
                 frames_c_slot.lock().replace(counter);
                 let w = reader
                     .window()
@@ -289,9 +342,7 @@ fn run_stream(
                 backend.set_video_window(Some(w));
                 println!("[video] moved to fresh window (reader C)");
                 let mut sink = sink_video.lock();
-                if !sink.open_compressed(params) {
-                    return Err(SinkError::Fatal("re-open on fresh window declined".into()));
-                }
+                reopen_mode(sink_video, mode, params)?;
                 sink.push_packet(pkt, pts)?;
             }
             Err(e) => return Err(e),
@@ -305,18 +356,29 @@ fn run_stream(
     Ok(())
 }
 
-fn make_reader() -> (ndk::media::image_reader::ImageReader, Arc<AtomicUsize>) {
+fn make_reader(mode: Mode) -> (ndk::media::image_reader::ImageReader, Arc<AtomicUsize>) {
     use ndk::hardware_buffer::HardwareBufferUsage;
     use ndk::media::image_reader::{ImageFormat, ImageReader};
-    // Usage flags matching a video decoder's output buffers; the plain
-    // `new` allocation path trips the emulator's AIDL c2 transport bug
-    // (work-done items with graphic blocks fail to marshal).
-    let usage = HardwareBufferUsage::GPU_COLOR_OUTPUT
-        | HardwareBufferUsage::GPU_SAMPLED_IMAGE
-        | HardwareBufferUsage::VIDEO_ENCODE;
-    let mut reader = ImageReader::new_with_usage(352, 288, ImageFormat::YUV_420_888, usage, 8)
-        .or_else(|_| ImageReader::new(352, 288, ImageFormat::YUV_420_888, 8))
-        .expect("ImageReader::new");
+    // Compressed mode hands the reader's window to MediaCodec: YUV output,
+    // with usage flags matching a video decoder's output buffers. Software
+    // mode posts RGBA through ANativeWindow_lock, so that reader is RGBA.
+    let (format, usage) = match mode {
+        Mode::Compressed => (
+            ImageFormat::YUV_420_888,
+            Some(
+                HardwareBufferUsage::GPU_COLOR_OUTPUT
+                    | HardwareBufferUsage::GPU_SAMPLED_IMAGE
+                    | HardwareBufferUsage::VIDEO_ENCODE,
+            ),
+        ),
+        Mode::SoftwareFrames => (ImageFormat::RGBA_8888, None),
+    };
+    let mut reader = match usage {
+        Some(usage) => ImageReader::new_with_usage(352, 288, format, usage, 8)
+            .or_else(|_| ImageReader::new(352, 288, format, 8)),
+        None => ImageReader::new(352, 288, format, 8),
+    }
+    .expect("ImageReader::new");
     let frames = Arc::new(AtomicUsize::new(0));
     let counter = frames.clone();
     reader

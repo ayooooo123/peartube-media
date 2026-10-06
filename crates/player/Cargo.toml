@@ -18,4 +18,5 @@ libc = "0.2"
 
 [dev-dependencies]
 oxideav-mp4.workspace = true
+oxideav-h264.workspace = true
 parking_lot = "0.12"
