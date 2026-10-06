@@ -3,7 +3,7 @@ name = "subs-bitmap"
 description = "Bitmap subtitle decoders and demuxers for peartube-media"
 version.workspace = true
 edition.workspace = true
-# Ports FFmpeg libavcodec/{pgssubdec,dvbsubdec}.c and libavformat/supdec.c
+# Ports FFmpeg subtitle decoders and SUP/VobSub demuxers (see src/lib.rs).
 # (LGPL-2.1-or-later).
 license = "LGPL-2.1-or-later"
 publish.workspace = true
@@ -17,3 +17,4 @@ oxideav-sub-image.workspace = true
 oxideav-mkv.workspace = true
 oxideav-mpegts.workspace = true
 parking_lot = "0.12"
+demux-misc = { path = "../demux-misc" }

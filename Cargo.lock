@@ -1101,8 +1101,9 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=f07b1a79317f53d31385715e6969b479219d10a1#f07b1a79317f53d31385715e6969b479219d10a1"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=d80e1b5bebc56793cd6b3f9bf42e24d60503f7fc#d80e1b5bebc56793cd6b3f9bf42e24d60503f7fc"
 dependencies = [
+ "compcol",
  "oxideav-core",
 ]
 
@@ -1635,6 +1636,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 name = "subs-bitmap"
 version = "0.1.0"
 dependencies = [
+ "demux-misc",
  "oxideav-core",
  "oxideav-mkv",
  "oxideav-mpegts",

@@ -13,21 +13,25 @@
 //! |---|---|---|
 //! | HDMV PGS | `hdmv_pgs_subtitle`, `pgs` | FFmpeg `libavcodec/pgssubdec.c` |
 //! | DVB subtitles | `dvb_subtitle`, `dvbsub` | FFmpeg `libavcodec/dvbsubdec.c` |
+//! | DVD/VobSub | `dvd_subtitle`, `dvdsub`, `vobsub` | FFmpeg `libavcodec/dvdsubdec.c`, `dvdsub.c` |
 //!
 //! | Container | Name | Ported from |
 //! |---|---|---|
 //! | Raw PGS (`.sup`) | `sup` | FFmpeg `libavformat/supdec.c` |
+//! | Paired VobSub (`.idx` + `.sub`) | `open_vobsub` API | FFmpeg `libavformat/mpeg.c`, `subtitles.c` |
 //!
 //! FFmpeg sources are from commit 2da55bf; each file's header was checked to
 //! be the GNU Lesser General Public License 2.1 or later, hence this crate's
 //! licence.
 //!
 //! Reference tests compare complete PGS canvases and their timing with
-//! FFmpeg through SUP, Matroska and M2TS, and DVB through MPEG-TS and
-//! Matroska (all 46 display states of FATE `sub/dvbsubtest_filter.ts`).
-//! Mutation tests exercise 7200 seeded PGS packet mutations and 4800 DVB
-//! mutations in real decoder epochs, including truncations and header/RLE
-//! bit flips. Every PGS reset is followed by a complete FFmpeg comparison.
+//! FFmpeg through SUP, Matroska and M2TS, DVB through MPEG-TS and Matroska
+//! (all 46 display states of FATE `sub/dvbsubtest_filter.ts`), and DVD
+//! through paired VobSub, MPEG-PS and ordinary/zlib Matroska. Mutation
+//! tests exercise 7200 seeded PGS, 4800 DVB and 4800 DVD packet mutations
+//! in real decoder epochs, including truncations and header/RLE bit flips,
+//! plus 2000 VobSub index mutations. Every PGS and DVD reset is followed by
+//! a complete FFmpeg comparison.
 
 #![forbid(unsafe_code)]
 
@@ -36,9 +40,13 @@ use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag, MediaType, R
 mod bytes;
 mod colorspace;
 mod dvb;
+mod dvd;
 mod pgs;
 mod subtitle;
 mod sup;
+mod vobsub;
+
+pub use vobsub::open_vobsub;
 
 /// Codec id of HDMV PGS subtitles: FFmpeg's codec name, which OxideAV's
 /// Matroska (`S_HDMV/PGS`) and MPEG-TS (stream type 0x90) demuxers and this
@@ -50,6 +58,8 @@ pub const OXIDEAV_PGS_CODEC_ID: &str = "pgs";
 pub const DVB_CODEC_ID: &str = "dvb_subtitle";
 /// FFmpeg's decoder name for DVB subtitles, also claimed.
 pub const DVB_DECODER_NAME: &str = "dvbsub";
+/// DVD subpictures in Matroska S_VOBSUB, MPEG-PS and paired VobSub files.
+pub const DVD_CODEC_ID: &str = "dvd_subtitle";
 
 /// Tag-resolution priority, below OxideAV's default 100. Decoder factories
 /// must additionally register before upstream factories: first_decoder
@@ -84,6 +94,15 @@ pub fn register(ctx: &mut RuntimeContext) {
                 .with_resolution_priority(RESOLUTION_PRIORITY)
                 .decoder(dvb::make_decoder)
                 .tag(CodecTag::matroska("S_DVBSUB")),
+        );
+    }
+    for id in [DVD_CODEC_ID, "dvdsub", "vobsub"] {
+        ctx.codecs.register(
+            CodecInfo::new(CodecId::new(id))
+                .capabilities(caps("dvdsub_ffmpeg_port"))
+                .with_resolution_priority(RESOLUTION_PRIORITY)
+                .decoder(dvd::make_decoder)
+                .tag(CodecTag::matroska("S_VOBSUB")),
         );
     }
     sup::register(&mut ctx.containers);

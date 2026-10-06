@@ -1,6 +1,7 @@
-//! Exact logical media-time evidence for the real subtitle consumer. The
-//! injected clock is held at each boundary, so OS scheduling cannot turn a
-//! correctly timed state change into a late wall-clock measurement.
+//! Logical media-time evidence for the real subtitle consumer, at the
+//! resolution of FFmpeg's reference. The injected clock is held at each
+//! boundary, so OS scheduling cannot turn a correctly timed state change
+//! into a late wall-clock measurement.
 
 #[path = "../../tests/support/bitmap.rs"]
 mod bitmap;
@@ -118,6 +119,22 @@ fn dvb_show_replace_and_timeout_clear_match_ffmpeg_exactly() {
     }
 }
 
+#[test]
+fn dvd_paired_ps_and_matroska_stop_times_match_ffmpeg_exactly() {
+    for (format, sample) in [
+        ("vobsub", "sub/vobsub.idx"),
+        ("mpeg", "sub/vobsub.sub"),
+        ("matroska", "filter/242_4.mkv"),
+        ("matroska", "mkv/subtitle_zlib.mks"),
+    ] {
+        let path = refcheck::fate(sample);
+        let reference = oracle::ffmpeg_reference(&path, 0);
+        assert!(!reference.cues.is_empty());
+        assert!(reference.cues.iter().all(|cue| cue.sub.end_us().is_some()));
+        check_timing(format, &path, &reference);
+    }
+}
+
 /// Independent presentation schedule derived only from FFmpeg's subtitles.
 /// Suppress redundant blank states, and expire visible states only when a
 /// later cue has not replaced them. A replacement at the exact end has no
@@ -149,11 +166,25 @@ fn expected_events(reference: &oracle::Reference) -> Vec<(Duration, Option<usize
     events
 }
 
+/// FFmpeg reports subtitle times in whole microseconds, rounded to nearest
+/// (`av_rescale_q`); the engine keeps each stream's exact time, e.g. a
+/// 90 kHz PTS of 11924914 is 132499044.4 µs. A change at FFmpeg time `at`
+/// must be absent at `at - 0.5 µs - 1 ns` and present at `at + 0.5 µs`,
+/// which pins the engine's boundary to FFmpeg's rounding of it.
+const HALF_US: Duration = Duration::from_nanos(500);
+
 fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Reference) {
     let mut ctx = codecs::context();
     subs_bitmap::register(&mut ctx);
     let ctx = Arc::new(ctx);
-    let mut demux = ctx.containers.open_demuxer(format, Box::new(std::fs::File::open(path).unwrap()), &ctx.codecs).unwrap();
+    let mut demux = if format == "vobsub" {
+        subs_bitmap::open_vobsub(
+            Box::new(std::fs::File::open(path).unwrap()),
+            Box::new(std::fs::File::open(path.with_extension("sub")).unwrap()),
+        ).unwrap()
+    } else {
+        ctx.containers.open_demuxer(format, Box::new(std::fs::File::open(path).unwrap()), &ctx.codecs).unwrap()
+    };
     let stream = demux.streams().iter().find(|stream| stream.params.media_type == MediaType::Subtitle).unwrap().clone();
     let decoder = ctx.codecs.first_decoder(&stream.params).unwrap();
     let params = stream.params.clone();
@@ -196,13 +227,13 @@ fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Refere
     let events = expected_events(reference);
     for (index, &(at, cue)) in events.iter().enumerate() {
         if index == 0 || events[index - 1].0 != at {
-            clock.set(at.saturating_sub(Duration::from_micros(1)), &lane);
+            clock.set(at.saturating_sub(HALF_US + Duration::from_nanos(1)), &lane);
             clock.synchronize();
             assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "{format}: unexpected show/clear before event {index}");
-            clock.set(at, &lane);
+            clock.set(at + HALF_US, &lane);
         }
         let show = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|error| panic!("{format} event {index}: {error}"));
-        assert_eq!(show.at, at, "{format} event {index}: exact media-time boundary");
+        assert_eq!(show.at, at + HALF_US, "{format} event {index}: media-time boundary within FFmpeg's microsecond rounding");
         match cue {
             Some(cue) => show.assert_canvas(reference, cue),
             None => {
@@ -216,7 +247,7 @@ fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Refere
     // timeouts: once blank, nothing remains to expire and EOF must finish.
     let final_cue = Duration::from_micros(reference.cues.last().unwrap().sub.start_us() as u64);
     let final_event = events.last().map_or(Duration::ZERO, |event| event.0);
-    clock.set(final_cue.max(final_event), &lane);
+    clock.set(final_cue.max(final_event) + HALF_US, &lane);
     running.handle.take().unwrap().join().unwrap();
     assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)), "{format}: extra trailing show/clear");
 }
