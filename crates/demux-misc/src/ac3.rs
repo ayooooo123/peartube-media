@@ -38,7 +38,7 @@ const EAC3_BLOCKS: [u16; 4] = [1, 2, 3, 6];
 /// CRC-16 ANSI (poly 0x8005, non-reflected, init 0) — FFmpeg's
 /// AV_CRC_16_ANSI, used by the ac3 probe and the frame crc1.
 /// Bit-at-a-time form; frames are ≤4096 bytes and probing runs on ≤256 KiB.
-fn crc16_ansi(data: &[u8]) -> u16 {
+pub(crate) fn crc16_ansi(data: &[u8]) -> u16 {
     static TABLE: std::sync::LazyLock<[u16; 256]> = std::sync::LazyLock::new(|| {
         let mut table = [0u16; 256];
         for (i, slot) in table.iter_mut().enumerate() {
@@ -103,7 +103,20 @@ pub fn parse_ac3_header(buf: &[u8]) -> Option<Ac3Header> {
         let sample_rate = SAMPLE_RATES[fscod as usize] >> sr_shift;
         let frame_size = FRAME_SIZE_TAB[frmsizecod][fscod as usize] as usize * 2;
         let acmod = (buf[6] >> 5) & 7;
-        let lfeon = (buf[6] >> 4) & 1;
+        // lfeon follows acmod and the 2-bit fields its layout carries:
+        // cmixlev (three front channels), surmixlev (surrounds), dsurmod
+        // (2/0), as ac3_parse_header reads them.
+        let mut skip = 0;
+        if acmod & 1 != 0 && acmod != 1 {
+            skip += 2;
+        }
+        if acmod & 4 != 0 {
+            skip += 2;
+        }
+        if acmod == 2 {
+            skip += 2;
+        }
+        let lfeon = (buf[6] >> (4 - skip)) & 1;
         let channels = ACMOD_CHANNELS[acmod as usize] + u16::from(lfeon);
         Some(Ac3Header {
             bitstream_id: bsid,

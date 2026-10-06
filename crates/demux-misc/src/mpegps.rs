@@ -1,435 +1,456 @@
-// Ported from FFmpeg libavformat/mpeg.c (commit 2da55bf).
+// Ported from FFmpeg libavformat/mpeg.c (commit 2da55bf), with the stream
+// discovery and parser stage of libavformat/demux.c (find_stream_info,
+// probe_codec, parse_packet, compute_pkt_fields) and the CVD/OGT
+// subpicture substreams of VLC modules/demux/mpeg/ps.h (commit 2e358f3).
 // License: LGPL-2.1-or-later
 //
-// MPEG-1/2 program stream demuxer (.mpg/.mpeg/.vob). Streams are created
-// on the fly the way FFmpeg does (AVFMTCTX_NOHEADER); private stream 1 is
-// split by substream id into AC-3 / DTS / LPCM (with FFmpeg's raw-AC3
-// detection), the program stream map overrides elementary stream types,
-// and subpicture streams map to the DVD subtitle codec. The PES parser
-// follows mpegps_read_pes_header: MPEG-1 stuffing, buffer scale/size,
-// MPEG-1 PTS/DTS, MPEG-2 PES flags and the PES extension 2 stream-id
-// remap.
+// MPEG-1/2 program stream demuxer (.mpg/.mpeg/.vob). The container
+// declares no streams (FFmpeg's AVFMTCTX_NOHEADER), so opening reads
+// ahead, at most FFmpeg's default probe size, and creates every stream
+// it meets the way avformat_find_stream_info does; whatever that read is
+// queued and played, and the stream list never changes afterwards. A
+// stream first seen later is dropped.
+//
+// Packets are the PES payloads FFmpeg's demuxer returns: private stream
+// 1 is split by substream id with FFmpeg's substream headers stripped,
+// the program stream map types elementary streams, DVD navigation
+// packets surface once DVD PCI/DSI structures are recognised. Two kinds
+// of stream differ from FFmpeg's raw PES output:
+// - DVD subpictures (substreams 0x20-0x3f) are reassembled into whole
+//   units across PES packets by FFmpeg's dvdsub parser, each unit keeping
+//   the timestamps of its first PES.
+// - CVD (substreams 0x00-0x03) and SVCD OGT (0x70) subpictures, which
+//   FFmpeg skips, are carried as VLC carries them: the PES payload with
+//   its leading substream id.
 
-use std::io::{Read, Seek, SeekFrom};
+use std::collections::VecDeque;
+use std::io::{BufReader, Read, Seek, SeekFrom};
+
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
-    MediaType, Packet, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error, MediaType,
+    Packet, ProbeData, ProbeScore, ReadSeek, Result, SampleFormat, StreamInfo, TimeBase,
     PROBE_SCORE_EXTENSION,
 };
 
-const PACK_START_CODE: u32 = 0x000001BA;
-const SYSTEM_HEADER_START_CODE: u32 = 0x000001BB;
-const PROGRAM_STREAM_MAP: u32 = 0x000001BC;
-const PRIVATE_STREAM_1: u32 = 0x000001BD;
-const PADDING_STREAM: u32 = 0x000001BE;
-const PRIVATE_STREAM_2: u32 = 0x000001BF;
+use crate::parser::{DvdSub, Parser, Unit};
 
-const MAX_PES_PAYLOAD: i64 = 64 * 1024 * 1024; // untrusted-input cap
+const PACK_START_CODE: u32 = 0x1BA;
+const SYSTEM_HEADER_START_CODE: u32 = 0x1BB;
+const PROGRAM_STREAM_MAP: u32 = 0x1BC;
+const PRIVATE_STREAM_1: u32 = 0x1BD;
+const PADDING_STREAM: u32 = 0x1BE;
+const PRIVATE_STREAM_2: u32 = 0x1BF;
+
+/// FFmpeg's default probesize: input bytes read at open to find streams.
+const PROBE_SIZE: u64 = 5_000_000;
+/// avformat_find_stream_info's analyze durations in 90 kHz ticks: 5 s
+/// once every stream has its parameters, else MPEG's 7 s per stream, or
+/// 30 s for a subtitle stream.
+const ANALYZE_ALL: i64 = 5 * 90_000;
+const ANALYZE_STREAM: i64 = 7 * 90_000;
+const ANALYZE_SUBTITLE: i64 = 30 * 90_000;
+/// Elementary-stream bytes kept per stream while discovering, from which
+/// its identity and parameters come.
+const HEAD_BYTES: usize = 1 << 20;
+
+const TIME_BASE: TimeBase = TimeBase::new(1, 90_000);
 
 /// ff_parse_pes_pts (mpeg.h)
-fn parse_pes_pts(buf: &[u8]) -> i64 {
+fn parse_pes_pts(buf: &[u8; 5]) -> i64 {
     (i64::from(buf[0] & 0x0E) << 29)
         | ((i64::from(u16::from_be_bytes([buf[1], buf[2]])) >> 1) << 15)
         | i64::from(u16::from_be_bytes([buf[3], buf[4]]) >> 1)
 }
 
-/// check_pes from mpeg.c's probe: does the bytes after this start code
-/// look like a PES header?
-fn check_pes(p: &[u8]) -> bool {
-    if p.len() < 5 {
-        return false;
-    }
-    let pes2 = (p[3] & 0xC0) == 0x80
-        && (p[4] & 0xC0) != 0x40
-        && ((p[4] & 0xC0) == 0x00 || (p[4] & 0xC0) >> 2 == (p.get(6).copied().unwrap_or(0) & 0xF0));
-    if pes2 {
-        return true;
-    }
-    let mut idx = 3;
-    while idx < p.len() && p[idx] == 0xFF {
-        idx += 1;
-    }
-    if idx + 2 <= p.len() && (p[idx] & 0xC0) == 0x40 {
-        idx += 2;
-    }
-    if idx < p.len() {
-        if (p[idx] & 0xE0) == 0x20 || (p[idx] & 0xF0) == 0x30 {
-            return true;
-        }
-        if p[idx] == 0xF {
-            return idx + 1 < p.len() && (p[idx + 1] & 6) == 2;
-        }
-    }
-    false
+/// `p[i]`, or 0 past the end (FFmpeg's probe buffers carry zero padding).
+fn at(p: &[u8], i: usize) -> u8 {
+    p.get(i).copied().unwrap_or(0)
 }
 
-/// ISO/IEC 13818-1 table 2-35 program stream map (mpegps_psm_parse).
-/// Returns stream-id → PES stream-type pairs, or `None` on a malformed map.
-fn parse_psm(data: &[u8]) -> Option<Vec<(u8, u8)>> {
-    if data.len() < 10 {
-        return None;
+/// check_pes (mpeg.c), with `i` at the start code's last byte.
+fn check_pes(p: &[u8], i: usize) -> bool {
+    let pes2 = (at(p, i + 3) & 0xC0) == 0x80
+        && (at(p, i + 4) & 0xC0) != 0x40
+        && ((at(p, i + 4) & 0xC0) == 0x00 || (at(p, i + 4) & 0xC0) >> 2 == (at(p, i + 6) & 0xF0));
+    let mut q = i + 3;
+    while q < p.len() && p[q] == 0xFF {
+        q += 1;
     }
-    let psm_length = u16::from_be_bytes([data[0], data[1]]) as usize;
-    let ps_info_length = u16::from_be_bytes([data[4], data[5]]) as usize;
-    let es_map_len = psm_length.checked_sub(ps_info_length + 10)?;
-    if 6 + ps_info_length + 2 > data.len() {
-        return None;
+    if (at(p, q) & 0xC0) == 0x40 {
+        q += 2;
     }
-    let mut out = Vec::new();
-    let mut pos = 6 + ps_info_length + 2; // past es_map_length field
-    let mut remaining = es_map_len;
-    while remaining >= 4 && pos + 4 <= data.len() {
-        let es_type = data[pos];
-        let es_id = data[pos + 1];
-        let es_info_length = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
-        pos += 4 + es_info_length;
-        remaining = remaining.saturating_sub(4 + es_info_length);
-        out.push((es_id, es_type));
-    }
-    Some(out)
+    let pes1 = if (at(p, q) & 0xF0) == 0x20 {
+        at(p, q) & at(p, q + 2) & at(p, q + 4) & 1 != 0
+    } else if (at(p, q) & 0xF0) == 0x30 {
+        at(p, q) & at(p, q + 2) & at(p, q + 4) & at(p, q + 5) & at(p, q + 7) & at(p, q + 9) & 1 != 0
+    } else {
+        at(p, q) == 0x0F
+    };
+    pes1 || pes2
 }
 
-/// FFmpeg's mpegps_probe, on the probe buffer.
+/// mpegps_probe.
 pub fn probe_mpegps(probe: &ProbeData) -> ProbeScore {
     let p = probe.buf;
-    if p.len() < 16 {
-        return 0;
-    }
-
     let mut code: u32 = 0xFFFF_FFFF;
     let (mut sys, mut pspack, mut priv1, mut vid, mut audio, mut invalid) = (0, 0, 0, 0, 0, 0);
+    let mut endpes = 0usize;
     let mut i = 0usize;
     while i < p.len() {
-        code = (code << 8) | u32::from(p[i]);
+        code = (code << 8).wrapping_add(u32::from(p[i]));
         if (code & 0xFFFF_FF00) == 0x100 {
-            let pes = check_pes(&p[i..]);
-            let pack =
-                i + 1 < p.len() && ((p[i + 1] & 0xC0) == 0x40 || (p[i + 1] & 0xF0) == 0x20);
-
+            let len = (usize::from(at(p, i + 1)) << 8) | usize::from(at(p, i + 2));
+            let pes = endpes <= i && check_pes(p, i);
+            let pack = (at(p, i + 1) & 0xC0) == 0x40 || (at(p, i + 1) & 0xF0) == 0x20;
             if code == SYSTEM_HEADER_START_CODE {
                 sys += 1;
             } else if code == PACK_START_CODE && pack {
                 pspack += 1;
-            } else if (0x1E0..=0x1EF).contains(&code) {
-                if pes {
-                    vid += 1;
-                } else {
-                    invalid += 1;
-                }
-            } else if (0x1C0..=0x1DF).contains(&code) {
-                if pes {
-                    audio += 1;
-                } else {
-                    invalid += 1;
-                }
-            } else if code == PRIVATE_STREAM_1 {
-                if pes {
-                    priv1 += 1;
-                } else {
-                    invalid += 1;
-                }
+            } else if (code & 0xF0) == 0xE0 && pes {
+                endpes = i + len;
+                vid += 1;
+            } else if (code & 0xE0) == 0xC0 && pes {
+                // skip the payload: no start code emulation from audio
+                audio += 1;
+                i += len;
+            } else if code == PRIVATE_STREAM_1 && pes {
+                priv1 += 1;
+                i += len;
+            } else if code == 0x1FD && pes {
+                vid += 1; // VC-1
+            } else if ((code & 0xF0) == 0xE0 || (code & 0xE0) == 0xC0 || code == PRIVATE_STREAM_1) && !pes {
+                invalid += 1;
             }
         }
         i += 1;
     }
 
+    let score = if vid + audio > invalid + 1 { PROBE_SCORE_EXTENSION / 2 } else { 0 };
     if sys > invalid && sys * 9 <= pspack * 10 {
-        if audio > 12 || vid > 3 || pspack > 2 {
+        return if audio > 12 || vid > 3 || pspack > 2 {
             PROBE_SCORE_EXTENSION + 2
         } else {
-            PROBE_SCORE_EXTENSION / 2 + 1
-        }
-    } else if pspack > invalid && (priv1 + vid + audio) * 10 >= pspack * 9 {
-        if pspack > 2 {
-            PROBE_SCORE_EXTENSION + 2
+            PROBE_SCORE_EXTENSION / 2 + u8::from(audio + vid + pspack > 1)
+        };
+    }
+    if pspack > invalid && (priv1 + vid + audio) * 10 >= pspack * 9 {
+        return if pspack > 2 { PROBE_SCORE_EXTENSION + 2 } else { PROBE_SCORE_EXTENSION / 2 };
+    }
+    if ((vid > 0) ^ (audio > 0)) && (audio > 4 || vid > 1) && sys == 0 && pspack == 0 && p.len() > 2048 && vid + audio > invalid {
+        // PES stream
+        return if audio > 12 || vid > 6 + 2 * invalid {
+            PROBE_SCORE_EXTENSION + 1
         } else {
             PROBE_SCORE_EXTENSION / 2
-        }
-    } else if (vid > 0 || audio > 0 || priv1 > 0)
-        && probe
-            .ext
-            .is_some_and(|e| e == "mpg" || e == "mpeg" || e == "vob")
-    {
-        PROBE_SCORE_EXTENSION
-    } else {
-        0
+        };
     }
+    score
 }
 
-/// Which codec a private-stream-1 substream id carries
-/// (mpegps_read_packet's 0x80..=0xcf ladder).
-fn priv1_codec(sub_id: u8) -> (&'static str, bool) {
-    match sub_id {
-        0x80..=0x87 => ("ac3", false),
-        0x88..=0x8F | 0x98..=0x9F => ("dts", false),
-        0xA0..=0xAF => ("pcm_dvd", false),
-        0xB0..=0xBF => ("truehd", false),
-        0xC0..=0xCF => ("ac3", false),
-        _ => ("ac3", false),
-    }
+/// How a stream's packets reach the caller.
+enum Framing {
+    /// One packet per PES payload, as FFmpeg's demuxer returns it.
+    Pes,
+    /// CVD/OGT: the PES payload behind its substream id byte.
+    SubstreamId(u8),
+    /// DVD subpicture units reassembled by the dvdsub parser.
+    Spu(Parser<DvdSub>),
 }
 
-/// Codec for a PSM PES stream type (STREAM_TYPE_* from mpeg.h).
-fn psm_codec(es_type: u8) -> Option<(&'static str, MediaType)> {
-    Some(match es_type {
-        0x01 | 0x02 => ("mpeg2video", MediaType::Video),
-        0x03 | 0x04 => ("mp3", MediaType::Audio),
-        0x0F => ("aac", MediaType::Audio),
-        0x10 => ("mpeg4", MediaType::Video),
-        0x1B => ("h264", MediaType::Video),
-        0x24 => ("hevc", MediaType::Video),
-        0x81 => ("ac3", MediaType::Audio),
-        0x82 => ("dts", MediaType::Audio),
-        _ => return None,
-    })
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum PsKind {
-    Audio,
-    Video,
-    Subtitle,
-}
-
-struct PsStream {
+struct Track {
+    /// FFmpeg's stream id: the start code, or the private stream 1
+    /// substream id.
     id: u32,
-    sub_id: Option<u8>,
-    index: u32,
+    /// FFmpeg's codec name; `None` while a video stream awaits probing.
+    codec: Option<&'static str>,
+    media: MediaType,
+    /// The first elementary-stream bytes (discovery only).
+    head: Vec<u8>,
+    /// Probe sizes already tried (FFmpeg probes at each power of two).
+    probed_at: usize,
+    probe_done: bool,
+    /// Its parameters are known (has_codec_parameters).
+    ready: bool,
+    first_ts: Option<i64>,
+    start_time: Option<i64>,
+    framing: Framing,
+}
+
+/// One PES header: its stream id after private-stream-1 / extension
+/// remapping, payload length still to read, timestamps, file position.
+struct PesHeader {
+    startcode: u32,
+    len: i64,
+    pts: Option<i64>,
+    dts: Option<i64>,
+    pos: i64,
 }
 
 pub struct MpegPsDemuxer {
-    input: Box<dyn ReadSeek>,
+    input: BufReader<Box<dyn ReadSeek>>,
     streams: Vec<StreamInfo>,
-    states: Vec<PsStream>,
-    psm_es_type: Vec<u8>,
+    tracks: Vec<Track>,
+    psm_es_type: [u8; 256],
+    /// mpeg.c's sofdec: 1 Sofdec, -1 not, 0 not known yet.
+    sofdec: i32,
+    dvd: bool,
+    imkh_cctv: bool,
+    raw_ac3: bool,
+    discovering: bool,
+    queue: VecDeque<Packet>,
+    eof: bool,
 }
 
 impl MpegPsDemuxer {
-    /// Create the stream for a start code (+ optional substream id),
-    /// mirroring mpegps_read_packet's codec ladder.
-    fn stream_for(&mut self, startcode: u32, sub_id: Option<u8>) -> u32 {
-        if let Some(s) = self
-            .states
-            .iter()
-            .find(|s| s.id == startcode && s.sub_id == sub_id)
-        {
-            return s.index;
-        }
-
-        let psm_type = sub_id
-            .and_then(|sid| self.psm_es_type.get(sid as usize).copied())
-            .filter(|_| startcode == PRIVATE_STREAM_1);
-
-        let (codec, kind) = if let Some(t) = psm_type.and_then(psm_codec) {
-            (t.0, match t.1 {
-                MediaType::Video => PsKind::Video,
-                MediaType::Audio => PsKind::Audio,
-                MediaType::Subtitle => PsKind::Subtitle,
-                MediaType::Data | MediaType::Unknown => PsKind::Video,
-            })
-        } else if startcode == PRIVATE_STREAM_1 {
-            if let Some(sid) = sub_id {
-                if (0x20..=0x3F).contains(&sid) {
-                    // DVD subpicture substream (mpegps_read_packet's
-                    // 0x20..=0x3f → dvd_subtitle).
-                    ("dvdsub", PsKind::Subtitle)
-                } else {
-                    let (c, _) = priv1_codec(sid);
-                    (c, PsKind::Audio)
-                }
-            } else {
-                ("ac3", PsKind::Audio)
+    fn byte(&mut self) -> Result<Option<u8>> {
+        let mut b = [0u8; 1];
+        loop {
+            match self.input.read(&mut b) {
+                Ok(0) => return Ok(None),
+                Ok(_) => return Ok(Some(b[0])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
             }
-        } else if (0x1E0..=0x1EF).contains(&startcode) {
-            ("mpeg2video", PsKind::Video)
-        } else if (0x1C0..=0x1DF).contains(&startcode) {
-            ("mp2", PsKind::Audio)
-        } else if (0x80..=0x87).contains(&startcode) || (0xC0..=0xCF).contains(&startcode) {
-            ("ac3", PsKind::Audio)
-        } else if (0x88..=0x8F).contains(&startcode) || (0x98..=0x9F).contains(&startcode) {
-            ("dts", PsKind::Audio)
-        } else if (0x20..=0x3F).contains(&startcode) {
-            ("dvdsub", PsKind::Subtitle)
-        } else if startcode == PRIVATE_STREAM_2 {
-            ("dvdnav", PsKind::Subtitle)
-        } else {
-            // 0x1FD and friends: FFmpeg probes; carry as MPEG video.
-            ("mpeg2video", PsKind::Video)
-        };
-
-        let index = self.streams.len() as u32;
-        let codec_id = CodecId::new(codec);
-        let params = match kind {
-            PsKind::Video => CodecParameters::video(codec_id),
-            PsKind::Audio => CodecParameters::audio(codec_id),
-            PsKind::Subtitle => CodecParameters::subtitle(codec_id),
-        };
-        self.streams.push(StreamInfo {
-            index,
-            params,
-            time_base: TimeBase::new(1, 90000),
-            duration: None,
-            start_time: Some(0),
-        });
-        self.states.push(PsStream {
-            id: startcode,
-            sub_id,
-            index,
-        });
-        index
+        }
     }
 
-    /// mpegps_read_pes_header: scan to the next PES packet. Returns
-    /// `(startcode, sub_id, consumed_prefix, len, pts, dts)` where
-    /// `consumed_prefix` are payload bytes already read (raw-AC3
-    /// detection / the priv1 substream byte).
-    #[allow(clippy::type_complexity)]
-    fn read_pes_header(&mut self) -> Result<(u32, Option<u8>, Vec<u8>, i64, Option<i64>, Option<i64>)> {
-        let mut code: u32 = 0xFFFF_FFFF;
-        'pes_scan: loop {
-            // find next start code
-            let mut b = [0u8; 1];
-            loop {
-                match self.input.read(&mut b) {
-                    Ok(0) => return Err(Error::Eof),
-                    Ok(_) => {}
-                    Err(e) => return Err(e.into()),
+    /// Fill `buf` as far as the input goes; returns the bytes read.
+    fn read_up_to(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let mut got = 0;
+        while got < buf.len() {
+            match self.input.read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(got)
+    }
+
+    /// avio_rb16; `None` at the end of the input.
+    fn rb16(&mut self) -> Result<Option<i64>> {
+        let mut b = [0u8; 2];
+        Ok((self.read_up_to(&mut b)? == 2).then(|| i64::from(u16::from_be_bytes(b))))
+    }
+
+    fn skip(&mut self, n: i64) -> Result<()> {
+        self.input.seek_relative(n)?;
+        Ok(())
+    }
+
+    fn position(&mut self) -> Result<i64> {
+        Ok(self.input.stream_position()? as i64)
+    }
+
+    /// get_pts: the 5-byte timestamp starting with `first`, if 4 more
+    /// bytes follow.
+    fn get_pts(&mut self, first: Option<u8>) -> Result<Option<i64>> {
+        let mut buf = [0u8; 5];
+        let start = match first {
+            Some(c) => {
+                buf[0] = c;
+                1
+            }
+            None => 0,
+        };
+        let need = 5 - start;
+        Ok((self.read_up_to(&mut buf[start..])? == need).then(|| parse_pes_pts(&buf)))
+    }
+
+    /// mpegps_read_header: IMKH CCTV and Sofdec signatures.
+    fn read_header(&mut self) -> Result<()> {
+        let last_pos = self.position()?;
+        let mut buffer = [0u8; 6];
+        let n = self.read_up_to(&mut buffer)?;
+        // avio_get_str stops after a NUL
+        let used = buffer[..n].iter().position(|&b| b == 0).map_or(n, |z| z + 1);
+        let text = &buffer[..used.min(n)];
+        if text.starts_with(b"IMKH") {
+            self.imkh_cctv = true;
+            self.input.seek(SeekFrom::Start((last_pos + used as i64) as u64))?;
+        } else if text.starts_with(b"Sofdec") {
+            self.sofdec = 1;
+            self.input.seek(SeekFrom::Start((last_pos + used as i64) as u64))?;
+        } else {
+            self.input.seek(SeekFrom::Start(last_pos as u64))?;
+        }
+        Ok(())
+    }
+
+    /// mpegps_psm_parse (ISO/IEC 13818-1 table 2-35).
+    fn psm_parse(&mut self) -> Result<()> {
+        let Some(psm_length) = self.rb16()? else { return Ok(()) };
+        self.skip(2)?;
+        let Some(ps_info_length) = self.rb16()? else { return Ok(()) };
+        self.skip(ps_info_length)?;
+        if self.rb16()?.is_none() {
+            return Ok(());
+        }
+        // es_map_length is ignored: FFmpeg trusts psm_length
+        let mut es_map_length = psm_length - ps_info_length - 10;
+        while es_map_length >= 4 {
+            let mut entry = [0u8; 4];
+            if self.read_up_to(&mut entry)? < 4 {
+                return Ok(());
+            }
+            let es_info_length = i64::from(u16::from_be_bytes([entry[2], entry[3]]));
+            self.psm_es_type[usize::from(entry[1])] = entry[0];
+            self.skip(es_info_length)?;
+            es_map_length -= 4 + es_info_length;
+        }
+        self.skip(4) // crc32
+    }
+
+    /// The private stream 2 packet behind its start code, when it is not a
+    /// DVD navigation packet to deliver: mpeg.c's Sofdec / DVD detection.
+    /// Returns true when the packet is to be parsed as a stream packet.
+    fn private_stream_2(&mut self) -> Result<bool> {
+        if self.sofdec == 0 {
+            let Some(len) = self.rb16()? else { return Ok(false) };
+            let mut ps2buf = vec![0u8; len as usize];
+            let read = self.read_up_to(&mut ps2buf)?;
+            if read == ps2buf.len() {
+                if len >= 6 {
+                    if let Some(s) = ps2buf[..ps2buf.len() - 5].iter().position(|&b| b == b'S') {
+                        self.sofdec = i32::from(&ps2buf[s + 1..s + 6] == b"ofdec");
+                    }
                 }
-                code = (code << 8) | u32::from(b[0]);
-                if (code & 0xFFFF_FF00) == 0x100 {
-                    break;
+                if self.sofdec == 0 {
+                    self.sofdec = -1;
+                }
+                if self.sofdec < 0 {
+                    let bcd = |b: u8| u32::from(b >> 4) * 10 + u32::from(b & 0x0F);
+                    let time_ok = |h: u8, m: u8, s: u8| {
+                        bcd(h) <= 23 && bcd(m) <= 59 && bcd(s) <= 59 && (h & 0x0F) < 10 && (m & 0x0F) < 10 && (s & 0x0F) < 10
+                    };
+                    if len == 980 && ps2buf[0] == 0 {
+                        // PCI structure?
+                        let startpts = u32::from_be_bytes(ps2buf[0x0D..0x11].try_into().unwrap());
+                        let endpts = u32::from_be_bytes(ps2buf[0x11..0x15].try_into().unwrap());
+                        self.dvd = time_ok(ps2buf[0x19], ps2buf[0x1A], ps2buf[0x1B]) && endpts >= startpts;
+                    } else if len == 1018 && ps2buf[0] == 1 {
+                        // DSI structure?
+                        self.dvd = time_ok(ps2buf[0x1D], ps2buf[0x1E], ps2buf[0x1F]);
+                    }
                 }
             }
-            let mut startcode = code;
+            // Not a DVD packet: ignored. Otherwise back to its length field.
+            if !self.dvd {
+                return Ok(false);
+            }
+            self.skip(-(read as i64 + 2))?;
+            Ok(true)
+        } else if !self.dvd {
+            if let Some(len) = self.rb16()? {
+                self.skip(len)?;
+            }
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
 
-            // container-level packets we skip by length
-            if startcode == PACK_START_CODE {
-                // mpeg.c's read_pes_header does not parse the pack body:
-                // it just resyncs with find_next_start_code, which lands
-                // right after the 12-byte (MPEG-1) / 14-byte (MPEG-2) pack
-                // header. Skip the same amount: 8/10 bytes remain after the
-                // 4-byte start code we consumed.
-                let mut pack_head = [0u8; 1];
-                self.input.read_exact(&mut pack_head)?;
-                if (pack_head[0] & 0xC0) == 0x40 {
-                    // MPEG-2: SCR(6) + mux rate(3) + padding(1) = 10 more
-                    let mut rest = [0u8; 9];
-                    self.input.read_exact(&mut rest)?;
-                    self.input.seek(SeekFrom::Current(i64::from(rest[8] & 7)))?;
-                } else if (pack_head[0] & 0xF0) == 0x20 {
-                    // MPEG-1: SCR(5) + mux rate(3) = 8 more
-                    let mut rest = [0u8; 7];
-                    self.input.read_exact(&mut rest)?;
-                } else {
-                    // unknown: resync like find_next_start_code would
-                    code = 0xFFFF_FFFF;
+    /// mpegps_read_pes_header. `Ok(None)` at the end of the input.
+    fn read_pes_header(&mut self) -> Result<Option<PesHeader>> {
+        let mut last_sync = self.position()?;
+        let mut error_redo = false;
+        loop {
+            if error_redo {
+                self.input.seek(SeekFrom::Start(last_sync as u64))?;
+                error_redo = false;
+            }
+            // find_next_start_code
+            let mut state: u32 = 0xFF;
+            let mut startcode = loop {
+                let Some(v) = self.byte()? else { return Ok(None) };
+                if state == 0x000001 {
+                    break 0x100 | u32::from(v);
+                }
+                state = ((state << 8) | u32::from(v)) & 0xFF_FFFF;
+            };
+            last_sync = self.position()?;
+
+            match startcode {
+                PACK_START_CODE | SYSTEM_HEADER_START_CODE => continue,
+                PADDING_STREAM => {
+                    if let Some(len) = self.rb16()? {
+                        self.skip(len)?;
+                    }
                     continue;
                 }
-                code = 0xFFFF_FFFF;
-                continue;
-            } else if startcode == SYSTEM_HEADER_START_CODE
-                || startcode == PADDING_STREAM
-                || startcode == PRIVATE_STREAM_2
-            {
-                let mut len_buf = [0u8; 2];
-                self.input.read_exact(&mut len_buf)?;
-                let len = u16::from_be_bytes(len_buf) as i64;
-                if !(0..=MAX_PES_PAYLOAD).contains(&len) {
-                    return Err(Error::invalid("mpegps: oversized packet"));
-                }
-                self.input.seek(SeekFrom::Current(len))?;
-                code = 0xFFFF_FFFF;
-                continue;
-            } else if startcode == PROGRAM_STREAM_MAP {
-                let mut len_buf = [0u8; 2];
-                self.input.read_exact(&mut len_buf)?;
-                let len = u16::from_be_bytes(len_buf) as usize;
-                if len > MAX_PES_PAYLOAD as usize {
-                    return Err(Error::invalid("mpegps: PSM too large"));
-                }
-                let mut body = vec![0u8; len];
-                self.input.read_exact(&mut body)?;
-                if let Some(map) = parse_psm(&body) {
-                    self.psm_es_type = vec![0u8; 256];
-                    for (es_id, es_type) in map {
-                        self.psm_es_type[es_id as usize] = es_type;
+                PRIVATE_STREAM_2 => {
+                    if !self.private_stream_2()? {
+                        continue;
                     }
                 }
-                code = 0xFFFF_FFFF;
+                PROGRAM_STREAM_MAP => {
+                    self.psm_parse()?;
+                    continue;
+                }
+                _ => {}
+            }
+            if !((0x1C0..=0x1DF).contains(&startcode)
+                || (0x1E0..=0x1EF).contains(&startcode)
+                || startcode == PRIVATE_STREAM_1
+                || startcode == PRIVATE_STREAM_2
+                || startcode == 0x1FD)
+            {
                 continue;
             }
-
-            if !is_known_stream(startcode) {
-                code = 0xFFFF_FFFF;
-                continue;
-            }
-
-            let mut len_buf = [0u8; 2];
-            self.input.read_exact(&mut len_buf)?;
-            let mut len = i64::from(u16::from_be_bytes(len_buf));
+            let pos = self.position()? - 4;
+            let Some(mut len) = self.rb16()? else { return Ok(None) };
             let mut pts = None;
             let mut dts = None;
-
             if startcode != PRIVATE_STREAM_2 {
                 // stuffing
-                let mut c: u32;
-                loop {
+                let stuffed = loop {
                     if len < 1 {
-                        // FFmpeg's error_redo: abandon this packet.
-                        code = 0xFFFF_FFFF;
-                        continue 'pes_scan;
+                        break None;
                     }
-                    let mut sb = [0u8; 1];
-                    self.input.read_exact(&mut sb)?;
-                    c = u32::from(sb[0]);
+                    let Some(b) = self.byte()? else { return Ok(None) };
                     len -= 1;
-                    if c != 0xFF {
-                        break;
+                    if b != 0xFF {
+                        break Some(b);
                     }
-                }
+                };
+                let Some(mut c) = stuffed else {
+                    error_redo = true;
+                    continue;
+                };
                 if (c & 0xC0) == 0x40 {
                     // buffer scale & size
-                    let mut bb = [0u8; 2];
-                    self.input.read_exact(&mut bb)?;
+                    self.skip(1)?;
+                    let Some(b) = self.byte()? else { return Ok(None) };
+                    c = b;
                     len -= 2;
-                    c = u32::from(bb[1]);
                 }
                 if (c & 0xE0) == 0x20 {
-                    // MPEG-1 PTS (c carries the first byte)
-                    let mut ts = [0u8; 5];
-                    ts[0] = c as u8;
-                    self.input.read_exact(&mut ts[1..])?;
-                    pts = Some(parse_pes_pts(&ts));
+                    pts = self.get_pts(Some(c))?;
                     dts = pts;
                     len -= 4;
                     if c & 0x10 != 0 {
-                        let mut ts2 = [0u8; 5];
-                        self.input.read_exact(&mut ts2)?;
-                        dts = Some(parse_pes_pts(&ts2));
+                        dts = self.get_pts(None)?;
                         len -= 5;
                     }
                 } else if (c & 0xC0) == 0x80 {
                     // MPEG-2 PES
-                    let mut fb = [0u8; 2];
-                    self.input.read_exact(&mut fb)?;
-                    let mut flags = u32::from(fb[0]);
-                    let mut header_len = i64::from(fb[1]);
+                    let Some(flags_byte) = self.byte()? else { return Ok(None) };
+                    let Some(header_len_byte) = self.byte()? else { return Ok(None) };
+                    let mut flags = flags_byte;
+                    let mut header_len = i64::from(header_len_byte);
                     len -= 2;
                     if header_len > len {
-                        code = 0xFFFF_FFFF;
+                        error_redo = true;
                         continue;
                     }
                     len -= header_len;
                     if flags & 0x80 != 0 {
-                        let mut ts = [0u8; 5];
-                        self.input.read_exact(&mut ts)?;
-                        dts = Some(parse_pes_pts(&ts));
-                        pts = dts;
+                        pts = self.get_pts(None)?;
+                        dts = pts;
                         header_len -= 5;
                         if flags & 0x40 != 0 {
-                            let mut ts2 = [0u8; 5];
-                            self.input.read_exact(&mut ts2)?;
-                            dts = Some(parse_pes_pts(&ts2));
+                            dts = self.get_pts(None)?;
                             header_len -= 5;
                         }
                     }
@@ -438,124 +459,641 @@ impl MpegPsDemuxer {
                     }
                     if flags & 0x01 != 0 {
                         // PES extension
-                        if header_len < 1 {
-                            code = 0xFFFF_FFFF;
-                            continue;
-                        }
-                        let mut eb = [0u8; 1];
-                        self.input.read_exact(&mut eb)?;
-                        let mut pes_ext = eb[0];
+                        let Some(mut pes_ext) = self.byte()? else { return Ok(None) };
                         header_len -= 1;
-                        let mut skip = u32::from((pes_ext >> 4) & 0xB);
+                        // PES private data, pack header field, sequence
+                        // counter, P-STD buffer
+                        let mut skip = i64::from((pes_ext >> 4) & 0xB);
                         skip += skip & 0x9;
-                        if pes_ext & 0x40 != 0 || i64::from(skip) > header_len {
+                        if pes_ext & 0x40 != 0 || skip > header_len {
                             pes_ext = 0;
                             skip = 0;
                         }
-                        self.input.seek(SeekFrom::Current(i64::from(skip)))?;
-                        header_len -= i64::from(skip);
+                        self.skip(skip)?;
+                        header_len -= skip;
                         if pes_ext & 0x01 != 0 {
                             // PES extension 2
-                            if header_len < 2 {
-                                code = 0xFFFF_FFFF;
-                                continue;
-                            }
-                            let mut e2 = [0u8; 2];
-                            self.input.read_exact(&mut e2)?;
-                            let ext2_len = e2[0];
+                            let Some(ext2_len) = self.byte()? else { return Ok(None) };
                             header_len -= 1;
                             if (ext2_len & 0x7F) > 0 {
-                                let id_ext = e2[1];
-                                header_len -= 1;
+                                let Some(id_ext) = self.byte()? else { return Ok(None) };
                                 if id_ext & 0x80 == 0 {
-                                    // stream-id remap (mpeg.c):
-                                    // ((startcode & 0xff) << 8) | id_ext
                                     startcode = ((startcode & 0xFF) << 8) | u32::from(id_ext);
                                 }
+                                header_len -= 1;
                             }
                         }
                     }
                     if header_len < 0 {
-                        code = 0xFFFF_FFFF;
+                        error_redo = true;
                         continue;
                     }
-                    self.input.seek(SeekFrom::Current(header_len))?;
-                } else if c != 0xF {
-                    code = 0xFFFF_FFFF;
+                    self.skip(header_len)?;
+                } else if c != 0x0F {
                     continue;
                 }
             }
 
-            // private stream 1: substream id leads the payload
-            let mut sub_id: Option<u8> = None;
-            let mut prefix: Vec<u8> = Vec::new();
             if startcode == PRIVATE_STREAM_1 {
-                let mut sb = [0u8; 2];
-                // read first payload byte, then peek at the second for
-                // FFmpeg's raw-AC3 detection.
-                self.input.read_exact(&mut sb[..1])?;
-                if sb[0] == 0x0B {
-                    self.input.read_exact(&mut sb[1..])?;
-                    if sb[1] == 0x77 {
-                        // raw AC-3: no substream header; both bytes are payload
-                        prefix.extend_from_slice(&sb);
-                        len -= 2;
-                        sub_id = Some(0x80);
+                let Some(sub) = self.byte()? else { return Ok(None) };
+                startcode = u32::from(sub);
+                self.raw_ac3 = false;
+                if sub == 0x0B {
+                    let Some(second) = self.byte()? else { return Ok(None) };
+                    if second == 0x77 {
+                        startcode = 0x80;
+                        self.raw_ac3 = true;
+                        self.skip(-2)?;
                     } else {
-                        // not AC-3: both bytes are the (sub_id +) payload
-                        prefix.extend_from_slice(&sb);
-                        len -= 2;
-                        sub_id = Some(sb[0]);
+                        self.skip(-1)?;
                     }
                 } else {
                     len -= 1;
-                    sub_id = Some(sb[0]);
                 }
             }
-            // Non-raw-AC3 private-stream-1 audio carries a substream header
-            // the decoders do not expect (mpegps_read_packet "found:" path):
-            // 0x80..0xCF: 3-byte header; 0xB0..0xBF (MLP): 4 bytes total;
-            // 0xA0..0xAF (pcm_dvd): 3 bytes.
-            if let Some(sid) = sub_id
-                && (0x80..=0xCF).contains(&sid) {
-                    let mut hdr = [0u8; 3];
-                    self.input.read_exact(&mut hdr)?;
-                    len -= 3;
-                    if (0xB0..=0xBF).contains(&sid) {
-                        let mut b = [0u8; 1];
-                        self.input.read_exact(&mut b)?;
-                        len -= 1;
-                    }
-                }
             if len < 0 {
-                code = 0xFFFF_FFFF;
+                error_redo = true;
                 continue;
             }
-            return Ok((startcode, sub_id, prefix, len, pts, dts));
+            return Ok(Some(PesHeader { startcode, len, pts, dts, pos }));
         }
     }
 }
 
-/// Stream ids mpegps_read_packet recognises.
-fn is_known_stream(startcode: u32) -> bool {
-    (0x1C0..=0x1DF).contains(&startcode)
-        || (0x1E0..=0x1EF).contains(&startcode)
-        || startcode == PRIVATE_STREAM_1
-        || startcode == PRIVATE_STREAM_2
-        || startcode == 0x1FD
-        || (0x80..=0xCF).contains(&startcode)
+impl MpegPsDemuxer {
+    /// mpegps_read_packet: reads PES packets until one belongs to a
+    /// stream (creating streams while discovering) and queues what it
+    /// yields. `Ok(None)` at the end of the input, else the stream and the
+    /// packet's timestamp.
+    fn read_packet(&mut self) -> Result<Option<(usize, Option<i64>)>> {
+        loop {
+            let Some(PesHeader { startcode, mut len, pts, dts, pos }) = self.read_pes_header()? else {
+                return Ok(None);
+            };
+            // DVD-Video LPCM carries a dynamic range byte where DVD-Audio
+            // LPCM and MLP do not: (pcm_dvd, pcm_dvda).
+            let mut lpcm = (true, false);
+            if (0x80..=0xCF).contains(&startcode) {
+                if len < 4 {
+                    self.skip(len)?;
+                    continue;
+                }
+                if !self.raw_ac3 {
+                    if (0xA0..=0xAF).contains(&startcode) {
+                        if len < 6 {
+                            self.skip(len)?;
+                            continue;
+                        }
+                        let mut header = [0u8; 6];
+                        if self.read_up_to(&mut header)? != 6 {
+                            return Ok(None);
+                        }
+                        self.skip(-6)?;
+                        let pcm_dvd = header[5] == 0x80;
+                        lpcm = (pcm_dvd, startcode == 0xA0 && !pcm_dvd);
+                    } else {
+                        // audio substream header
+                        self.skip(3)?;
+                        len -= 3;
+                        if (0xB0..=0xBF).contains(&startcode) {
+                            // MLP/TrueHD audio has a 4-byte header
+                            self.skip(1)?;
+                            len -= 1;
+                        }
+                    }
+                }
+            }
+
+            let track = match self.tracks.iter().position(|t| t.id == startcode) {
+                Some(track) => track,
+                None if self.discovering => match self.new_track(startcode, len, lpcm)? {
+                    Some(track) => track,
+                    None => {
+                        self.skip(len)?;
+                        continue;
+                    }
+                },
+                None => {
+                    // a stream first met after open is not one of ours
+                    self.skip(len)?;
+                    continue;
+                }
+            };
+
+            let codec = self.tracks[track].codec;
+            if (0xA0..=0xAF).contains(&startcode) && !self.raw_ac3 {
+                // Substream headers of codecs whose decoders do not expect
+                // them; PCM_DVDA parses its header from the packet.
+                let header_len = match codec {
+                    Some("mlp") => 9,
+                    Some("pcm_dvd") => 3,
+                    _ => 0,
+                };
+                if len <= header_len {
+                    self.skip(len)?;
+                    continue;
+                }
+                self.skip(header_len)?;
+                len -= header_len;
+            } else if (0xA0..=0xAF).contains(&startcode) && codec == Some("mlp") {
+                if len < 6 {
+                    self.skip(len)?;
+                    continue;
+                }
+                self.skip(6)?;
+                len -= 6;
+            }
+
+            let mut data = vec![0u8; len as usize];
+            let got = self.read_up_to(&mut data)?;
+            if got == 0 && len > 0 {
+                return Ok(None);
+            }
+            data.truncate(got);
+            self.deliver(track, data, pts, dts, pos);
+            return Ok(Some((track, dts.or(pts))));
+        }
+    }
+
+    /// mpegps_read_packet's codec ladder for a stream id met for the
+    /// first time, plus VLC's CVD/OGT substreams. `None` skips the packet.
+    fn new_track(&mut self, startcode: u32, len: i64, (pcm_dvd, pcm_dvda): (bool, bool)) -> Result<Option<usize>> {
+        use MediaType::{Audio, Data, Subtitle, Video};
+        let es_type = self.psm_es_type[(startcode & 0xFF) as usize];
+        let (codec, media) = match es_type {
+            // FFmpeg types PSM MPEG-1 video as MPEG-2; the stream's headers
+            // say which it is (see `mpeg_video`).
+            0x01 | 0x02 => (Some("mpeg2video"), Video),
+            0x03 | 0x04 => (Some("mp3"), Audio),
+            0x0F => (Some("aac"), Audio),
+            0x10 => (Some("mpeg4"), Video),
+            0x1B => (Some("h264"), Video),
+            0x24 => (Some("hevc"), Video),
+            0x33 => (Some("vvc"), Video),
+            0x81 => (Some("ac3"), Audio),
+            0x90 => (Some("pcm_alaw"), Audio),
+            0x91 if self.imkh_cctv => (Some("pcm_mulaw"), Audio),
+            _ => match startcode {
+                0x1E0..=0x1EF => {
+                    // An AVS sequence header makes it CAVS; anything else
+                    // is identified from its content (FFmpeg's
+                    // request_probe).
+                    let mut head = [0u8; 8];
+                    let n = self.read_up_to(&mut head)?;
+                    self.skip(-(n as i64))?;
+                    let cavs = n == 8 && head[..4] == [0, 0, 1, 0xB0] && (head[6] != 0 || head[7] != 1);
+                    (cavs.then_some("cavs"), Video)
+                }
+                PRIVATE_STREAM_2 => (Some("dvd_nav_packet"), Data),
+                0x1C0..=0x1DF => {
+                    let codec = if self.sofdec > 0 {
+                        "adpcm_adx"
+                    } else if self.imkh_cctv && startcode == 0x1C0 && len > 80 {
+                        "pcm_alaw"
+                    } else {
+                        "mp2"
+                    };
+                    (Some(codec), Audio)
+                }
+                0x80..=0x87 | 0xC0..=0xCF => (Some("ac3"), Audio),
+                // 0x90-0x97 is reserved for SDDS in DVD specs
+                0x88..=0x8F | 0x98..=0x9F => (Some("dts"), Audio),
+                0xA0..=0xAF => {
+                    let codec = if pcm_dvda {
+                        "pcm_dvda"
+                    } else if !pcm_dvd {
+                        "mlp"
+                    } else {
+                        "pcm_dvd"
+                    };
+                    (Some(codec), Audio)
+                }
+                0xB0..=0xBF => (Some("truehd"), Audio),
+                0x20..=0x3F => (Some("dvd_subtitle"), Subtitle),
+                0xFD55..=0xFD5F => (Some("vc1"), Video),
+                0x69 | 0x49 => (Some("ivtv_vbi"), Subtitle),
+                // VLC ps.h ps_track_fill: CVD and SVCD OGT subpictures,
+                // passed on with their substream id.
+                0x00..=0x03 => (Some("cvd_subtitle"), Subtitle),
+                0x70 => (Some("ogt"), Subtitle),
+                _ => return Ok(None),
+            },
+        };
+        let framing = match codec {
+            Some("dvd_subtitle") => Framing::Spu(Parser::new(DvdSub::default())),
+            Some("cvd_subtitle" | "ogt") => Framing::SubstreamId(startcode as u8),
+            _ => Framing::Pes,
+        };
+        self.tracks.push(Track {
+            id: startcode,
+            codec,
+            media,
+            head: Vec::new(),
+            probed_at: 0,
+            probe_done: codec.is_some(),
+            ready: false,
+            first_ts: None,
+            start_time: None,
+            framing,
+        });
+        Ok(Some(self.tracks.len() - 1))
+    }
+
+    /// Queue what one PES payload of `track` yields.
+    fn deliver(&mut self, track: usize, data: Vec<u8>, pts: Option<i64>, dts: Option<i64>, pos: i64) {
+        let t = &mut self.tracks[track];
+        if self.discovering {
+            if t.start_time.is_none() {
+                t.start_time = pts;
+            }
+            if t.head.len() < HEAD_BYTES {
+                let take = (HEAD_BYTES - t.head.len()).min(data.len());
+                t.head.extend_from_slice(&data[..take]);
+            }
+            if !t.probe_done {
+                t.probe(false);
+            }
+            if !t.ready {
+                t.ready = t.params_ready();
+            }
+        }
+        let index = track as u32;
+        match &mut t.framing {
+            Framing::Pes => self.queue.push_back(packet(index, data, pts, dts)),
+            Framing::SubstreamId(id) => {
+                let mut with_id = Vec::with_capacity(data.len() + 1);
+                with_id.push(*id);
+                with_id.extend_from_slice(&data);
+                self.queue.push_back(packet(index, with_id, pts, dts));
+            }
+            Framing::Spu(parser) => {
+                let mut units = Vec::new();
+                parser.push(&data, pts, dts, pos, &mut units);
+                self.queue.extend(units.into_iter().map(|u| unit_packet(index, u)));
+            }
+        }
+    }
+
+    /// The end of the input: parsers hand over what they still hold.
+    fn end_of_input(&mut self) {
+        self.eof = true;
+        for (index, t) in self.tracks.iter_mut().enumerate() {
+            if let Framing::Spu(parser) = &mut t.framing {
+                let mut units = Vec::new();
+                parser.flush(&mut units);
+                self.queue.extend(units.into_iter().map(|u| unit_packet(index as u32, u)));
+            }
+        }
+    }
+
+    /// avformat_find_stream_info for a header-less container: read until
+    /// the probe size, the end of the input, or a stream's timestamps span
+    /// the analyze duration, then fix the streams.
+    fn discover(&mut self) -> Result<()> {
+        let start = self.position()?;
+        loop {
+            if (self.position()? - start) as u64 >= PROBE_SIZE {
+                break;
+            }
+            let Some((track, ts)) = self.read_packet()? else {
+                self.end_of_input();
+                break;
+            };
+            let Some(ts) = ts else { continue };
+            let first = *self.tracks[track].first_ts.get_or_insert(ts);
+            let limit = if self.tracks.iter().all(|t| t.ready) {
+                ANALYZE_ALL
+            } else if self.tracks[track].media == MediaType::Subtitle {
+                ANALYZE_SUBTITLE
+            } else {
+                ANALYZE_STREAM
+            };
+            if ts - first >= limit {
+                break;
+            }
+        }
+        self.discovering = false;
+        for t in &mut self.tracks {
+            if !t.probe_done {
+                t.probe(true);
+            }
+        }
+        self.streams = self.tracks.iter().enumerate().map(|(i, t)| t.stream_info(i as u32)).collect();
+        for t in &mut self.tracks {
+            t.head = Vec::new();
+        }
+        Ok(())
+    }
 }
 
-pub fn open_mpegps(
-    input: Box<dyn ReadSeek>,
-    _codecs: &dyn CodecResolver,
-) -> Result<Box<dyn Demuxer>> {
-    Ok(Box::new(MpegPsDemuxer {
-        input,
+fn packet(index: u32, data: Vec<u8>, pts: Option<i64>, dts: Option<i64>) -> Packet {
+    let mut p = Packet::new(index, TIME_BASE, data);
+    p.pts = pts;
+    p.dts = dts;
+    p.flags.keyframe = true;
+    p
+}
+
+/// A parsed subtitle unit, stamped as compute_pkt_fields stamps a stream
+/// without frame durations: dts follows pts.
+fn unit_packet(index: u32, unit: Unit) -> Packet {
+    let ts = unit.pts.or(unit.dts);
+    packet(index, unit.data, ts, ts)
+}
+
+/// floor(log2(x)), 0 for 0 (av_log2).
+fn log2(x: usize) -> u32 {
+    if x == 0 { 0 } else { usize::BITS - 1 - x.leading_zeros() }
+}
+
+/// set_codec_from_probe_data on elementary-stream bytes, for the video
+/// formats it maps: the best probe score wins; a tie decides nothing.
+fn probe_video_es(es: &[u8]) -> Option<(&'static str, u8)> {
+    let probe = ProbeData { buf: es, ext: None };
+    let scores = [
+        ("h264", crate::h264::probe_h264(&probe)),
+        ("hevc", crate::hevc::probe_hevc(&probe)),
+        ("mpeg2video", crate::mpegvideo::probe_mpegvideo(&probe)),
+    ];
+    let best = scores.iter().map(|&(_, s)| s).max()?;
+    let mut winners = scores.iter().filter(|&&(_, s)| s == best && s > 0);
+    let winner = winners.next()?;
+    winners.next().is_none().then_some((winner.0, best))
+}
+
+impl Track {
+    /// probe_codec: probe the stream's bytes each time they reach a new
+    /// power of two (and at the end); a score above
+    /// AVPROBE_SCORE_STREAM_RETRY settles it, a lower one stands until a
+    /// later probe replaces it.
+    fn probe(&mut self, end: bool) {
+        let size = self.head.len();
+        if !end && log2(size) == log2(self.probed_at) {
+            return;
+        }
+        self.probed_at = size;
+        if let Some((codec, score)) = probe_video_es(&self.head) {
+            self.codec = Some(codec);
+            if score > 24 {
+                self.probe_done = true;
+            }
+        }
+    }
+
+    /// has_codec_parameters, as far as this demuxer fills parameters.
+    fn params_ready(&self) -> bool {
+        match self.media {
+            MediaType::Audio => {
+                let p = self.parameters();
+                p.sample_rate.is_some() && p.channels.is_some()
+            }
+            MediaType::Video => self.parameters().width.is_some(),
+            _ => true,
+        }
+    }
+
+    /// The stream's codec and parameters from its first bytes, as
+    /// FFmpeg's parsers and decoders report them after find_stream_info.
+    fn parameters(&self) -> CodecParameters {
+        /// Headers come from the start of a stream; scans stop here.
+        const AUDIO_SCAN: usize = 64 * 1024;
+        const VIDEO_SCAN: usize = 256 * 1024;
+        let codec = self.codec.unwrap_or("none");
+        let id = CodecId::new(codec);
+        let mut p = match self.media {
+            MediaType::Video => CodecParameters::video(id),
+            MediaType::Audio => CodecParameters::audio(id),
+            MediaType::Subtitle => CodecParameters::subtitle(id),
+            _ => CodecParameters::data(id),
+        };
+        let audio_head = &self.head[..self.head.len().min(AUDIO_SCAN)];
+        let video_head = &self.head[..self.head.len().min(VIDEO_SCAN)];
+        let audio: Option<(&'static str, u32, u16, Option<SampleFormat>)> = match codec {
+            "mpeg2video" => {
+                if let Some((codec, width, height)) = mpeg_video(video_head) {
+                    p.codec_id = CodecId::new(codec);
+                    p.width = Some(width);
+                    p.height = Some(height);
+                }
+                None
+            }
+            "cavs" => {
+                if let Some((width, height)) = cavs_sequence(video_head) {
+                    p.width = Some(width);
+                    p.height = Some(height);
+                }
+                None
+            }
+            "mp2" | "mp3" => mpeg_audio(audio_head).map(|(codec, rate, channels)| (codec, rate, channels, None)),
+            "ac3" => ac3_frame(audio_head)
+                .map(|h| (if h.bitstream_id > 10 { "eac3" } else { "ac3" }, h.sample_rate, h.channels, None)),
+            "dts" => dts_core(audio_head).map(|(rate, channels)| ("dts", rate, channels, None)),
+            // pcm_dvd_parse_header: quantization, frequency, channels
+            "pcm_dvd" => audio_head.get(1).map(|&h| {
+                const RATES: [u32; 4] = [48000, 96000, 44100, 32000];
+                let format = if h >> 6 == 0 { SampleFormat::S16 } else { SampleFormat::S32 };
+                ("pcm_dvd", RATES[usize::from((h >> 4) & 3)], 1 + u16::from(h & 7), Some(format))
+            }),
+            "pcm_dvda" => {
+                pcm_dvda_layout(audio_head).map(|(rate, channels, format)| ("pcm_dvda", rate, channels, Some(format)))
+            }
+            "pcm_alaw" | "pcm_mulaw" => Some((codec, 8000, 1, None)),
+            _ => None,
+        };
+        if let Some((codec, rate, channels, format)) = audio {
+            p.codec_id = CodecId::new(codec);
+            p.sample_rate = Some(rate);
+            p.channels = Some(channels);
+            p.sample_format = format;
+        }
+        p
+    }
+
+    fn stream_info(&self, index: u32) -> StreamInfo {
+        StreamInfo {
+            index,
+            params: self.parameters(),
+            time_base: TIME_BASE,
+            duration: None,
+            start_time: self.start_time,
+        }
+    }
+}
+
+/// The offset just past `00 00 01 code` in `es` at or after `from`.
+fn start_code(es: &[u8], from: usize, code: impl Fn(u8) -> bool) -> Option<usize> {
+    (from..es.len().saturating_sub(3))
+        .find(|&i| es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1 && code(es[i + 3]))
+        .map(|i| i + 4)
+}
+
+/// FFmpeg's mpegvideo parser on the first sequence header: MPEG-1 unless
+/// a sequence extension follows it, and the frame size including the
+/// extension's high bits.
+fn mpeg_video(es: &[u8]) -> Option<(&'static str, u32, u32)> {
+    let seq = start_code(es, 0, |c| c == 0xB3)?;
+    let b = es.get(seq..seq + 3)?;
+    let mut width = (u32::from(b[0]) << 4) | u32::from(b[1] >> 4);
+    let mut height = (u32::from(b[1] & 0x0F) << 8) | u32::from(b[2]);
+    let mut codec = "mpeg1video";
+    let mut at = seq;
+    while let Some(next) = start_code(es, at, |_| true) {
+        let code = es[next - 1];
+        if code == 0xB5 && es.get(next).is_some_and(|b| b >> 4 == 1) {
+            if let Some(ext) = es.get(next..next + 3) {
+                width |= ((u32::from(ext[1]) & 1) << 13) | ((u32::from(ext[2]) & 0x80) << 5);
+                height |= (u32::from(ext[2]) & 0x60) << 7;
+                codec = "mpeg2video";
+            }
+            break;
+        }
+        if code == 0x00 || code == 0xB3 {
+            break;
+        }
+        at = next;
+    }
+    Some((codec, width, height))
+}
+
+/// The AVS sequence header (cavsdec.c decode_seq_header): width and height.
+fn cavs_sequence(es: &[u8]) -> Option<(u32, u32)> {
+    let seq = start_code(es, 0, |c| c == 0xB0)?;
+    let b = es.get(seq..seq + 6)?;
+    // profile (8), level (8), progressive_sequence (1), width (14), height (14)
+    let bits = u32::from_be_bytes([b[2], b[3], b[4], b[5]]);
+    Some(((bits >> 17) & 0x3FFF, (bits >> 3) & 0x3FFF))
+}
+
+/// One MPEG audio header (ff_mpa_check_header + ff_mpa_decode_header):
+/// codec, sample rate, channels and frame size; free format is not a
+/// frame here, as for FFmpeg's parser.
+fn mpa_header(h: u32) -> Option<(&'static str, u32, u16, usize)> {
+    if (h & 0xFFE0_0000) != 0xFFE0_0000
+        || (h & (3 << 19)) == 1 << 19
+        || (h & (3 << 17)) == 0
+        || (h & (0xF << 12)) == 0xF << 12
+        || (h & (3 << 10)) == 3 << 10
+    {
+        return None;
+    }
+    const FREQ: [u32; 3] = [44100, 48000, 32000];
+    const BITRATE: [[[u32; 15]; 3]; 2] = [
+        [
+            [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
+            [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
+            [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+        ],
+        [
+            [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
+            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+        ],
+    ];
+    let (lsf, mpeg25) = if h & (1 << 20) != 0 { (u32::from(h & (1 << 19) == 0), 0) } else { (1, 1) };
+    let layer = 4 - ((h >> 17) & 3);
+    let sample_rate = FREQ[((h >> 10) & 3) as usize] >> (lsf + mpeg25);
+    let bitrate_index = ((h >> 12) & 0xF) as usize;
+    let padding = (h >> 9) & 1;
+    if bitrate_index == 0 {
+        return None;
+    }
+    let kbps = BITRATE[lsf as usize][(layer - 1) as usize][bitrate_index];
+    let frame_size = match layer {
+        1 => (kbps * 12000 / sample_rate + padding) * 4,
+        2 => kbps * 144_000 / sample_rate + padding,
+        _ => kbps * 144_000 / (sample_rate << lsf) + padding,
+    };
+    let codec = match layer {
+        1 => "mp1",
+        2 => "mp2",
+        _ => "mp3",
+    };
+    let channels = if (h >> 6) & 3 == 3 { 1 } else { 2 };
+    Some((codec, sample_rate, channels, frame_size as usize))
+}
+
+/// What FFmpeg's mpegaudio parser reports once two consecutive headers
+/// agree (its header_count threshold): codec, sample rate, channels.
+fn mpeg_audio(es: &[u8]) -> Option<(&'static str, u32, u16)> {
+    // header + layer + frequency + lsf/mpeg25
+    const SAME_HEADER_MASK: u32 = 0xFFE0_0000 | (3 << 17) | (3 << 10) | (3 << 19);
+    let word = |i: usize| es.get(i..i + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    (0..es.len()).find_map(|i| {
+        let h = word(i)?;
+        let (codec, rate, channels, size) = mpa_header(h)?;
+        let next = word(i + size)?;
+        mpa_header(next)?;
+        ((next & SAME_HEADER_MASK) == (h & SAME_HEADER_MASK)).then_some((codec, rate, channels))
+    })
+}
+
+/// The first AC-3/E-AC-3 syncframe whose CRC holds, which FFmpeg's ac3
+/// parser takes the stream's parameters from.
+fn ac3_frame(es: &[u8]) -> Option<crate::ac3::Ac3Header> {
+    (0..es.len().saturating_sub(7)).find_map(|i| {
+        if es[i] != 0x0B || es[i + 1] != 0x77 {
+            return None;
+        }
+        let h = crate::ac3::parse_ac3_header(&es[i..])?;
+        let frame = es.get(i..i + h.frame_size)?;
+        (crate::ac3::crc16_ansi(&frame[2..]) == 0).then_some(h)
+    })
+}
+
+/// The first DTS core frame header: FFmpeg's sample rate table and the
+/// channels of its audio mode plus LFE.
+fn dts_core(es: &[u8]) -> Option<(u32, u16)> {
+    const RATES: [u32; 16] = [0, 8000, 16000, 32000, 0, 0, 11025, 22050, 44100, 0, 0, 12000, 24000, 48000, 96000, 192000];
+    const AMODE: [u16; 10] = [1, 2, 2, 2, 2, 3, 3, 4, 4, 5];
+    let sync = (0..es.len().saturating_sub(12)).find(|&i| es[i..i + 4] == [0x7F, 0xFE, 0x80, 0x01])?;
+    let v = u64::from_be_bytes(es[sync + 4..sync + 12].try_into().ok()?);
+    let amode = ((v >> 30) & 0x3F) as usize;
+    let rate = RATES[((v >> 26) & 0xF) as usize];
+    let lfe = (v >> 9) & 3;
+    (rate != 0 && lfe != 3).then_some(())?;
+    Some((rate, AMODE.get(amode)? + u16::from(lfe != 0)))
+}
+
+/// pcm_dvda_parse_header: sample rate, channels and sample format of a
+/// DVD-Audio LPCM packet header (group 1 sets the rate).
+fn pcm_dvda_layout(head: &[u8]) -> Option<(u32, u16, SampleFormat)> {
+    const GROUPS: [(u16, u16); 21] = [
+        (1, 0), (2, 0), (2, 1), (2, 2), (2, 1), (2, 2), (2, 3), (2, 1), (2, 2), (2, 3), (2, 2),
+        (2, 3), (2, 4), (3, 1), (3, 2), (3, 1), (3, 2), (3, 3), (4, 1), (4, 1), (4, 2),
+    ];
+    let (quantization, frequency, assignment) = (*head.get(6)?, *head.get(7)?, *head.get(9)? & 0x1F);
+    let (g1, mut g2) = *GROUPS.get(usize::from(assignment))?;
+    let (quant1, freq1) = (quantization >> 4, frequency >> 4);
+    let (quant2, freq2) = (quantization & 0xF, frequency & 0xF);
+    if quant2 == 0xF || freq2 == 0xF {
+        g2 = 0;
+    }
+    if quant1 > 2 || (freq1 & 7) > 2 || (g2 > 0 && (quant2 > 2 || (freq2 & 7) > 2)) {
+        return None;
+    }
+    let rate = (if freq1 & 8 != 0 { 44100 } else { 48000 }) << (freq1 & 7);
+    let bits = 16 + 4 * u32::from(quant1.max(if g2 > 0 { quant2 } else { 0 }));
+    let format = if bits == 16 { SampleFormat::S16 } else { SampleFormat::S32 };
+    Some((rate, g1 + g2, format))
+}
+
+pub fn open_mpegps(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    let mut demuxer = MpegPsDemuxer {
+        input: BufReader::with_capacity(64 * 1024, input),
         streams: Vec::new(),
-        states: Vec::new(),
-        psm_es_type: vec![0u8; 256],
-    }))
+        tracks: Vec::new(),
+        psm_es_type: [0; 256],
+        sofdec: 0,
+        dvd: false,
+        imkh_cctv: false,
+        raw_ac3: false,
+        discovering: true,
+        queue: VecDeque::new(),
+        eof: false,
+    };
+    demuxer.read_header()?;
+    demuxer.discover()?;
+    Ok(Box::new(demuxer))
 }
 
 impl Demuxer for MpegPsDemuxer {
@@ -568,27 +1106,17 @@ impl Demuxer for MpegPsDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        let (startcode, sub_id, prefix, len, pts, dts) = self.read_pes_header()?;
-        // Skip data-stream packets we cannot assign a codec to
-        // (mpeg.c's `goto skip` path for unknown ids) — everything
-        // accepted above maps to a stream.
-        let idx = self.stream_for(startcode, sub_id);
-        if len > MAX_PES_PAYLOAD {
-            return Err(Error::invalid("mpegps: payload too large"));
+        loop {
+            if let Some(packet) = self.queue.pop_front() {
+                return Ok(packet);
+            }
+            if self.eof {
+                return Err(Error::Eof);
+            }
+            if self.read_packet()?.is_none() {
+                self.end_of_input();
+            }
         }
-        let prefix_len = prefix.len();
-        let mut data = prefix;
-        data.reserve(len as usize);
-        (&mut self.input).take(len as u64).read_to_end(&mut data)?;
-        if data.len() < prefix_len + len as usize {
-            return Err(Error::Eof);
-        }
-        let tb = self.streams[idx as usize].time_base;
-        let mut pkt = Packet::new(idx, tb, data);
-        pkt.pts = pts;
-        pkt.dts = dts;
-        pkt.flags.keyframe = true;
-        Ok(pkt)
     }
 }
 
