@@ -18,3 +18,8 @@ pub use headless::{AudioCapture, Capture, Headless, SubtitleCapture, VideoCaptur
 pub mod android;
 #[cfg(target_os = "android")]
 pub use android::AndroidBackend;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub mod apple;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use apple::AppleBackend;
