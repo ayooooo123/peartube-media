@@ -114,6 +114,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-ra"
+version = "0.1.0"
+dependencies = [
+ "demux-rm",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codecs"
 version = "0.1.0"
 dependencies = [
