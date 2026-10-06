@@ -9,11 +9,12 @@
 //! FFmpeg's own FATE lossy DCA tests use a one-off comparison with fuzz
 //! 9 on f32 for the same reason.
 
-use oxideav_core::{Frame, MediaType};
+use oxideav_core::{Frame, MediaType, ProbeData, RuntimeContext};
+use std::io::Read;
 use refcheck::{decode, fate};
 
 fn registrars() -> Vec<refcheck::Registrar> {
-    vec![codec_dca::register]
+    vec![codec_dca::register, oxideav_mpegts::register]
 }
 
 /// Interleaved PCM bytes of every decoded audio frame (one `data[0]`
@@ -291,17 +292,117 @@ fn lossy_xxch_71_24_48_2046() {
 // ───────────────────────── fate-dca-core (dts.ts via MPEG-TS) ─────────────────────────
 
 /// `fate-dca-core`: `pcm -i dts/dts.ts` against `dts/dts.pcm` (oneoff,
-/// fuzz 9). Decoded through oxideav-mpegts + our decoder, compared at
-/// >= 90 dB SNR against FFmpeg's PCM.
+/// fuzz 9). The TS carries DTS as stream type 0x06 (private data) with no
+/// registration descriptor, which oxideav-mpegts drops; extract the
+/// elementary stream ourselves (PMT: type 0x06 → pid 0x100) and decode
+/// through the raw `dts` demuxer.
 #[test]
 fn dca_core_ts() {
     let path = fate("dts/dts.ts");
-    let decoded = decode(&path, &registrars(), MediaType::Audio, 0);
+    let mut ts = Vec::new();
+    std::fs::File::open(&path)
+        .unwrap()
+        .read_to_end(&mut ts)
+        .unwrap();
 
-    let ours = refcheck::interleaved_f32(&decoded);
+    // Extract the ES: collect payload of PID 0x100 from PUSI packets,
+    // skipping the 1-byte pointer + PMT sections.
+    let mut es = Vec::new();
+    let mut i = 0usize;
+    while i + 188 <= ts.len() {
+        if ts[i] != 0x47 {
+            i += 1;
+            continue;
+        }
+        let pid = ((u16::from(ts[i + 1]) & 0x1f) << 8) | u16::from(ts[i + 2]);
+        if pid != 0x100 {
+            i += 188;
+            continue;
+        }
+        let afc = (ts[i + 3] >> 4) & 3;
+        let mut start = i + 4;
+        if afc & 2 != 0 {
+            start += 1 + usize::from(ts[i + 4]); // adaptation field
+        }
+        if start >= i + 188 {
+            i += 188;
+            continue;
+        }
+        let pusi = ts[i + 1] & 0x40 != 0;
+        let mut payload = &ts[start..i + 188];
+        if pusi {
+            let ptr = usize::from(payload[0]);
+            let mut sec = &payload[1 + ptr..];
+            if !sec.is_empty() && sec[0] == 0x02 {
+                // PMT section on this pid: skip the whole section
+                // (table header 3 bytes + section_length).
+                let slen = 3 + (usize::from(sec[1] & 0xf) << 8 | usize::from(sec[2]));
+                sec = &sec[slen.min(sec.len())..];
+                // A PES may follow in the same packet.
+                if sec.len() >= 9 && sec[0..3] == [0, 0, 1] {
+                    let hlen = usize::from(sec[8]);
+                    sec = &sec[9 + hlen..];
+                } else {
+                    sec = &[];
+                }
+            } else if sec.len() >= 9 && sec[0..3] == [0, 0, 1] {
+                // PES packet: skip the header.
+                let hlen = usize::from(sec[8]);
+                sec = &sec[9 + hlen..];
+            } else {
+                sec = &[];
+            }
+            payload = sec;
+        }
+        es.extend_from_slice(payload);
+        i += 188;
+    }
+    assert!(!es.is_empty(), "dts.ts: no ES extracted");
 
-    // FFmpeg's reference: `ffmpeg -i dts.ts -f f32le -` (the FATE `pcm`
-    // helper compares s16; use f32 for the SNR comparison).
+    // Decode the ES through the raw dts demuxer + our decoder.
+    let mut ctx = RuntimeContext::new();
+    codec_dca::register(&mut ctx);
+    let probe = ProbeData {
+        buf: &es[..es.len().min(256 * 1024)],
+        ext: Some("dts"),
+    };
+    let format = "dts".to_string();
+    let _ = ctx.containers.probe_candidates(&probe);
+    let mut demuxer = ctx
+        .containers
+        .open_demuxer(&format, Box::new(std::io::Cursor::new(es)), &ctx.codecs)
+        .expect("open dts demuxer");
+    let stream = demuxer.streams()[0].clone();
+    let mut decoder = ctx.codecs.first_decoder(&stream.params).unwrap();
+    let ch = usize::from(stream.params.channels.unwrap_or(2));
+    let mut ours: Vec<f32> = Vec::new();
+    let mut samples = 0usize;
+    loop {
+        match demuxer.next_packet() {
+            Ok(p) => {
+                let _ = decoder.send_packet(&p);
+                loop {
+                    match decoder.receive_frame() {
+                        Ok(Frame::Audio(a)) => {
+                            let n = a.samples as usize;
+                            for i in 0..n {
+                                for plane in &a.data {
+                                    let b = &plane[i * 4..i * 4 + 4];
+                                    ours.push(f32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+                                }
+                            }
+                            samples += n;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(samples > 0, "dts.ts: no frames decoded");
+
     let out = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(&path)
