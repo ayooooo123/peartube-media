@@ -20,10 +20,11 @@
 use check_aac::decoded_f32;
 
 /// Samples the fork matches at ≥ 90 dB SNR against FFmpeg's float
-/// decode: AAC LC / Main / SSR multichannel, HE-AAC v1 (SBR) stereo +
-/// 5.1, HE-AAC v2 (SBR + parametric stereo) in every CT signalling
-/// variant, and ER AAC LD. Each floor sits just under the measured
-/// SNR, so a regression fails even while it stays above 90 dB.
+/// decode: AAC LC / Main / SSR / LTP multichannel (including coupling
+/// channels), HE-AAC v1 (SBR) stereo + 5.1, HE-AAC v2 (SBR + parametric
+/// stereo) in every CT signalling variant, and ER AAC LD. Each floor
+/// sits just under the measured SNR, so a regression fails even while
+/// it stays above 90 dB.
 const PASSING: &[(&str, f64)] = &[
     // AAC LC mono/stereo/multichannel (al* series).
     ("aac/al04_44.mp4", 138.0),
@@ -38,6 +39,12 @@ const PASSING: &[(&str, f64)] = &[
     ("aac/al18_44.mp4", 137.0),
     // AAC Main 5.1 (prediction before intensity stereo).
     ("aac/am05_44.mp4", 102.0),
+    // AAC LC 96 kHz 5.1 with a dependently switched coupling channel
+    // (DPCM gains, sign split off the running sum as FFmpeg does).
+    ("aac/al07_96.mp4", 137.0),
+    // AAC LTP stereo (LTP analysis windowed with the 256-point short
+    // transform at block switches).
+    ("aac/ap05_48.mp4", 134.0),
     // HE-AAC v1 (SBR), stereo and 5.1, dual-rate and 96 kHz-core.
     ("aac/al_sbr_cm_48_2.mp4", 133.0),
     ("aac/al_sbr_cm_48_5.1.mp4", 129.0),
@@ -61,15 +68,7 @@ const PASSING: &[(&str, f64)] = &[
 /// float decode is still below the 90 dB floor. Each entry pins the
 /// measured SNR: a change in either direction (a regression or the
 /// gap being closed) fails the assert, so the table tracks progress.
-const KNOWN_GAPS: &[(&str, f64)] = &[
-    // 96 kHz 5.1: the front CPE's right channel and both surround
-    // channels drift from block 190 on (front left, centre and LFE
-    // match at 138-141 dB).
-    ("aac/al07_96.mp4", 60.0),
-    // LTP 48k stereo: the right channel matches at 135 dB since the
-    // pair-LTP fix; the left channel diverges in frames 69-72 only.
-    ("aac/ap05_48.mp4", 66.0),
-];
+const KNOWN_GAPS: &[(&str, f64)] = &[];
 
 /// Samples `aac.mak` lists that the fork cannot decode at all: AOT 42
 /// (USAC / xHE-AAC) and AOT 39 (ER AAC ELD) decoders do not exist in
