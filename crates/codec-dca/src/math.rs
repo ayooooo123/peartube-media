@@ -128,20 +128,21 @@ pub fn core_dequantize(output: &mut [i32], input: &[i32], step_size: i32, scale:
     let mut step_scale: i64 = i64::from(step_size) * i64::from(scale);
     let mut shift: u32 = 0;
 
-    // Limit scale factor resolution to 22 bits
+    // Limit scale factor resolution to 22 bits.
+    // av_log2(v) + 1 == 64 - leading_zeros(v) for v > 0.
     if step_scale > (1 << 23) {
-        shift = (63 - (step_scale >> 23).leading_zeros()).min(62); // av_log2(step_scale >> 23) + 1
+        shift = 64 - (step_scale >> 23).leading_zeros();
         step_scale >>= shift;
     }
 
     // Scale the samples
     if residual {
         for (o, &i) in output.iter_mut().zip(input.iter()) {
-            *o = o.wrapping_add(norm__(i as i64 * step_scale, 22 - shift));
+            *o = clip23(o.wrapping_add(norm__(i as i64 * step_scale, 22 - shift)));
         }
     } else {
         for (o, &i) in output.iter_mut().zip(input.iter()) {
-            *o = norm__(i as i64 * step_scale, 22 - shift);
+            *o = clip23(norm__(i as i64 * step_scale, 22 - shift));
         }
     }
 }

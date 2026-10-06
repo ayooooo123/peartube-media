@@ -394,9 +394,11 @@ impl CoreDecoder {
     }
 
     /// ADPCM history window before row start (4 samples + `j`).
-    fn adpcm_hist(&self, ch: usize, band: usize, x96: bool, j: usize) -> [i32; 4] {
+    /// The 4 subband samples preceding absolute data position
+    /// `ADPCM_COEFFS + ofs + j` — the ADPCM prediction window.
+    fn adpcm_hist(&self, ch: usize, band: usize, x96: bool, ofs: usize, j: usize) -> [i32; 4] {
         let buf = if x96 { &self.x96_subband } else { &self.subband };
-        let base = buf.row_base(ch, band) + j;
+        let base = buf.row_base(ch, band) + crate::data::DCA_ADPCM_COEFFS + ofs + j - 4;
         [
             buf.data[base],
             buf.data[base + 1],
@@ -895,7 +897,7 @@ impl CoreDecoder {
         }
         for job in jobs {
             for j in 0..len {
-                let hist = self.adpcm_hist(vq_index_ch, job.band, x96, j);
+                let hist = self.adpcm_hist(vq_index_ch, job.band, x96, ofs, j);
                 let x = dcaadpcm_predict(job.pred_id, &hist);
                 let buf = if x96 {
                     &mut self.x96_subband
@@ -1004,7 +1006,7 @@ impl CoreDecoder {
                     // Adjust scale factor when SEL indicates Huffman code
                     let scale = if huffman > 0 {
                         let adj = self.scale_factor_adj[ch][abitsu - 1];
-                        clip23(adj * scale >> 22)
+                        clip23(((i64::from(adj) * i64::from(scale)) >> 22) as i32)
                     } else {
                         scale
                     };
