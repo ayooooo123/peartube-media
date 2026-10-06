@@ -1,0 +1,57 @@
+use oxideav_core::{Frame, ProbeData, RuntimeContext};
+use std::io::Read;
+
+fn main() {
+    let path = std::env::args().nth(1).expect("path");
+    let fmt = std::env::args().nth(2).expect("fmt");
+    let mut data = Vec::new();
+    std::fs::File::open(&path).unwrap().read_to_end(&mut data).unwrap();
+    let mut ctx = RuntimeContext::new();
+    codec_dca::register(&mut ctx);
+    let ext = std::env::args().nth(3).unwrap_or_else(|| fmt.clone());
+    let probe = ProbeData { buf: &data[..data.len().min(256 * 1024)], ext: Some(ext.as_str()) };
+    let _ = ctx.containers.probe_candidates(&probe);
+    let mut dem = ctx
+        .containers
+        .open_demuxer(&fmt, Box::new(std::io::Cursor::new(data)), &ctx.codecs)
+        .expect("open");
+    let stream = dem.streams()[0].clone();
+    let mut dec = ctx.codecs.first_decoder(&stream.params).unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let mut nf = 0usize;
+        let mut nsm = 0usize;
+        match dem.next_packet() {
+            Ok(p) => {
+                match dec.send_packet(&p) {
+                    Ok(_) => eprintln!("pkt send ok"),
+                    Err(e) => eprintln!("pkt send ERR: {e}"),
+                }
+                loop {
+                    match dec.receive_frame() {
+                        Ok(Frame::Audio(a)) => {
+                            nf += 1;
+                            nsm += a.samples as usize;
+                            for plane in &a.data {
+                                out.extend_from_slice(plane);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            if nf == 0 {
+                                eprintln!("first receive err: {e}");
+                            }
+                            break;
+                        }
+                    }
+                }
+                eprintln!("pkt: frames={nf} samples={nsm}");
+            }
+            Err(_) => break,
+        }
+    }
+    eprintln!("total bytes {}", out.len());
+    let dst = std::env::args().nth(4).expect("out");
+    std::fs::write(dst, &out).unwrap();
+    println!("bytes={}", out.len());
+}

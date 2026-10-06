@@ -1602,7 +1602,7 @@ impl CoreDecoder {
             for band in self.x96_subband_start..self.nsubbands[ch] {
                 // If Huffman code was used, the difference of abits was encoded
                 if sel < 7 {
-                    let book = &self.vlcs.quant_index[5 + usize::from(self.x96_high_res)][sel];
+                    let book = &self.vlcs.quant_index[5 + 2 * usize::from(self.x96_high_res)][sel];
                     abits += book.get(gb, 2);
                 } else {
                     abits = gb.get_bits(3 + u32::from(self.x96_high_res)) as i32;
@@ -1610,6 +1610,10 @@ impl CoreDecoder {
 
                 let cap = 7 + 8 * i32::from(self.x96_high_res);
                 if abits < 0 || abits > cap {
+                    if std::env::var("DCA_TRACE").is_ok() {
+                        eprintln!("TRACE-R x96abits ch={ch} band={band} abits={abits} cap={cap} sel={sel} hr={} start={} nsub={}",
+                            self.x96_high_res, self.x96_subband_start, self.nsubbands[ch]);
+                    }
                     return Err("invalid X96 bit allocation index");
                 }
 
@@ -2111,6 +2115,7 @@ impl CoreDecoder {
 
 
         // Parse X96 unless decoding XLL
+        let x96_dbg = std::env::var("DCA_TRACE").is_ok();
         if self.packet & packet_xll(self) == 0 {
             if exss_mask & crate::dca::exss_mask::EXSS_X96 != 0 {
                 let asset = asset.unwrap();
@@ -2118,7 +2123,11 @@ impl CoreDecoder {
                 let mut gb = BitReader::new(sub);
                 match self.parse_x96_frame_exss(&mut gb) {
                     Ok(()) => self.ext_audio_mask |= crate::dca::exss_mask::EXSS_X96,
-                    Err(_) => {}
+                    Err(e) => {
+                        if x96_dbg {
+                            eprintln!("TRACE-R x96exss ERR: {e}");
+                        }
+                    }
                 }
             } else if self.x96_pos != 0 {
                 let mut gb = BitReader::new(data);

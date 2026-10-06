@@ -137,8 +137,12 @@ pub fn core_dequantize(output: &mut [i32], input: &[i32], step_size: i32, scale:
 
     // Scale the samples
     if residual {
+        // The C clips the DELTA and adds it to the (unclipped, wrapping)
+        // running sum: output[n] += clip23(norm__(...)). The sum itself is
+        // never clipped — later stages (XLL residual reconstruction,
+        // filter bank inputs) consume the full range.
         for (o, &i) in output.iter_mut().zip(input.iter()) {
-            *o = clip23(o.wrapping_add(norm__(i as i64 * step_scale, 22 - shift)));
+            *o = o.wrapping_add(clip23(norm__(i as i64 * step_scale, 22 - shift)));
         }
     } else {
         for (o, &i) in output.iter_mut().zip(input.iter()) {
