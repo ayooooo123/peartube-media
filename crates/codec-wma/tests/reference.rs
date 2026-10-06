@@ -47,6 +47,30 @@ fn ffmpeg_pcm_md5(path: &std::path::Path, bytes: usize) -> String {
 
 /// Our interleaved PCM bytes at `bytes` bytes per sample, from our f32
 /// stream (lossless decoders emit exact integer values scaled to [-1, 1)).
+fn pcm_bytes_from_decoded(decoded: &refcheck::Decoded, bits: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for f in &decoded.frames {
+        if let oxideav_core::Frame::Audio(af) = f {
+            let n_samples = af.samples as usize;
+            let n_ch = af.data.len();
+            if bits == 16 {
+                for i in 0..n_samples {
+                    for c in 0..n_ch {
+                        out.extend_from_slice(&af.data[c][i * 2..i * 2 + 2]);
+                    }
+                }
+            } else if bits == 24 {
+                for i in 0..n_samples {
+                    for c in 0..n_ch {
+                        out.extend_from_slice(&af.data[c][i * 4 + 1..i * 4 + 4]);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn pcm_bytes_from_f32(samples: &[f32], bits: u32) -> Vec<u8> {
     let bytes = (bits / 8) as usize;
     let mut out = Vec::with_capacity(samples.len() * bytes);
@@ -71,11 +95,21 @@ fn wmalossless_luckynight_bit_exact() {
     assert_eq!(decoded.params.channels, Some(2), "channel count");
     assert_eq!(decoded.params.sample_rate, Some(44_100), "sample rate");
     let ours = pcm_bytes_from_f32(&samples_f32(&decoded), 16);
-    // FFmpeg's FATE reference decodes with -frames 209; compare the prefix.
-    let ff = ffmpeg_pcm_md5(&path, 16);
-    let ff_len = ffmpeg_pcm_len(&path, 2);
-    assert_eq!(ours.len(), ff_len, "pcm byte count (frames 209)");
-    assert_eq!(refcheck::md5_hex(&ours), ff, "pcm md5 differs from FFmpeg");
+    // FFmpeg's FATE reference (fate-lossless-wma) decodes with -frames 209.
+    let target_frames = 209;
+    let bytes_per_frame = 2048 * 2 * 2; // 2048 samples * 2 ch * 2 bytes
+    let target_bytes = target_frames * bytes_per_frame;
+    assert!(ours.len() >= target_bytes, "must decode at least 209 frames");
+    let ff_209 = {
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&path)
+            .args(["-map", "0:a:0", "-f", "s16le", "-c:a", "pcm_s16le", "-frames", "209", "-af", "aresample", "-"])
+            .output()
+            .expect("ffmpeg must be on PATH");
+        refcheck::md5_hex(&out.stdout)
+    };
+    assert_eq!(refcheck::md5_hex(&ours[..target_bytes]), ff_209, "pcm md5 differs from FFmpeg for 209 frames");
 }
 
 /// Our PCM byte count for a full decode, for the frame-limited comparisons.
@@ -111,7 +145,7 @@ fn wmalossless_megaweird24_bit_exact() {
     let decoded = decode(&path, &registrars(), MediaType::Audio, 0);
     assert_eq!(decoded.params.channels, Some(2), "channel count");
     assert_eq!(decoded.params.sample_rate, Some(48_000), "sample rate");
-    let ours = pcm_bytes_from_f32(&samples_f32(&decoded), 24);
+    let ours = pcm_bytes_from_decoded(&decoded, 24);
     let ff = ffmpeg_pcm_md5(&path, 3);
     let ff_len = ffmpeg_pcm_len(&path, 3);
     assert_eq!(ours.len(), ff_len, "pcm byte count");

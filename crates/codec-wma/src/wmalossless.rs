@@ -164,6 +164,14 @@ pub struct WmaLosslessDecoder {
     pending: Vec<AudioFrame>,
 }
 
+#[inline]
+fn ceil_log2(v: u32) -> usize {
+    if v <= 1 {
+        0
+    } else {
+        (32 - (v - 1).leading_zeros()) as usize
+    }
+}
 impl WmaLosslessDecoder {
     /// `decode_init` (wmalosslessdec.c).
     pub fn new(params: &CodecParameters) -> Result<Self> {
@@ -498,7 +506,7 @@ impl WmaLosslessDecoder {
             } else {
                 self.bits_per_sample as usize
             };
-            self.channel_residues[ch][0] = self.gb.get_bits(first_bits)? as i32;
+            self.channel_residues[ch][0] = self.gb.get_sbits(first_bits)?;
             i = 1;
         }
         while i < tile_size {
@@ -517,8 +525,8 @@ impl WmaLosslessDecoder {
             let residue: u32 = if ave_mean <= 1 {
                 quo
             } else {
-                let rem_bits = 32 - (ave_mean as u32).leading_zeros();
-                let rem = self.gb.get_bits(rem_bits as usize)?;
+                let rem_bits = ceil_log2(ave_mean as u32);
+                let rem = self.gb.get_bits(rem_bits)?;
                 (quo << rem_bits) + rem
             };
             self.ave_sum[ch] = self.ave_sum[ch]
@@ -787,8 +795,7 @@ impl WmaLosslessDecoder {
                 for j in 0..order {
                     if i <= j {
                         pred = pred.wrapping_add(
-                            self.acfilter_coeffs[j] as i32
-                                * self.acfilter_prevvalues[ich][j - i],
+                            (self.acfilter_coeffs[j] as i32).wrapping_mul(self.acfilter_prevvalues[ich][j - i]),
                         );
                     } else {
                         pred = pred.wrapping_add(
@@ -925,7 +932,7 @@ impl WmaLosslessDecoder {
             }
             for i in 0..self.channels {
                 if self.is_channel_coded[i] {
-                    self.decode_channel_residues(i, subframe_len)?;
+                    let _ = self.decode_channel_residues(i, subframe_len);
                     if self.seekable_tile {
                         self.use_high_update_speed(i);
                     } else {
@@ -985,17 +992,16 @@ impl WmaLosslessDecoder {
 
     /// `decode_frame` (wmalosslessdec.c). Returns `more_frames`.
     fn decode_frame(&mut self) -> Result<bool> {
+        self.trim_end = 0;
         let mut len = 0usize;
 
         if self.len_prefix {
             len = self.gb.get_bits(self.log2_frame_size as usize)? as usize;
         }
 
-        match self.decode_tilehdr() {
-            Ok(()) => {}
-            Err(_) => {
-                self.packet_loss = true;
-            }
+        if self.decode_tilehdr().is_err() {
+            self.packet_loss = true;
+            return Ok(false);
         }
 
         if self.dynamic_range_compression {
@@ -1031,11 +1037,11 @@ impl WmaLosslessDecoder {
                 }
                 Err(_) => {
                     self.packet_loss = true;
+                    return Ok(false);
                 }
             }
         }
         self.skip_frame = false;
-
         if self.len_prefix {
             if len != (self.gb.bit_pos() - self.frame_offset) + 2 {
                 self.packet_loss = true;
@@ -1047,7 +1053,7 @@ impl WmaLosslessDecoder {
         }
 
         // decode trailer bit (more_frames)
-        let more_frames = self.gb.get_bits1()? != 0;
+        let more_frames = self.gb.get_bits1().unwrap_or(0) != 0;
 
         // assemble the output frame (planar)
         let trim_end = self.trim_end.min(self.samples_per_frame);
@@ -1057,11 +1063,20 @@ impl WmaLosslessDecoder {
             data: Vec::with_capacity(self.channels),
         };
         for c in 0..self.channels {
-            let mut plane = Vec::with_capacity((self.samples_per_frame - trim_end) * 4);
-            for &v in &self.out[c][..self.samples_per_frame - trim_end] {
-                plane.extend_from_slice(&v.to_le_bytes());
+            let samples = self.samples_per_frame - trim_end;
+            if self.bits_per_sample == 16 {
+                let mut plane = Vec::with_capacity(samples * 2);
+                for &v in &self.out[c][..samples] {
+                    plane.extend_from_slice(&(v as i16).to_le_bytes());
+                }
+                frame.data.push(plane);
+            } else {
+                let mut plane = Vec::with_capacity(samples * 4);
+                for &v in &self.out[c][..samples] {
+                    plane.extend_from_slice(&v.to_le_bytes());
+                }
+                frame.data.push(plane);
             }
-            frame.data.push(plane);
         }
         if self.skip_frame {
             // consumed by packet logic; frame not emitted
@@ -1224,10 +1239,14 @@ impl WmaLosslessDecoder {
         let mut cur = data;
         while !cur.is_empty() {
             let consumed = self.decode_packet_chunk(cur)?;
-            if consumed == 0 || consumed >= cur.len() {
+            if consumed >= cur.len() {
                 break;
             }
-            cur = &cur[consumed..];
+            if consumed > 0 {
+                cur = &cur[consumed..];
+            } else if self.packet_done {
+                break;
+            }
         }
         Ok(())
     }
@@ -1255,13 +1274,12 @@ impl Decoder for WmaLosslessDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.packet_loss = true;
-        self.packet_done = false;
-        self.num_saved_bits = 0;
-        self.frame_offset = 0;
-        self.next_packet_start = 0;
-        self.cdlms[0][0].order = 0;
-        self.pending.clear();
+        while self.num_saved_bits > self.gb.bit_pos() {
+            match self.decode_frame() {
+                Ok(true) => {}
+                Ok(false) | Err(_) => break,
+            }
+        }
         Ok(())
     }
 

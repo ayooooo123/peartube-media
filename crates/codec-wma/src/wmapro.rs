@@ -202,7 +202,7 @@ pub struct WmaProDecoder {
     chgroup: Vec<ChannelGrp>,
     channel: Vec<ChannelCtx>,
     parsed_all_subframes: bool,
-    pending: Option<AudioFrame>,
+    pending: Vec<AudioFrame>,
     drc_gain: u8,
 }
 
@@ -243,7 +243,7 @@ impl WmaProDecoder {
             return Err(Error::unsupported(format!("wmapro: bits per sample is {bits_per_sample}")));
         }
 
-        let log2_frame_size = (usize::BITS - block_align.leading_zeros()) + 4;
+        let log2_frame_size: u32 = (32 - (block_align as u32).leading_zeros() - 1) + 4;
         if log2_frame_size > 25 {
             return Err(Error::unsupported("wmapro: large block align"));
         }
@@ -417,7 +417,7 @@ impl WmaProDecoder {
             chgroup: (0..WMAPRO_MAX_CHANNELS).map(|_| ChannelGrp::default()).collect(),
             channel: (0..nb_channels).map(|_| ChannelCtx::new(samples_per_frame)).collect(),
             parsed_all_subframes: false,
-            pending: None,
+            pending: Vec::new(),
             drc_gain: 0,
         })
     }
@@ -680,9 +680,9 @@ impl WmaProDecoder {
 
             for i in 0..4 {
                 if vals[i] != 0 {
-                    let sign = self.gb.get_bits1()? as u32 - 1;
+                    let sign_bit = if self.gb.get_bits1()? == 0 { 1u32 << 31 } else { 0 };
                     self.channel[c].coeffs[cur_coeff] =
-                        f32::from_bits(vals[i] ^ (sign << 31));
+                        f32::from_bits(vals[i] ^ sign_bit);
                     num_zeros = 0;
                 } else {
                     self.channel[c].coeffs[cur_coeff] = 0.0;
@@ -1125,7 +1125,6 @@ impl WmaProDecoder {
         if self.len_prefix {
             len = self.gb.get_bits(self.log2_frame_size as usize)? as usize;
         }
-
         if self.decode_tilehdr().is_err() {
             self.packet_loss = true;
             return Ok(false);
@@ -1169,41 +1168,52 @@ impl WmaProDecoder {
             }
         }
 
-        // copy samples out (done by caller through pending frame)
         let mut frame = AudioFrame {
             samples: self.samples_per_frame as u32,
             pts: None,
             data: Vec::with_capacity(self.channels),
         };
-        for i in 0..self.channels {
-            frame.data.push(
-                self.channel[i].out[..self.samples_per_frame]
-                    .iter()
-                    .copied()
-                    .collect::<Vec<f32>>()
-                    .iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-            );
+
+        let start = self.trim_start;
+        let end = self.samples_per_frame.saturating_sub(self.trim_end);
+        self.trim_start = 0;
+        self.trim_end = 0;
+
+        if start < end {
+            frame.samples = (end - start) as u32;
+            for i in 0..self.channels {
+                frame.data.push(
+                    self.channel[i].out[start..end]
+                        .iter()
+                        .copied()
+                        .collect::<Vec<f32>>()
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect::<Vec<u8>>(),
+                );
+            }
+            if self.skip_frame {
+                self.skip_frame = false;
+            } else {
+                self.pending.push(frame);
+            }
+        } else if self.skip_frame {
+            self.skip_frame = false;
         }
+
         for i in 0..self.channels {
             let half = self.samples_per_frame / 2;
             let out = &mut self.channel[i].out;
             out.copy_within(self.samples_per_frame..self.samples_per_frame + half, 0);
         }
 
-        if self.skip_frame {
-            self.skip_frame = false;
-        } else {
-            self.pending = Some(frame);
-        }
-
         if self.len_prefix {
-            if len != (self.gb.bits_count() - self.subframe_offset) + 2 {
+            if len != (self.gb.bits_count() - self.frame_offset) + 2 {
+                eprintln!("packet_loss: len mismatch: len={len} bits_count={} frame_offset={}", self.gb.bits_count(), self.frame_offset);
                 self.packet_loss = true;
                 return Ok(false);
             }
-            let skip = len - (self.gb.bits_count() - self.subframe_offset) - 1;
+            let skip = len - (self.gb.bits_count() - self.frame_offset) - 1;
             if skip > 0 {
                 self.gb.skip_bits(skip)?;
             }
@@ -1219,59 +1229,50 @@ impl WmaProDecoder {
     /// the frame reservoir. `append` continues the previous frame; otherwise
     /// the reservoir restarts at the current byte-aligned offset.
     fn save_bits(&mut self, gb: &mut BitReader<'_>, len: usize, append: bool) {
+        if len == 0 {
+            return;
+        }
         if !append {
             self.frame_offset = gb.bits_count() & 7;
             self.num_saved_bits = self.frame_offset;
-            self.gb = crate::bits::OwnedBitReader::new();
+            self.frame_data.clear();
         }
         let total = self.num_saved_bits + len;
-        if len == 0 || (total + 7) >> 3 > MAX_FRAMESIZE {
+        let bytes = ((total + 7) >> 3).max(1);
+        if bytes > MAX_FRAMESIZE {
             self.packet_loss = true;
+            self.num_saved_bits = 0;
             return;
         }
-        // grow the reservoir byte buffer
-        let bytes = ((total + 7) >> 3).max(1);
-        self.frame_data.clear();
-        self.frame_data.resize(bytes, 0);
-        // copy bits one chunk at a time (FFmpeg: put_bits + byte copy)
-        let mut written = 0usize;
-        while written < len {
-            let chunk = (len - written).min(32);
-            let v = gb.get_bits(chunk).unwrap_or(0) as u64;
-            self.put_bits(self.num_saved_bits + written, chunk, v);
-            written += chunk;
+        if self.frame_data.len() < bytes {
+            self.frame_data.resize(bytes, 0);
+        }
+        let start_bit = self.num_saved_bits;
+        for i in 0..len {
+            let bit = gb.get_bits1().unwrap_or(0);
+            let idx = start_bit + i;
+            let byte = idx / 8;
+            let off = idx % 8;
+            if bit != 0 {
+                self.frame_data[byte] |= 1 << (7 - off);
+            } else {
+                self.frame_data[byte] &= !(1 << (7 - off));
+            }
         }
         self.num_saved_bits = total;
-        // re-init gb over the saved frame data, skipping the frame offset
         let data = self.frame_data.clone();
         self.gb = crate::bits::OwnedBitReader::from_bits(data, self.num_saved_bits);
         let _ = self.gb.skip_bits(self.frame_offset);
     }
 
-    fn put_bits(&mut self, bit_pos: usize, nbits: usize, val: u64) {
-        for b in 0..nbits {
-            let bit = ((val >> (nbits - 1 - b)) & 1) as u8;
-            let idx = bit_pos + b;
-            let byte = idx / 8;
-            let off = idx % 8;
-            if byte < self.frame_data.len() {
-                if bit != 0 {
-                    self.frame_data[byte] |= 1 << (7 - off);
-                } else {
-                    self.frame_data[byte] &= !(1 << (7 - off));
-                }
-            }
-        }
-    }
-
-    /// `decode_packet` (wmaprodec.c) for the WMAPRO flavor.
-    fn decode_packet_impl(&mut self, data: &[u8]) -> Result<()> {
-        let mut buf = data;
-        if buf.is_empty() {
+    /// `decode_packet` (wmaprodec.c) for one block_align chunk.
+    fn decode_packet_chunk(&mut self, cur_data: &[u8]) -> Result<usize> {
+        let mut buf_size = cur_data.len();
+        if buf_size == 0 {
+            self.packet_done = false;
             if self.eof_done {
-                return Ok(());
+                return Ok(0);
             }
-            // output remaining samples: the last half-frame
             let mut frame = AudioFrame {
                 samples: self.samples_per_frame as u32,
                 pts: None,
@@ -1287,29 +1288,30 @@ impl WmaProDecoder {
             }
             self.eof_done = true;
             self.packet_done = true;
-            self.pending = Some(frame);
-            return Ok(());
+            self.pending.push(frame);
+            return Ok(0);
         }
 
+        let mut gb;
         if self.packet_done || self.packet_loss {
             self.packet_done = false;
-            if buf.len() < block_align_of(self) {
+            if buf_size < block_align_of(self) {
                 self.packet_loss = true;
                 return Err(Error::invalid("wmapro: input packet too small"));
             }
-            self.next_packet_start = buf.len() - block_align_of(self);
-            buf = &buf[..block_align_of(self)];
-            self.buf_bit_size = buf.len() << 3;
+            self.next_packet_start = buf_size - block_align_of(self);
+            buf_size = block_align_of(self);
+            self.buf_bit_size = buf_size << 3;
 
-            let mut gb = BitReader::new(buf);
+            gb = BitReader::with_bit_len(&cur_data[..buf_size], self.buf_bit_size);
             let packet_sequence_number = gb.get_bits(4)? as u8;
             gb.skip_bits(2)?;
             let num_bits_prev_frame = gb.get_bits(self.log2_frame_size as usize)? as usize;
-            if std::env::var_os("WMA_DEBUG").is_some() {
-                eprintln!("wmapro: pkt seq={packet_sequence_number} nbpf={num_bits_prev_frame} loss={}", self.packet_loss);
-            }
 
-            if !self.packet_loss && ((self.packet_sequence_number as u32 + 1) & 0xF) != packet_sequence_number as u32 {
+            if !self.packet_loss
+                && ((self.packet_sequence_number as u32 + 1) & 0xF) != packet_sequence_number as u32
+            {
+                eprintln!("packet_loss: seq mismatch: prev={} curr={}", self.packet_sequence_number, packet_sequence_number);
                 self.packet_loss = true;
             }
             self.packet_sequence_number = packet_sequence_number;
@@ -1325,80 +1327,81 @@ impl WmaProDecoder {
                 if !self.packet_loss {
                     self.decode_frame()?;
                 }
+            } else if self.num_saved_bits > self.frame_offset {
+                // ignoring previously saved bits
             }
 
             if self.packet_loss {
                 self.num_saved_bits = 0;
                 self.packet_loss = false;
+                self.frame_data.clear();
             }
         } else {
-            if data.len() < self.next_packet_start {
+            if cur_data.len() < self.next_packet_start {
                 self.packet_loss = true;
                 return Err(Error::invalid("wmapro: packet too small"));
             }
-            self.buf_bit_size = (data.len() - self.next_packet_start) << 3;
-            let mut gb = BitReader::new(&data[self.next_packet_start..]);
+            self.buf_bit_size = (cur_data.len() - self.next_packet_start) << 3;
+            gb = BitReader::with_bit_len(&cur_data[self.next_packet_start..], self.buf_bit_size);
             gb.skip_bits(self.packet_offset)?;
-            if self.len_prefix
-                && gb.bits_left() > self.log2_frame_size as usize
-            {
+
+            let remaining = self.buf_bit_size.saturating_sub(gb.bits_count());
+            if self.len_prefix && remaining > self.log2_frame_size as usize {
                 let frame_size = gb.show_bits(self.log2_frame_size as usize)? as usize;
-                if frame_size != 0 && frame_size <= gb.bits_left() {
+                if frame_size > 0 && frame_size <= remaining {
                     self.save_bits(&mut gb, frame_size, false);
                     if !self.packet_loss {
-                        self.packet_done = !self.decode_frame()?;
+                        let more = self.decode_frame()?;
+                        self.packet_done = !more;
                     }
                 } else {
                     self.packet_done = true;
                 }
+            } else if !self.len_prefix && self.num_saved_bits > self.gb.bit_pos() {
+                let more = self.decode_frame()?;
+                self.packet_done = !more;
             } else {
                 self.packet_done = true;
             }
-            // continue reading the packet from where save_bits left the cursor
-            self.gb = crate::bits::OwnedBitReader::from_bits(
-                data[self.next_packet_start..].to_vec(),
-                self.buf_bit_size,
-            );
-            let _ = self.gb.skip_bits(gb.bits_count());
         }
 
-        self.packet_offset = self.gb.bits_count() & 7;
+        let remaining = self.buf_bit_size as i64 - gb.bits_count() as i64;
+        if remaining < 0 {
+            eprintln!("packet_loss: remaining < 0: {remaining}");
+            self.packet_loss = true;
+        }
+
+        if self.packet_done && !self.packet_loss && remaining > 0 {
+            self.save_bits(&mut gb, remaining as usize, false);
+        }
+
+        self.packet_offset = gb.bits_count() & 7;
         if self.packet_loss {
             return Err(Error::invalid("wmapro: packet loss"));
         }
+        let consumed = (gb.bits_count() >> 3) + self.next_packet_start;
+        self.next_packet_start = 0;
+        Ok(consumed)
+    }
 
-        if self.packet_done && !self.packet_loss && self.gb.bits_left() > 0 {
-            let rest = self.gb.bits_left();
-            let data = self.gb_drain();
-            self.save_from(&data, rest, false);
+    fn decode_packet_impl(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            self.decode_packet_chunk(&[])?;
+            return Ok(());
+        }
+        let mut cur = data;
+        while !cur.is_empty() {
+            let consumed = self.decode_packet_chunk(cur)?;
+            if consumed >= cur.len() {
+                break;
+            }
+            if consumed > 0 {
+                cur = &cur[consumed..];
+            } else if self.packet_done {
+                break;
+            }
         }
         Ok(())
-    }
-
-    /// Snapshot the reservoir bytes for a re-save pass.
-    fn gb_drain(&mut self) -> Vec<u8> {
-        let bytes = (self.gb.total_bits() + 7) >> 3;
-        let pos_bytes = (self.gb.bit_pos() / 8) + 2;
-        let n = bytes.max(pos_bytes);
-        let mut data = vec![0u8; n];
-        let mut r = self.gb.as_reader();
-        let mut idx = 0usize;
-        while idx < n {
-            if r.bits_left() >= 8 {
-                data[idx] = r.get_bits(8).unwrap_or(0) as u8;
-            } else if r.bits_left() > 0 {
-                let b = r.bits_left();
-                data[idx] = (r.get_bits(b).unwrap_or(0) << (8 - b)) as u8;
-            }
-            idx += 1;
-        }
-        data
-    }
-
-    /// save_bits variant taking a byte buffer directly.
-    fn save_from(&mut self, data: &[u8], len: usize, _append: bool) {
-        let mut gb = BitReader::new(data);
-        self.save_bits(&mut gb, len, false);
     }
 }
 
@@ -1416,10 +1419,10 @@ impl Decoder for WmaProDecoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.pending.take() {
-            Some(f) => Ok(Frame::Audio(f)),
-            None => Err(Error::NeedMore),
+        if !self.pending.is_empty() {
+            return Ok(Frame::Audio(self.pending.remove(0)));
         }
+        Err(Error::NeedMore)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -1431,7 +1434,7 @@ impl Decoder for WmaProDecoder {
         self.packet_loss = true;
         self.eof_done = false;
         self.skip_frame = true;
-        self.pending = None;
+        self.pending.clear();
         Ok(())
     }
 

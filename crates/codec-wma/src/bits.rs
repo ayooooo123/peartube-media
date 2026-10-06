@@ -225,10 +225,11 @@ impl OwnedBitReader {
         Self::default()
     }
 
-    /// Adopt `data`, limiting reading to `bit_len` bits.
-    pub fn from_bits(data: Vec<u8>, bit_len: usize) -> Self {
-        let max_bits = data.len().saturating_mul(8);
-        Self { data, bit_pos: 0, total_bits: bit_len.min(max_bits) }
+    /// Adopt `data`, limiting reading to `bit_len` bits plus zero padding.
+    pub fn from_bits(mut data: Vec<u8>, bit_len: usize) -> Self {
+        data.resize(data.len() + 256, 0);
+        let total_bits = (bit_len + 2048).min(data.len() * 8);
+        Self { data, bit_pos: 0, total_bits }
     }
 
     pub fn as_reader(&self) -> BitReader<'_> {
@@ -267,11 +268,12 @@ impl OwnedBitReader {
     }
 
     /// Replace the buffer and length, resetting the cursor.
-    pub fn reset(&mut self, data: Vec<u8>, bit_len: usize) {
-        let max_bits = data.len().saturating_mul(8);
+    pub fn reset(&mut self, mut data: Vec<u8>, bit_len: usize) {
+        data.resize(data.len() + 256, 0);
+        let total_bits = (bit_len + 2048).min(data.len() * 8);
         self.data = data;
         self.bit_pos = 0;
-        self.total_bits = bit_len.min(max_bits);
+        self.total_bits = total_bits;
     }
 }
 
@@ -282,16 +284,7 @@ impl OwnedBitReader {
     #[inline]
     pub fn get_bits(&mut self, n: usize) -> Result<u32> {
         let mut r = self.as_reader_pos();
-        let v = match r.get_bits(n) {
-            Ok(v) => v,
-            Err(_) => {
-                // consume what remains, return zeros for the rest
-                let avail = r.bits_left();
-                let _ = r.get_bits(avail);
-                self.bit_pos = r.bits_count();
-                return Ok(0u32);
-            }
-        };
+        let v = r.get_bits(n)?;
         self.bit_pos = r.bits_count();
         Ok(v)
     }
