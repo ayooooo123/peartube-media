@@ -95,6 +95,16 @@ pub fn normalize_newlines(s: &str) -> String {
     out
 }
 
+/// FFmpeg's subtitle API stores display duration as unsigned milliseconds.
+/// Preserve the demuxer's negative final-cue sentinel through that conversion.
+pub(crate) fn subtitle_end_us(packet: &Packet, start_us: i64) -> i64 {
+    let duration_ms = packet.time_base.rescale(
+        packet.duration.unwrap_or(0),
+        oxideav_core::TimeBase::new(1, 1_000),
+    ) as u32;
+    start_us.saturating_add(i64::from(duration_ms) * 1_000)
+}
+
 /// Generic container demuxer for standalone text subtitle formats.
 pub struct TextSubtitleDemuxer {
     pub format_name: &'static str,
