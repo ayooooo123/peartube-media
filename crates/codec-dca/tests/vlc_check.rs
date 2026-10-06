@@ -1,5 +1,4 @@
 use codec_dca::bitreader::BitReader;
-use codec_dca::vlc::Vlc;
 
 #[test]
 fn transition_mode_book_decodes_canonically() {

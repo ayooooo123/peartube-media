@@ -123,17 +123,6 @@ fn xll_suite_sample(name: &str, width: usize) {
     );
 }
 
-fn ours_samples(decoded: &refcheck::Decoded) -> usize {
-    decoded
-        .frames
-        .iter()
-        .filter_map(|f| match f {
-            Frame::Audio(a) => Some(a.samples as usize),
-            _ => None,
-        })
-        .sum()
-}
-
 #[test]
 fn xll_51_16_192_768_0() {
     xll_suite_sample("xll_51_16_192_768_0", 2);
