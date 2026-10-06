@@ -284,59 +284,184 @@ fn lossy_xxch_71_24_48_2046() {
 
 // ───────────────────────── demuxer packet layout ─────────────────────────
 
-/// The `dtshd` demuxer must cut the same frames ffprobe reports
-/// (`ffprobe -show_packets` on xll_51_24_48_768.dtshd: 2 packets of 768
-/// samples at 48 kHz). Packet count and total sample coverage must match.
-#[test]
-fn dtshd_demuxer_packet_metadata() {
-    use oxideav_core::{ProbeData, RuntimeContext};
-    use std::fs::File;
-    use std::io::Read;
+/// One `ffprobe -show_packets` row.
+struct FfPacket {
+    stream: u32,
+    pts: Option<i64>,
+    dts: Option<i64>,
+    duration: Option<i64>,
+    size: usize,
+    md5: String,
+}
 
-    for (rel, rate) in [
-        ("dts/dcadec-suite/xll_51_24_48_768.dtshd", 48_000u32),
-        ("dts/dcadec-suite/xll_51_16_192_768_0.dtshd", 192_000),
-        ("dts/dcadec-suite/core_51_24_48_768_0.dtshd", 48_000),
-    ] {
-        let path = fate(rel);
+/// One `ffprobe -show_streams` row.
+struct FfStream {
+    codec_name: String,
+    time_base: (i64, i64),
+    start_pts: Option<i64>,
+    duration_ts: Option<i64>,
+}
+
+/// FFmpeg's demuxed-and-parsed packet table for `path`, as `ffprobe
+/// -show_packets -show_streams` prints it. Fails unless ffprobe succeeds
+/// and reports at least one stream and one packet.
+fn ffprobe_table(path: &std::path::Path) -> (Vec<FfStream>, Vec<FfPacket>) {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-show_data_hash", "md5", "-show_entries"])
+        .arg(
+            "stream=codec_name,time_base,start_pts,duration_ts:\
+             packet=stream_index,pts,dts,duration,size,data_hash",
+        )
+        .args(["-of", "compact"])
+        .arg(path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    assert!(
+        out.status.success(),
+        "ffprobe {} failed: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ts = |v: &str| if v == "N/A" { None } else { Some(v.parse::<i64>().unwrap()) };
+    let (mut streams, mut packets) = (Vec::new(), Vec::new());
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut fields = line.split('|');
+        let section = fields.next().unwrap_or("");
+        let kv: std::collections::HashMap<&str, &str> =
+            fields.filter_map(|f| f.split_once('=')).collect();
+        match section {
+            "packet" => packets.push(FfPacket {
+                stream: kv["stream_index"].parse().unwrap(),
+                pts: ts(kv["pts"]),
+                dts: ts(kv["dts"]),
+                duration: ts(kv["duration"]),
+                size: kv["size"].parse().unwrap(),
+                md5: kv["data_hash"].trim_start_matches("MD5:").to_string(),
+            }),
+            "stream" => {
+                let (num, den) = kv["time_base"].split_once('/').unwrap();
+                streams.push(FfStream {
+                    codec_name: kv["codec_name"].to_string(),
+                    time_base: (num.parse().unwrap(), den.parse().unwrap()),
+                    start_pts: ts(kv["start_pts"]),
+                    duration_ts: ts(kv["duration_ts"]),
+                });
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !streams.is_empty() && !packets.is_empty(),
+        "ffprobe {}: empty oracle ({} streams, {} packets)",
+        path.display(),
+        streams.len(),
+        packets.len()
+    );
+    (streams, packets)
+}
+
+/// `a` ticks of time base `ta` and `b` ticks of `tb` name the same instant.
+fn same_time(a: Option<i64>, ta: (i64, i64), b: Option<i64>, tb: (i64, i64)) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            i128::from(a) * i128::from(ta.0) * i128::from(tb.1)
+                == i128::from(b) * i128::from(tb.0) * i128::from(ta.1)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Every DTS-HD input of FFmpeg's dca.mak (DCADEC_SUITE_LOSSLESS_16,
+/// DCADEC_SUITE_LOSSLESS_24 and DCADEC_SUITE_LOSSY).
+const DTSHD_SUITE: [&str; 19] = [
+    "xll_51_16_192_768_0",
+    "xll_51_16_192_768_1",
+    "xll_51_24_48_768",
+    "xll_51_24_48_none",
+    "xll_71_24_48_768_0",
+    "xll_71_24_48_768_1",
+    "xll_71_24_96_768",
+    "xll_x96_51_24_96_1509",
+    "xll_xch_61_24_48_768",
+    "core_51_24_48_768_0",
+    "core_51_24_48_768_1",
+    "x96_51_24_96_1509",
+    "x96_xch_61_24_96_3840",
+    "x96_xxch_71_24_96_3840",
+    "xbr_51_24_48_3840",
+    "xbr_xch_61_24_48_3840",
+    "xbr_xxch_71_24_48_3840",
+    "xch_61_24_48_768",
+    "xxch_71_24_48_2046",
+];
+
+/// The `dtshd` demuxer cuts the frames FFmpeg's dca parser cuts and times
+/// them as libavformat does (FATE's dca-xll tests check the same
+/// `packet=pts,duration` table): for every DTS-HD sample, the stream's
+/// codec, time base, start time and duration match `ffprobe`, and each
+/// packet's size, payload MD5, pts, dts and duration match, rescaled
+/// through both time bases. The packet durations cover the stream's whole
+/// duration.
+#[test]
+fn dtshd_demuxer_packet_tables_match_ffprobe() {
+    use oxideav_core::{RuntimeContext, TimeBase};
+
+    for name in DTSHD_SUITE {
+        let path = fate(&format!("dts/dcadec-suite/{name}.dtshd"));
+        let (ff_streams, ff_packets) = ffprobe_table(&path);
+
         let mut ctx = RuntimeContext::new();
         codec_dca::register(&mut ctx);
-        let mut head = vec![0u8; 256 * 1024];
-        let n = File::open(&path)
-            .and_then(|mut f| f.read(&mut head))
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let probe = ProbeData {
-            buf: &head[..n],
-            ext: Some("dtshd"),
-        };
-        let candidates = ctx.containers.probe_candidates(&probe);
-        let format = match candidates.first() {
-            Some(c) if c.score >= oxideav_core::PROBE_SCORE_EXTENSION => c.name.to_string(),
-            _ => "dtshd".to_string(),
-        };
-        let file = File::open(&path).unwrap();
+        let format = refcheck::probe_container(&ctx, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(format, "dtshd", "{name}: container");
+        let file = std::fs::File::open(&path).unwrap();
         let mut demuxer = ctx
             .containers
             .open_demuxer(&format, Box::new(file), &ctx.codecs)
-            .unwrap_or_else(|e| panic!("open {format}: {e}"));
-        assert_eq!(demuxer.streams()[0].time_base.den(), i64::from(rate), "{rel}: time base");
+            .unwrap_or_else(|e| panic!("{name}: open: {e}"));
 
-        let mut count = 0usize;
-        let mut samples = 0u64;
-        while let Ok(packet) = demuxer.next_packet() {
-            samples += packet.data.len() as u64;
-            count += 1;
+        assert_eq!(demuxer.streams().len(), ff_streams.len(), "{name}: stream count");
+        let stream = demuxer.streams()[0].clone();
+        let ff = &ff_streams[0];
+        let tb = |t: TimeBase| (t.num(), t.den());
+        assert_eq!(stream.params.codec_id.as_str(), ff.codec_name, "{name}: codec");
+        assert_eq!(tb(stream.time_base), ff.time_base, "{name}: time base");
+        assert!(
+            same_time(stream.start_time, tb(stream.time_base), ff.start_pts, ff.time_base),
+            "{name}: start time {:?} vs ffprobe {:?}",
+            stream.start_time,
+            ff.start_pts
+        );
+        assert!(
+            same_time(stream.duration, tb(stream.time_base), ff.duration_ts, ff.time_base),
+            "{name}: duration {:?} vs ffprobe {:?}",
+            stream.duration,
+            ff.duration_ts
+        );
+
+        let mut ours = Vec::new();
+        loop {
+            match demuxer.next_packet() {
+                Ok(p) => ours.push(p),
+                Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("{name}: demux: {e}"),
+            }
         }
-        // ffprobe: STRMDATA extent read as 1024-byte packets.
-        let expect_packets = {
-            let out = std::process::Command::new("ffprobe")
-                .args(["-v", "error", "-show_packets", "-of", "csv"])
-                .arg(&path)
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).lines().count()
-        };
-        assert_eq!(count, expect_packets, "{rel}: packet count vs ffprobe");
-        assert!(samples > 0, "{rel}: no data demuxed");
+        assert_eq!(ours.len(), ff_packets.len(), "{name}: packet count");
+        for (i, (p, f)) in ours.iter().zip(&ff_packets).enumerate() {
+            let ptb = tb(p.time_base);
+            assert_eq!(p.stream_index, f.stream, "{name}: packet {i} stream");
+            assert_eq!(p.data.len(), f.size, "{name}: packet {i} size");
+            assert_eq!(refcheck::md5_hex(&p.data), f.md5, "{name}: packet {i} payload");
+            for (what, a, b) in [("pts", p.pts, f.pts), ("dts", p.dts, f.dts), ("duration", p.duration, f.duration)] {
+                assert!(
+                    same_time(a, ptb, b, ff.time_base),
+                    "{name}: packet {i} {what} {a:?} vs ffprobe {b:?}"
+                );
+            }
+        }
+        let covered: i64 = ff_packets.iter().map(|f| f.duration.unwrap_or(0)).sum();
+        assert_eq!(Some(covered), ff.duration_ts, "{name}: packet durations vs stream duration");
     }
 }
