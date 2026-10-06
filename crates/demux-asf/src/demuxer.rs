@@ -548,6 +548,14 @@ impl AsfDemuxer {
             params.bit_rate = Some(wfx.avg_bytes_per_sec.saturating_mul(8) as u64);
             params.extradata = wfx.extradata;
             params.tag = Some(tag);
+            // WMA family decoders need the WAVEFORMATEX framing size
+            // (FFmpeg's AVCodecContext::block_align); the codec option bag
+            // is the agreed transport (see oxideav-adpcm's "block_align").
+            if wfx.block_align > 0 {
+                params
+                    .options
+                    .insert("block_align", wfx.block_align.to_string());
+            }
 
             let mut stream_info = StreamInfo {
                 index: stream_index,
