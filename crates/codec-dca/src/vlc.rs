@@ -157,23 +157,24 @@ impl Vlc {
         let (mut code, mut n) = (code0, n0);
         if max_depth > 1 && n < 0 {
             gb.skip(self.bits);
-            // Enter auxiliary table: index rides in `code`.
+            // Enter auxiliary table: index rides in `code`. The aux entry's
+            // own length (n) is what gets skipped, like FFmpeg's final
+            // SKIP_BITS(n_) — the peek consumed nb_bits virtually.
             let nb_bits = -n as u32;
             let sub = &self.aux[code as usize];
             let idx2 = sub_idx(sub, gb.show_bits(nb_bits));
             code = sub[idx2].0;
             n = sub[idx2].1 as i32;
             if max_depth > 2 && n < 0 {
-                gb.skip(nb_bits);
                 let nb_bits2 = -n as u32;
                 let sub2 = &self.aux[code as usize];
                 let idx3 = sub_idx(sub2, gb.show_bits(nb_bits2));
                 code = sub2[idx3].0;
-                let _ = sub2[idx3].1; // terminal: length unused after final lookup
-                gb.skip(nb_bits2.max(0) as u32);
+                n = sub2[idx3].1 as i32;
+                gb.skip(n.max(0) as u32);
                 return code;
             }
-            gb.skip(nb_bits.max(0) as u32);
+            gb.skip(n.max(0) as u32);
             return code;
         }
         gb.skip(n.max(0) as u32);
@@ -195,16 +196,15 @@ impl Vlc {
             code = sub[idx2].0;
             n = sub[idx2].1 as i32;
             if max_depth > 2 && n < 0 {
-                gb.skip(nb_bits);
                 let nb_bits2 = -n as u32;
                 let sub2 = &self.aux[code as usize];
                 let idx3 = sub_idx(sub2, gb.show_bits(nb_bits2));
                 code = sub2[idx3].0;
-                let _ = sub2[idx3].1; // terminal: length unused after final lookup
-                gb.skip(nb_bits2.max(0) as u32);
+                n = sub2[idx3].1 as i32;
+                gb.skip(n.max(0) as u32);
                 return code;
             }
-            gb.skip(nb_bits.max(0) as u32);
+            gb.skip(n.max(0) as u32);
             return code;
         }
         gb.skip(n.max(0) as u32);
