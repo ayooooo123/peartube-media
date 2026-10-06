@@ -374,10 +374,10 @@ pub fn synth_filter_float(
         while j < 512 {
             let jj = j as isize;
             let ii = i as isize;
-            a += window[i + j] * (-sb((15 - ii + jj - 512)));
-            b += window[i + j + 16] * sb((ii + jj - 512));
-            c += window[i + j + 32] * sb((16 + ii + jj - 512));
-            d += window[i + j + 48] * sb((31 - ii + jj - 512));
+            a += window[i + j] * (-sb(15 - ii + jj - 512));
+            b += window[i + j + 16] * sb(ii + jj - 512);
+            c += window[i + j + 32] * sb(16 + ii + jj - 512);
+            d += window[i + j + 48] * sb(31 - ii + jj - 512);
             j += 64;
         }
         out[i] = a * scale;
@@ -464,10 +464,10 @@ pub fn synth_filter_fixed(
             j += 64;
         }
         while j < 512 {
-            a += i64::from(window[i + j]) * i64::from(sb((i as isize + j as isize - 512)));
-            b += i64::from(window[i + j + 16]) * i64::from(sb((15 - i as isize + j as isize - 512)));
-            c += i64::from(window[i + j + 32]) * i64::from(sb((16 + i as isize + j as isize - 512)));
-            d += i64::from(window[i + j + 48]) * i64::from(sb((31 - i as isize + j as isize - 512)));
+            a += i64::from(window[i + j]) * i64::from(sb(i as isize + j as isize - 512));
+            b += i64::from(window[i + j + 16]) * i64::from(sb(15 - i as isize + j as isize - 512));
+            c += i64::from(window[i + j + 32]) * i64::from(sb(16 + i as isize + j as isize - 512));
+            d += i64::from(window[i + j + 48]) * i64::from(sb(31 - i as isize + j as isize - 512));
             j += 64;
         }
         out[i] = clip23(crate::math::norm21(a));
@@ -511,10 +511,10 @@ pub fn synth_filter_fixed_64(
             j += 128;
         }
         while j < 1024 {
-            a += i64::from(window[i + j]) * i64::from(sb((i as isize + j as isize - 1024)));
-            b += i64::from(window[i + j + 32]) * i64::from(sb((31 - i as isize + j as isize - 1024)));
-            c += i64::from(window[i + j + 64]) * i64::from(sb((32 + i as isize + j as isize - 1024)));
-            d += i64::from(window[i + j + 96]) * i64::from(sb((63 - i as isize + j as isize - 1024)));
+            a += i64::from(window[i + j]) * i64::from(sb(i as isize + j as isize - 1024));
+            b += i64::from(window[i + j + 32]) * i64::from(sb(31 - i as isize + j as isize - 1024));
+            c += i64::from(window[i + j + 64]) * i64::from(sb(32 + i as isize + j as isize - 1024));
+            d += i64::from(window[i + j + 96]) * i64::from(sb(63 - i as isize + j as isize - 1024));
             j += 128;
         }
         out[i] = clip23(crate::math::norm20(a));
