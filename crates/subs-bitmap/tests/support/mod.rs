@@ -565,7 +565,8 @@ pub fn decode_subtitles(path: &Path, registrars: &[Registrar], nth: usize) -> De
 /// `ffmpeg -c copy` remux of subtitle stream `s:nth` of `path` into a
 /// scratch file named `name`, with extra muxer arguments.
 pub fn remux(path: &Path, nth: usize, name: &str, muxer: &[&str]) -> PathBuf {
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let scratch = option_env!("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let out = scratch.join(name);
     let map = format!("0:s:{nth}");
     let status = Command::new("ffmpeg")
         .args(["-v", "error", "-y", "-copyts", "-i"])

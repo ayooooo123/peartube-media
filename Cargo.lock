@@ -1452,6 +1452,7 @@ dependencies = [
  "oxideav-subtitle",
  "parking_lot",
  "refcheck",
+ "subs-bitmap",
  "thiserror 2.0.21",
 ]
 

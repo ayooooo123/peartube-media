@@ -15,10 +15,13 @@ use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
 use crate::clock::FreeRunningClock;
 use crate::headless::find_headless;
 use crate::source::{open_source, ReadAheadSource, SourceMonitor};
-use crate::subs::run_subtitle_loop;
+use crate::subs::{run_subtitle_loop, SubtitlePipeline};
 
 mod transport;
 use transport::{Due, Live, Pipe, Transport};
+
+#[cfg(test)]
+mod subtitle_tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
@@ -105,7 +108,7 @@ pub(crate) struct Lane {
     pub(crate) cv: Condvar,
     /// Seek generation the queued packets belong to; changed only with
     /// `queue` locked, when the demuxer empties the lane for a seek.
-    seek_gen: AtomicU64,
+    pub(crate) seek_gen: AtomicU64,
     /// A pipeline thread drains the lane (see `Consumer`); changed only with
     /// `queue` locked. Without one, packets for the lane are dropped:
     /// queued, they would fill it and park the demuxer for good.
@@ -947,19 +950,23 @@ fn spawn_subtitles(
             Ok(d) => d,
             Err(_) => return,
         };
-        run_subtitle_loop(
+        let (ctx, params) = (Arc::clone(&shared.ctx), stream.params.clone());
+        let seeks = Arc::clone(&shared);
+        let pipeline = SubtitlePipeline {
             decoder,
-            sink,
+            new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
             clock,
-            stream.time_base,
-            w,
-            h,
+            time_base: stream.time_base,
+            video_width: w,
+            video_height: h,
             realtime,
             lane,
             demux_cv,
-            shared.stopped.clone(),
+            seek_generation: Box::new(move || seeks.seek_gen.load(Ordering::SeqCst)),
+            stopped: shared.stopped.clone(),
             retired,
-        );
+        };
+        run_subtitle_loop(pipeline, sink);
     })
 }
 
