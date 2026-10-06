@@ -6,7 +6,8 @@
 
 #![forbid(unsafe_code)]
 
-use oxideav_core::{Frame, MediaType, SampleFormat};
+use oxideav_core::bits::{BitReader, BitWriter};
+use oxideav_core::{CodecParameters, Decoder, Frame, MediaType, Packet, SampleFormat, TimeBase};
 
 /// Decode an `aac.mak` FATE sample through the fork behind OxideAV's
 /// `mov` / `mp4` / `mpegts` containers and convert every audio frame to
@@ -56,26 +57,28 @@ pub const MUTATION_SAMPLES: &[&str] = &[
     "aac/CT_DecoderCheck/sbr_i-ps_i.aac",
 ];
 
-/// USAC FD corpus and its MP4 edit-list trim, in samples per channel
-/// `(path, initial_skip, final_padding)`. The raw decoder cannot apply
-/// these until container-provided sample-trim metadata reaches the decode pipeline.
-pub const USAC_SAMPLES: &[(&str, usize, usize)] = &[
-    ("aac/Fd_2_c1_Ms_0x01.mp4", 2323, 763),
-    ("aac/Fd_2_c1_Ms_0x04.mp4", 2220, 859),
-    ("aac/usac/Fd_1_c1_0x03.mp4", 2220, 340),
-    ("aac/usac/Fd_1_c1_0x04.mp4", 2220, 516),
-    ("aac/usac/Fd_2_c1_0x03.mp4", 2220, 340),
-    ("aac/usac/Fd_2_c1_0x05.mp4", 2220, 852),
-    ("aac/usac/Fd_2_c1_Tns_0x04.mp4", 2220, 859),
-    ("aac/usac/Ext_2_c1_Ln_0x03.mp4", 1600, 704),
+/// USAC FD corpus: `(path, initial_skip, final_padding, snr_floor_db)`.
+/// Skip and padding are the MP4 edit-list trim in samples per channel. The
+/// raw decoder cannot apply them until container-provided sample-trim
+/// metadata reaches the decode pipeline. Floors are the first measured SNR
+/// (fork `e03fbe6`) minus 0.5 dB.
+pub const USAC_SAMPLES: &[(&str, usize, usize, f64)] = &[
+    ("aac/Fd_2_c1_Ms_0x01.mp4", 2323, 763, 138.962070),
+    ("aac/Fd_2_c1_Ms_0x04.mp4", 2220, 859, 138.573987),
+    ("aac/usac/Fd_1_c1_0x03.mp4", 2220, 340, 138.753700),
+    ("aac/usac/Fd_1_c1_0x04.mp4", 2220, 516, 138.715224),
+    ("aac/usac/Fd_2_c1_0x03.mp4", 2220, 340, 138.742638),
+    ("aac/usac/Fd_2_c1_0x05.mp4", 2220, 852, 138.611948),
+    ("aac/usac/Fd_2_c1_Tns_0x04.mp4", 2220, 859, 137.773368),
+    ("aac/usac/Ext_2_c1_Ln_0x03.mp4", 1600, 704, 139.604440),
     // FFmpeg omits the final whole AU outside the edit, then trims 128
     // samples from the preceding AU. OxideAV returns both raw AUs.
-    ("aac/usac/xhe_target_level.m4a", 0, 1024 + 128),
+    ("aac/usac/xhe_target_level.m4a", 0, 1024 + 128, 138.516260),
 ];
 
-/// Decode a USAC MP4 with FFmpeg-compatible optional loudness normalization.
-/// The output remains untrimmed: the test asserts presentation bounds itself.
-pub fn decoded_usac_target(rel: &str, target: i32) -> (Vec<f32>, std::path::PathBuf, u16) {
+/// The first audio stream's parameters and all of its packets, demuxed by
+/// OxideAV's mov/mp4 registry.
+pub fn usac_packets(rel: &str) -> (CodecParameters, Vec<Packet>) {
     use oxideav_core::{Error, RuntimeContext};
     let path = refcheck::fate(rel);
     let mut ctx = RuntimeContext::new();
@@ -85,31 +88,77 @@ pub fn decoded_usac_target(rel: &str, target: i32) -> (Vec<f32>, std::path::Path
     let file = std::fs::File::open(&path).unwrap();
     let mut demuxer = ctx.containers.open_demuxer("mov", Box::new(file), &ctx.codecs).unwrap();
     let stream = demuxer.streams().iter().find(|s| s.params.media_type == MediaType::Audio).unwrap().clone();
-    let mut params = stream.params;
-    params.options.insert("target_level", target.to_string());
-    let mut decoder = ctx.codecs.first_decoder(&params).unwrap();
-    let mut frames = Vec::new();
-    let drain = |decoder: &mut Box<dyn oxideav_core::Decoder>, frames: &mut Vec<Frame>| loop {
-        match decoder.receive_frame() {
-            Ok(frame) => frames.push(frame),
-            Err(Error::NeedMore | Error::Eof) => break,
-            Err(error) => panic!("{rel}: receive: {error}"),
-        }
-    };
+    let mut packets = Vec::new();
     loop {
         match demuxer.next_packet() {
-            Ok(packet) if packet.stream_index == stream.index => {
-                decoder.send_packet(&packet).unwrap_or_else(|e| panic!("{rel}: packet {:?}: {e}", packet.pts));
-                drain(&mut decoder, &mut frames);
-            }
+            Ok(packet) if packet.stream_index == stream.index => packets.push(packet),
             Ok(_) => {}
             Err(Error::Eof) => break,
             Err(error) => panic!("{rel}: demux: {error}"),
         }
     }
-    decoder.flush().unwrap();
-    drain(&mut decoder, &mut frames);
-    let format = decoder.output_audio_format().unwrap();
-    let output = refcheck::Decoded { params, audio_format: Some(format), frames };
-    (refcheck::interleaved_f32(&output), path, format.channels)
+    (stream.params, packets)
+}
+
+/// A fresh decoder for `params` from the fork's codec registration.
+pub fn aac_decoder(params: &CodecParameters) -> Box<dyn Decoder> {
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_aac::__oxideav_entry(&mut ctx);
+    ctx.codecs.first_decoder(params).unwrap()
+}
+
+/// Send one access unit and return its frame as interleaved f32 PCM.
+pub fn decode_one(decoder: &mut Box<dyn Decoder>, packet: &Packet) -> oxideav_core::Result<Vec<f32>> {
+    decoder.send_packet(packet)?;
+    match decoder.receive_frame()? {
+        Frame::Audio(audio) => {
+            Ok(audio.data[0].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+        }
+        _ => panic!("AAC decoder returned a non-audio frame"),
+    }
+}
+
+/// `au` (for a configuration whose first element is AudioPreRoll with an
+/// explicit payload length) with that payload removed. FFmpeg 2da55bf parses
+/// AudioPreRoll as a fill element, so this is the input it effectively
+/// decodes.
+pub fn strip_preroll(au: &[u8]) -> Vec<u8> {
+    let mut r = BitReader::new(au);
+    let mut w = BitWriter::new();
+    w.write_u32(r.read_u32(1).unwrap(), 1);
+    if r.read_bit().unwrap() {
+        assert!(!r.read_bit().unwrap(), "AudioPreRoll uses an explicit length");
+        let mut length = r.read_u32(8).unwrap();
+        if length == 255 {
+            length += r.read_u32(16).unwrap() - 2;
+        }
+        r.skip(length * 8).unwrap();
+    }
+    w.write_u32(0, 1);
+    while r.bits_remaining() > 0 {
+        let n = r.bits_remaining().min(32) as u32;
+        w.write_u32(r.read_u32(n).unwrap(), n);
+    }
+    w.finish()
+}
+
+/// Decode a USAC MP4 with optional loudness normalization (`target` 0 is
+/// off). With `strip`, AudioPreRoll payloads are removed first (FFmpeg's
+/// effective input); otherwise the packets are decoded as delivered. The
+/// output remains untrimmed: tests assert presentation bounds themselves.
+pub fn decoded_usac(rel: &str, target: i32, strip: bool) -> (Vec<f32>, std::path::PathBuf, u16) {
+    let (mut params, packets) = usac_packets(rel);
+    params.options.insert("target_level", target.to_string());
+    let mut decoder = aac_decoder(&params);
+    let mut pcm = Vec::new();
+    for packet in &packets {
+        let decoded = if strip {
+            decode_one(&mut decoder, &Packet::new(0, TimeBase::new(1, 48000), strip_preroll(&packet.data)))
+        } else {
+            decode_one(&mut decoder, packet)
+        };
+        pcm.extend(decoded.unwrap_or_else(|e| panic!("{rel}: packet {:?}: {e}", packet.pts)));
+    }
+    let channels = decoder.output_audio_format().unwrap().channels;
+    (pcm, refcheck::fate(rel), channels)
 }

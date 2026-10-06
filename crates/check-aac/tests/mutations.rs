@@ -8,7 +8,7 @@
 //! test failure carrying the seed and the sample, so the input can be
 //! reproduced with `MUTATION_SEED`.
 
-use check_aac::{decoded_f32, MUTATION_SAMPLES};
+use check_aac::{aac_decoder, decoded_f32, usac_packets, MUTATION_SAMPLES};
 use oxideav_core::{Frame, RuntimeContext};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -142,6 +142,119 @@ fn exercise_mutations(samples: &[&str], seed: u64) {
             panic!(
                 "mutation panic: run {run} sample {rel} packet {packet_idx} seed {seed_for_report:#x}"
             );
+        }
+    }
+}
+
+/// One persistent decoder per run over a window of real USAC AUs starting at
+/// an independent AU, with one to three AUs corrupted (bit flips, truncation,
+/// emptied, dropped or duplicated). No panic; every emitted frame is 1024
+/// finite samples per channel; a failed packet emits nothing. The noise-free,
+/// all-independent stream resynchronizes bit-exactly two AUs after the last
+/// corruption, and `reset()` restores fresh-decoder output exactly.
+#[test]
+fn usac_persistent_sequence_mutations() {
+    use oxideav_core::{Error, Packet};
+    const WINDOW: usize = 10;
+    let corpora: Vec<_> = [
+        "aac/Fd_2_c1_Ms_0x04.mp4",
+        "aac/usac/Fd_1_c1_0x03.mp4",
+        "aac/usac/Fd_2_c1_Tns_0x04.mp4",
+        "aac/usac/Ext_2_c1_Ln_0x03.mp4",
+        "aac/usac/xhe_target_level.m4a",
+    ]
+    .iter()
+    .map(|rel| {
+        let (params, packets) = usac_packets(rel);
+        let starts: Vec<usize> = (0..packets.len().saturating_sub(WINDOW))
+            .filter(|&i| packets[i].data[0] & 0x80 != 0)
+            .collect();
+        let channels = aac_decoder(&params).output_audio_format().unwrap().channels as usize;
+        (*rel, params, packets, starts, channels)
+    })
+    .collect();
+    let mut clean_cache = std::collections::HashMap::new();
+    let mut state = 0x5EED_AAC4_2000_0002u64;
+    for run in 0..2000 {
+        let corpus = (xorshift(&mut state) as usize) % corpora.len();
+        let (rel, params, packets, starts, channels) = &corpora[corpus];
+        let start = starts[(xorshift(&mut state) as usize) % starts.len()];
+        let window = &packets[start..start + WINDOW];
+        let clean = clean_cache.entry((corpus, start)).or_insert_with(|| {
+            let mut decoder = aac_decoder(params);
+            window.iter().map(|p| check_aac::decode_one(&mut decoder, p).unwrap()).collect::<Vec<_>>()
+        });
+        // (original index, bytes) in sending order.
+        let mut sequence: Vec<(usize, Vec<u8>, bool)> =
+            window.iter().enumerate().map(|(i, p)| (i, p.data.clone(), false)).collect();
+        let mut last = 0;
+        for _ in 0..1 + (xorshift(&mut state) as usize) % 3 {
+            let at = (xorshift(&mut state) as usize) % (WINDOW - 3);
+            let position = sequence.iter().position(|s| s.0 == at).unwrap_or(0);
+            last = last.max(at);
+            let data = &mut sequence[position].1;
+            match xorshift(&mut state) % 5 {
+                0 => {
+                    for _ in 0..1 + xorshift(&mut state) % 8 {
+                        let bit = (xorshift(&mut state) as usize) % (data.len() * 8).max(1);
+                        if !data.is_empty() {
+                            data[bit / 8] ^= 1 << (bit % 8);
+                        }
+                    }
+                }
+                1 => {
+                    let keep = (xorshift(&mut state) as usize) % data.len().max(1);
+                    data.truncate(keep);
+                }
+                2 => data.clear(),
+                3 => {
+                    sequence.remove(position);
+                }
+                _ => {
+                    let copy = sequence[position].clone();
+                    sequence.insert(position, copy);
+                }
+            }
+            let marked = position.min(sequence.len() - 1);
+            sequence[marked].2 = true;
+        }
+        let seed = state;
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let mut decoder = aac_decoder(params);
+            let mut frames: Vec<(usize, bool, Vec<f32>)> = Vec::new();
+            for (index, data, mutated) in &sequence {
+                let sent = decoder.send_packet(&Packet::new(0, oxideav_core::TimeBase::new(1, 48000), data.clone()));
+                match decoder.receive_frame() {
+                    Ok(Frame::Audio(audio)) => {
+                        assert!(sent.is_ok() && !data.is_empty(), "frame without a decoded packet");
+                        assert_eq!(audio.samples, 1024);
+                        assert_eq!(audio.data[0].len(), 1024 * channels * 4);
+                        let pcm: Vec<f32> =
+                            audio.data[0].chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+                        assert!(pcm.iter().all(|v| v.is_finite()));
+                        frames.push((*index, *mutated, pcm));
+                        assert!(matches!(decoder.receive_frame(), Err(Error::NeedMore)));
+                    }
+                    Ok(_) => panic!("non-audio frame"),
+                    Err(Error::NeedMore) => assert!(sent.is_err() || data.is_empty(), "decoded packet without a frame"),
+                    Err(error) => panic!("receive_frame: {error}"),
+                }
+            }
+            if rel.contains("Ext_") {
+                for (index, mutated, pcm) in &frames {
+                    if !mutated && *index >= last + 2 {
+                        assert_eq!(pcm, &clean[*index], "AU {index} after resynchronization");
+                    }
+                }
+            }
+            decoder.reset().unwrap();
+            for (i, packet) in window.iter().enumerate() {
+                assert_eq!(check_aac::decode_one(&mut decoder, packet).unwrap(), clean[i], "AU {i} after reset");
+            }
+        }));
+        if let Err(panic) = outcome {
+            let message = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+            panic!("USAC sequence mutation run {run}, {rel} from AU {start}, seed {seed:#x}: {message}");
         }
     }
 }

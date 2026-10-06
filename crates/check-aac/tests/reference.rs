@@ -146,10 +146,17 @@ fn reference_known_gap_samples() {
 /// Keep the raw FD PCM and container presentation trim separate. These
 /// assertions verify the exact untrimmed length and compare every presented
 /// sample, including the first block; no codec startup region is omitted.
+/// FFmpeg 2da55bf parses AudioPreRoll as fill, so xhe_target_level is
+/// compared with its AU0 pre-roll payload removed; the fork's primed
+/// production output is verified separately in `tests/usac_tools.rs`.
 #[test]
 fn reference_usac_samples() {
-    for &(rel, initial_skip, final_padding) in check_aac::USAC_SAMPLES {
-        let (ours, path, channels) = decoded_f32(rel);
+    for &(rel, initial_skip, final_padding, floor) in check_aac::USAC_SAMPLES {
+        let (ours, path, channels) = if rel.ends_with("xhe_target_level.m4a") {
+            check_aac::decoded_usac(rel, 0, true)
+        } else {
+            decoded_f32(rel)
+        };
         let ff = refcheck::ffmpeg_audio_f32(&path, 0);
         let start = initial_skip * channels as usize;
         let end_padding = final_padding * channels as usize;
@@ -157,7 +164,7 @@ fn reference_usac_samples() {
         let presented = &ours[start..ours.len() - end_padding];
         let snr = refcheck::snr_db(&ff, presented, 0);
         eprintln!("{rel}: {} raw interleaved samples, skip {start}, tail {end_padding}, SNR {snr:.6} dB", ours.len());
-        assert!(snr >= 90.0, "{rel}: USAC FD SNR {snr:.6} dB below 90 dB");
+        assert!(snr >= floor, "{rel}: USAC FD SNR {snr:.6} dB below floor {floor} dB");
         let stem = path.file_stem().unwrap().to_str().unwrap();
         if stem.starts_with("Fd_") {
             // The two older Ms references retain final padding; the newer
@@ -183,13 +190,14 @@ fn assert_fate_pcm(path: &std::path::Path, pcm: &[f32]) {
 
 #[test]
 fn reference_usac_loudness_targets() {
-    for (rel, target, golden) in [
-        ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -16, "aac/usac/Ext_2_c1_Ln_0x03__Lou-16.s16"),
-        ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -24, "aac/usac/Ext_2_c1_Ln_0x03__Lou-24.s16"),
-        ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -31, "aac/usac/Ext_2_c1_Ln_0x03__Lou-31.s16"),
-        ("aac/usac/xhe_target_level.m4a", -24, "aac/usac/xhe_target_level.s16"),
+    // Floors: the first measured SNR (fork e03fbe6) minus 0.5 dB.
+    for (rel, target, golden, floor) in [
+        ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -16, "aac/usac/Ext_2_c1_Ln_0x03__Lou-16.s16", 139.252920),
+        ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -24, "aac/usac/Ext_2_c1_Ln_0x03__Lou-24.s16", 139.604440),
+        ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -31, "aac/usac/Ext_2_c1_Ln_0x03__Lou-31.s16", 139.325931),
+        ("aac/usac/xhe_target_level.m4a", -24, "aac/usac/xhe_target_level.s16", 138.133034),
     ] {
-        let (ours, path, channels) = check_aac::decoded_usac_target(rel, target);
+        let (ours, path, channels) = check_aac::decoded_usac(rel, target, rel.ends_with("xhe_target_level.m4a"));
         let reference = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-nostdin", "-target_level", &target.to_string(), "-i"])
             .arg(&path)
@@ -197,14 +205,14 @@ fn reference_usac_loudness_targets() {
             .output().unwrap();
         assert!(reference.status.success(), "FFmpeg: {}", String::from_utf8_lossy(&reference.stderr));
         let ff: Vec<_> = reference.stdout.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
-        let &(_, initial_skip, final_padding) = check_aac::USAC_SAMPLES.iter().find(|s| s.0 == rel).unwrap();
+        let &(_, initial_skip, final_padding, _) = check_aac::USAC_SAMPLES.iter().find(|s| s.0 == rel).unwrap();
         let start = initial_skip * channels as usize;
         let tail = final_padding * channels as usize;
         assert_eq!(ours.len(), ff.len() + start + tail, "{rel}: target {target} raw length");
         let presented = &ours[start..ours.len() - tail];
         let snr = refcheck::snr_db(&ff, presented, 0);
         eprintln!("{rel}: target {target}, SNR {snr:.6} dB");
-        assert!(snr >= 90.0, "{rel}: target {target} SNR {snr:.6} dB");
+        assert!(snr >= floor, "{rel}: target {target} SNR {snr:.6} dB below floor {floor} dB");
         // xHE's S16 FATE reference retains 128/ch padding, but not the
         // whole final AU that is outside the edit-list presentation.
         let fate_pcm = if rel.ends_with("xhe_target_level.m4a") {
