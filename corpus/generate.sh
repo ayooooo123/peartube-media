@@ -127,6 +127,9 @@ run -f lavfi -i "sine=frequency=440:sample_rate=8000" "${DUR[@]}" -c:a pcm_mulaw
 run "${A_IN[@]}" "${DUR[@]}" -c:a pcm_s16le "$CORPUS_DIR/audio_lpcm.wav"
 run -f lavfi -i "sine=frequency=440:sample_rate=44100" "${DUR[@]}" -c:a adpcm_ms "$CORPUS_DIR/audio_adpcm.wav"
 run "${A_IN[@]}" "${DUR[@]}" -c:a libmp3lame -b:a 128k "$CORPUS_DIR/audio.mp3"
+# Genuine WMV1/WMA1, rather than attributing the WMV2/WMA2 FATE clip to both.
+run "${V_IN[@]}" "${A_IN[@]}" "${DUR[@]}" -c:v wmv1 -q:v 10 -c:a wmav1 -b:a 128k \
+  "$CORPUS_DIR/wmv1_wma1.asf"
 run "${V_IN[@]}" "${DUR[@]}" -c:v mjpeg -pix_fmt yuvj420p -q:v 6 "$CORPUS_DIR/video_mjpeg.avi"
 run "${V_IN[@]}" "${DUR[@]}" -c:v mpeg4 -pix_fmt yuv420p -q:v 6 "$CORPUS_DIR/video_mpeg4.avi"
 run "${V_IN[@]}" "${DUR[@]}" -c:v mpeg4 -pix_fmt yuv420p -q:v 6 -vtag XVID "$CORPUS_DIR/mpeg4_xvid.avi"
