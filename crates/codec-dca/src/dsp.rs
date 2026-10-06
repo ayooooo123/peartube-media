@@ -724,62 +724,49 @@ pub fn dmix_scale_inv(dst: &mut [i32], scale_inv: i32, len: usize) {
     }
 }
 
-fn filter0(dst: &mut [i32], src: &[i32], coeff: i32, len: usize) {
-    for i in 0..len {
-        dst[i] = dst[i].wrapping_sub(mul22(src[i], coeff));
-    }
-}
-
 /// `assemble_freq_bands_c`. `src0`/`src1` are the history-extended band
 /// buffers: `DCA_XLL_DECI_HISTORY_MAX` (8) history samples before a
-/// `len`-sample window, so each slice is `8 + len` long and windows are
-/// taken at `offset = 8 - i .. 8 - i + len`. `dst` receives `2 * len`
-/// interleaved samples.
+/// `len`-sample window, so each slice is `8 + len` long.
+/// `dst` receives `2 * len` interleaved samples.
 pub fn assemble_freq_bands(dst: &mut [i32], src0: &mut [i32], src1: &mut [i32], coeff: &[i32], len: usize) {
-    {
-        let s1 = src1.to_vec();
-        filter0(&mut src0[..len], &s1[..len], coeff[0], len);
+    for k in 0..len {
+        src0[8 + k] = src0[8 + k].wrapping_sub(mul22(src1[8 + k], coeff[0]));
     }
-    {
-        let s0 = src0.to_vec();
-        filter0(&mut src1[..len], &s0[..len], coeff[1], len);
+    for k in 0..len {
+        src1[8 + k] = src1[8 + k].wrapping_sub(mul22(src0[8 + k], coeff[1]));
     }
-    {
-        let s1 = src1.to_vec();
-        filter0(&mut src0[..len], &s1[..len], coeff[2], len);
+    for k in 0..len {
+        src0[8 + k] = src0[8 + k].wrapping_sub(mul22(src1[8 + k], coeff[2]));
     }
-    {
-        let s0 = src0.to_vec();
-        filter0(&mut src1[..len], &s0[..len], coeff[3], len);
+    for k in 0..len {
+        src1[8 + k] = src1[8 + k].wrapping_sub(mul22(src0[8 + k], coeff[3]));
     }
 
-    // `i++, src0--`: pass i reads src0 at base 8 - i (over the history),
-    // src1 stays at base 8. Both filters index [0..len) from their bases.
+    // `for (i = 0; i < 8; i++, src0--)`:
+    // Pass i accesses src0 at offset 8 - i and src1 at offset 8.
+    // Each step modifies the buffer in place for the subsequent steps.
     for i in 0..8usize {
         let b0 = 8 - i;
         let b1 = 8;
-        let s0 = src0.to_vec();
-        let s1 = src1.to_vec();
-        filter1_sh(&mut src0[b0..b0 + len], &s1[b1..b1 + len], coeff[i + 4], len);
-        filter1_sh(&mut src1[b1..b1 + len], &s0[b0..b0 + len], coeff[i + 12], len);
-        filter1_sh(&mut src0[b0..b0 + len], &s1[b1..b1 + len], coeff[i + 4], len);
+        for k in 0..len {
+            src0[b0 + k] = src0[b0 + k].wrapping_sub(mul23(src1[b1 + k], coeff[i + 4]));
+        }
+        for k in 0..len {
+            src1[b1 + k] = src1[b1 + k].wrapping_sub(mul23(src0[b0 + k], coeff[i + 12]));
+        }
+        for k in 0..len {
+            src0[b0 + k] = src0[b0 + k].wrapping_sub(mul23(src1[b1 + k], coeff[i + 4]));
+        }
     }
 
-    // Final read: after the loop src0's base sits at 0 (history start) and
-    // src1's at 8. `*dst++ = *src1++` reads src1[8+n]; `*dst++ = *++src0`
-    // (pre-increment from base 0) reads src0[1+n].
+    // After loop, src0 was decremented 8 times to index 0.
+    // `*dst++ = *src1++`: reads src1[8 + n]
+    // `*dst++ = *++src0`: reads src0[1 + n]
     let mut dpos = 0usize;
     for n in 0..len {
         dst[dpos] = src1[8 + n];
         dst[dpos + 1] = src0[1 + n];
         dpos += 2;
-    }
-}
-
-/// `filter1` with an already-shifted source window.
-fn filter1_sh(dst: &mut [i32], src: &[i32], coeff: i32, len: usize) {
-    for i in 0..len {
-        dst[i] = dst[i].wrapping_sub(mul23(src[i], coeff));
     }
 }
 

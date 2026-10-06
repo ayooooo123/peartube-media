@@ -222,6 +222,7 @@ impl DcaDecoder {
 
                 // Set 'residual ok' flag for the next frame
                 self.packet |= pkt::DCA_PACKET_RESIDUAL;
+                self.core.packet = self.packet;
             }
 
             let mut buffers = self.xll_buffers.take().unwrap_or_default();

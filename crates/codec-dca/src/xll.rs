@@ -633,6 +633,7 @@ impl XllDecoder {
     // ───────────── band data ─────────────
 
     fn chs_parse_band_data(&mut self, gb: &mut BitReader, c: usize, band: usize, seg: usize, band_data_end: usize, bufs: &mut ChsBuffers) -> XllResult<()> {
+        let band_off = band * self.chset[c].nchannels;
         let seg_common;
         // Start unpacking MSB portion of the segment
         if seg == 0 || gb.get_bits(1) == 0 {
@@ -708,7 +709,7 @@ impl XllDecoder {
             }
 
             let nseg = self.nsegsamples;
-            let msb = &mut bufs.msb[i];
+            let msb = &mut bufs.msb[band_off + i];
             let msb_off = seg * nseg;
 
             if !self.chset[c].rice_code_flag_get(k) {
@@ -788,7 +789,7 @@ impl XllDecoder {
             // Unpack all LSB parts of residuals of this segment
             for i in 0..self.chset[c].nchannels {
                 if self.chset[c].bands[band].nscalablelsbs[i] != 0 {
-                    if let Some(lsb) = bufs.lsb[i].as_mut() {
+                    if let Some(lsb) = bufs.lsb[band_off + i].as_mut() {
                         let nseg = self.nsegsamples;
                         let off = seg * nseg;
                         for v in lsb[off..off + nseg].iter_mut() {
@@ -822,6 +823,7 @@ impl XllDecoder {
 
     fn chs_filter_band_data(&mut self, c: usize, band: usize, bufs: &mut ChsBuffers) {
         let nsamples = self.nframesamples;
+        let band_off = band * self.chset[c].nchannels;
 
         // Inverse adaptive or fixed prediction
         for i in 0..self.chset[c].nchannels {
@@ -843,15 +845,15 @@ impl XllDecoder {
                 for j in 0..nsamples - order {
                     let mut err: i64 = 0;
                     for k in 0..order {
-                        err += i64::from(bufs.msb[i][j + k]) * i64::from(coeff[order - k - 1]);
+                        err += i64::from(bufs.msb[band_off + i][j + k]) * i64::from(coeff[order - k - 1]);
                     }
-                    bufs.msb[i][j + order] = bufs.msb[i][j + order].wrapping_sub(clip23(norm16(err)));
+                    bufs.msb[band_off + i][j + order] = bufs.msb[band_off + i][j + order].wrapping_sub(clip23(norm16(err)));
                 }
             } else {
                 // Inverse fixed coefficient prediction
                 for _j in 0..self.chset[c].bands[band].fixed_pred_order[i] {
                     for k in 1..nsamples {
-                        bufs.msb[i][k] = bufs.msb[i][k].wrapping_add(bufs.msb[i][k - 1]);
+                        bufs.msb[band_off + i][k] = bufs.msb[band_off + i][k].wrapping_add(bufs.msb[band_off + i][k - 1]);
                     }
                 }
             }
@@ -863,16 +865,16 @@ impl XllDecoder {
                 let coeff = self.chset[c].bands[band].decor_coeff[i];
                 if coeff != 0 {
                     // decor(dst, src, coeff): dst[i] += (src[i]*coeff + 4) >> 3
-                    let src: Vec<i32> = bufs.msb[i * 2].to_vec();
-                    dsp::decor(&mut bufs.msb[i * 2 + 1], &src, coeff, nsamples);
+                    let src: Vec<i32> = bufs.msb[band_off + i * 2].to_vec();
+                    dsp::decor(&mut bufs.msb[band_off + i * 2 + 1], &src, coeff, nsamples);
                 }
             }
 
             // Reorder channel buffers to the original order (pointer swap
             // in C; here swap the Vecs).
-            let mut tmp: Vec<Vec<i32>> = (0..self.chset[c].nchannels).map(|i| std::mem::take(&mut bufs.msb[i])).collect();
+            let mut tmp: Vec<Vec<i32>> = (0..self.chset[c].nchannels).map(|i| std::mem::take(&mut bufs.msb[band_off + i])).collect();
             for i in 0..self.chset[c].nchannels {
-                bufs.msb[self.chset[c].bands[band].orig_order[i]] = std::mem::take(&mut tmp[i]);
+                bufs.msb[band_off + self.chset[c].bands[band].orig_order[i]] = std::mem::take(&mut tmp[i]);
             }
         }
 
@@ -880,7 +882,7 @@ impl XllDecoder {
         if self.chset[c].nfreqbands == 1 {
             for i in 0..self.chset[c].nchannels {
                 let spkr = self.chset[c].ch_remap[i];
-                self.output_samples[spkr] = bufs.msb[i].clone();
+                self.output_samples[spkr] = bufs.msb[band_off + i].clone();
             }
         }
     }
@@ -902,20 +904,21 @@ impl XllDecoder {
 
     fn chs_assemble_msbs_lsbs(&mut self, c: usize, band: usize, bufs: &mut ChsBuffers) {
         let nsamples = self.nframesamples;
+        let band_off = band * self.chset[c].nchannels;
 
         for ch in 0..self.chset[c].nchannels {
             let shift = self.chs_get_lsb_width(c, band, ch);
             if shift != 0 {
                 if self.chset[c].bands[band].nscalablelsbs[ch] != 0 {
                     let adj = self.chset[c].bands[band].bit_width_adjust[ch];
-                    if let Some(lsb) = bufs.lsb[ch].as_mut() {
+                    if let Some(lsb) = bufs.lsb[band_off + ch].as_mut() {
                         for n in 0..nsamples {
-                            bufs.msb[ch][n] = (bufs.msb[ch][n] as i64 * (1i64 << shift) + ((lsb[n] as i64) << adj)) as i32;
+                            bufs.msb[band_off + ch][n] = (bufs.msb[band_off + ch][n] as i64 * (1i64 << shift) + ((lsb[n] as i64) << adj)) as i32;
                         }
                     }
                 } else {
                     for n in 0..nsamples {
-                        bufs.msb[ch][n] = (bufs.msb[ch][n] as i64 * (1i64 << shift)) as i32;
+                        bufs.msb[band_off + ch][n] = (bufs.msb[band_off + ch][n] as i64 * (1i64 << shift)) as i32;
                     }
                 }
             }
