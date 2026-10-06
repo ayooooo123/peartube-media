@@ -42,6 +42,27 @@ let state = player.state(); // position, duration, playing, buffering, ended, er
 
 OxideAV crates are used at pinned git revisions; their crates.io releases lag their repositories. When a crate needs a fix, it is forked to `ayooooo123/oxideav-<name>` and `[patch.crates-io]` points the whole dependency graph at the fork. Fixes go upstream where OxideAV's clean-room rule allows.
 
+### Matroska packet compatibility
+
+The MKV fork follows nested SeekHeads, recovers complete packets from damaged
+Cluster tails, reconstructs ProRes/WavPack payloads, and derives lace timing,
+TrackTimestampScale and H.264/HEVC decode timestamps. H.264 startup analysis is
+bounded to 512 KiB of queued payload plus the current Block.
+
+Matroska/WebM WebVTT packets carry raw cue text to the registered subtitle
+adapter, which uses the packet timestamps rather than requiring an in-band
+WebVTT timing line. The typed `MkvDemuxer::webvtt_metadata()` accessor preserves
+each cue's identifier/settings across lacing and seeks. **The generic
+`Demuxer`/`Packet` path does not transport these settings**, so player cue text
+and timing work but WebVTT settings/layout are not yet end-to-end compatible.
+
+`cargo test -p check-mkv -p player --no-fail-fast` compares packet fields
+directly with FFmpeg 9, checks incremental reads and malformed input, and
+exercises player subtitle dispatch. Known-wrong packet digests are not accepted:
+outstanding CodecDelay timestamp differences remain failing assertions until
+the separate AudioTrim work supplies the missing behavior.
+
+
 ## Licenses
 
 Code in this repository is MIT unless a crate says otherwise. Decoders with no public specification (TrueHD/MLP, several Windows Media and RealMedia codecs) are ports of FFmpeg's LGPL-2.1-or-later decoders; each such crate is LGPL-2.1-or-later, carries its own LICENSE, and ports only FFmpeg files whose headers say LGPL.
