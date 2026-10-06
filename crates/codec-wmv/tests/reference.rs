@@ -1,7 +1,7 @@
 mod common;
 
 use common::encoded_sample;
-use oxideav_core::RuntimeContext;
+use oxideav_core::{CodecTag, RuntimeContext};
 use refcheck::fate;
 use std::fs::File;
 
@@ -11,11 +11,22 @@ fn test_registration() {
     codec_wmv::register(&mut ctx);
 
     // Verify all registered codec IDs
-    assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("wmv1")));
-    assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("wmv2")));
-    assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("msmpeg4v1")));
-    assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("msmpeg4v2")));
-    assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new("msmpeg4v3")));
+    for id in ["wmv1", "wmv2", "wmv3", "vc1", "msmpeg4v1", "msmpeg4v2", "msmpeg4v3"] {
+        assert!(ctx.codecs.has_decoder(&oxideav_core::CodecId::new(id)), "{id}");
+    }
+
+    // The container tags FFmpeg maps to WMV3 / VC-1 (riff.c, isom.c).
+    let tags: Vec<(String, String)> =
+        ctx.codecs.all_tag_registrations().map(|(t, id)| (format!("{t:?}"), id.as_str().to_string())).collect();
+    for (tag, id) in [
+        (CodecTag::fourcc(b"WMV3"), "wmv3"),
+        (CodecTag::fourcc(b"WVC1"), "vc1"),
+        (CodecTag::fourcc(b"WMVA"), "vc1"),
+        (CodecTag::fourcc(b"vc-1"), "vc1"),
+        (CodecTag::mp4_object_type(0xA3), "vc1"),
+    ] {
+        assert!(tags.contains(&(format!("{tag:?}"), id.to_string())), "{tag:?} -> {id}");
+    }
 
     // Verify container registrations
     assert_eq!(ctx.containers.container_for_extension("rcv"), Some("vc1test"));
@@ -230,6 +241,66 @@ fn msmpeg4v1_mpg4_avi_matches_ffmpeg() {
 #[test]
 fn msmpeg4v3_asf_matches_ffmpeg() {
     check_video("asf/bug821-2.asf", &[codec_wmv::register, demux_asf::register], &["-idct", "simple"]);
+}
+
+/// WMV3 Main profile I/P/B pictures in RCV: `fate-vc1test_smm0005`.
+#[test]
+fn vc1test_smm0005_matches_ffmpeg() {
+    check_video("vc1/SMM0005.rcv", &[codec_wmv::register], &["-idct", "simple"]);
+}
+
+/// WMV3 Main profile I/P pictures, PAL size: `fate-vc1test_smm0015`.
+#[test]
+fn vc1test_smm0015_matches_ffmpeg() {
+    check_video("vc1/SMM0015.rcv", &[codec_wmv::register], &["-idct", "simple"]);
+}
+
+/// VC-1 Advanced profile, progressive I/P, QCIF: `fate-vc1_sa00040`.
+#[test]
+fn vc1_sa00040_matches_ffmpeg() {
+    check_video("vc1/SA00040.vc1", &[codec_wmv::register], &["-idct", "simple"]);
+}
+
+/// VC-1 Advanced profile, progressive I/P: `fate-vc1_sa00050`.
+#[test]
+fn vc1_sa00050_matches_ffmpeg() {
+    check_video("vc1/SA00050.vc1", &[codec_wmv::register], &["-idct", "simple"]);
+}
+
+/// VC-1 Advanced profile level 1, progressive I/P in slices: `fate-vc1_sa10091`.
+#[test]
+fn vc1_sa10091_matches_ffmpeg() {
+    check_video("vc1/SA10091.vc1", &[codec_wmv::register], &["-idct", "simple"]);
+}
+
+/// VC-1 Advanced profile, interlaced field pictures (P/B): `fate-vc1_sa10143`.
+#[test]
+fn vc1_sa10143_matches_ffmpeg() {
+    check_video("vc1/SA10143.vc1", &[codec_wmv::register], &["-idct", "simple"]);
+}
+
+/// VC-1 Advanced profile level 2, 704x480 I/P in slices: `fate-vc1_sa20021`.
+#[test]
+fn vc1_sa20021_matches_ffmpeg() {
+    check_video("vc1/SA20021.vc1", &[codec_wmv::register], &["-idct", "simple"]);
+}
+
+/// VC-1 Advanced profile, 1080i: interlaced frame pictures with 2MV/4MV
+/// field motion, and field pictures: `fate-vc1_ilaced_twomv`.
+#[test]
+fn vc1_ilaced_twomv_matches_ffmpeg() {
+    check_video("vc1/ilaced_twomv.vc1", &[codec_wmv::register], &["-idct", "simple", "-flags", "+bitexact"]);
+}
+
+/// VC-1 in a Smooth Streaming (fragmented MP4) file, 'vc-1' sample entry
+/// with a `dvc1` sequence header: `fate-vc1-ism`.
+#[test]
+fn vc1_ism_matches_ffmpeg() {
+    check_video(
+        "isom/vc1-wmapro.ism",
+        &[codec_wmv::register, oxideav_mp4::__oxideav_entry, oxideav_mov::registry::register],
+        &["-idct", "simple"],
+    );
 }
 
 /// WMV1, CIF, fixed quantiser (`fate-vsynth*-wmv1` settings).

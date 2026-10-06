@@ -164,9 +164,9 @@ fn idct_row_cond_dc(row: &mut [i16]) {
     row[4] = (a3.wrapping_sub(b3) >> ROW_SHIFT) as i16;
 }
 
-/// `IDCT_COLS` of the template: returns the eight column outputs (before
+/// `IDCT_COLS` of the template: returns the eight column outputs (after
 /// the final shift), in output row order.
-fn idct_cols(b: &[i16; 64], c: usize) -> [i32; 8] {
+fn idct_cols(b: &[i16], c: usize) -> [i32; 8] {
     let col = |r: usize| b[8 * r + c] as i32;
     let mut a0 = m(W4, col(0).wrapping_add((1 << (COL_SHIFT - 1)) / W4));
     let mut a1 = a0;
@@ -258,7 +258,7 @@ const R3: i32 = 23170;
 const R_SHIFT: u32 = 11;
 
 /// `idct4col_add`.
-fn idct4col_add(dest: &mut [u8], off: usize, stride: usize, b: &[i16; 64], c: usize) {
+fn idct4col_add(dest: &mut [u8], off: usize, stride: usize, b: &[i16], c: usize) {
     let a0 = b[c] as i32;
     let a1 = b[8 + c] as i32;
     let a2 = b[16 + c] as i32;
@@ -296,8 +296,9 @@ fn idct4row(row: &mut [i16]) {
     row[3] = ((c0.wrapping_sub(c1) as u32) >> R_SHIFT) as i16;
 }
 
-/// `ff_simple_idct84_add`: 8 wide, 4 tall (coefficients in rows 0..4).
-pub fn simple_idct84_add(dest: &mut [u8], off: usize, stride: usize, block: &mut [i16; 64]) {
+/// `ff_simple_idct84_add`: 8 wide, 4 tall (coefficients in rows 0..4 of
+/// the 8-stride `block`).
+pub fn simple_idct84_add(dest: &mut [u8], off: usize, stride: usize, block: &mut [i16]) {
     for r in 0..4 {
         idct_row_cond_dc(&mut block[8 * r..8 * r + 8]);
     }
@@ -306,16 +307,40 @@ pub fn simple_idct84_add(dest: &mut [u8], off: usize, stride: usize, block: &mut
     }
 }
 
-/// `ff_simple_idct48_add`: 4 wide, 8 tall (coefficients in columns 0..4).
-pub fn simple_idct48_add(dest: &mut [u8], off: usize, stride: usize, block: &mut [i16; 64]) {
+/// `ff_simple_idct48_add`: 4 wide, 8 tall (coefficients in columns 0..4 of
+/// the 8-stride `block`).
+pub fn simple_idct48_add(dest: &mut [u8], off: usize, stride: usize, block: &mut [i16]) {
     for r in 0..8 {
-        idct4row(&mut block[8 * r..8 * r + 8]);
+        idct4row(&mut block[8 * r..8 * r + 4]);
     }
     for c in 0..4 {
         let v = idct_cols(block, c);
         for (r, &x) in v.iter().enumerate() {
             let d = &mut dest[off + r * stride + c];
             *d = clip_u8((*d as i32).wrapping_add(x));
+        }
+    }
+}
+
+/// `ff_simple_idct44_add`.
+pub fn simple_idct44_add(dest: &mut [u8], off: usize, stride: usize, block: &mut [i16]) {
+    for r in 0..4 {
+        idct4row(&mut block[8 * r..8 * r + 4]);
+    }
+    for c in 0..4 {
+        idct4col_add(dest, off, stride, block, c);
+    }
+}
+
+/// `ff_simple_idct_int16_8bit`: in-place 8x8 transform (`idctSparseCol`).
+pub fn simple_idct_inplace(block: &mut [i16; 64]) {
+    for r in 0..8 {
+        idct_row_cond_dc(&mut block[8 * r..8 * r + 8]);
+    }
+    for c in 0..8 {
+        let v = idct_cols(block, c);
+        for (r, &x) in v.iter().enumerate() {
+            block[8 * r + c] = x as i16;
         }
     }
 }

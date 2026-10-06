@@ -151,6 +151,8 @@ dependencies = [
  "demux-asf",
  "oxideav-avi",
  "oxideav-core",
+ "oxideav-mov",
+ "oxideav-mp4",
  "refcheck",
 ]
 
