@@ -231,16 +231,6 @@ fn lossy_suite_sample(name: &str) {
         panic!("{name}: NaN samples ours={nan_ours} ref={nan_ref}");
     }
     let snr = refcheck::snr_db(&reference, &ours, 1024);
-    if std::env::var("DCA_PERCH").is_ok() {
-        for c in 0..6 {
-            let rc: Vec<f32> = reference.chunks_exact(6).map(|w| w[c]).collect();
-            let oc: Vec<f32> = ours.chunks_exact(6).map(|w| w[c]).collect();
-            let nn = rc.len().min(oc.len());
-            let sc: f64 = rc[..nn].iter().map(|v| (*v as f64) * (*v as f64)).sum();
-            let nc: f64 = rc[..nn].iter().zip(oc[..nn].iter()).map(|(a, b)| ((*a - *b) as f64).powi(2)).sum();
-            eprintln!("{name} ch{c}: SNR {:.2}", if nc > 0.0 { 10.0 * (sc / nc).log10() } else { 999.0 });
-        }
-    }
     assert!(
         snr >= 90.0,
         "{name}: SNR {snr:.2} dB < 90 dB vs FFmpeg (len {} vs {})",
