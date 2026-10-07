@@ -356,6 +356,15 @@ fn overlapping_text_cues_stay_bounded_beside_1080p_video() {
 /// one at a time.
 static GATE_TESTS: Mutex<()> = Mutex::new(());
 
+/// Sets its flag when dropped, also while a panic unwinds.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Subtitle selections made while the Player opens never cost the audio
 /// track chosen by default, and an explicit audio choice made then stands.
 /// Held cases: the selections are made while the demuxer is held inside its
@@ -419,14 +428,18 @@ fn subtitle_selections_while_opening_keep_the_audio_choice() {
                     break;
                 }
             });
+            // The selections stop however this closure ends: a failed wait
+            // below must not leave the scope joining them forever.
+            let _stop = SetOnDrop(&published);
             // The selections run before the Player reads its selection and
             // go on until it has published its tracks.
+            let begun = Instant::now();
             while !selecting.load(Ordering::SeqCst) {
+                assert!(begun.elapsed() < Duration::from_secs(10), "{what}: the selections never started");
                 std::thread::yield_now();
             }
             scripted::release();
             wait_until(&player, Duration::from_secs(10), &format!("{what}: the tracks"), |state| !state.tracks.is_empty());
-            published.store(true, Ordering::SeqCst);
         });
         settled(&player, &backend, &what, explicit);
         drop(player);
