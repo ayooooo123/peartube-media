@@ -27,7 +27,9 @@ mod demuxer;
 pub use demuxer::register_containers;
 
 use crate::decoder::DcaDecoder;
-use oxideav_core::{AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, Decoder, Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, SampleFormat};
+use crate::demuxer::{FrameSplitter, Oversized};
+use oxideav_core::{AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, Decoder, Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, SampleFormat, TimeBase};
+use std::collections::VecDeque;
 
 /// OxideAV's DTS codec id — every demuxer already maps DTS tags to it, so
 /// registering under the same id with a lower priority makes this decoder
@@ -110,8 +112,112 @@ pub struct DcaDecoderImpl {
     emitted: u64,
     /// Absolute decoded-sample position (trim window reference).
     decoded: u64,
+    /// Frames cut from the packets so far, and their timing.
+    stream: FrameStream,
+    /// The packets' time base, which decoded frames are timed in.
+    time_base: TimeBase,
     /// Decoded frames not yet received.
-    ready: std::collections::VecDeque<Frame>,
+    ready: VecDeque<Frame>,
+}
+
+/// AV_PARSER_PTS_NB: the packets whose timestamps FFmpeg's parser keeps.
+const PTS_NB: usize = 4;
+
+/// The dca parser stage FFmpeg runs between its demuxers and the decoder,
+/// which a demuxer's packets reach here instead (an MPEG-TS PES may hold
+/// several frames, or part of one): frames cut from the packets' bytes as
+/// they arrive. A frame takes the PTS of the packet its first byte arrived
+/// in when no earlier frame started there (ff_fetch_timestamp), else it
+/// follows the frame before it by that frame's duration, as libavformat
+/// times parsed packets.
+#[derive(Default)]
+struct FrameStream {
+    split: FrameSplitter,
+    /// Stream offset of the next input byte.
+    fed: u64,
+    /// Where the last packets started, and their PTS: those that started
+    /// after the current frame's first byte, at most [`PTS_NB`].
+    packets: VecDeque<(u64, Option<i64>)>,
+    /// The frame in progress: where it starts and the PTS it takes from
+    /// its packet, fetched once its start is known.
+    current: Option<(u64, Option<i64>)>,
+    /// Where the timeline goes on after the last frame, when known.
+    next_pts: Option<i64>,
+    /// `dca_parse_params`'s LBR sampling rate code.
+    lbr_sr_code: Option<u8>,
+}
+
+impl FrameStream {
+    /// A packet's bytes start at the next input byte.
+    fn packet_starts(&mut self, pts: Option<i64>) {
+        if self.packets.len() == PTS_NB {
+            self.packets.pop_front();
+        }
+        self.packets.push_back((self.fed, pts));
+    }
+
+    /// The PTS of the last packet that started at or before `at`, if it
+    /// started after the previous frame's first byte.
+    fn fetch(&mut self, at: u64) -> Option<i64> {
+        let pts = self.packets.iter().rev().find(|&&(start, _)| start <= at).and_then(|&(_, pts)| pts);
+        self.packets.retain(|&(start, _)| start > at);
+        pts
+    }
+
+    /// Fetch the PTS of the frame in progress when its start is new.
+    fn note_start(&mut self) {
+        if self.current.is_none() {
+            if let Some(at) = self.split.frame_start() {
+                self.current = Some((at, self.fetch(at)));
+            }
+        }
+    }
+
+    /// The time of the frame cut at `at`: its packet's PTS, else the end
+    /// of the frame before it.
+    fn pts_of(&mut self, at: u64) -> Option<i64> {
+        let fetched = match self.current.take() {
+            Some((start, pts)) if start == at => pts,
+            _ => self.fetch(at),
+        };
+        fetched.or(self.next_pts)
+    }
+}
+
+/// What the frames decoded in one call came to: the call fails only when
+/// some frame failed and none decoded.
+#[derive(Default)]
+struct Outcome {
+    decoded: bool,
+    error: Option<&'static str>,
+}
+
+impl Outcome {
+    fn add(&mut self, result: Result<(), &'static str>) {
+        match result {
+            Ok(()) => self.decoded = true,
+            Err(e) => {
+                self.error.get_or_insert(e);
+            }
+        }
+    }
+
+    fn result(self) -> CoreResult<()> {
+        match self.error {
+            Some(e) if !self.decoded => Err(CoreError::InvalidData(format!("dca: {e}"))),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// `samples` at `rate` in ticks of `tb`, rounded down as libavformat
+/// rounds parsed packet durations; `None` without a rate or time base.
+fn ticks(samples: u64, rate: u32, tb: TimeBase) -> Option<i64> {
+    let den = u128::from(rate) * u128::try_from(tb.num()).ok()?;
+    if den == 0 {
+        return None;
+    }
+    i64::try_from(u128::from(samples) * u128::try_from(tb.den()).ok()? / den).ok()
 }
 
 impl DcaDecoderImpl {
@@ -126,7 +232,9 @@ impl DcaDecoderImpl {
             keep,
             emitted: 0,
             decoded: 0,
-            ready: std::collections::VecDeque::new(),
+            stream: FrameStream::default(),
+            time_base: TimeBase::new(1, 1),
+            ready: VecDeque::new(),
         }
     }
 
@@ -157,36 +265,25 @@ impl Decoder for DcaDecoderImpl {
         &self.codec_id
     }
 
-    /// A packet can carry several frames (an MPEG-TS PES does); FFmpeg's
-    /// dca parser cuts them apart before its decoder sees them, so each is
-    /// decoded here in turn, the later ones timed after the earlier.
+    /// Packets are cut into frames as FFmpeg's dca parser cuts the stream
+    /// they make up, whether a packet holds several frames (an MPEG-TS PES
+    /// can) or a frame spans packets; a frame is decoded once the next one
+    /// starts, or at the end of the input.
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
-        let mut pts = packet.pts;
-        let mut first_error = None;
-        let mut decoded_any = false;
-        for frame in demuxer::split_frames(&packet.data) {
-            match self.inner.decode_packet(frame, pts) {
-                Ok(_) => {
-                    decoded_any = true;
-                    let Some(pending) = self.inner.pending.take() else { continue };
-                    let (rate, samples) = (pending.sample_rate, pending_samples(&pending));
-                    if let Some(frame) = self.convert(pending) {
-                        self.ready.push_back(frame);
-                    }
-                    // samples at `rate` in the packet's time base
-                    let tb = packet.time_base;
-                    pts = pts.zip(i64::try_from(u128::from(samples) * tb.den() as u128 / (tb.num().max(1) as u128 * u128::from(rate.max(1)))).ok())
-                        .map(|(p, d)| p + d);
-                }
-                Err(e) => {
-                    first_error.get_or_insert(e);
-                }
-            }
+        self.time_base = packet.time_base;
+        if !packet.data.is_empty() {
+            self.stream.packet_starts(packet.pts);
         }
-        match first_error {
-            Some(e) if !decoded_any => Err(CoreError::InvalidData(format!("dca: {e}"))),
-            _ => Ok(()),
+        let mut outcome = Outcome::default();
+        let mut rest = &packet.data[..];
+        while !rest.is_empty() {
+            let n = rest.len().min(self.stream.split.room());
+            self.stream.split.push(&rest[..n]);
+            self.stream.fed += n as u64;
+            rest = &rest[n..];
+            self.decode_complete_frames(&mut outcome);
         }
+        outcome.result()
     }
 
     fn receive_frame(&mut self) -> CoreResult<Frame> {
@@ -197,14 +294,33 @@ impl Decoder for DcaDecoderImpl {
         self.audio_format()
     }
 
+    /// The end of the input: the frame still held is decoded. Input that
+    /// never started a frame since the last one is an error.
     fn flush(&mut self) -> CoreResult<()> {
+        let mut outcome = Outcome::default();
+        let skipped = self.stream.split.skipped();
+        match self.stream.split.finish() {
+            Some((at, frame)) => {
+                let pts = self.stream.pts_of(at);
+                outcome.add(self.decode_frame(&frame, pts));
+            }
+            None if skipped => outcome.add(Err("no frame starts in the input")),
+            None => {}
+        }
+        self.stream = FrameStream::default();
         self.inner.flush();
-        Ok(())
+        outcome.result()
     }
 
+    /// Forget the frame in progress, its timing and the decoded state: the
+    /// next packet decodes as the first one would.
     fn reset(&mut self) -> CoreResult<()> {
         self.ready.clear();
-        self.flush()
+        self.stream = FrameStream::default();
+        self.decoded = 0;
+        self.emitted = 0;
+        self.inner.flush();
+        Ok(())
     }
 }
 
@@ -217,6 +333,54 @@ fn pending_samples(frame: &decoder::PendingFrame) -> u64 {
 }
 
 impl DcaDecoderImpl {
+    /// Decode every frame the input so far completes.
+    fn decode_complete_frames(&mut self, outcome: &mut Outcome) {
+        loop {
+            match self.stream.split.next_frame() {
+                Ok(Some((at, frame))) => {
+                    let pts = self.stream.pts_of(at);
+                    outcome.add(self.decode_frame(&frame, pts));
+                }
+                Ok(None) => {
+                    self.stream.note_start();
+                    return;
+                }
+                Err(Oversized { at, head }) => {
+                    // Not decodable, but timed like any other frame: the
+                    // next one follows it when its header tells how long
+                    // it lasts.
+                    let pts = self.stream.pts_of(at);
+                    let tb = self.time_base;
+                    let duration = demuxer::parse_params(&head, &mut self.stream.lbr_sr_code)
+                        .and_then(|(samples, rate)| ticks(samples, rate, tb));
+                    self.stream.next_pts = pts.zip(duration).map(|(p, d)| p.saturating_add(d));
+                    outcome.add(Err("frame longer than the decoder takes"));
+                }
+            }
+        }
+    }
+
+    /// Decode one frame presented at `pts`. The frame after it follows by
+    /// its duration whether or not it decodes: the parsed one, as FFmpeg's
+    /// parser reports it, else the decoded one; with neither, the next
+    /// frame's time is unknown.
+    fn decode_frame(&mut self, frame: &[u8], pts: Option<i64>) -> Result<(), &'static str> {
+        let tb = self.time_base;
+        let mut duration = demuxer::parse_params(frame, &mut self.stream.lbr_sr_code)
+            .and_then(|(samples, rate)| ticks(samples, rate, tb));
+        let result = self.inner.decode_packet(frame, pts);
+        if result.is_ok() {
+            if let Some(pending) = self.inner.pending.take() {
+                duration = duration.or_else(|| ticks(pending_samples(&pending), pending.sample_rate, tb));
+                if let Some(frame) = self.convert(pending) {
+                    self.ready.push_back(frame);
+                }
+            }
+        }
+        self.stream.next_pts = pts.zip(duration).map(|(p, d)| p.saturating_add(d));
+        result.map(|_| ())
+    }
+
     /// One decoded frame in the decoder's output layout, trimmed to the
     /// dtshd sample window; `None` when nothing of it remains.
     fn convert(&mut self, frame: decoder::PendingFrame) -> Option<Frame> {

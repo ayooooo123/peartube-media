@@ -9,6 +9,7 @@
 use crate::bitreader::BitReader;
 use crate::data::{FF_DCA_FREQ_RANGES, FF_DCA_SAMPLE_RATES, FF_DCA_SAMPLING_FREQS};
 use crate::dca::{self, CoreFrameHeader, DCA_CORE_FRAME_HEADER_SIZE};
+use crate::decoder::MAX_PACKET_SIZE;
 use crate::exss::{ExssParser, exss_parse};
 use crate::lbr::{DCA_LBR_HEADER_DECODER_INIT, DCA_LBR_HEADER_SYNC_ONLY};
 use oxideav_core::{
@@ -342,25 +343,130 @@ impl ParseState {
     }
 }
 
-/// The frames one packet holds, cut where FFmpeg's dca parser would cut a
-/// stream made of it: an MPEG-TS PES can carry several frames, which
-/// FFmpeg's decoder only ever sees one at a time. Bytes ahead of the first
-/// frame are dropped as the parser's initial padding; the last frame runs
-/// to the end of the packet.
-pub(crate) fn split_frames(data: &[u8]) -> Vec<&[u8]> {
-    let mut pc = ParseState::default();
-    let mut frames = Vec::new();
-    let mut rest = data;
-    while let Some(end) = pc.find_frame_end(rest).filter(|&end| end > 0) {
-        let start = std::mem::take(&mut pc.startpos).min(end);
-        frames.push(&rest[start..end]);
-        rest = &rest[end..];
+/// Bytes of the next frame's marker read before the parser knows the
+/// frame ahead of it ended: a core marker is recognised on its sixth byte.
+const MARKER_TAIL: usize = 5;
+
+/// Input kept while no frame has started: a marker starts at most six
+/// bytes before the byte that completes it.
+const SCAN_TAIL: usize = 8;
+
+/// The most a [`FrameSplitter`] holds: the largest frame the decoder takes
+/// (a 16 KiB core and a 1 MiB extension substream), the start of the
+/// marker that would end it, and one byte to tell that it does not.
+const MAX_HELD: usize = MAX_PACKET_SIZE + MARKER_TAIL + 1;
+
+/// Of a dropped frame: the bytes kept to read its header from.
+const DROPPED_HEAD: usize = 4096;
+
+/// A frame that grew past what the decoder takes and was dropped: the
+/// stream offset of its first byte, and its first bytes, from which its
+/// header still tells its duration.
+pub(crate) struct Oversized {
+    pub(crate) at: u64,
+    pub(crate) head: Vec<u8>,
+}
+
+/// FFmpeg's dca parser over input that arrives in pieces: whole frames,
+/// cut where `dca_find_frame_end` cuts them, the bytes ahead of the first
+/// frame dropped as its initial padding and bytes between frames kept
+/// with the frame before them. It holds one frame in progress, never one
+/// longer than [`MAX_PACKET_SIZE`]: such a frame is an error, after which
+/// cutting resumes at the next marker.
+#[derive(Default)]
+pub(crate) struct FrameSplitter {
+    pc: ParseState,
+    /// The frame in progress, or input scanned before one starts.
+    pending: Vec<u8>,
+    /// Stream offset of `pending[0]`.
+    base: u64,
+    /// Input was dropped since the last frame for lack of a frame start.
+    skipped: bool,
+}
+
+impl FrameSplitter {
+    /// Bytes [`push`](Self::push) takes now; at least one after
+    /// [`next_frame`](Self::next_frame) returned `Ok(None)`.
+    pub(crate) fn room(&self) -> usize {
+        MAX_HELD.saturating_sub(self.pending.len())
     }
-    let start = pc.startpos.min(rest.len());
-    if start < rest.len() || frames.is_empty() {
-        frames.push(&rest[start..]);
+
+    /// Append input, at most [`room`](Self::room) bytes.
+    pub(crate) fn push(&mut self, data: &[u8]) {
+        debug_assert!(data.len() <= self.room());
+        self.pending.extend_from_slice(data);
     }
-    frames
+
+    /// The next complete frame, and the stream offset of its first byte;
+    /// `Ok(None)` until more input completes one.
+    pub(crate) fn next_frame(&mut self) -> std::result::Result<Option<(u64, Vec<u8>)>, Oversized> {
+        if let Some(end) = self.pc.find_frame_end(&self.pending) {
+            let start = std::mem::take(&mut self.pc.startpos).min(end);
+            let at = self.base + start as u64;
+            let len = end - start;
+            let frame = if len > MAX_PACKET_SIZE {
+                Err(Oversized { at, head: self.pending[start..start + DROPPED_HEAD].to_vec() })
+            } else {
+                Ok(Some((at, self.pending[start..end].to_vec())))
+            };
+            self.drop_front(end);
+            self.skipped = false;
+            return frame;
+        }
+        if self.pc.frame_start_found != 0 {
+            // Initial padding before the first frame.
+            let lead = std::mem::take(&mut self.pc.startpos).min(self.pending.len());
+            if lead > 0 {
+                self.drop_front(lead);
+                self.skipped = true;
+            }
+            if self.pending.len() > MAX_PACKET_SIZE + MARKER_TAIL {
+                // Not a frame the decoder takes, whatever ends it: start
+                // over on what may begin the next marker.
+                let dropped = Oversized { at: self.base, head: self.pending[..DROPPED_HEAD].to_vec() };
+                let keep = self.pending.split_off(self.pending.len() - SCAN_TAIL);
+                self.base += self.pending.len() as u64;
+                self.pending = keep;
+                self.pc = ParseState::default();
+                return Err(dropped);
+            }
+        } else if self.pending.len() > SCAN_TAIL {
+            let junk = self.pending.len() - SCAN_TAIL;
+            self.drop_front(junk);
+            self.pc.size -= junk;
+            self.skipped = true;
+        }
+        Ok(None)
+    }
+
+    /// The end of the input: the frame in progress, as FFmpeg's parser
+    /// flush hands it over, and the stream offset of its first byte.
+    /// Starts over afterwards.
+    pub(crate) fn finish(&mut self) -> Option<(u64, Vec<u8>)> {
+        let started = self.pc.frame_start_found != 0;
+        let start = self.pc.startpos.min(self.pending.len());
+        let frame = started.then(|| (self.base + start as u64, self.pending[start..].to_vec()));
+        *self = Self::default();
+        frame
+    }
+
+    /// The stream offset of the frame in progress, once its start is known.
+    pub(crate) fn frame_start(&self) -> Option<u64> {
+        (self.pc.frame_start_found != 0).then(|| self.base + self.pc.startpos as u64)
+    }
+
+    /// Whether input was dropped for lack of a frame start since the last
+    /// frame.
+    pub(crate) fn skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// Drop `n` scanned bytes from the front.
+    fn drop_front(&mut self, n: usize) {
+        self.pending.drain(..n);
+        self.base += n as u64;
+        self.pc.scanned = self.pc.scanned.saturating_sub(n);
+    }
 }
 
 // ───────────────────────── raw `dts` demuxer ─────────────────────────
@@ -371,9 +477,8 @@ pub(crate) fn split_frames(data: &[u8]) -> Vec<&[u8]> {
 pub struct RawDtsDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    pc: ParseState,
-    /// Bytes not yet consumed by the parser.
-    pending: Vec<u8>,
+    /// Frames cut from the input read so far.
+    split: FrameSplitter,
     /// Timestamps of the frames cut so far.
     clock: FrameClock,
     eof: bool,
@@ -425,35 +530,33 @@ impl RawDtsDemuxer {
             params,
         };
 
+        let mut split = FrameSplitter::default();
+        split.push(&head);
         Ok(Box::new(RawDtsDemuxer {
             input,
             streams: vec![stream],
-            pc: ParseState {
-                lastmarker: 0,
-                ..ParseState::default()
-            },
-            pending: head,
+            split,
             clock: FrameClock::default(),
             eof: false,
         }))
     }
 
-    fn read_more(&mut self) -> Result<usize> {
-        let mut buf = vec![0u8; RAW_PACKET_SIZE];
+    /// `ff_raw_read_partial_packet`: up to 1024 more bytes, as many as the
+    /// splitter takes.
+    fn read_more(&mut self) -> Result<()> {
+        let mut buf = [0u8; RAW_PACKET_SIZE];
+        let want = RAW_PACKET_SIZE.min(self.split.room());
         let mut filled = 0usize;
-        loop {
-            let n = self.input.read(&mut buf[filled..])?;
+        while filled < want {
+            let n = self.input.read(&mut buf[filled..want])?;
             if n == 0 {
                 self.eof = true;
                 break;
             }
             filled += n;
-            if filled == buf.len() {
-                break;
-            }
         }
-        self.pending.extend_from_slice(&buf[..filled]);
-        Ok(filled)
+        self.split.push(&buf[..filled]);
+        Ok(())
     }
 }
 
@@ -493,37 +596,25 @@ impl Demuxer for RawDtsDemuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
-            // Try to find a complete frame in `pending`.
-            let end = self.pc.find_frame_end(&self.pending);
-            if let Some(end) = end {
-                // Frame data is pending[..end]; skip initial padding.
-                self.pc.startpos = self.pc.startpos.min(end);
-                let start = self.pc.startpos;
-                self.pc.startpos = 0;
-                let frame = self.pending[start..end].to_vec();
-                self.pending.drain(..end);
-
-                if frame.len() < MIN_FRAME {
-                    continue;
+            match self.split.next_frame() {
+                Err(dropped) => {
+                    // Timed as FFmpeg times the oversized packet it would
+                    // return: the next frame follows it.
+                    self.clock.advance(&self.streams[0], &dropped.head);
+                    return Err(oversized());
                 }
-
-                return Ok(self.clock.packet(&self.streams[0], frame));
+                Ok(Some((_, frame))) if frame.len() < MIN_FRAME => continue,
+                Ok(Some((_, frame))) => return Ok(self.clock.packet(&self.streams[0], frame)),
+                Ok(None) => {}
             }
-
             if self.eof {
-                // Drain trailing frame if the parser holds one (FFmpeg
-                // flushes the parser at EOF; without it the tail frame is
-                // lost, so emit what remains when it looks like a frame).
-                if self.pending.len() > MIN_FRAME && self.pc.lastmarker != 0 {
-                    let start = self.pc.startpos.min(self.pending.len());
-                    let frame = self.pending.split_off(start);
-                    self.pending.clear();
-                    self.pc = ParseState::default();
-                    return Ok(self.clock.packet(&self.streams[0], frame));
-                }
-                return Err(Error::Eof);
+                // FFmpeg flushes the parser at the end of the input; the
+                // tail frame it holds comes out when it looks like one.
+                return match self.split.finish() {
+                    Some((_, frame)) if frame.len() > MIN_FRAME => Ok(self.clock.packet(&self.streams[0], frame)),
+                    _ => Err(Error::Eof),
+                };
             }
-
             self.read_more()?;
         }
     }
@@ -539,12 +630,16 @@ impl Demuxer for RawDtsDemuxer {
 
 const MIN_FRAME: usize = 16;
 
+fn oversized() -> Error {
+    Error::invalid(format!("dts: frame longer than the {MAX_PACKET_SIZE} bytes the decoder takes"))
+}
+
 /// `dca_parse_params` (dca_parser.c): a frame's duration in samples at its
 /// own rate, and that rate — from the core frame header, or for a frame
 /// that starts with an extension substream, from its LBR or XLL asset.
 /// `lbr_sr_code` is the parser context's `sr_code`: an LBR sync-only
 /// header reuses the rate of the last decoder-init header.
-fn parse_params(frame: &[u8], lbr_sr_code: &mut Option<u8>) -> Option<(u64, u32)> {
+pub(crate) fn parse_params(frame: &[u8], lbr_sr_code: &mut Option<u8>) -> Option<(u64, u32)> {
     if frame.len() < DCA_CORE_FRAME_HEADER_SIZE {
         return None;
     }
@@ -606,7 +701,19 @@ struct FrameClock {
 
 impl FrameClock {
     fn packet(&mut self, stream: &StreamInfo, frame: Vec<u8>) -> Packet {
-        let duration = match parse_params(&frame, &mut self.lbr_sr_code) {
+        let pts = self.next_pts;
+        let duration = self.advance(stream, &frame);
+        Packet::new(0, stream.time_base, frame)
+            .with_pts(pts)
+            .with_dts(pts)
+            .with_duration(duration)
+            .with_keyframe(true)
+    }
+
+    /// Move past a frame: its duration from its header, rescaled to the
+    /// stream's sample rate, 0 when the header does not parse.
+    fn advance(&mut self, stream: &StreamInfo, frame: &[u8]) -> i64 {
+        let duration = match parse_params(frame, &mut self.lbr_sr_code) {
             Some((samples, rate)) if rate != 0 => match stream.params.sample_rate {
                 // av_rescale(duration, avctx->sample_rate, sample_rate)
                 Some(to) => ((u128::from(samples) * u128::from(to) + u128::from(rate / 2)) / u128::from(rate))
@@ -616,13 +723,8 @@ impl FrameClock {
             },
             _ => 0,
         };
-        let pts = self.next_pts;
         self.next_pts = self.next_pts.saturating_add(duration);
-        Packet::new(0, stream.time_base, frame)
-            .with_pts(pts)
-            .with_dts(pts)
-            .with_duration(duration)
-            .with_keyframe(true)
+        duration
     }
 }
 
@@ -637,8 +739,8 @@ const STRMDATA: u64 = 0x5354_524D_4441_5441;
 pub struct DtshdDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    pc: ParseState,
-    pending: Vec<u8>,
+    /// Frames cut from the STRMDATA read so far.
+    split: FrameSplitter,
     data_end: u64,
     /// Sample rate from AUPR_HDR.
     sample_rate: u32,
@@ -756,8 +858,7 @@ impl DtshdDemuxer {
         Ok(Box::new(DtshdDemuxer {
             input,
             streams: vec![stream],
-            pc: ParseState::default(),
-            pending: Vec::new(),
+            split: FrameSplitter::default(),
             data_end,
             sample_rate,
             duration_samples,
@@ -788,46 +889,33 @@ impl Demuxer for DtshdDemuxer {
         // the parser (AVSTREAM_PARSE_FULL_RAW). OxideAV has no parser, so
         // reassemble whole frames here with the dca_parser state machine.
         loop {
-            let mut frame_end = None;
-            while frame_end.is_none() {
-                frame_end = self.pc.find_frame_end(&self.pending);
-                if frame_end.is_some() || self.eof {
-                    break;
+            match self.split.next_frame() {
+                Err(dropped) => {
+                    self.clock.advance(&self.streams[0], &dropped.head);
+                    return Err(oversized());
                 }
-                let left = self.data_end.saturating_sub(self.pos);
-                let chunk = left.min(1024);
-                if chunk == 0 {
-                    self.eof = true;
-                    break;
-                }
-                let start = self.pending.len();
-                self.pending.resize(start + chunk as usize, 0);
-                self.input.read_exact(&mut self.pending[start..])?;
-                self.pos += chunk;
+                Ok(Some((_, frame))) if frame.len() < MIN_FRAME => continue,
+                Ok(Some((_, frame))) => return Ok(self.clock.packet(&self.streams[0], frame)),
+                Ok(None) => {}
             }
-
-            let Some(end) = frame_end else {
-                // EOF: the parser flush emits what it holds as the last
-                // frame, after any initial padding.
-                if self.pending.is_empty() {
-                    return Err(Error::Eof);
-                }
-                let start = self.pc.startpos.min(self.pending.len());
-                let frame = self.pending.split_off(start);
-                self.pending.clear();
-                self.pc = ParseState::default();
-                return Ok(self.clock.packet(&self.streams[0], frame));
-            };
-
-            self.pc.startpos = self.pc.startpos.min(end);
-            let start = self.pc.startpos;
-            self.pc.startpos = 0;
-            let frame = self.pending[start..end].to_vec();
-            self.pending.drain(..end);
-
-            if frame.len() >= MIN_FRAME {
-                return Ok(self.clock.packet(&self.streams[0], frame));
+            if self.eof {
+                // The parser flush emits what it holds as the last frame,
+                // after any initial padding.
+                return match self.split.finish() {
+                    Some((_, frame)) if !frame.is_empty() => Ok(self.clock.packet(&self.streams[0], frame)),
+                    _ => Err(Error::Eof),
+                };
             }
+            let left = self.data_end.saturating_sub(self.pos);
+            let chunk = left.min(RAW_PACKET_SIZE as u64).min(self.split.room() as u64) as usize;
+            if chunk == 0 {
+                self.eof = true;
+                continue;
+            }
+            let mut buf = [0u8; RAW_PACKET_SIZE];
+            self.input.read_exact(&mut buf[..chunk])?;
+            self.split.push(&buf[..chunk]);
+            self.pos += chunk as u64;
         }
     }
 
