@@ -55,11 +55,17 @@ impl SubtitleSink for TimedSubtitles {
 }
 
 fn open(path: &std::path::Path, subtitle: Option<u32>) -> (Player, Arc<TimedHeadless>, Arc<Mutex<Observation>>) {
+    open_with(path, subtitle, true)
+}
+
+fn open_with(path: &std::path::Path, subtitle: Option<u32>, realtime: bool) -> (Player, Arc<TimedHeadless>, Arc<Mutex<Observation>>) {
     let observation = Arc::new(Mutex::new(Observation::default()));
-    let backend = Arc::new(TimedHeadless { headless: Headless::new(), observation: observation.clone() });
+    let headless = Headless::new();
+    headless.set_active_streams(None, None, None, realtime);
+    let backend = Arc::new(TimedHeadless { headless, observation: observation.clone() });
     let player = Player::open(
         path.to_str().unwrap(), backend.clone(), Arc::new(codecs::context()),
-        PlayerOptions { subtitle, realtime: true, ..PlayerOptions::default() }, |_| {},
+        PlayerOptions { subtitle, realtime, ..PlayerOptions::default() }, |_| {},
     );
     (player, backend, observation)
 }
@@ -129,16 +135,12 @@ fn assert_ends_cleared(observation: &Mutex<Observation>, check: impl FnOnce(&[Sh
     assert!(observation.shows.last().is_some_and(|show| show.blank), "the overlay is cleared at Ended");
 }
 
-/// A PGS state without an end (no later display set clears it) over 1 s of
-/// video: it stays up while the video plays and comes down when the
-/// playback ends, not after the Player is dropped.
-#[test]
-fn open_ended_pgs_state_is_cleared_at_ended() {
-    let scratch = Scratch::new();
+/// One PGS display set, visible from 0.2 s, that nothing clears, over 1 s
+/// of video; FFmpeg's decode of the subtitles alone.
+fn open_ended_movie(scratch: &Scratch) -> (std::path::PathBuf, oracle::Reference) {
     let sup = scratch.file("open-ended.sup");
     let subtitles = scratch.file("open-ended.mks");
     let movie = scratch.file("open-ended.mkv");
-    // One display set, visible from 0.2 s, that nothing clears.
     pgs_states(&sup, &[(200, true)]);
     ffmpeg(&["-copyts", "-i", sup.to_str().unwrap(), "-map", "0:s", "-c:s", "copy", "-f", "matroska", subtitles.to_str().unwrap()]);
     ffmpeg(&[
@@ -149,10 +151,35 @@ fn open_ended_pgs_state_is_cleared_at_ended() {
     let reference = oracle::ffmpeg_reference(&subtitles, 0);
     assert_eq!(reference.cues.len(), 1);
     assert!(reference.cues[0].sub.num_rects > 0 && reference.cues[0].sub.end_us().is_none(), "{:?}", reference.cues[0].sub);
+    (movie, reference)
+}
 
+/// A PGS state without an end (no later display set clears it) over 1 s of
+/// video: it stays up while the video plays and comes down when the
+/// playback ends, not after the Player is dropped.
+#[test]
+fn open_ended_pgs_state_is_cleared_at_ended() {
+    let scratch = Scratch::new();
+    let (movie, reference) = open_ended_movie(&scratch);
     let (player, _backend, observation) = open(&movie, Some(1));
     let state = wait_until(&player, Duration::from_secs(10), "playback end", |state| state.ended);
     assert!(state.position <= Duration::from_millis(1500), "ended {:?} into 1 s of media", state.position);
+    assert_ends_cleared(&observation, |shows| {
+        assert_eq!(shows.len(), 2, "the state, then its clear");
+        shows[0].assert_canvas(&reference, 0);
+    });
+    drop(player);
+}
+
+/// Without realtime the subtitles behind the video still end cleared: the
+/// open-ended state is shown as it decodes and is down at Ended.
+#[test]
+fn open_ended_pgs_state_is_cleared_at_ended_without_realtime() {
+    let scratch = Scratch::new();
+    let (movie, reference) = open_ended_movie(&scratch);
+    let (player, backend, observation) = open_with(&movie, Some(1), false);
+    wait_until(&player, Duration::from_secs(20), "playback end", |state| state.ended);
+    assert_eq!(backend.headless.capture().video[0].frame_md5.len(), 10, "every video frame");
     assert_ends_cleared(&observation, |shows| {
         assert_eq!(shows.len(), 2, "the state, then its clear");
         shows[0].assert_canvas(&reference, 0);

@@ -274,3 +274,155 @@ fn dvb_final_visible_state_expires_at_ffmpeg_end_exactly() {
     assert!(expected_events(&reference).last().unwrap().1.is_none(), "must exercise an actual expiry");
     check_timing("matroska", &path, &reference);
 }
+
+/// Text cues `(start_ms, end_ms)` as FFmpeg muxes them into Matroska as
+/// WebVTT (the text decoders reject Matroska's SubRip blocks): the
+/// subtitle stream and its packets.
+fn text_cues(scratch: &Scratch, name: &str, cues: &[(u32, u32)]) -> (StreamInfo, Vec<Packet>) {
+    let stamp = |ms: u32| format!("{:02}:{:02}:{:02},{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
+    let srt: String = cues.iter().enumerate()
+        .map(|(index, &(start, end))| format!("{}\n{} --> {}\ncue {index}\n\n", index + 1, stamp(start), stamp(end)))
+        .collect();
+    let source = scratch.file(&format!("{name}.srt"));
+    let mks = scratch.file(&format!("{name}.mks"));
+    std::fs::write(&source, srt).unwrap();
+    ffmpeg(&["-copyts", "-i", source.to_str().unwrap(), "-c:s", "webvtt", "-f", "matroska", mks.to_str().unwrap()]);
+    let ctx = codecs::context();
+    let mut demux = ctx.containers.open_demuxer("matroska", Box::new(std::fs::File::open(&mks).unwrap()), &ctx.codecs).unwrap();
+    let stream = demux.streams().iter().find(|stream| stream.params.media_type == MediaType::Subtitle).unwrap().clone();
+    let mut packets = Vec::new();
+    loop {
+        match demux.next_packet() {
+            Ok(packet) if packet.stream_index == stream.index => packets.push(packet),
+            Ok(_) => {}
+            Err(Error::Eof) => break,
+            Err(error) => panic!("{name}: {error}"),
+        }
+    }
+    assert_eq!(packets.len(), cues.len(), "{name}: one packet per cue");
+    (stream, packets)
+}
+
+/// Each sink call: when on the clock, and how many images.
+struct CountSink {
+    clock: Arc<TestClock>,
+    shows: Sender<(Duration, usize)>,
+}
+
+impl SubtitleSink for CountSink {
+    fn show(&mut self, images: &[SubtitleImage], _width: u32, _height: u32) {
+        self.shows.send((self.clock.now().unwrap(), images.len())).unwrap();
+    }
+}
+
+/// A realtime pipeline on the injected clock, standing at `start` from the
+/// first turn, over `packets` and the lane's end marker, beside video or
+/// audio (`paced`) or alone.
+fn text_pipeline(stream: &StreamInfo, packets: &[Packet], paced: bool, start: Duration) -> (TestThread, Arc<TestClock>, mpsc::Receiver<(Duration, usize)>) {
+    let ctx = Arc::new(codecs::context());
+    let decoder = ctx.codecs.first_decoder(&stream.params).unwrap();
+    let params = stream.params.clone();
+    let lane = Lane::new();
+    let demux_cv = Arc::new(Condvar::new());
+    let consumer = Consumer::new(&lane, &demux_cv);
+    for packet in packets {
+        lane.push(QueuedPacket { packet: packet.clone(), metadata: PacketMetadata::default() });
+    }
+    lane.push_eof();
+    let clock = Arc::new(TestClock::default());
+    *clock.state.lock() = (start, 0);
+    let stopped = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let pipeline = SubtitlePipeline {
+        decoder,
+        new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
+        clock: clock.clone(),
+        time_base: stream.time_base,
+        video_width: 320,
+        video_height: 240,
+        realtime: true,
+        lane: lane.clone(),
+        demux_cv,
+        seek_generation: Box::new(|| 0),
+        paced: Box::new(move || paced),
+        stopped: stopped.clone(),
+        retired: Arc::new(AtomicBool::new(false)),
+    };
+    let sink = Box::new(CountSink { clock: clock.clone(), shows: tx });
+    let handle = std::thread::spawn(move || {
+        let _consumer = consumer;
+        run_subtitle_loop(pipeline, sink);
+    });
+    (TestThread { stopped, lane, handle: Some(handle) }, clock, rx)
+}
+
+/// Waits until the pipeline has taken everything from its lane, the end
+/// marker included, while the clock stands still.
+fn assert_lane_drains(running: &TestThread, what: &str) {
+    let begun = Instant::now();
+    while !running.lane.queue.lock().is_empty() {
+        assert!(begun.elapsed() < Duration::from_secs(10), "{what}: the lane holds {} entries", running.lane.queue.lock().len());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Behind video or audio the subtitle lane drains whatever its cues'
+/// starts are: a decoded cue starting exactly at the clock plus
+/// `QUEUE_MAX_SECS` holds no packet back (the demuxer would wait on the
+/// lane while audio runs dry). Alone, the lane keeps the clock's pace, one
+/// decoded cue waiting at a time. Either way each cue shows exactly from
+/// its start to its end, never early.
+#[test]
+fn paced_subtitles_drain_at_the_queue_horizon() {
+    let scratch = Scratch::new();
+    let now = Duration::from_secs(10);
+    let horizon = now + Duration::from_secs_f64(QUEUE_MAX_SECS);
+    let ms = |at: Duration| at.as_millis() as u32;
+    let (stream, packets) = text_cues(&scratch, "horizon", &[
+        (ms(horizon), ms(horizon) + 400), (ms(horizon) + 500, ms(horizon) + 900), (ms(horizon) + 1000, ms(horizon) + 1400),
+    ]);
+    for paced in [true, false] {
+        let (running, clock, rx) = text_pipeline(&stream, &packets, paced, now);
+        if paced {
+            assert_lane_drains(&running, "behind video or audio, a cue starting at the clock plus QUEUE_MAX_SECS");
+        } else {
+            clock.synchronize();
+            clock.set(now, &running.lane);
+            clock.synchronize();
+            assert_eq!(running.lane.queue.lock().len(), 3, "alone, one decoded cue waits; two packets and the end marker stay");
+        }
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "paced {paced}: nothing shows before the first start");
+        for (offset_ms, images) in [(0, 1), (400, 0), (500, 1), (900, 0), (1000, 1), (1400, 0)] {
+            let at = horizon + Duration::from_millis(offset_ms);
+            clock.set(at - Duration::from_nanos(1), &running.lane);
+            clock.synchronize();
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "paced {paced}: a change before {at:?}");
+            clock.set(at, &running.lane);
+            let show = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|error| panic!("paced {paced} at {at:?}: {error}"));
+            assert_eq!(show, (at, images), "paced {paced}");
+        }
+        drop(running);
+    }
+}
+
+/// A flood of a hundred overlapping cues inside the read-ahead, behind
+/// video or audio: the lane still drains, the earliest 64 (by start) wait
+/// and come up, and no show carries more than 64 images.
+#[test]
+fn paced_subtitles_drain_a_flood_into_a_bounded_queue() {
+    let scratch = Scratch::new();
+    let cues: Vec<_> = (0..100).map(|i| (11_000 + i, 11_500 + i)).collect();
+    let (stream, packets) = text_cues(&scratch, "flood", &cues);
+    let (running, clock, rx) = text_pipeline(&stream, &packets, true, Duration::from_secs(10));
+    assert_lane_drains(&running, "a hundred cues inside the read-ahead");
+    clock.set(Duration::from_millis(11_200), &running.lane);
+    let show = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(show, (Duration::from_millis(11_200), 64), "every kept cue is due: the earliest 64 come up together");
+    clock.set(Duration::from_millis(11_563), &running.lane);
+    let show = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(show, (Duration::from_millis(11_563), 0), "the 64th kept cue (from 11.063 s) ends last");
+    clock.set(Duration::from_secs(13), &running.lane);
+    clock.synchronize();
+    let rest: Vec<_> = rx.try_iter().collect();
+    assert!(rest.is_empty(), "nothing after the last kept cue: {rest:?}");
+}

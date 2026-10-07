@@ -1,13 +1,14 @@
 //! Subtitle pipeline: packets → cues → `SubtitleSink::show` on the clock.
 //!
-//! Text/ASS cues render through the oxideav-subtitle compositor and stay up
-//! from their start to their end, overlapping cues together. Bitmap
-//! subtitles (PGS, DVB, VobSub, ...) decode to display states: an RGBA
-//! canvas the size of the subtitle plane, shown from its pts until its
-//! [`VideoFrame::display_duration`] runs out or, without one, until the next
-//! frame of the stream replaces it (a blank canvas clears the screen). The
-//! sink gets a bitmap state cropped to its visible pixels, positioned on the
-//! canvas, with the canvas size as the space it scales to the video.
+//! Text/ASS cues render through the oxideav-subtitle compositor, cropped to
+//! their visible pixels, and stay up from their start to their end,
+//! overlapping cues together. Bitmap subtitles (PGS, DVB, VobSub, ...)
+//! decode to display states: an RGBA canvas the size of the subtitle plane,
+//! shown from its pts until its [`VideoFrame::display_duration`] runs out
+//! or, without one, until the next frame of the stream replaces it (a blank
+//! canvas clears the screen). The sink gets a bitmap state cropped to its
+//! visible pixels, positioned on the canvas, with the canvas size as the
+//! space it scales to the video.
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -20,7 +21,7 @@ use parking_lot::Condvar;
 
 use crate::backend::{Clock, SubtitleImage, SubtitleSink};
 use crate::clock::current_monotonic_ns;
-use crate::engine::{Lane, QUEUE_MAX_SECS};
+use crate::engine::Lane;
 
 /// Longest the pipeline waits without looking at the clock again. The lane
 /// wakes it on everything that matters (a packet, a seek, the clock starting
@@ -32,28 +33,61 @@ const MAX_WAIT: Duration = Duration::from_millis(100);
 const MAX_CANVAS_SIDE: usize = 4096;
 const MAX_CANVAS_PIXELS: usize = 4096 * 4096;
 
-/// Decoded cues waiting for their start, at most: behind video or audio
-/// only cues stamped beyond the demuxer's read-ahead pile up there.
+/// Decoded cues waiting for their start, at most: behind video or audio the
+/// lane drains into them, so only cues stamped beyond the demuxer's
+/// read-ahead, or a flood, pile up there.
 const MAX_PENDING_CUES: usize = 64;
 const MAX_PENDING_BYTES: usize = 64 << 20;
 
-/// Renders one text/ASS cue onto a video-sized RGBA canvas.
+/// Text cues up at once, at most: past either bound the earliest up go
+/// first.
+const MAX_TEXT_UP: usize = 64;
+const MAX_TEXT_UP_BYTES: usize = 64 << 20;
+
+/// Renders one text/ASS cue on a video-sized RGBA canvas and crops it to
+/// its visible pixels, positioned on that canvas (an empty image when
+/// nothing is visible).
 pub fn render_text_cue(
     cue: &oxideav_core::SubtitleCue,
     video_width: u32,
     video_height: u32,
 ) -> SubtitleImage {
-    let w = video_width.max(320);
-    let h = video_height.max(240);
-    let comp = oxideav_subtitle::compositor::Compositor::new(w, h);
+    let w = video_width.max(320) as usize;
+    let h = video_height.max(240) as usize;
+    let comp = oxideav_subtitle::compositor::Compositor::new(w as u32, h as u32);
     let rgba = comp.render(cue);
-    SubtitleImage {
-        x: 0,
-        y: 0,
-        width: w,
-        height: h,
-        rgba,
+    visible(&rgba, w * 4, w, h).unwrap_or(SubtitleImage { x: 0, y: 0, width: 0, height: 0, rgba: Vec::new() })
+}
+
+/// The visible (non-transparent) pixels of a `width x height` RGBA plane
+/// with `stride` bytes per row, as an image positioned on it; `None` when
+/// none is visible.
+fn visible(data: &[u8], stride: usize, width: usize, height: usize) -> Option<SubtitleImage> {
+    let rows = || data.chunks_exact(stride).take(height).map(|row| &row[..width * 4]);
+    let (mut left, mut right, mut top, mut bottom) = (width, 0, height, 0);
+    for (y, row) in rows().enumerate() {
+        let Some(first) = row.chunks_exact(4).position(|px| px[3] != 0) else {
+            continue;
+        };
+        let last = row.chunks_exact(4).rposition(|px| px[3] != 0).unwrap_or(first);
+        left = left.min(first);
+        right = right.max(last + 1);
+        top = top.min(y);
+        bottom = y + 1;
     }
+    (left < right).then(|| {
+        let mut rgba = Vec::with_capacity((right - left) * (bottom - top) * 4);
+        for row in rows().skip(top).take(bottom - top) {
+            rgba.extend_from_slice(&row[left * 4..right * 4]);
+        }
+        SubtitleImage {
+            x: left as i32,
+            y: top as i32,
+            width: (right - left) as u32,
+            height: (bottom - top) as u32,
+            rgba,
+        }
+    })
 }
 
 /// One bitmap display state, as the sink gets it.
@@ -87,36 +121,10 @@ pub fn extract_bitmap_cue(frame: &VideoFrame) -> Option<BitmapCue> {
     {
         return None;
     }
-    let rows = || plane.data.chunks_exact(stride).take(height);
-    let (mut left, mut right, mut top, mut bottom) = (width, 0, height, 0);
-    for (y, row) in rows().enumerate() {
-        let mut pixels = row.chunks_exact(4);
-        let Some(first) = pixels.position(|px| px[3] != 0) else {
-            continue;
-        };
-        let last = row.chunks_exact(4).rposition(|px| px[3] != 0).unwrap_or(first);
-        left = left.min(first);
-        right = right.max(last + 1);
-        top = top.min(y);
-        bottom = y + 1;
-    }
-    let image = (left < right).then(|| {
-        let mut rgba = Vec::with_capacity((right - left) * (bottom - top) * 4);
-        for row in rows().skip(top).take(bottom - top) {
-            rgba.extend_from_slice(&row[left * 4..right * 4]);
-        }
-        SubtitleImage {
-            x: left as i32,
-            y: top as i32,
-            width: (right - left) as u32,
-            height: (bottom - top) as u32,
-            rgba,
-        }
-    });
     Some(BitmapCue {
         canvas_width: width as u32,
         canvas_height: height as u32,
-        image,
+        image: visible(&plane.data, stride, width, height),
     })
 }
 
@@ -213,6 +221,13 @@ impl OnScreen {
                 self.bitmap = None;
                 self.text.push(image);
                 self.text_ends.push(cue.end.unwrap_or(cue.start));
+                // Past MAX_TEXT_UP*, the earliest up go first; the newest
+                // always shows.
+                let mut bytes: usize = self.text.iter().map(|image| image.rgba.len()).sum();
+                while self.text.len() > 1 && (self.text.len() > MAX_TEXT_UP || bytes > MAX_TEXT_UP_BYTES) {
+                    bytes -= self.text.remove(0).rgba.len();
+                    self.text_ends.remove(0);
+                }
             }
             Content::Bitmap(state) => {
                 self.text.clear();
@@ -438,9 +453,11 @@ impl SubtitlePipeline {
 /// it), so captures see the exact cue sequence. A seek clears the screen
 /// and starts over from the demuxer's new position. Alone, it ends at the
 /// lane's end once nothing more is due (a bitmap state without an end stays
-/// up). Behind video or audio it stays until they have played, then clears
-/// the screen (the engine also retires it then). It also ends when the
-/// player stops or a selection switch sets `retired`, clearing the screen.
+/// up). Behind video or audio it drains its lane as packets come, and the
+/// playback ends with the screen clear: in realtime it stays until they
+/// have played, then clears (the engine also retires it then); otherwise
+/// it clears at the lane's end. It also ends when the player stops or a
+/// selection switch sets `retired`, clearing the screen.
 pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn SubtitleSink>) {
     let mut screen = Screen {
         sink,
@@ -469,10 +486,13 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
             continue;
         }
 
+        let paced = (pipe.paced)();
+        was_paced |= paced;
         if !pipe.realtime {
             if eof {
-                // The last state goes at its end.
-                if on.next_end().is_some() {
+                // The last state goes at its end; behind video or audio the
+                // playback ends with nothing up, an open-ended state too.
+                if on.next_end().is_some() || was_paced {
                     screen.clear();
                 }
                 return;
@@ -505,15 +525,13 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
             }
         }
         let next = on.next_end().into_iter().chain(pending.front().map(|cue| cue.start)).min();
-        let paced = (pipe.paced)();
-        was_paced |= paced;
-        // Taking the next packet only once every decoded cue is up makes
-        // this lane bound the demuxer's read-ahead when it is alone. Behind
-        // video or audio, which bound it themselves, a cue due beyond that
-        // read-ahead (a hostile stamp, a PTS jump) must not stop the lane:
-        // the demuxer would wait on it and starve them.
-        let horizon = now.unwrap_or_default() + Duration::from_secs_f64(QUEUE_MAX_SECS);
-        let take = !eof && pending.front().is_none_or(|cue| cue.start > horizon && paced);
+        // Alone, this lane bounds the demuxer's read-ahead: it takes the
+        // next packet only once every decoded cue is up. Behind video or
+        // audio, which bound the read-ahead themselves, it drains whatever
+        // its cues' starts: holding a packet back could stop the demuxer
+        // short of the audio the clock needs to reach that cue. The decoded
+        // cues wait in `pending`, bounded.
+        let take = !eof && (paced || pending.is_empty());
         if !take && next.is_none() {
             // Nothing more is due. Alone, the last state stays up as the
             // playback ends. Behind video or audio it stays while they

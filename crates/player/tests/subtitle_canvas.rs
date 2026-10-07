@@ -325,9 +325,9 @@ fn pixel_width_zero_movie(label: &str) -> PathBuf {
 /// regions keep FFmpeg's pixel positions inside it. In FFmpeg's H.264 VOB
 /// (PS discovery parses no H.264 size) neither FFmpeg nor the PS demuxer
 /// reads a subtitle packet: selected, that empty stream holds nothing up,
-/// realtime or not, and changes none of the frames decoded. (Those are 19
-/// of FFmpeg's 20, and realtime drops some as late, with or without a
-/// subtitle: gaps of the H.264-in-PS video path.)
+/// realtime or not, and changes none of the frames decoded; in realtime
+/// every decoded frame is presented or counted late. Whether those frames
+/// are FFmpeg's is `h264_vob_plays_every_ffmpeg_frame`.
 #[test]
 fn unknown_video_size_never_stalls_playback_behind_dvd_cues() {
     let idx = refcheck::fate("sub/vobsub.idx");
@@ -365,7 +365,7 @@ fn unknown_video_size_never_stalls_playback_behind_dvd_cues() {
                 played.frames.len(), visible.len());
         }
     }
-    let path = dvd_movie_from("h264-two-cues.vob", "720x480", "libx264", "vob", &idx, "180.797", "4");
+    let path = h264_vob("h264-two-cues.vob");
     let (streams, packets) = streams_and_subtitles(&path, "mpeg");
     let video = streams.iter().find(|s| s.params.media_type == MediaType::Video).unwrap();
     assert_eq!((video.params.codec_id.as_str(), video.params.width, video.params.height), ("h264", None, None));
@@ -376,11 +376,32 @@ fn unknown_video_size_never_stalls_playback_behind_dvd_cues() {
     for realtime in [false, true] {
         let played = play(&path, Some(subtitle.index), (720, 480), realtime, Duration::from_secs(30));
         assert!(played.shows.iter().all(|show| show.blank), "h264-two-cues.vob (realtime {realtime}): nothing shown");
-        if !realtime {
+        if realtime {
+            assert_eq!(played.frames.len() + played.state.dropped_frames as usize, alone.frames.len(),
+                "h264-two-cues.vob: every decoded frame presented or counted late");
+        } else {
             assert_eq!(played.frames, alone.frames, "h264-two-cues.vob: the frames decoded without a subtitle");
         }
         eprintln!("h264-two-cues.vob realtime={realtime}: ended, {} frames ({} without a subtitle)", played.frames.len(), alone.frames.len());
     }
+}
+
+/// FFmpeg's VOB of four seconds of 5 fps H.264 with the FATE VobSub track
+/// from 180.797 s.
+fn h264_vob(label: &str) -> PathBuf {
+    dvd_movie_from(label, "720x480", "libx264", "vob", &refcheck::fate("sub/vobsub.idx"), "180.797", "4")
+}
+
+/// Packet P1-1's acceptance for the H.264 VOB: every video frame FFmpeg
+/// decodes, with its subtitle stream selected.
+#[test]
+#[ignore = "blocked on the video owner: the H.264-in-MPEG-PS path presents 19 of FFmpeg's 20 frames, with or without a subtitle (truncated CABAC slices: `h264 slice skipped ... read past end of bitstream`)"]
+fn h264_vob_plays_every_ffmpeg_frame() {
+    let path = h264_vob("h264-every-frame.vob");
+    let (streams, _) = streams_and_subtitles(&path, "mpeg");
+    let subtitle = streams.iter().find(|s| s.params.media_type == MediaType::Subtitle).unwrap();
+    let played = play(&path, Some(subtitle.index), (720, 480), false, Duration::from_secs(30));
+    assert_every_video_frame(&path, &played, false);
 }
 
 /// FFmpeg reads `size:` with sscanf("%dx%d") (dvdsubdec.c): a line without
