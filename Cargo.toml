@@ -100,7 +100,7 @@ oxideav-avi = { git = "https://github.com/OxideAV/oxideav-avi", rev = "2a5aa9fc7
 oxideav-basic = { git = "https://github.com/OxideAV/oxideav-basic", rev = "c44bb55f9f94e18ede7e9267493b0b6776a8e1c4" }
 oxideav-cinepak = { git = "https://github.com/OxideAV/oxideav-cinepak", rev = "4dae215ff7509dfd7e2e7d1bae72128630ccce7d" }
 oxideav-cook = { git = "https://github.com/OxideAV/oxideav-cook", rev = "f8584e427c6f87de24e2f2de124e0242824f7006" }
-oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "80948860b817c416ca405430e890a8f8cda9d6a3" }
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }
 oxideav-dirac = { git = "https://github.com/OxideAV/oxideav-dirac", rev = "1315f66f5f222dcafa5594bee401c797e5f5a769" }
 oxideav-dts = { git = "https://github.com/OxideAV/oxideav-dts", rev = "9a7c128366aa4914331825e3b5d40a3d3304c090" }
 oxideav-dvd = { git = "https://github.com/OxideAV/oxideav-dvd", rev = "f237f8c05fb3a70d0d9c7e7c99c56110c570d849" }
@@ -118,7 +118,7 @@ oxideav-image-filter = { git = "https://github.com/OxideAV/oxideav-image-filter"
 oxideav-indeo = { git = "https://github.com/OxideAV/oxideav-indeo", rev = "c5352660dd42d5d16d50cba0388b21b4fbeb037a" }
 oxideav-midi = { git = "https://github.com/OxideAV/oxideav-midi", rev = "cf1b26b7b44b3427e78378c2b74e80e695c12e58" }
 oxideav-mjpeg = { git = "https://github.com/OxideAV/oxideav-mjpeg", rev = "3e8f65f5c36d1dddbc481512487c6e8cd86e6f03" }
-oxideav-mkv = { git = "https://github.com/ayooooo123/oxideav-mkv", rev = "f07b1a79317f53d31385715e6969b479219d10a1" }
+oxideav-mkv = { git = "https://github.com/ayooooo123/oxideav-mkv", rev = "8658864fc4f7296c86e7ba4a6089800ae9fc37cf" }
 oxideav-mod = { git = "https://github.com/OxideAV/oxideav-mod", rev = "f509819bc977ac4d499fb95f1156bc536a9a964f" }
 oxideav-mov = { git = "https://github.com/OxideAV/oxideav-mov", rev = "deccbd8c6c728d9ab2bda6c70ffec22967884dc8" }
 oxideav-mp1 = { git = "https://github.com/OxideAV/oxideav-mp1", rev = "e01e2d0dfa651f39d5ba05ee3129b7144282dceb" }

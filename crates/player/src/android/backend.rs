@@ -139,8 +139,8 @@ impl VideoSink for VideoSinkWrapper {
         self.inner.lock().open_compressed(params)
     }
 
-    fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError> {
-        self.inner.lock().push_packet(packet, pts)
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+        self.inner.lock().push_packet(packet, pts, random_access)
     }
 
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> {

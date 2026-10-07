@@ -93,8 +93,10 @@ pub trait VideoSink: Send {
     /// decode in software and call `push_frame`.
     fn open_compressed(&mut self, params: &CodecParameters) -> bool;
     /// One compressed access unit, in decode order; `pts` is its media
-    /// presentation time. The sink decodes it and presents it on the clock.
-    fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError>;
+    /// presentation time. `random_access` combines the parser keyframe flag
+    /// and the container's independent random-access indication. The sink
+    /// decodes the unit and presents it on the clock.
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError>;
     /// Prepares for software frames of this stream.
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError>;
     /// One decoded frame, in presentation order, to show at media time `pts`.
@@ -108,8 +110,9 @@ pub trait VideoSink: Send {
     /// the frame is on screen.
     fn frame_lead(&self) -> Duration;
     /// Signals end of compressed input so a platform decoder releases its
-    /// reordered tail. Frame-only outputs have no decoder to drain.
-    fn finish(&mut self) -> Result<(), SinkError> { Ok(()) }
+    /// reordered tail. Every sink states what it does; a frame-only output
+    /// has nothing to drain.
+    fn finish(&mut self) -> Result<(), SinkError>;
     /// Drops everything queued and decoder state (seek).
     fn flush(&mut self);
     /// Pause/resume presentation (the clock stops with the audio).

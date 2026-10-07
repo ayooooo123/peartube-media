@@ -530,7 +530,7 @@ impl VideoSink for HeadlessVideoSink {
         false
     }
 
-    fn push_packet(&mut self, _packet: &Packet, _pts: Duration) -> Result<(), SinkError> {
+    fn push_packet(&mut self, _packet: &Packet, _pts: Duration, _random_access: bool) -> Result<(), SinkError> {
         Ok(())
     }
 
@@ -591,6 +591,11 @@ impl VideoSink for HeadlessVideoSink {
 
     fn frame_lead(&self) -> Duration {
         Duration::ZERO
+    }
+
+    /// Declines compressed input: no decoder to drain.
+    fn finish(&mut self) -> Result<(), SinkError> {
+        Ok(())
     }
 
     fn flush(&mut self) {

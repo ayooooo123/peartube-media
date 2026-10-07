@@ -96,9 +96,11 @@ dependencies = [
 name = "check-mkv"
 version = "0.1.0"
 dependencies = [
+ "codecs",
  "oxideav-core",
  "oxideav-mkv",
  "parking_lot",
+ "player",
  "refcheck",
 ]
 
@@ -949,7 +951,7 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.1.37"
-source = "git+https://github.com/ayooooo123/oxideav-core?rev=80948860b817c416ca405430e890a8f8cda9d6a3#80948860b817c416ca405430e890a8f8cda9d6a3"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=96094a916d8b9f2695f70bb0d53e5956b8a79847#96094a916d8b9f2695f70bb0d53e5956b8a79847"
 dependencies = [
  "bytemuck",
  "serde_json",
@@ -1102,8 +1104,9 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=f07b1a79317f53d31385715e6969b479219d10a1#f07b1a79317f53d31385715e6969b479219d10a1"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=8658864fc4f7296c86e7ba4a6089800ae9fc37cf#8658864fc4f7296c86e7ba4a6089800ae9fc37cf"
 dependencies = [
+ "compcol",
  "oxideav-core",
 ]
 

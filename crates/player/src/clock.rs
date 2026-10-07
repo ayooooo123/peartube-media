@@ -181,6 +181,11 @@ impl MasterClock {
                 lead.held = lead.now(&self.free);
             }
             self.free.pause();
+            if let Some(held) = lead.held {
+                // A suspended device may lose its timestamp before resume.
+                // Keep the fallback at the same held presentation position.
+                self.free.set_position(held);
+            }
         }
     }
 
@@ -446,5 +451,36 @@ pub(crate) mod timing {
             assert_eq!(after.relative, before.relative);
             assert!(constraint(thread.0).unwrap().1);
         }
+    }
+}
+
+#[cfg(test)]
+mod master_tests {
+    use super::*;
+
+    // A device can lose its timestamp while suspended. The paused position
+    // must survive that loss, resume, and the eventual audio hand-back.
+    #[test]
+    fn resume_without_a_device_timestamp_preserves_the_held_position() {
+        struct DeviceClock(Mutex<Option<Duration>>);
+        impl Clock for DeviceClock {
+            fn now(&self) -> Option<Duration> { *self.0.lock() }
+            fn monotonic_ns_at(&self, _: Duration) -> Option<i64> { None }
+        }
+        let master = MasterClock::new();
+        let position = Duration::from_secs(42);
+        let device = Arc::new(DeviceClock(Mutex::new(Some(position))));
+        master.follow_audio(device.clone(), 0);
+        master.set_running(true);
+        master.set_running(false);
+        *device.0.lock() = None;
+        assert_eq!(master.now(), Some(position));
+        master.set_running(true);
+        let resumed = master.now().unwrap();
+        assert!(resumed >= position && resumed < position + Duration::from_secs(1),
+            "fallback jumped from {position:?} to {resumed:?}");
+        master.release_audio();
+        let released = master.now().unwrap();
+        assert!(released >= resumed && released < position + Duration::from_secs(1));
     }
 }

@@ -526,7 +526,7 @@ impl VideoSink for AndroidVideoSink {
         self.open_compressed_inner(params, self.prefer_software)
     }
 
-    fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError> {
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
         if self.backend.is_suspended.load(Ordering::SeqCst) {
             return Err(SinkError::Unavailable);
         }
@@ -536,7 +536,7 @@ impl VideoSink for AndroidVideoSink {
         // After a codec teardown (window loss, suspend, fallback), wait for
         // the next keyframe so the rebuilt codec starts from a clean point.
         if self.awaiting_keyframe {
-            if packet.flags.keyframe {
+            if random_access {
                 self.awaiting_keyframe = false;
             } else {
                 return Ok(());

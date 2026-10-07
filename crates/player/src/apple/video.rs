@@ -93,7 +93,10 @@ pub struct AppleVideoSink {
 enum Timing {
     /// The layer is a renderer of the playback's synchronizer, beside the
     /// audio renderer: its timebase is the audio clock.
-    Synchronized(SendSync<Retained<AVSampleBufferRenderSynchronizer>>),
+    Synchronized {
+        synchronizer: SendSync<Retained<AVSampleBufferRenderSynchronizer>>,
+        clock: Arc<dyn Clock>,
+    },
     /// No audio output: the layer's own timebase (on the host clock),
     /// anchored to the engine's clock whenever presentation starts, stops or
     /// jumps.
@@ -113,31 +116,57 @@ impl Timing {
     fn set_playing(&self, playing: bool) {
         let rate = if playing { 1.0 } else { 0.0 };
         match self {
-            Timing::Synchronized(synchronizer) => unsafe { synchronizer.setRate(rate as f32) },
-            Timing::Own { .. } => self.anchor(rate),
+            Timing::Synchronized { synchronizer, .. } if !playing => unsafe {
+                synchronizer.setRate(0.0);
+            },
+            Timing::Synchronized { .. } | Timing::Own { .. } => self.anchor(rate),
             Timing::Unavailable => {}
         }
     }
 
-    /// The engine's clock jumped (a seek). A synchronized layer follows the
-    /// audio, which re-anchors the synchronizer at its first write.
+    /// Re-anchor after a seek even if audio never writes another sample.
     fn jumped(&self, playing: bool) {
         self.anchor(if playing { 1.0 } else { 0.0 });
     }
 
-    /// Own timebase: runs at `rate` from where the engine's clock is now.
+    /// Follow the engine's position when it is using its free-running clock.
+    /// When audio leads, both clocks already read the same native timebase.
     fn anchor(&self, rate: f64) {
-        let Timing::Own { timebase, clock } = self else {
-            return;
-        };
-        let Some(now) = clock.now() else {
-            return;
-        };
-        // SAFETY: CMTimebase/CMClock calls on live objects; CoreMedia's sync
-        // API is thread-safe.
-        unsafe {
-            let host_now = CMClock::host_time_clock().time();
-            let _ = timebase.set_rate_and_anchor_time(rate, cm_time_from_duration(now, 1_000_000_000), host_now);
+        match self {
+            Timing::Synchronized { synchronizer, clock } => unsafe {
+                let timebase = synchronizer.timebase();
+                let seconds = |time: CMTime| {
+                    (time.flags.contains(CMTimeFlags::Valid) && time.timescale > 0)
+                        .then(|| time.value as f64 / f64::from(time.timescale))
+                };
+                // Bracket the clock read: thread preemption between reads
+                // must not look like skew when audio owns this timebase.
+                let before = seconds(timebase.time());
+                let now = clock.now();
+                let after = seconds(timebase.time());
+                if let Some(now) = now {
+                    let aligned = before.zip(after).is_some_and(|(before, after)| {
+                        let at = now.as_secs_f64();
+                        at >= before - 0.001 && at <= after + 0.001
+                    });
+                    if !aligned {
+                        let sync: &AVSampleBufferRenderSynchronizer = synchronizer;
+                        let time = cm_time_from_duration(now, 1_000_000_000);
+                        let _: () = objc2::msg_send![sync, setRate: rate as f32, time: time];
+                        return;
+                    }
+                }
+                synchronizer.setRate(rate as f32);
+            },
+            Timing::Own { timebase, clock } => {
+                let Some(now) = clock.now() else { return };
+                // CoreMedia's synchronization API is thread-safe.
+                unsafe {
+                    let host_now = CMClock::host_time_clock().time();
+                    let _ = timebase.set_rate_and_anchor_time(rate, cm_time_from_duration(now, 1_000_000_000), host_now);
+                }
+            }
+            Timing::Unavailable => {}
         }
     }
 }
@@ -337,7 +366,7 @@ impl AppleVideoSink {
         let timing = match synchronizer {
             Some(synchronizer) => {
                 if join_synchronizer(&layer, &synchronizer) {
-                    Timing::Synchronized(SendSync(synchronizer))
+                    Timing::Synchronized { synchronizer: SendSync(synchronizer), clock }
                 } else {
                     Timing::Unavailable
                 }
@@ -558,7 +587,7 @@ impl VideoSink for AppleVideoSink {
         true
     }
 
-    fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError> {
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
         if let Some(err) = self.failed.lock().expect("failed lock").take() {
             self.fallback_reported.set(true);
             return Err(SinkError::Fallback(err));
@@ -575,9 +604,8 @@ impl VideoSink for AppleVideoSink {
                 .compressed
                 .as_mut()
                 .ok_or_else(|| SinkError::Fatal("push_packet without open_compressed".into()))?;
-            let is_key = packet.flags.keyframe;
             if !comp.primed {
-                if !is_key {
+                if !random_access {
                     // Wait for a random-access point before first enqueue.
                     return Ok(());
                 }
@@ -688,8 +716,15 @@ impl VideoSink for AppleVideoSink {
     fn frame_lead(&self) -> Duration {
         match self.timing {
             Timing::Unavailable => Duration::ZERO,
-            Timing::Synchronized(_) | Timing::Own { .. } => FRAME_LEAD,
+            Timing::Synchronized { .. } | Timing::Own { .. } => FRAME_LEAD,
         }
+    }
+
+    /// The layer's decoder presents queued samples by timestamp without an
+    /// end-of-stream marker: the native smoke displays the final reordered
+    /// frame of a B-frame stream at EOS.
+    fn finish(&mut self) -> Result<(), SinkError> {
+        Ok(())
     }
 }
 
@@ -881,7 +916,7 @@ impl Drop for AppleVideoSink {
         // cannot deadlock; the next sink's setup queues behind it.
         let layer = SendSync(self.layer.0.clone());
         match &self.timing {
-            Timing::Synchronized(synchronizer) => {
+            Timing::Synchronized { synchronizer, .. } => {
                 let synchronizer = synchronizer.clone();
                 self.main.exec_async(move || {
                     let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {

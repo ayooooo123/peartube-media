@@ -1676,3 +1676,4 @@ fn flash_beeps_remain_synchronized_after_stall_pause_and_seek() {
     assert!(state.ended && state.error.is_none(), "{state:?}");
     assert_flash_beeps(&backend.capture(), &bytes, &[(0..7).collect(), (3..8).collect()], "headless-stall-seek");
 }
+

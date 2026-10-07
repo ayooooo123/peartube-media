@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use oxideav_core::{
-    CodecParameters, Decoder, Demuxer, Frame, MediaType, Packet, ProbeData, RuntimeContext,
+    CodecParameters, Decoder, Demuxer, Frame, MediaType, Packet, PacketMetadata, ProbeData, RuntimeContext,
     SampleFormat, StreamInfo, TimeBase, PROBE_SCORE_EXTENSION,
 };
 
@@ -98,10 +98,16 @@ const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
 
+/// Side data travels with its packet, including across equal-PTS laces.
+pub(crate) struct QueuedPacket {
+    pub(crate) packet: Packet,
+    pub(crate) metadata: PacketMetadata,
+}
+
 /// One decoder lane. A lane owns its packet queue and wakes the demux loop
 /// whenever it drains, so the demuxer never stalls behind a slow sink.
 pub(crate) struct Lane {
-    pub(crate) queue: Mutex<Vec<Packet>>,
+    pub(crate) queue: Mutex<Vec<QueuedPacket>>,
     pub(crate) cv: Condvar,
     /// Seek generation the queued packets belong to; changed only with
     /// `queue` locked, when the demuxer empties the lane for a seek.
@@ -114,7 +120,7 @@ pub(crate) struct Lane {
 
 /// What a pipeline got from its lane.
 enum Pop {
-    Packet(Packet),
+    Packet(QueuedPacket),
     /// The demuxer's end marker.
     Eof,
     /// The lane holds packets of a seek the pipeline has not reset for, or
@@ -132,7 +138,7 @@ impl Lane {
         })
     }
 
-    fn push(&self, packet: Packet) {
+    fn push(&self, packet: QueuedPacket) {
         let mut q = self.queue.lock();
         if !self.consumed.load(Ordering::SeqCst) {
             return;
@@ -169,10 +175,14 @@ impl Lane {
         let mut last: Option<f64> = None;
         let mut bytes = 0;
         for p in q.iter() {
-            let secs = time_base.seconds_of(p.pts.unwrap_or(0));
+            let secs = time_base.seconds_of(p.packet.pts.unwrap_or(0));
             first.get_or_insert(secs);
             last = Some(secs);
-            bytes += p.data.len();
+            let side_bytes = p.metadata.webvtt.as_ref().map_or(0, |m| {
+                std::mem::size_of_val(m.as_ref())
+                    + m.identifier.capacity() + m.settings.capacity()
+            });
+            bytes += std::mem::size_of::<QueuedPacket>() + p.packet.data.capacity() + side_bytes;
         }
         let span = match (first, last) {
             (Some(a), Some(b)) => (b - a).max(0.0),
@@ -206,7 +216,7 @@ impl Lane {
             }
             let current = generation == seen_seek;
             match q.first() {
-                Some(p) if current && p.stream_index == u32::MAX => {
+                Some(p) if current && p.packet.stream_index == u32::MAX => {
                     q.remove(0);
                     break Pop::Eof;
                 }
@@ -304,17 +314,20 @@ impl PipelineThread {
 trait PushEof {
     fn push_eof_marker(&mut self);
 }
-impl PushEof for Vec<Packet> {
+impl PushEof for Vec<QueuedPacket> {
     fn push_eof_marker(&mut self) {
         // EOF marker: a packet with stream_index == u32::MAX.
-        self.push(Packet {
-            stream_index: u32::MAX,
-            time_base: TimeBase::new(1, 1000),
-            pts: None,
-            dts: None,
-            duration: None,
-            flags: Default::default(),
-            data: Vec::new(),
+        self.push(QueuedPacket {
+            packet: Packet {
+                stream_index: u32::MAX,
+                time_base: TimeBase::new(1, 1000),
+                pts: None,
+                dts: None,
+                duration: None,
+                flags: Default::default(),
+                data: Vec::new(),
+            },
+            metadata: PacketMetadata::default(),
         });
     }
 }
@@ -1156,10 +1169,14 @@ fn run_demux_loop(run: &mut Run<'_>) {
             continue;
         }
 
-        let packet_res = std::panic::catch_unwind(AssertUnwindSafe(|| run.demuxer.next_packet()));
+        let packet_res = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let packet = run.demuxer.next_packet()?;
+            let metadata = run.demuxer.packet_metadata();
+            Ok::<_, oxideav_core::Error>(QueuedPacket { packet, metadata })
+        }));
         match packet_res {
             Ok(Ok(packet)) => {
-                let stream_id = packet.stream_index;
+                let stream_id = packet.packet.stream_index;
                 let pipe = if Some(stream_id) == run.current_video {
                     Some(Pipe::Video)
                 } else if Some(stream_id) == run.current_audio {
@@ -1167,7 +1184,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
                 } else {
                     None
                 };
-                let end = pipe.and_then(|_| packet_end_secs(&packet));
+                let end = pipe.and_then(|_| packet_end_secs(&packet.packet));
                 match pipe {
                     Some(Pipe::Video) => run.video_lane.push(packet),
                     Some(Pipe::Audio) => run.audio_lane.push(packet),
@@ -1412,7 +1429,7 @@ fn run_audio_thread(
         let applied = written.running;
         let woken = || quit() || Some(shared.running()) != applied;
         let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
-        let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+        let QueuedPacket { packet, .. } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
@@ -1632,8 +1649,6 @@ fn write_pcm(
     written: &mut Written,
     retired: &AtomicBool,
 ) -> bool {
-    #[cfg(target_os = "macos")]
-    let _timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
     let channels = channels.max(1);
     let rate = rate.max(1);
     let frames = pcm.len() / channels;
@@ -1642,19 +1657,25 @@ fn write_pcm(
     while done < frames {
         let at = pts + Duration::from_secs_f64(done as f64 / f64::from(rate));
         sync_audio_sink(sink, shared, &mut written.running);
-        if realtime {
-            match shared.preroll(at, written.running, None, seen_seek, retired) {
-                Preroll::Go => {}
-                Preroll::Resync => continue,
-                Preroll::Abort => return false,
+        let result = {
+            #[cfg(target_os = "macos")]
+            let _timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
+            if realtime {
+                match shared.preroll(at, written.running, None, seen_seek, retired) {
+                    Preroll::Go => {}
+                    Preroll::Resync => continue,
+                    Preroll::Abort => return false,
+                }
             }
-        }
+            let until = frames.min(done + chunk);
+            sink.write(&pcm[done * channels..until * channels], at)
+        };
         let until = frames.min(done + chunk);
-        match sink.write(&pcm[done * channels..until * channels], at) {
+        match result {
             Ok(0) => {
-                // Timeout or paused/full: retain these samples and retry.
-                // A bounded wait keeps transport changes interruptible.
-                shared.wait_output();
+                // Full (or paused): retain these samples and retry once the
+                // output can drain.
+                if !shared.wait_output(seen_seek, retired) { return false; }
             }
             Ok(n) => {
                 done += n.min(until - done);
@@ -1665,9 +1686,18 @@ fn write_pcm(
                     shared.pipe_primed(Pipe::Audio, seen_seek);
                 }
             }
+            Err(SinkError::Unavailable) => {
+                // Suspended: the platform's resume recreates the output.
+                // Reopening here would restart it in the background. Keep
+                // the samples; the free clock leads until audio plays again.
+                if written.leads.is_some() {
+                    written.reopen(shared);
+                }
+                if !shared.wait_resumed(seen_seek, retired) { return false; }
+            }
             Err(_) => {
-                // Sink refused (device lost): keep the engine alive; the
-                // platform resume path reopens it.
+                // Sink refused (device lost): keep the engine alive and
+                // reopen it for the next samples.
                 written.reopen(shared);
                 let _ = sink.open(rate, channels as u16);
                 return true;
@@ -1865,7 +1895,7 @@ fn run_video_thread(
 
         let woken = || quit() || Some(shared.running()) != sink_running;
         let report = |dry| shared.pipe_starved(Pipe::Video, dry);
-        let packet = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+        let QueuedPacket { packet, metadata } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
@@ -1899,7 +1929,7 @@ fn run_video_thread(
                     while !quit() && shared.seek_gen.load(Ordering::SeqCst) == seen_seek {
                         sync_video_sink(&mut *sink, &shared, &mut sink_running);
                         if !matches!(sink.finish(), Err(SinkError::WouldBlock)) { break; }
-                        shared.wait_output();
+                        shared.wait_retry();
                     }
                 }
                 if realtime {
@@ -1921,7 +1951,8 @@ fn run_video_thread(
             last_end = last_end.max(Duration::from_secs_f64(end.max(0.0)));
         }
 
-        if need_keyframe && !packet.flags.keyframe {
+        let random_access = packet.flags.keyframe || metadata.container_keyframe;
+        if need_keyframe && !random_access {
             continue;
         }
         need_keyframe = false;
@@ -1943,8 +1974,8 @@ fn run_video_thread(
             let result = loop {
                 if quit() || shared.seek_gen.load(Ordering::SeqCst) != seen_seek { break Ok(()); }
                 sync_video_sink(&mut *sink, &shared, &mut sink_running);
-                match sink.push_packet(&packet, pts) {
-                    Err(SinkError::WouldBlock) => shared.wait_output(),
+                match sink.push_packet(&packet, pts, random_access) {
+                    Err(SinkError::WouldBlock) => shared.wait_retry(),
                     result => break result,
                 }
             };
@@ -2138,13 +2169,17 @@ fn present_frame(
         shared.pipe_primed(Pipe::Video, seen_seek);
     }
     if realtime {
-        match shared.wait_due(pts, sink.frame_lead(), seen_seek, retired) {
-            Due::Now => {}
-            Due::Late => {
-                shared.state.lock().dropped_frames += 1;
-                return true;
+        loop {
+            sync_video_sink(sink, shared, sink_running);
+            match shared.wait_due(pts, sink.frame_lead(), *sink_running, seen_seek, retired) {
+                Due::Now => break,
+                Due::Resync => continue,
+                Due::Late => {
+                    shared.state.lock().dropped_frames += 1;
+                    return true;
+                }
+                Due::Abort => return false,
             }
-            Due::Abort => return false,
         }
     }
     sync_video_sink(sink, shared, sink_running);

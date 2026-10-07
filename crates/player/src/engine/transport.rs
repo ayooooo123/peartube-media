@@ -113,6 +113,8 @@ pub(super) enum Due {
     Now,
     /// More than `VIDEO_LEAD` past due: drop it.
     Late,
+    /// Apply a transport run-state change to the sink before waiting again.
+    Resync,
     /// The player stopped or a seek superseded the frame.
     Abort,
 }
@@ -352,6 +354,7 @@ impl SharedState {
         &self,
         pts: Duration,
         lead: Duration,
+        applied: Option<bool>,
         seen_seek: u64,
         retired: &AtomicBool,
     ) -> Due {
@@ -362,6 +365,9 @@ impl SharedState {
         loop {
             if self.superseded(seen_seek, retired) {
                 return Due::Abort;
+            }
+            if applied != Some(t.running) {
+                return Due::Resync;
             }
             let now = self.master.now().unwrap_or_default();
             if now > pts + VIDEO_LEAD {
@@ -471,9 +477,41 @@ impl SharedState {
     }
 
 
-    /// A sink made no room in its bounded write. Yield on the transport's
-    /// condvar, so pause/seek/drop interrupts the retry without losing PCM.
-    pub(super) fn wait_output(&self) {
+    /// A sink made no room in its bounded write, or is unavailable until the
+    /// platform resumes. While the clock stands still nothing drains the
+    /// output, so wait for it to run instead of polling the device; a
+    /// running output gets a short wait. Pause/seek/drop interrupt both,
+    /// and the caller retries the same PCM. False when that PCM is stale.
+    pub(super) fn wait_output(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
+        let mut t = self.transport.lock();
+        if t.running {
+            self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
+        }
+        while !t.running && !self.superseded(seen_seek, retired) {
+            self.transport_cv.wait(&mut t);
+        }
+        !self.superseded(seen_seek, retired)
+    }
+
+    /// The output is unavailable until the platform resumes it, and resuming
+    /// plays the player. Waits for that rather than reopening the output in
+    /// the background. An output still missing after `play` is retried
+    /// after a short wait. False when the caller's PCM is stale.
+    pub(super) fn wait_resumed(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
+        let mut t = self.transport.lock();
+        if !t.paused {
+            self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
+        }
+        while t.paused && !self.superseded(seen_seek, retired) {
+            self.transport_cv.wait(&mut t);
+        }
+        !self.superseded(seen_seek, retired)
+    }
+
+    /// A platform decoder's input was full. It can still drain while the
+    /// clock stands still (decoding ahead of presentation), so retry after a
+    /// short wait that pause/seek/drop also interrupt.
+    pub(super) fn wait_retry(&self) {
         let mut t = self.transport.lock();
         self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
     }
@@ -493,5 +531,276 @@ impl SharedState {
         self.stopped.load(Ordering::SeqCst)
             || retired.load(Ordering::SeqCst)
             || self.seek_gen.load(Ordering::SeqCst) != seen_seek
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod callback_tests {
+    use super::*;
+    use super::super::{Player, PlayerOptions};
+    use crate::backend::{AudioSink, Backend, Clock, SinkError, SubtitleSink, VideoSink};
+    use crate::Headless;
+    use std::sync::mpsc;
+
+    struct FullPausedOutput {
+        enabled: AtomicBool,
+        attempts: mpsc::Sender<()>,
+    }
+
+    #[derive(Default)]
+    struct Suspension {
+        active: AtomicBool,
+        unavailable_writes: std::sync::atomic::AtomicUsize,
+        opens_while_suspended: std::sync::atomic::AtomicUsize,
+    }
+
+    struct GatedAudio {
+        sink: Box<dyn AudioSink>,
+        gate: Option<mpsc::Receiver<()>>,
+        entered: mpsc::Sender<()>,
+        paused_full: Option<Arc<FullPausedOutput>>,
+        playing: bool,
+        suspension: Arc<Suspension>,
+    }
+
+    impl AudioSink for GatedAudio {
+        fn open(&mut self, rate: u32, channels: u16) -> Result<(), SinkError> {
+            if self.suspension.active.load(Ordering::SeqCst) {
+                self.suspension.opens_while_suspended.fetch_add(1, Ordering::SeqCst);
+            }
+            self.sink.open(rate, channels)
+        }
+        fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
+            if let Some(gate) = self.gate.take() {
+                self.entered.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).expect("demux did not finish");
+            }
+            if self.suspension.active.load(Ordering::SeqCst) {
+                self.suspension.unavailable_writes.fetch_add(1, Ordering::SeqCst);
+                return Err(SinkError::Unavailable);
+            }
+            if !self.playing {
+                if let Some(probe) = &self.paused_full {
+                    if probe.enabled.load(Ordering::SeqCst) {
+                        let _ = probe.attempts.send(());
+                        return Ok(0);
+                    }
+                }
+            }
+            self.sink.write(pcm, pts)
+        }
+        fn play(&mut self) { self.playing = true; self.sink.play(); }
+        fn pause(&mut self) { self.playing = false; self.sink.pause(); }
+        fn flush(&mut self) { self.sink.flush(); }
+        fn clock(&self) -> Arc<dyn Clock> { self.sink.clock() }
+    }
+
+    struct GatedBackend {
+        inner: Arc<Headless>,
+        gate: parking_lot::Mutex<Option<mpsc::Receiver<()>>>,
+        entered: mpsc::Sender<()>,
+        paused_full: Option<Arc<FullPausedOutput>>,
+        suspension: Arc<Suspension>,
+    }
+
+    impl Backend for GatedBackend {
+        fn audio(&self) -> Box<dyn AudioSink> {
+            Box::new(GatedAudio {
+                sink: self.inner.audio(),
+                gate: self.gate.lock().take(),
+                entered: self.entered.clone(),
+                paused_full: self.paused_full.clone(),
+                playing: false,
+                suspension: self.suspension.clone(),
+            })
+        }
+        fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
+            self.inner.video(clock)
+        }
+        fn subtitles(&self) -> Box<dyn SubtitleSink> { self.inner.subtitles() }
+        fn suspend(&self) { self.suspension.active.store(true, Ordering::SeqCst); }
+        fn resume(&self) { self.suspension.active.store(false, Ordering::SeqCst); }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn application_callback_runs_after_audio_realtime_scope() {
+        let path = std::env::temp_dir().join(format!("player-callback-policy-{}.mkv", std::process::id()));
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+                "sine=sample_rate=48000:duration=0.25", "-c:a", "pcm_s16le"])
+            .arg(&path).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let (release, gate) = mpsc::channel();
+        let (entered, first_write) = mpsc::channel();
+        let backend = Arc::new(GatedBackend {
+            inner: Headless::new(), gate: parking_lot::Mutex::new(Some(gate)), entered,
+            paused_full: None, suspension: Arc::default(),
+        });
+        let (policy, observed) = mpsc::channel();
+        let player = Player::open(path.to_str().unwrap(), backend, Arc::new(codecs::context()),
+            PlayerOptions::default(), move |_| {
+                if std::thread::current().name() != Some("peartube-audio") { return; }
+                unsafe extern "C" {
+                    fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
+                }
+                let mut value = libc::thread_time_constraint_policy {
+                    period: 0, computation: 0, constraint: 0, preemptible: 0,
+                };
+                let mut count = libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT;
+                let mut default = 0;
+                let result = unsafe {
+                    let thread = libc::mach_thread_self();
+                    let result = libc::thread_policy_get(thread, libc::THREAD_TIME_CONSTRAINT_POLICY as u32,
+                        std::ptr::from_mut(&mut value).cast(), &mut count, &mut default);
+                    mach_port_deallocate(libc::mach_task_self(), thread);
+                    result
+                };
+                let _ = policy.send((result, default));
+            });
+        first_write.recv_timeout(Duration::from_secs(5)).expect("no actual decoded audio");
+        // Let the real demuxer reach EOF while the first device write waits.
+        // Releasing that write must prime audio and release the startup hold
+        // on the audio worker, rather than racing a demux-thread callback.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        {
+            let mut transport = player.shared.transport.lock();
+            while !transport.demux_eof && Instant::now() < deadline {
+                player.shared.transport_cv.wait_for(&mut transport, Duration::from_millis(10));
+            }
+            assert!(transport.demux_eof, "real demuxer did not reach EOF");
+            assert!(transport.buffering, "audio was not held for the first write");
+        }
+        release.send(()).unwrap();
+        let policy = observed.recv_timeout(Duration::from_secs(5))
+            .expect("audio priming did not invoke the application callback");
+        drop(player);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(policy.0, libc::KERN_SUCCESS);
+        assert_ne!(policy.1, 0, "application callback inherited realtime policy");
+    }
+
+    #[test]
+    fn paused_full_output_does_not_retry_until_resumed() {
+        let path = std::env::temp_dir().join(format!("player-paused-output-{}.mkv", std::process::id()));
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+                "sine=sample_rate=48000:duration=1", "-c:a", "pcm_s16le"])
+            .arg(&path).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reference = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"]).arg(&path)
+            .args(["-f", "f32le", "-"]).output().unwrap();
+        assert!(reference.status.success(), "{}", String::from_utf8_lossy(&reference.stderr));
+        let (release, gate) = mpsc::channel();
+        let (entered, first_write) = mpsc::channel();
+        let (attempts, retries) = mpsc::channel();
+        let probe = Arc::new(FullPausedOutput { enabled: AtomicBool::new(false), attempts });
+        let inner = Headless::new();
+        inner.set_active_streams(None, Some((0, "pcm_s16le".into())), None, true);
+        let backend = Arc::new(GatedBackend {
+            inner: inner.clone(), gate: parking_lot::Mutex::new(Some(gate)), entered,
+            paused_full: Some(probe.clone()), suspension: Arc::default(),
+        });
+        let owner = Arc::new(parking_lot::Mutex::new(None::<std::sync::Weak<Player>>));
+        let callback_owner = owner.clone();
+        let player = Arc::new(Player::open(path.to_str().unwrap(), backend,
+            Arc::new(codecs::context()), PlayerOptions::default(), move |_| {
+                if std::thread::current().name() == Some("peartube-audio")
+                    && !probe.enabled.swap(true, Ordering::SeqCst)
+                {
+                    // Pause from the real audio-priming callback, before a
+                    // second write can fill the simulated device.
+                    let player = callback_owner.lock().as_ref().unwrap().upgrade().unwrap();
+                    player.pause();
+                }
+            }));
+        *owner.lock() = Some(Arc::downgrade(&player));
+        first_write.recv_timeout(Duration::from_secs(5)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        {
+            let mut transport = player.shared.transport.lock();
+            while !transport.demux_eof && Instant::now() < deadline {
+                player.shared.transport_cv.wait_for(&mut transport, Duration::from_millis(10));
+            }
+            assert!(transport.demux_eof);
+        }
+        release.send(()).unwrap();
+        retries.recv_timeout(Duration::from_secs(5)).expect("paused output never filled");
+        // A spurious wake must not retry device I/O while it cannot drain.
+        player.shared.wake_clock_waiters();
+        assert!(matches!(retries.recv_timeout(Duration::from_millis(250)),
+            Err(mpsc::RecvTimeoutError::Timeout)), "paused output was polled again");
+        player.play();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        {
+            let mut state = player.shared.state.lock();
+            while !state.ended && state.error.is_none() && Instant::now() < deadline {
+                player.shared.condvar.wait_for(&mut state, Duration::from_millis(20));
+            }
+            assert!(state.ended && state.error.is_none(), "{state:?}");
+        }
+        drop(player);
+        let captured = inner.capture();
+        assert_eq!(captured.audio.len(), 1);
+        let actual: Vec<u8> = captured.audio[0].pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+        assert_eq!(actual, reference.stdout, "pause lost or duplicated pending PCM");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn suspended_output_is_not_reopened_and_keeps_pcm() {
+        let path = std::env::temp_dir().join(format!("player-suspended-output-{}.mkv", std::process::id()));
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+                "sine=sample_rate=48000:duration=1", "-c:a", "pcm_s16le"])
+            .arg(&path).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reference = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-i"]).arg(&path)
+            .args(["-f", "f32le", "-"]).output().unwrap();
+        assert!(reference.status.success(), "{}", String::from_utf8_lossy(&reference.stderr));
+        let (release, gate) = mpsc::channel();
+        let (entered, first_write) = mpsc::channel();
+        let suspension = Arc::new(Suspension::default());
+        let inner = Headless::new();
+        inner.set_active_streams(None, Some((0, "pcm_s16le".into())), None, true);
+        let backend = Arc::new(GatedBackend {
+            inner: inner.clone(), gate: parking_lot::Mutex::new(Some(gate)), entered,
+            paused_full: None, suspension: suspension.clone(),
+        });
+        let player = Player::open(path.to_str().unwrap(), backend, Arc::new(codecs::context()),
+            PlayerOptions::default(), |_| {});
+        // Suspend while the first actual device write is in flight: its
+        // samples meet an unavailable output.
+        first_write.recv_timeout(Duration::from_secs(5)).unwrap();
+        player.suspend();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while suspension.unavailable_writes.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(suspension.unavailable_writes.load(Ordering::SeqCst) > 0, "write never met suspension");
+        // Stay suspended long enough for a background reopen to happen.
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(suspension.unavailable_writes.load(Ordering::SeqCst), 1,
+            "suspended output was polled");
+        assert_eq!(suspension.opens_while_suspended.load(Ordering::SeqCst), 0,
+            "suspended output was reopened in the background");
+        player.resume();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        {
+            let mut state = player.shared.state.lock();
+            while !state.ended && state.error.is_none() && Instant::now() < deadline {
+                player.shared.condvar.wait_for(&mut state, Duration::from_millis(20));
+            }
+            assert!(state.ended && state.error.is_none(), "{state:?}");
+        }
+        drop(player);
+        let captured = inner.capture();
+        assert_eq!(captured.audio.len(), 1);
+        let actual: Vec<u8> = captured.audio[0].pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+        assert_eq!(actual, reference.stdout, "suspension lost or duplicated pending PCM");
+        std::fs::remove_file(path).unwrap();
     }
 }

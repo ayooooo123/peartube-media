@@ -19,6 +19,7 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 
 - **Source**: `oxideav-http`'s `HttpSource` (HTTP/1.1 Range, `Read + Seek`) behind a bounded read-ahead ring. Reads have a deadline, so a suspended worklet fails reads instead of hanging them; resume reopens at the last offset.
 - **Demux**: `ContainerRegistry::probe_input` (rewinds after reading up to 256 KiB), then `open_demuxer(name, input, &codecs)`. One demux thread fills per-stream packet queues bounded in both duration and bytes.
+- **Packet metadata and seeking**: snapshot `Demuxer::packet_metadata()` with each packet, including queued-byte accounting for owned cue metadata. A container random-access point is separate from the codec parser's keyframe flag; the engine and both native decoder gates accept either without changing parser flags. The open-GOP Matroska regression requires all 100 post-seek frames to match FFmpeg, not merely resumed output. Metadata transport is in place; generic audio trimming and WebVTT settings rendering remain incomplete.
 - **Buffering**: the read-ahead ring reports when a read waits for bytes that have not arrived. The clock holds at the start until the first audio and video are decoded and about a second is queued (or the input ends), likewise after a seek, and mid-stream whenever a pipeline runs dry while the source is starved, until a second is queued past the clock again. `buffering` in the state follows the hold; `play`/`pause` stay the user's intent, so a pause during buffering stays paused when the data arrives.
 - **Audio**: always decoded in software (OxideAV or `codec-*`) to PCM. Android plays it through AAudio, Apple through `AVSampleBufferAudioRenderer`. The sink's presented position is the master clock; Android maps AAudio frame/time pairs onto `CLOCK_MONOTONIC`, clamped to the audio actually queued. Pause and buffering stop the audio output, including while its final queued samples drain. After a seek, only audio from the new seek generation may lead; without audio, or after it ends, the free clock continues from the current position.
 - **Video**: the platform decoder first, chosen by trying it: Android `MediaCodec::from_decoder_type` + `configure` on the slot's `ANativeWindow` (the NDK has no codec-list API below API 36); Apple enqueues compressed `CMSampleBuffer`s on `AVSampleBufferDisplayLayer`. Any failure, at open or mid-stream, tears the platform decoder down and continues in software from the next keyframe. Software frames go to Android as RGBA_8888 through `ANativeWindow_lock` (after `oxideav-pixfmt` conversion), and to Apple as `CVPixelBuffer` sample buffers on the same layer.
@@ -65,8 +66,10 @@ are failures, not permission to loosen the bound.
 
 On macOS, the dedicated realtime audio/video workers use a scoped Mach
 time-constraint policy for paced waits and audio device writes: 20 ms
-period, 1 ms computation budget, 2 ms constraint. Codec decoding remains
-under ordinary scheduling. Mach policy changes permanently opt a pthread
+period, 1 ms computation budget, 2 ms constraint. Codec decoding and
+application event callbacks remain under ordinary scheduling. A real-Player
+regression holds the first device write until demux EOF, then checks the
+audio-priming callback's actual Mach policy. Mach policy changes permanently opt a pthread
 out of QoS, so only these owned workers opt out at creation; a guard refuses
 to modify a borrowed QoS-managed thread. Each timed scope restores the
 previous Mach mode/precedence on exit or unwind and releases its Mach send
@@ -115,9 +118,10 @@ adb -s emulator-5554 shell 'chmod 755 /data/local/tmp/engine_sync && PEARTUBE_SY
 The debug-only trace records native AAudio frame/time pairs and video
 release targets. Software traces also record entry, conversion, window-lock
 and post times, separating a late engine wake from rendering or callback
-delay. ImageReader callbacks read each frame's identifier, so
-arrival can be compared independently with the corresponding audio sample
-time. This measures a native surface consumer, not physical display
+delay. ImageReader callbacks read each displayed frame's identifier and
+compare arrival with AAudio frame/time pairs. The audio frame-to-media-PTS
+mapping still comes from the engine; these traces do not independently
+verify the identity or timing of the audible PCM content. This measures a native surface consumer, not physical display
 scanout. The compressed harness uses the emulator's `c2.android` MediaCodec;
 `--software` exercises engine decode plus `ANativeWindow`, and `--transport`
 exercises pause/seek. Report offsets after the initial second, including

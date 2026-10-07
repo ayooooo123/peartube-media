@@ -40,8 +40,8 @@ impl VideoSink for MeasuredVideo {
         eprintln!("APPLE_VIDEO compressed={accepted}");
         accepted
     }
-    fn push_packet(&mut self, p: &Packet, pts: Duration) -> Result<(), SinkError> {
-        self.0.push_packet(p, pts).inspect_err(|error| eprintln!("APPLE_PACKET {error:?}"))
+    fn push_packet(&mut self, p: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+        self.0.push_packet(p, pts, random_access).inspect_err(|error| eprintln!("APPLE_PACKET {error:?}"))
     }
     fn open_frames(&mut self, p: &CodecParameters) -> Result<(), SinkError> {
         eprintln!("APPLE_VIDEO software_frames");
@@ -61,6 +61,7 @@ fn main() {
     let path = std::env::args().nth(1).expect("apple_play clip.mkv [--software] [--transport]");
     let software = std::env::args().any(|a| a == "--software");
     let transport = std::env::args().any(|a| a == "--transport");
+    let audio_tail = std::env::args().any(|a| a == "--audio-tail-seek");
     let mtm = MainThreadMarker::new().unwrap();
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -78,7 +79,10 @@ fn main() {
     native.video_layer().setFrame(CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: frame.size });
     let backend = Arc::new(Measured { native, audio_clock: Mutex::new(None), software });
     std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| measure(path, backend, transport)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if audio_tail { measure_audio_tail(path, backend) }
+            else { measure(path, backend, transport) }
+        }));
         if let Err(e) = &result { eprintln!("Apple timing smoke failed: {e:?}"); }
         dispatch2::run_on_main(|_| READBACK.with(|slot| { slot.borrow_mut().take(); }));
         std::process::exit(if result.is_ok() { 0 } else { 1 });
@@ -159,9 +163,71 @@ fn measure(path: String, backend: Arc<Measured>, transport: bool) {
         if state.ended { break; }
         std::thread::sleep(Duration::from_millis(5));
     }
+    // The decoder's reordered tail must reach the screen at end of stream.
+    let duration = player.state().duration.expect("duration");
+    std::thread::sleep(Duration::from_millis(200));
+    let last = ((duration.as_millis() / 40) as u32 - 1) % 256;
+    let shown = displayed_frame(backend.clone());
+    eprintln!("APPLE_EOS expected_frame={last} displayed={shown:?}");
+    assert_eq!(shown, Some(last), "final reordered frame not displayed at end of stream");
     assert!(offsets.len() >= 4, "insufficient renderer readback samples: {offsets:?}");
     eprintln!("Apple sampled offsets_ms={offsets:?} final_metrics={previous:?} transport={swapped}");
     assert!(offsets.iter().all(|v| v.abs() <= 40.0), "displayed video/audio offset exceeds 40 ms: {offsets:?}");
+    drop(player);
+}
+
+/// The fixture has eight seconds of barcode video and only three of audio.
+/// This checks seek recovery, not continuous A/V presentation timing.
+fn measure_audio_tail(path: String, backend: Arc<Measured>) {
+    let player = Player::open(&path, backend.clone(), Arc::new(codecs::context()), PlayerOptions::default(), |_| {});
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = player.state();
+        assert!(state.error.is_none(), "{state:?}");
+        assert!(Instant::now() < deadline, "initial playback stalled: {state:?}");
+        if !state.buffering && state.position >= Duration::from_secs(1) { break; }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    player.seek(Duration::from_secs(6));
+    loop {
+        let state = player.state();
+        assert!(state.error.is_none(), "{state:?}");
+        assert!(Instant::now() < deadline, "audio-less seek stalled: {state:?}");
+        assert!(!state.ended, "ended before the tail observation: {state:?}");
+        if !state.buffering && state.position >= Duration::from_secs(7) { break; }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let native = backend.native.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    dispatch2::run_on_main(move |_| unsafe {
+        use objc2_av_foundation::AVQueuedSampleBufferRendering;
+        let renderer = native.video_layer().sampleBufferRenderer();
+        eprintln!("APPLE_TAIL_RUNNING rate={} time={:?}", renderer.timebase().rate(), renderer.timebase().time());
+        let block = block2::RcBlock::new(move |metrics: *mut objc2_av_foundation::AVVideoPerformanceMetrics| {
+            let value = metrics.as_ref().map(|m| (m.totalNumberOfFrames(), m.numberOfDroppedFrames(), m.totalAccumulatedFrameDelay()));
+            let _ = tx.send(value);
+        });
+        renderer.loadVideoPerformanceMetricsWithCompletionHandler(&block);
+    });
+    eprintln!("APPLE_TAIL_METRICS {:?} state={:?}", rx.recv_timeout(Duration::from_secs(2)).unwrap(), player.state());
+    player.pause();
+    let frozen = Instant::now() + Duration::from_secs(1);
+    loop {
+        let native = backend.native.clone();
+        let stopped = dispatch2::run_on_main(move |_| unsafe {
+            use objc2_av_foundation::AVQueuedSampleBufferRendering;
+            native.video_layer().sampleBufferRenderer().timebase().rate() == 0.0
+        });
+        if stopped { break; }
+        assert!(Instant::now() < frozen, "tail renderer did not pause");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let position = player.state().position;
+    let frame = displayed_frame(backend).expect("no displayed video after seeking beyond audio");
+    let offset_ms = f64::from(frame) * 40.0 - position.as_secs_f64() * 1000.0;
+    eprintln!("APPLE_AUDIO_TAIL engine_s={:.9} frame={frame} offset_ms={offset_ms:.6}", position.as_secs_f64());
+    assert!(offset_ms.abs() <= 40.0, "stale video timebase after audio-less seek: {offset_ms} ms");
     drop(player);
 }
 
