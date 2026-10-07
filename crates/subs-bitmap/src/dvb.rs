@@ -11,14 +11,17 @@
 //!   ancillary pages of the first record in the extradata (MPEG-TS
 //!   descriptor 0x59, Matroska CodecPrivate), as VLC's dvbsub.c filters a
 //!   PID by its service's pages and as FFmpeg does with `dvb_substream` 0.
-//!   FFmpeg's default decodes every page, so two services sharing a PID
-//!   would draw over each other. Without valid extradata every page is
-//!   decoded, as in FFmpeg.
+//!   As in VLC, the ancillary page lends its resources (regions, CLUTs,
+//!   objects) but not its page compositions, unless it is the composition
+//!   page itself. FFmpeg's default decodes every page, so two services
+//!   sharing a PID would draw over each other. Without valid extradata
+//!   every page is decoded, as in FFmpeg.
 //! - Hostile-input bounds FFmpeg does not have: canvases (display
 //!   definitions) of at most 4096x4096, at most 4096x4096 region pixels in
 //!   all, at most 1024 object placements, and per packet at most
-//!   `PAINT_WORK_PER_PACKET` of object painting; one display end with no
-//!   bitmap renders its blank canvas once per packet.
+//!   `PAINT_WORK_PER_PACKET` of painting (region allocations and fills,
+//!   object placements); one display end with no bitmap renders its blank
+//!   canvas once per packet.
 //! - A segment shorter than the fields its parser reads ends the packet
 //!   with an error, and pixel strings read zeros past their block; FFmpeg
 //!   reads on into the bytes that follow (the next segment, then zero
@@ -38,8 +41,9 @@ const MAX_REGION_PIXELS: usize = 320 * 1024 * 4;
 const MAX_REGION_BYTES: usize = MAX_SIDE * MAX_SIDE;
 /// Object placements (an object shown in a region) at any time.
 const MAX_OBJECT_DISPLAYS: usize = 1024;
-/// Painting one packet's objects may cost at most this much: for each
-/// placement, its field data plus every pixel of its region.
+/// Painting one packet may cost at most this much: every pixel a region
+/// allocation or fill writes, and for each object placement its field data
+/// plus every pixel of its region.
 const PAINT_WORK_PER_PACKET: usize = 16 << 20;
 
 fn invalid() -> Error {
@@ -222,6 +226,10 @@ impl Context {
             return Err(invalid());
         }
         let resize = area != region.pixels.len();
+        // Allocating or filling the region writes every pixel of it.
+        let writes = if resize || data[1] & 8 != 0 { area } else { 0 };
+        self.paint_left = self.paint_left.checked_sub(writes)
+            .ok_or(Error::invalid("DVB subtitle: region filling exceeds the per-packet bound"))?;
         region.width = width;
         region.height = height;
         region.depth = match (data[6] >> 2) & 7 {
@@ -684,7 +692,12 @@ impl Decoder for DvbDecoder {
                 return Err(invalid());
             }
             let body = &data[6..6 + len];
-            if self.pages.is_none_or(|pages| pages.contains(&page_id)) {
+            // dvbsub.c also skips a page composition on an ancillary page
+            // that is not the composition page.
+            let wanted = self.pages.is_none_or(|[composition, ancillary]| {
+                page_id == composition || (page_id == ancillary && kind != 0x10)
+            });
+            if wanted {
                 match kind {
                     0x10 => { self.context.page(body)?; page = true; }
                     0x11 => { self.context.region(body)?; region = true; }

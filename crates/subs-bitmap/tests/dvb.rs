@@ -324,6 +324,70 @@ fn dvb_pid_with_two_services_shows_only_the_declared_first() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// The FATE stream with its service's resources on the ancillary page: its
+/// CLUT and object segments move from page 1 to the declared ancillary
+/// page 0x152, and after every page-1 composition comes a newer one on
+/// 0x152 that moves every region by (16, 16) and starts a new epoch (a
+/// mode change, which drops regions and objects). VLC skips page
+/// compositions on an ancillary page that differs from the composition
+/// page and keeps its other segments (dvbsub.c), so the stream must decode
+/// exactly as FFmpeg decodes the original.
+fn ancillary_page_compositions(source: &Path, path: &Path) {
+    let (_, packets) = packets(source, "mpegts");
+    let mut units = Vec::new();
+    let mut moved = 0;
+    for packet in &packets {
+        let data = &packet.data;
+        let mut segments = Vec::new();
+        let mut at = 2;
+        while at + 6 <= data.len() && data[at] == 0x0f {
+            let len = usize::from(u16::from_be_bytes([data[at + 4], data[at + 5]]));
+            let mut segment = data[at..at + 6 + len].to_vec();
+            if matches!(segment[1], 0x12 | 0x13) && segment[2..4] == [0, 1] {
+                segment[2..4].copy_from_slice(&[0x01, 0x52]);
+                moved += 1;
+            }
+            segments.extend_from_slice(&segment);
+            if segment[1] == 0x10 && segment[2..4] == [0, 1] {
+                let mut page = segment.clone();
+                page[2..4].copy_from_slice(&[0x01, 0x52]);
+                // A newer version, as a mode change.
+                page[7] = (page[7].wrapping_add(0x80) & 0xf0) | (2 << 2) | (page[7] & 3);
+                for region in page[8..].chunks_exact_mut(6) {
+                    let x = u16::from_be_bytes([region[2], region[3]]) + 16;
+                    let y = u16::from_be_bytes([region[4], region[5]]) + 16;
+                    region[2..4].copy_from_slice(&x.to_be_bytes());
+                    region[4..6].copy_from_slice(&y.to_be_bytes());
+                }
+                segments.extend_from_slice(&page);
+            }
+            at += 6 + len;
+        }
+        units.push((packet.pts.expect("subtitle PTS") as u64, segments));
+    }
+    assert!(moved > 0, "resources moved to the ancillary page");
+    assert!(units.iter().any(|(_, segments)| segments.windows(4).any(|w| w == [0x0f, 0x10, 0x01, 0x52])), "ancillary compositions");
+    subtitle_ts(path, &[b'e', b'n', b'g', 0x10, 0x00, 0x01, 0x01, 0x52], &units);
+}
+
+#[test]
+fn dvb_ancillary_page_keeps_its_resources_but_not_its_compositions() {
+    let _serial = SERIAL.lock();
+    let source = fate("sub/dvbsubtest_filter.ts");
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("dvb-ancillary-{}.ts", std::process::id()));
+    ancillary_page_compositions(&source, &path);
+    let (stream, _) = packets(&path, "mpegts");
+    assert_eq!(stream.params.extradata, [0, 1, 0x01, 0x52, 0x10]);
+    let reference = ffmpeg_reference(&source, 0);
+    let decoded = decode_subtitles(&path, REGISTRARS, 0);
+    assert!(decoded.errors.is_empty(), "{:?}", decoded.errors);
+    let want = reference_cues(&reference);
+    let got = decoded_cues(&decoded.frames, decoded.stream.time_base, reference.width, reference.height);
+    let diffs = cue_diffs(&want, &got, reference.width, Match::Exact);
+    assert!(diffs.is_empty(), "an ancillary page composition reached the screen:\n{}", diffs.join("\n"));
+    std::fs::remove_file(path).unwrap();
+}
+
 /// One DVB subtitling segment of page 1.
 fn page_segment(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut out = vec![0x0f, kind, 0, 1];

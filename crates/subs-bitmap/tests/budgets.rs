@@ -134,3 +134,44 @@ fn dvb_object_fanout_and_paint_work_are_bounded() {
         decode_all(&mut *decoder, packets.into_iter().enumerate().map(|(i, data)| packet(i as i64, data)))
     });
 }
+
+/// Region compositions alone, without any object, pay for the pixels they
+/// write: a 16 KiB packet of 1,024 region segments filling one 1024x1024
+/// region, or resizing it in every segment, would write 1 GiB. Each stops
+/// with an error once the packet's paint work is spent, and the next valid
+/// packet decodes.
+#[test]
+fn dvb_region_fills_and_resizes_pay_the_paint_budget() {
+    // Region 0, fill flag set, 1024 wide, `height` tall, 4-bit, CLUT 0.
+    let region = |height: u16| {
+        let mut body = vec![0, 0x08, 0x04, 0x00];
+        body.extend_from_slice(&height.to_be_bytes());
+        body.extend_from_slice(&[0x08, 0, 0, 0]);
+        segment(0x11, &body)
+    };
+    let same_size: Vec<_> = (0..1024).map(|_| region(1024)).collect();
+    let resizes: Vec<_> = (0..1024).map(|i| region(1024 - i % 2)).collect();
+    // A 16x16 page in a new epoch: one region at (0, 0) showing object 1,
+    // 16 pixels of colour 1 (opaque in the default CLUT) on each field row.
+    let page = segment(0x10, &[5, 0x18, 0, 0, 0, 0, 0, 0]);
+    let small = segment(0x11, &[0, 0x08, 0, 16, 0, 16, 0x08, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+    let field = [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x00, 0xf0];
+    let mut object = vec![0, 1, 0, 0, field.len() as u8, 0, field.len() as u8];
+    object.extend_from_slice(&field);
+    object.extend_from_slice(&field);
+    let valid = dvb(&[page, small, segment(0x13, &object), segment(0x80, &[])]);
+    for (what, segments) in [("1024 same-size fills", same_size), ("1024 resizes", resizes)] {
+        let hostile = dvb(&segments);
+        assert!(hostile.len() <= 16 * 1024 + 1, "{what}: {} bytes", hostile.len());
+        let valid = valid.clone();
+        within(Duration::from_secs(20), what, move || {
+            let mut decoder = decoder("dvb_subtitle");
+            assert!(decoder.send_packet(&packet(0, hostile)).is_err(), "{what}: 1 GiB of region writes in one packet");
+            assert!(decoder.receive_frame().is_err(), "{what}: nothing to show");
+            decoder.send_packet(&packet(90_000, valid)).unwrap();
+            let Ok(Frame::Video(frame)) = decoder.receive_frame() else { panic!("{what}: the valid packet after it") };
+            let plane = &frame.planes[0];
+            assert_ne!(plane.data[3], 0, "{what}: the region's object is visible at (0, 0)");
+        });
+    }
+}
