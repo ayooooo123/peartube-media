@@ -64,10 +64,14 @@ unknown size; any other Top-Level element doing so is InvalidData (a resilient
 open skips it, and between Clusters playback resumes at the next Cluster).
 SegmentUUID, PrevUUID and NextUUID must be 16 octets. Text fields in Info,
 Chapters and Attachments hold at most 64 KiB, and each of these masters keeps
-at most 1 MiB; attachment payloads are never read at open. Everything the open
+at most 1 MiB. Past it, Chapters and Attachments keep the records that fit, in
+order, and record one damage event, and the open goes on, strict or resilient:
+a long chapter list never stops playback. Attachment payloads are never read at
+open; one fetched on request grows only as bytes arrive, and a payload reaching
+past its AttachedFile or the Segment is refused unread. Everything the open
 keeps from Tracks or Tags, including tag resolution, the per-stream views and
-room to parse a codec configuration, stays within the master's 32 MiB limit at
-its peak and after the open. The Cues index
+room to parse or decompress a codec configuration, stays within the master's
+32 MiB limit at its peak and after the open. The Cues index
 keeps at most 32 MiB: past that it keeps the CuePoints that fit and records a
 damage event, and a seek past the last point kept for its track scans the
 Clusters from the first one (a known read cost on large remote files). Cluster
