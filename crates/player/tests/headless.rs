@@ -1934,4 +1934,69 @@ fn video_without_container_size_plays_at_the_decoded_size() {
     assert_eq!(video.frame_md5, expected, "pictures differ from FFmpeg");
 }
 
+/// Plays `bytes`, a `ext` file that declares no picture size, and checks
+/// that the player state reports the decoded `size`, that the sink was
+/// opened at it, and that every picture equals FFmpeg's decode.
+fn assert_plays_at_decoded_size(ext: &str, bytes: Vec<u8>, size: (u32, u32), frames: usize) {
+    let path = tempfile(ext);
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let options = PlayerOptions { realtime: false, ..PlayerOptions::default() };
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), options, |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(30), finished);
+    drop(player);
+    let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &[]);
+    std::fs::remove_file(&path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{ext}: {state:?}");
+    assert_eq!(state.video_size, Some(size), "{ext}: decoded size not published");
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    assert_eq!((video.width, video.height), size, "{ext}: sink not opened at the decoded size");
+    assert_eq!(expected.len(), frames, "{ext}: FFmpeg frame count");
+    assert_eq!(video.frame_md5, expected, "{ext}: pictures differ from FFmpeg");
+}
+
+/// An odd-size test card: one second at 25 fps, cropped from whole blocks.
+const ODD_TESTSRC: &str = "testsrc=size=33x17:rate=25:duration=1";
+
+#[test]
+fn raw_hevc_plays_at_the_cropped_decoded_size() {
+    // x265 codes 4:2:0 only at even sizes; 34×18 is still cropped from the
+    // 40×24 its coding blocks cover.
+    let bytes = ffmpeg_file("hevc", &[
+        "-f", "lavfi", "-i", "testsrc=size=34x18:rate=25:duration=1", "-pix_fmt", "yuv420p",
+        "-c:v", "libx265", "-x265-params", "log-level=error:bframes=2",
+    ]);
+    assert_plays_at_decoded_size("hevc", bytes, (34, 18), 25);
+}
+
+/// An IVF file of `codec` whose file header declares a 0×0 picture.
+fn ivf_without_size(codec: &[&str]) -> Vec<u8> {
+    let mut args = vec!["-f", "lavfi", "-i", ODD_TESTSRC, "-pix_fmt", "yuv420p"];
+    args.extend_from_slice(codec);
+    let mut bytes = ffmpeg_file("ivf", &args);
+    assert_eq!(&bytes[..4], b"DKIF");
+    // Width and height, 16 bits each, at bytes 12..16.
+    bytes[12..16].fill(0);
+    bytes
+}
+
+#[test]
+fn ivf_vp8_without_size_plays_at_the_decoded_size() {
+    let bytes = ivf_without_size(&["-c:v", "libvpx", "-b:v", "200k"]);
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25);
+}
+
+#[test]
+fn ivf_vp9_without_size_plays_at_the_decoded_size() {
+    let bytes = ivf_without_size(&["-c:v", "libvpx-vp9", "-b:v", "200k"]);
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25);
+}
+
+#[test]
+fn ivf_av1_without_size_plays_at_the_decoded_size() {
+    let bytes = ivf_without_size(&["-c:v", "libaom-av1", "-cpu-used", "8", "-b:v", "200k"]);
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25);
+}
+
 

@@ -16,7 +16,7 @@
 
 use std::sync::LazyLock;
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, PixelFormat, Result};
 
 use crate::bits::BitReader;
 use crate::idct;
@@ -1589,6 +1589,17 @@ impl Decoder for MsDecoder {
 
     fn receive_frame(&mut self) -> Result<Frame> {
         self.pending.take().ok_or(Error::NeedMore)
+    }
+
+    /// Every picture has the container's size (the bitstream carries
+    /// none) and is cropped to it.
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        // `new` bounds both by `MAX_DIM`.
+        Some((self.width as u32, self.height as u32))
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        Some(PixelFormat::Yuv420P)
     }
 
     fn flush(&mut self) -> Result<()> {

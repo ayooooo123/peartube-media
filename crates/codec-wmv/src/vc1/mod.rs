@@ -16,7 +16,7 @@ mod pred;
 
 use std::sync::LazyLock;
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, PixelFormat, Result};
 
 use crate::bits::BitReader;
 use crate::mpv::Picture;
@@ -470,7 +470,12 @@ pub struct Vc1Decoder {
     low_delay: bool,
     pub(crate) x8: Option<IntraX8>,
 
-    pending: std::collections::VecDeque<Frame>,
+    /// Output frames not yet returned, each with the size it was cropped
+    /// to (the size in force when it was output; `init_context` drops the
+    /// references when the coded size changes).
+    pending: std::collections::VecDeque<(Frame, (u32, u32))>,
+    /// Size of the frame `receive_frame` last returned.
+    last_output: Option<(u32, u32)>,
 }
 
 /// Index helpers for the arrays allocated "so they can be used with
@@ -731,6 +736,7 @@ impl Vc1Decoder {
             low_delay: true,
             x8: None,
             pending: std::collections::VecDeque::new(),
+            last_output: None,
         }
     }
 
@@ -2074,14 +2080,16 @@ impl Vc1Decoder {
 
         // Output and reference update.
         let cur = self.cur.take().expect("current picture");
+        let size = (self.width as usize, self.height as usize);
+        let reported = (self.width as u32, self.height as u32);
         if self.pict_type == PICT_B {
-            self.pending.push_back(cur.pic.to_frame(self.width as usize, self.height as usize, pts));
+            self.pending.push_back((cur.pic.to_frame(size.0, size.1, pts), reported));
             self.spare.push(cur);
         } else {
             if self.low_delay {
-                self.pending.push_back(cur.pic.to_frame(self.width as usize, self.height as usize, pts));
+                self.pending.push_back((cur.pic.to_frame(size.0, size.1, pts), reported));
             } else if let Some(last) = self.last.as_ref() {
-                self.pending.push_back(last.pic.to_frame(self.width as usize, self.height as usize, pts));
+                self.pending.push_back((last.pic.to_frame(size.0, size.1, pts), reported));
             }
             self.next = Some(cur);
         }
@@ -2158,14 +2166,30 @@ impl Decoder for Vc1Decoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        self.pending.pop_front().ok_or(Error::NeedMore)
+        let (frame, size) = self.pending.pop_front().ok_or(Error::NeedMore)?;
+        self.last_output = Some(size);
+        Ok(frame)
+    }
+
+    /// The frame last returned; before the first, the next queued one.
+    /// The coded size (`init_context`); display size only sets the aspect.
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.last_output
+            .or_else(|| self.pending.front().map(|(_, size)| *size))
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output_video_dimensions().map(|_| PixelFormat::Yuv420P)
     }
 
     fn flush(&mut self) -> Result<()> {
         // End of stream: the last reference is still waiting (B-frame delay).
         if !self.low_delay {
             if let Some(next) = self.next.take() {
-                self.pending.push_back(next.pic.to_frame(self.width as usize, self.height as usize, None));
+                let size = (self.width as u32, self.height as u32);
+                self.pending
+                    .push_back((next.pic.to_frame(self.width as usize, self.height as usize, None), size));
                 self.spare.push(next);
             }
         }
