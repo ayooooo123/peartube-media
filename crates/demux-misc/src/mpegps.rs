@@ -58,6 +58,16 @@ const ANALYZE_SUBTITLE: i64 = 30 * 90_000;
 /// Elementary-stream bytes kept per stream while discovering, from which
 /// its identity and parameters come.
 const HEAD_BYTES: usize = 1 << 20;
+/// Parameters come from headers at the start of a stream; scans of its
+/// head stop here.
+const AUDIO_SCAN: usize = 64 * 1024;
+const VIDEO_SCAN: usize = 256 * 1024;
+/// The longest MPEG audio frame (layer II, 160 kbit/s at 8 kHz, is 2881
+/// bytes) and AC-3 / E-AC-3 syncframe (4096 bytes), rounded up.
+const MPA_MAX_FRAME: usize = 4096;
+const AC3_MAX_FRAME: usize = 4096;
+/// mpegaudio parser: header + layer + frequency + lsf/mpeg25 must repeat.
+const SAME_HEADER_MASK: u32 = 0xFFE0_0000 | (3 << 17) | (3 << 10) | (3 << 19);
 
 const TIME_BASE: TimeBase = TimeBase::new(1, 90_000);
 
@@ -181,9 +191,21 @@ struct Track {
     probe_done: bool,
     /// Its parameters are known (has_codec_parameters).
     ready: bool,
+    /// What `params_ready` has looked at so far.
+    readiness: Readiness,
     first_ts: Option<i64>,
     start_time: Option<i64>,
     framing: Framing,
+}
+
+/// How far the search for a track's parameter header has got.
+#[derive(Default)]
+struct Readiness {
+    /// The codec searched for, and the length of the scan window then;
+    /// `None` before the first look.
+    seen: Option<(Option<&'static str>, usize)>,
+    /// No later bytes can change the outcome.
+    settled: bool,
 }
 
 /// One PES header: its stream id after private-stream-1 / extension
@@ -741,6 +763,7 @@ impl MpegPsDemuxer {
             probed_at: 0,
             probe_done: codec.is_some(),
             ready: false,
+            readiness: Readiness::default(),
             first_ts: None,
             start_time: None,
             framing,
@@ -932,24 +955,36 @@ impl Track {
         }
     }
 
-    /// has_codec_parameters, as far as this demuxer fills parameters.
-    fn params_ready(&self) -> bool {
-        match self.media {
-            MediaType::Audio => {
-                let p = self.parameters();
-                p.sample_rate.is_some() && p.channels.is_some()
-            }
-            MediaType::Video => self.parameters().width.is_some(),
-            _ => true,
-        }
+    /// has_codec_parameters, as far as this demuxer fills parameters: the
+    /// header `parameters` reads them from is whole within the stream's
+    /// head. Asked as the head grows, it looks only at what the new bytes
+    /// can complete, so discovery stays linear in its input whatever the
+    /// stream holds; the answer is the one a scan of the whole head gives.
+    fn params_ready(&mut self) -> bool {
+        let scan = match self.media {
+            MediaType::Video => VIDEO_SCAN,
+            MediaType::Audio => AUDIO_SCAN,
+            _ => return true,
+        };
+        let window = &self.head[..self.head.len().min(scan)];
+        let readiness = &mut self.readiness;
+        let seen = match readiness.seen {
+            // Same bytes, same codec: same answer.
+            Some((codec, len)) if codec == self.codec && len == window.len() => return false,
+            Some((codec, _)) if codec == self.codec && readiness.settled => return false,
+            Some((codec, len)) if codec == self.codec => len,
+            // A codec probed since then starts the search over.
+            _ => 0,
+        };
+        readiness.seen = Some((self.codec, window.len()));
+        let (ready, settled) = header_completed(self.media, self.codec.unwrap_or("none"), window, seen);
+        readiness.settled = settled;
+        ready
     }
 
     /// The stream's codec and parameters from its first bytes, as
     /// FFmpeg's parsers and decoders report them after find_stream_info.
     fn parameters(&self) -> CodecParameters {
-        /// Headers come from the start of a stream; scans stop here.
-        const AUDIO_SCAN: usize = 64 * 1024;
-        const VIDEO_SCAN: usize = 256 * 1024;
         let codec = self.codec.unwrap_or("none");
         let id = CodecId::new(codec);
         let mut p = match self.media {
@@ -1012,6 +1047,64 @@ impl Track {
     }
 }
 
+/// Whether the header `Track::parameters` reads `media`'s parameters from
+/// is whole in the scan window `es`, given that it was not within
+/// `es[..seen]`; and whether no later bytes can change the answer. Only
+/// candidates the bytes past `seen` can complete are looked at: one that
+/// starts further back fitted within `seen` and failed then.
+fn header_completed(media: MediaType, codec: &str, es: &[u8], seen: usize) -> (bool, bool) {
+    const DTS_SYNC: [u8; 4] = [0x7F, 0xFE, 0x80, 0x01];
+    match (media, codec) {
+        // The first sequence start code, then 3 (MPEG) or 6 (AVS) bytes:
+        // one that was not whole at `seen` starts after `seen - 4 - need`.
+        (MediaType::Video, "mpeg2video" | "cavs") => {
+            let (code, need) = if codec == "cavs" { (0xB0, 6) } else { (0xB3, 3) };
+            let whole = start_code(es, seen.saturating_sub(3 + need), |c| c == code).is_some_and(|seq| seq + need <= es.len());
+            (whole, false)
+        }
+        // mpeg_audio: a header followed one frame on by a matching one.
+        (MediaType::Audio, "mp2" | "mp3") => {
+            let word = |i: usize| es.get(i..i + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+            let pair = (seen.saturating_sub(MPA_MAX_FRAME + 4)..es.len()).any(|i| {
+                let Some(h) = word(i) else { return false };
+                let Some(first) = mpa_decode_header(h) else { return false };
+                // Both headers were there at `seen`: it failed then.
+                i + first.frame_bytes + 4 > seen
+                    && word(i + first.frame_bytes).is_some_and(|next| {
+                        mpa_decode_header(next).is_some() && next & SAME_HEADER_MASK == h & SAME_HEADER_MASK
+                    })
+            });
+            (pair, false)
+        }
+        // ac3_frame: a syncframe whose CRC holds.
+        (MediaType::Audio, "ac3") => {
+            let frame = (seen.saturating_sub(AC3_MAX_FRAME)..es.len().saturating_sub(7)).any(|i| {
+                if es[i] != 0x0B || es[i + 1] != 0x77 {
+                    return false;
+                }
+                let Some(h) = crate::ac3::parse_ac3_header(&es[i..]) else { return false };
+                let end = i + h.frame_size;
+                // In range and whole at `seen`: its CRC failed then.
+                let checked = i + 8 <= seen && end <= seen;
+                !checked && es.get(i..end).is_some_and(|frame| crate::ac3::crc16_ansi(&frame[2..]) == 0)
+            });
+            (frame, false)
+        }
+        // dts_core: the first sync decides, whether its header holds or not.
+        (MediaType::Audio, "dts") => {
+            let from = seen.saturating_sub(12);
+            let found = (from..es.len().saturating_sub(12)).any(|i| es[i..i + 4] == DTS_SYNC);
+            (found && dts_core(&es[from..]).is_some(), found)
+        }
+        (MediaType::Audio, "pcm_dvd") => (es.len() >= 2, false),
+        // pcm_dvda_layout reads bytes 6, 7 and 9.
+        (MediaType::Audio, "pcm_dvda") => (pcm_dvda_layout(es).is_some(), es.len() >= 10),
+        (MediaType::Audio, "pcm_alaw" | "pcm_mulaw") => (true, true),
+        // No header this demuxer reads parameters from.
+        _ => (false, true),
+    }
+}
+
 /// The offset just past `00 00 01 code` in `es` at or after `from`.
 fn start_code(es: &[u8], from: usize, code: impl Fn(u8) -> bool) -> Option<usize> {
     (from..es.len().saturating_sub(3))
@@ -1059,8 +1152,6 @@ fn cavs_sequence(es: &[u8]) -> Option<(u32, u32)> {
 /// What FFmpeg's mpegaudio parser reports once two consecutive headers
 /// agree (its header_count threshold): codec, sample rate, channels.
 fn mpeg_audio(es: &[u8]) -> Option<(&'static str, u32, u16)> {
-    // header + layer + frequency + lsf/mpeg25
-    const SAME_HEADER_MASK: u32 = 0xFFE0_0000 | (3 << 17) | (3 << 10) | (3 << 19);
     let word = |i: usize| es.get(i..i + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     (0..es.len()).find_map(|i| {
         let h = word(i)?;
@@ -1175,4 +1266,111 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("mpeg", "mpeg");
     reg.register_extension("vob", "mpeg");
     reg.register_extension("mpe", "mpeg");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn crc16(data: &[u8]) -> u16 {
+        crate::ac3::crc16_ansi(data)
+    }
+
+    fn noise(random: &mut impl FnMut() -> u32, len: usize) -> Vec<u8> {
+        (0..len).map(|_| random() as u8).collect()
+    }
+
+    /// Bytes around one complete parameter header of `codec`, near-misses
+    /// included (headers cut short, CRCs that fail, a second sync).
+    fn stream(codec: &str, random: &mut impl FnMut() -> u32) -> Vec<u8> {
+        let lead = (random() % 9000) as usize;
+        let mut out = noise(random, lead);
+        match codec {
+            "mpeg2video" => {
+                out.extend_from_slice(&[0, 0, 1]);
+                out.extend_from_slice(&[0, 0, 1, 0xB3, 0x2D, 0x01, 0xE0]);
+            }
+            "cavs" => out.extend_from_slice(&[0, 0, 1, 0xB0, 0x20, 0x42, 0x81, 0x68, 0x0F, 0x00]),
+            "mp2" => {
+                // A lone header, then two 576-byte 48 kHz frames in a row.
+                out.extend_from_slice(&[0xFF, 0xFD, 0xA4, 0x00]);
+                out.extend(noise(random, 100));
+                for _ in 0..2 {
+                    let mut frame = noise(random, 576);
+                    frame[..4].copy_from_slice(&[0xFF, 0xFD, 0xA4, 0x00]);
+                    out.extend(frame);
+                }
+            }
+            "ac3" => {
+                // 48 kHz, 128-byte frames: one failing its CRC, then a valid one.
+                for valid in [false, true] {
+                    let mut frame = noise(random, 128);
+                    frame[..8].copy_from_slice(&[0x0B, 0x77, 0, 0, 0x00, 0x40, 0x40, 0]);
+                    let crc = crc16(&frame[2..126]);
+                    frame[126..].copy_from_slice(&(crc ^ u16::from(!valid)).to_be_bytes());
+                    out.extend(frame);
+                }
+            }
+            "dts" => out.extend_from_slice(&[0x7F, 0xFE, 0x80, 0x01, 0xFC, 0x3C, 0x7F, 0xE8, 0x37, 0x00, 0x00, 0x00, 0x00]),
+            _ => {}
+        }
+        let tail = (random() % 9000) as usize;
+        out.extend(noise(random, tail));
+        out
+    }
+
+    /// `params_ready` asked after every delivery answers what the scan of
+    /// the whole head answers, however the bytes arrive.
+    #[test]
+    fn incremental_readiness_matches_a_full_scan() {
+        let mut state = 0x5053_5245_4144_5921u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u32
+        };
+        let cases = [
+            (MediaType::Video, Some("mpeg2video")),
+            (MediaType::Video, Some("cavs")),
+            (MediaType::Video, None),
+            (MediaType::Audio, Some("mp2")),
+            (MediaType::Audio, Some("ac3")),
+            (MediaType::Audio, Some("dts")),
+            (MediaType::Audio, Some("pcm_dvd")),
+            (MediaType::Audio, Some("pcm_dvda")),
+            (MediaType::Audio, Some("pcm_alaw")),
+        ];
+        for round in 0..400 {
+            let (media, codec) = cases[round % cases.len()];
+            let bytes = stream(codec.unwrap_or("none"), &mut random);
+            let mut track = Track {
+                id: 0,
+                codec,
+                media,
+                head: Vec::new(),
+                probed_at: 0,
+                probe_done: true,
+                ready: false,
+                readiness: Readiness::default(),
+                first_ts: None,
+                start_time: None,
+                framing: Framing::Pes,
+            };
+            let mut at = 0;
+            while at < bytes.len() && !track.ready {
+                let chunk = match random() % 4 { 0 => 1, 1 => 1 + random() as usize % 16, _ => 1 + random() as usize % 3000 };
+                let end = (at + chunk).min(bytes.len());
+                track.head.extend_from_slice(&bytes[at..end]);
+                at = end;
+                let p = track.parameters();
+                let full = match media {
+                    MediaType::Video => p.width.is_some(),
+                    _ => p.sample_rate.is_some() && p.channels.is_some(),
+                };
+                track.ready = track.params_ready();
+                assert_eq!(track.ready, full, "round {round}: {codec:?} after {at} of {} bytes", bytes.len());
+            }
+        }
+    }
 }

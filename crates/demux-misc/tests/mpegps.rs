@@ -522,3 +522,53 @@ fn discovery_stops_at_the_probe_size_in_pack_headers() {
 fn discovery_keeps_a_start_code_across_the_probe_size() {
     discovery_stops_at_the_probe_size("junk", |head| PROBE_SIZE - 2 - head, false);
 }
+
+/// CRC-16/ANSI (x^16 + x^15 + x^2 + 1, MSB first), as AC-3 syncframes use.
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &byte in data {
+        crc ^= u16::from(byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x8005 } else { crc << 1 };
+        }
+    }
+    crc
+}
+
+/// 64 KiB of AC-3 syncframe headers whose CRC fails, then about 300 000
+/// one-byte AC-3 PES packets: an input that keeps an audio stream's
+/// parameters unknown for the whole probe size. Discovery must look at
+/// what each packet adds, not scan the stream's head again per packet.
+#[test]
+fn discovery_does_not_rescan_a_parameterless_head_per_packet() {
+    // AC-3, 48 kHz, frmsizecod 0 (128-byte frames), bsid 8: a header the
+    // parser accepts every 8 bytes, each frame failing its CRC.
+    let unit = [0x0B, 0x77, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00];
+    let frame: Vec<u8> = unit.iter().copied().cycle().take(128).collect();
+    assert_ne!(crc16(&frame[2..]), 0, "the fixture's syncframes must fail their CRC");
+    let syncs: Vec<u8> = unit.iter().copied().cycle().take(32 * 1024).collect();
+    let mut ps = Vec::new();
+    for _ in 0..2 {
+        ps.extend_from_slice(&PACK);
+        ps.extend(private_pes(9000, &[&[0x80, 0x01, 0x00, 0x01][..], &syncs].concat()));
+    }
+    let tiny = pes(0xBD, None, &[0x80, 0x01, 0x00, 0x01, 0x77]);
+    for _ in 0..300_000 {
+        ps.extend_from_slice(&tiny);
+    }
+    ps.extend_from_slice(&[0, 0, 1, 0xB9]);
+    assert!(ps.len() < PROBE_SIZE, "discovery reads the whole input");
+
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ctx = codecs::context();
+        let demuxer = ctx.containers.open_demuxer("mpeg", Box::new(std::io::Cursor::new(ps)), &ctx.codecs).unwrap();
+        let streams: Vec<(String, Option<u32>)> =
+            demuxer.streams().iter().map(|s| (s.params.codec_id.as_str().to_string(), s.params.sample_rate)).collect();
+        let _ = done.send(streams);
+    });
+    let streams = finished
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("open did not finish within 20 s");
+    assert_eq!(streams, [("ac3".to_string(), None)]);
+}

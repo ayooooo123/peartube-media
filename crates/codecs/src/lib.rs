@@ -21,6 +21,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_mlp::register_codecs,
         codec_dca::register_codecs,
         subs_text::register_codecs,
+        // Every PGS, DVB, DVD, CVD and OGT id, ahead of oxideav-sub-image.
+        subs_bitmap::register_codecs,
         codec_rv::register_codecs,
         codec_wmv::register_codecs,
         codec_wma::lib_registration::register_codecs,
@@ -97,6 +99,7 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_dca::register_containers,
         codec_wmv::demuxers::register_containers,
         subs_text::register_containers,
+        subs_bitmap::register_containers,
     ] {
         register(&mut ctx.containers);
     }

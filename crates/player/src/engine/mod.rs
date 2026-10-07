@@ -15,10 +15,13 @@ use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
 use crate::clock::MasterClock;
 use crate::headless::find_headless;
 use crate::source::{open_source, ReadAheadSource, SourceMonitor};
-use crate::subs::run_subtitle_loop;
+use crate::subs::{run_subtitle_loop, SubtitlePipeline};
 
 mod transport;
 use transport::{Due, Live, Pipe, Preroll, Transport};
+
+#[cfg(test)]
+mod subtitle_tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
@@ -111,7 +114,7 @@ pub(crate) struct Lane {
     pub(crate) cv: Condvar,
     /// Seek generation the queued packets belong to; changed only with
     /// `queue` locked, when the demuxer empties the lane for a seek.
-    seek_gen: AtomicU64,
+    pub(crate) seek_gen: AtomicU64,
     /// A pipeline thread drains the lane (see `Consumer`); changed only with
     /// `queue` locked. Without one, packets for the lane are dropped:
     /// queued, they would fill it and park the demuxer for good.
@@ -370,11 +373,15 @@ struct SharedState {
     active_seek: Mutex<Option<Seek>>,
     /// Selection written by `select_audio` / `select_subtitle`; the demux
     /// loop applies it (flush + respawn the pipeline) and mirrors `state`.
-    wanted_audio: Mutex<Option<u32>>,
+    wanted_audio: Mutex<AudioChoice>,
     wanted_video: Mutex<Option<u32>>,
     wanted_subtitle: Mutex<Option<u32>>,
     /// Bumped on every selection change; the demux loop compares to detect it.
     select_gen: AtomicU64,
+    /// The playback has video or audio pipelines (playing or played out),
+    /// as its selection stands: subtitles beside them end with the screen
+    /// clear. Set by the demux thread whenever it starts or retires them.
+    beside_media: AtomicBool,
     backend: Arc<dyn Backend>,
     /// The playback's clock (see `MasterClock`); `transport` decides when
     /// it runs.
@@ -403,6 +410,14 @@ struct Seek {
     generation: u64,
     /// Target in seconds.
     target: f64,
+}
+
+/// The audio track asked for: the playback's default, or one the caller
+/// chose (`None`: no audio). A switch of another kind keeps the default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AudioChoice {
+    Default,
+    Chosen(Option<u32>),
 }
 
 impl SharedState {
@@ -461,10 +476,11 @@ impl Player {
             seek_gen: AtomicU64::new(0),
             seek_target: Mutex::new(None),
             active_seek: Mutex::new(None),
-            wanted_audio: Mutex::new(options.audio),
+            wanted_audio: Mutex::new(options.audio.map_or(AudioChoice::Default, |stream| AudioChoice::Chosen(Some(stream)))),
             wanted_video: Mutex::new(options.video),
             wanted_subtitle: Mutex::new(options.subtitle),
             select_gen: AtomicU64::new(1),
+            beside_media: AtomicBool::new(false),
             backend,
             master: Arc::new(MasterClock::new()),
             audio_sink: Mutex::new(None),
@@ -510,7 +526,7 @@ impl Player {
     }
 
     pub fn select_audio(&self, stream: Option<u32>) {
-        *self.shared.wanted_audio.lock() = stream;
+        *self.shared.wanted_audio.lock() = AudioChoice::Chosen(stream);
         self.shared.select_gen.fetch_add(1, Ordering::SeqCst);
         self.shared.condvar.notify_all();
         notify_changed(&self.shared);
@@ -760,7 +776,10 @@ fn run_player_pipeline(
     let select_gen = shared.select_gen.load(Ordering::SeqCst);
     let options_video = *shared.wanted_video.lock();
     let current_video = options_video.or(first_video);
-    let current_audio = (*shared.wanted_audio.lock()).or(first_audio);
+    let current_audio = match *shared.wanted_audio.lock() {
+        AudioChoice::Default => first_audio,
+        AudioChoice::Chosen(stream) => stream,
+    };
     let current_subtitle = *shared.wanted_subtitle.lock();
 
     {
@@ -863,6 +882,7 @@ fn run_player_pipeline(
         video_stream.map(|stream| spawn_video(&shared, stream, &video_lane, &demux_cv, realtime));
     run.audio_thread =
         audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
+    shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
     run.sub_thread = find_stream(&streams, current_subtitle)
         .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime));
 
@@ -870,11 +890,21 @@ fn run_player_pipeline(
     shared.pipelines_started();
     run_demux_loop(&mut run);
 
-    for thread in [run.video_thread.take(), run.audio_thread.take(), run.sub_thread.take()]
-        .into_iter()
-        .flatten()
-    {
+    // Subtitles never hold the end of a playback with video or audio: a
+    // state still up when those have played (its end can be minutes or
+    // hours out) comes down with them. Alone, subtitles play to their last
+    // end; without realtime nothing waits on the clock and the pipeline
+    // ends once its lane has drained.
+    let paced = run.video_thread.is_some() || run.audio_thread.is_some();
+    for thread in [run.video_thread.take(), run.audio_thread.take()].into_iter().flatten() {
         thread.join();
+    }
+    if let Some(subtitles) = run.sub_thread.take() {
+        if paced && realtime {
+            subtitles.retire(&shared, &sub_lane);
+        } else {
+            subtitles.join();
+        }
     }
     // Everything has played: the idle audio output stops with the clock.
     if let Some(sink) = shared.audio_sink.lock().as_mut() {
@@ -1008,27 +1038,49 @@ fn spawn_subtitles(
     let consumer = Consumer::new(lane, demux_cv);
     let sink = shared.backend.subtitles();
     let clock = shared.sink_clock();
-    let (w, h) = shared.state.lock().video_size.unwrap_or((320, 240));
     let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
     PipelineThread::spawn("peartube-subtitles", move |retired| {
         let _consumer = consumer;
-        let decoder = match shared.ctx.codecs.first_decoder(&stream.params) {
+        let mut params = stream.params.clone();
+        let (video_size, lanes) = (shared.state.lock().video_size, shared.lanes.lock().clone());
+        // DVD, CVD and OGT place regions in video pixels. For a stream that
+        // declares no canvas, FFmpeg's is the video's (fftools/ffmpeg_demux.c
+        // sub2video); the DVD decoder's own `size:` line still takes
+        // precedence, as dvdsubdec's does. The video size is known only from
+        // the container at open: nothing publishes a decoded one, so without
+        // it the decoders keep their 720x576, and nothing waits for a size.
+        let video_pixels = matches!(params.codec_id.as_str(), "dvd_subtitle" | "dvdsub" | "vobsub" | "cvd_subtitle" | "ogt");
+        let declared = params.width.unwrap_or(0) > 0 && params.height.unwrap_or(0) > 0;
+        if let Some((width, height)) = video_size.filter(|_| video_pixels && !declared) {
+            params.width = Some(params.width.unwrap_or(0).max(width));
+            params.height = Some(params.height.unwrap_or(0).max(height));
+        }
+        let (w, h) = video_size.unwrap_or((320, 240));
+        let decoder = match shared.ctx.codecs.first_decoder(&params) {
             Ok(d) => d,
             Err(_) => return,
         };
-        run_subtitle_loop(
+        let ctx = Arc::clone(&shared.ctx);
+        let (seeks, members) = (Arc::clone(&shared), Arc::clone(&shared));
+        let pipeline = SubtitlePipeline {
             decoder,
-            sink,
+            new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
             clock,
-            stream.time_base,
-            w,
-            h,
+            time_base: stream.time_base,
+            video_width: w,
+            video_height: h,
             realtime,
             lane,
             demux_cv,
-            shared.stopped.clone(),
+            seek_generation: Box::new(move || seeks.seek_gen.load(Ordering::SeqCst)),
+            // A video or audio pipeline drains its lane: the demuxer's
+            // read-ahead is bounded by theirs.
+            paced: Box::new(move || lanes.iter().take(2).any(|lane| lane.consumed.load(Ordering::SeqCst))),
+            beside_media: Box::new(move || members.beside_media.load(Ordering::SeqCst)),
+            stopped: shared.stopped.clone(),
             retired,
-        );
+        };
+        run_subtitle_loop(pipeline, sink);
     })
 }
 
@@ -1159,8 +1211,12 @@ fn run_demux_loop(run: &mut Run<'_>) {
             // lane without a consumer is always empty (see `Consumer`).
             // Leaving ends `run_player_pipeline`, which joins the pipelines
             // and sets Ended. A seek or a selection switch clears lanes and
-            // reopens `eof` at the top of this loop.
-            let drained = [run.video_thread.as_ref(), run.audio_thread.as_ref(), run.sub_thread.as_ref()]
+            // reopens `eof` at the top of this loop. In realtime, subtitles
+            // beside video or audio do not hold the end: their last state
+            // comes down when those have played (`run_player_pipeline`).
+            let paced = run.options.realtime && (run.video_thread.is_some() || run.audio_thread.is_some());
+            let subtitles = run.sub_thread.as_ref().filter(|_| !paced);
+            let drained = [run.video_thread.as_ref(), run.audio_thread.as_ref(), subtitles]
                 .into_iter().flatten().all(|thread| thread.handle.is_finished());
             if drained {
                 return;
@@ -1273,11 +1329,16 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
 /// pipeline, start the new one, and refresh the headless registry entry. A
 /// new audio track resumes where playback is: the demuxer re-reads from the
 /// clock's position (a refresh seek) instead of starting the track wherever
-/// it has read ahead to.
+/// it has read ahead to. A subtitle switch never seeks: the new track shows
+/// from its next cue the demuxer reads.
 fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let shared = run.shared;
 
-    let wanted_audio = *shared.wanted_audio.lock();
+    // The default audio track stays whatever else changes.
+    let wanted_audio = match *shared.wanted_audio.lock() {
+        AudioChoice::Default => run.current_audio,
+        AudioChoice::Chosen(stream) => stream,
+    };
     let wanted_subtitle = *shared.wanted_subtitle.lock();
     let audio_changed = wanted_audio != run.current_audio;
     let sub_changed = wanted_subtitle != run.current_subtitle;
@@ -1340,6 +1401,8 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
             run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
         }
     }
+    // Subtitles beside video or audio, running or new, end with them.
+    shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
     if sub_changed {
         let stream = find_stream(run.streams, run.current_subtitle)
             .filter(|s| s.params.media_type == MediaType::Subtitle);

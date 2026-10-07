@@ -52,6 +52,7 @@ oxideav-h264.workspace = true
 parking_lot = "0.12"
 codecs = { path = "../codecs" }
 refcheck = { path = "../refcheck" }
+subs-bitmap = { path = "../subs-bitmap" }
 
 [[example]]
 name = "android_probe"
