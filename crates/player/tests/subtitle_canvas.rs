@@ -395,7 +395,6 @@ fn h264_vob(label: &str) -> PathBuf {
 /// Packet P1-1's acceptance for the H.264 VOB: every video frame FFmpeg
 /// decodes, with its subtitle stream selected.
 #[test]
-#[ignore = "blocked on the video owner: the H.264-in-MPEG-PS path presents 19 of FFmpeg's 20 frames, with or without a subtitle (truncated CABAC slices: `h264 slice skipped ... read past end of bitstream`)"]
 fn h264_vob_plays_every_ffmpeg_frame() {
     let path = h264_vob("h264-every-frame.vob");
     let (streams, _) = streams_and_subtitles(&path, "mpeg");
