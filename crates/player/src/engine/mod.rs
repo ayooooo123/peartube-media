@@ -942,15 +942,58 @@ fn spawn_subtitles(
     let consumer = Consumer::new(lane, demux_cv);
     let sink = shared.backend.subtitles();
     let clock = shared.sink_clock();
-    let (w, h) = shared.state.lock().video_size.unwrap_or((320, 240));
     let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
     PipelineThread::spawn("peartube-subtitles", move |retired| {
         let _consumer = consumer;
-        let decoder = match shared.ctx.codecs.first_decoder(&stream.params) {
+        let mut params = stream.params.clone();
+        // DVD/CVD/OGT positions are video pixels unless the stream declares
+        // its own canvas. PGS/DVB instead define their canvas in-band.
+        let video_pixels = matches!(params.codec_id.as_str(), "dvd_subtitle" | "dvdsub" | "vobsub" | "cvd_subtitle" | "ogt");
+        // VobSub's size is parsed/validated by the DVD decoder, where it
+        // takes precedence over CodecParameters. Do not wait on video for it.
+        let indexed_size = matches!(params.codec_id.as_str(), "dvd_subtitle" | "dvdsub" | "vobsub")
+            && params.extradata.split(|&b| b == b'\n' || b == b'\r').any(|line| line.starts_with(b"size:"));
+        if video_pixels && !indexed_size
+            && (params.width.unwrap_or(0) == 0 || params.height.unwrap_or(0) == 0)
+        {
+            let video_lane = shared.lanes.lock().first().cloned();
+            loop {
+                if shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst)
+                    || shared.failed.load(Ordering::SeqCst)
+                {
+                    return;
+                }
+                let (size, video) = {
+                    let state = shared.state.lock();
+                    (state.video_size, state.video)
+                };
+                if let Some((width, height)) = size.filter(|&(w, h)| w > 0 && h > 0) {
+                    if params.width.unwrap_or(0) == 0 { params.width = Some(width); }
+                    if params.height.unwrap_or(0) == 0 { params.height = Some(height); }
+                    break;
+                }
+                if video.is_none() {
+                    // Subtitle-only playback retains the decoder's fallback.
+                    break;
+                }
+                if video_lane.as_ref().is_none_or(|lane| !lane.consumed.load(Ordering::SeqCst)) {
+                    // Video ended without ever reporting a size. There is no
+                    // authoritative canvas: never label 720x576 as its size.
+                    return;
+                }
+                // Keep the first packet intact until size publication. Stop,
+                // selection retirement and seeks wake this lane; the bounded
+                // wait also observes video EOF/failure without a notification.
+                let mut queue = lane.queue.lock();
+                lane.cv.wait_for(&mut queue, Duration::from_millis(100));
+            }
+        }
+        let (w, h) = shared.state.lock().video_size.unwrap_or((320, 240));
+        let decoder = match shared.ctx.codecs.first_decoder(&params) {
             Ok(d) => d,
             Err(_) => return,
         };
-        let (ctx, params) = (Arc::clone(&shared.ctx), stream.params.clone());
+        let ctx = Arc::clone(&shared.ctx);
         let seeks = Arc::clone(&shared);
         let pipeline = SubtitlePipeline {
             decoder,

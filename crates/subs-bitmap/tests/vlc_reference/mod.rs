@@ -20,7 +20,7 @@ fn build() -> [PathBuf; 2] {
     let revision = Command::new("git").args(["-C", source.to_str().unwrap(), "rev-parse", "HEAD"]).output().expect("original VLC source checkout");
     assert!(revision.status.success());
     assert_eq!(String::from_utf8(revision.stdout).unwrap().trim(), REVISION, "VLC oracle source must be the audited revision");
-    let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vlc_reference");
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../subs-bitmap/tests/vlc_reference");
     ["cvd", "ogt"].map(|kind| {
         let binary = directory().join(kind);
         let decoder = if kind == "cvd" { "cvdsub.c" } else { "svcdsub.c" };
