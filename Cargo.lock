@@ -137,6 +137,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-mpegts"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "oxideav-core",
+ "oxideav-mpegts",
+ "player",
+ "refcheck",
+]
+
+[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1230,7 +1241,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpegts"
 version = "0.0.3"
-source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=3fcd78e3b86e90d7edca97356b3d7195dba22711#3fcd78e3b86e90d7edca97356b3d7195dba22711"
+source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=cae69e3c911a830b07e8e35b1b88e26f2e842b62#cae69e3c911a830b07e8e35b1b88e26f2e842b62"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",
