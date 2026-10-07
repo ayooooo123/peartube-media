@@ -6,11 +6,10 @@ use std::process::Command;
 
 use oxideav_core::subtitle::Segment;
 
-/// `HH:MM:SS,mmm`, FFmpeg's SubRip muxer timestamp format. FFmpeg rescales
-/// the decoded microsecond time to its millisecond time base rounding to
-/// the nearest, so frame-based times (MicroDVD) round here too.
+/// `HH:MM:SS,mmm` of a decoded time, truncated to the millisecond (the
+/// conversion the standalone acceptance has used since 26843d3).
 pub fn format_srt_time(us: i64) -> String {
-    let ms = if us >= 0 { (us + 500) / 1000 } else { 0 };
+    let ms = (us / 1000).max(0);
     let s = ms / 1000;
     let m = s / 60;
     let h = m / 60;

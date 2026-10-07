@@ -7,9 +7,10 @@
 //! * Matroska/WebM cue times equal `ffprobe -show_packets` to the
 //!   microsecond;
 //! * the Player shows every cue, each rendered exactly as FFmpeg's SubRip
-//!   conversion of that cue renders: FFmpeg applies the ASS styles carried
-//!   in CodecPrivate in that conversion, so this is where they are checked,
-//!   and the colours they assign must be on screen.
+//!   conversion of that cue renders, read by oxideav-subtitle's SubRip
+//!   parser: FFmpeg applies the ASS styles carried in CodecPrivate in that
+//!   conversion, so this is where they are checked, and the colours they
+//!   assign must be on screen.
 
 mod common;
 
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{ffmpeg_cues, srt_timing, visible_text};
-use oxideav_core::{CodecId, CodecParameters, Frame, MediaType, Packet, SubtitleCue, TimeBase};
+use oxideav_core::{CuePosition, Frame, MediaType, SubtitleCue, TextAlign};
 use parking_lot::Mutex;
 use player::backend::{AudioSink, Backend, Clock, SubtitleImage, SubtitleSink, VideoSink};
 use player::{Event, Headless, Player, PlayerOptions, TrackKind};
@@ -103,17 +104,31 @@ fn ffprobe_packets(path: &Path) -> Vec<(i64, i64)> {
         .collect()
 }
 
-/// FFmpeg's SubRip rendering of one cue (styles applied), decoded by the
-/// production SubRip decoder: what the cue must look like on screen.
+/// FFmpeg's SubRip rendering of one cue (styles applied), as the cue must
+/// look on screen. It is read by oxideav-subtitle's SubRip parser, code
+/// independent of the decoders under test; the one `{\anN}` FFmpeg's
+/// encoder may write is its alignment marker, which that parser does not
+/// know, so it becomes the cue's horizontal alignment here.
 fn styled_cue(body: &str) -> SubtitleCue {
-    let ctx = codecs::context();
-    let mut decoder = ctx.codecs.first_decoder(&CodecParameters::subtitle(CodecId::new("subrip"))).unwrap();
-    let packet = Packet::new(0, TimeBase::new(1, 1000), body.as_bytes().to_vec()).with_pts(0).with_duration(1000);
-    decoder.send_packet(&packet).unwrap_or_else(|e| panic!("SubRip {body:?}: {e}"));
-    match decoder.receive_frame() {
-        Ok(Frame::Subtitle(cue)) => cue,
-        other => panic!("SubRip {body:?} decoded to {other:?}"),
+    let mut body = body.to_string();
+    let mut align = None;
+    if let Some(at) = body.find("{\\an") {
+        let n = body.as_bytes().get(at + 4).copied();
+        if body.as_bytes().get(at + 5) == Some(&b'}') {
+            align = match n {
+                Some(b'1' | b'4' | b'7') => Some(TextAlign::Left),
+                Some(b'3' | b'6' | b'9') => Some(TextAlign::Right),
+                _ => None,
+            };
+            body.replace_range(at..at + 6, "");
+        }
     }
+    let document = format!("1\n00:00:00,000 --> 00:00:01,000\n{body}\n");
+    let mut track = oxideav_subtitle::srt::parse(document.as_bytes()).unwrap_or_else(|e| panic!("SubRip {body:?}: {e}"));
+    assert_eq!(track.cues.len(), 1, "FFmpeg's SubRip cue {body:?} parses to {} cues", track.cues.len());
+    let mut cue = track.cues.remove(0);
+    cue.positioning = align.map(|align| CuePosition { x: None, y: None, align, size: None });
+    cue
 }
 
 /// Plays `path` with subtitle stream `stream` selected and returns every
