@@ -61,24 +61,49 @@ const MAX_PENDING_BYTES: usize = 3 * 2000;
 /// Extracts the A/53 caption triplets of one access unit of `codec` (an
 /// FFmpeg codec id: `h264`, `hevc`, `mpeg1video`, `mpeg2video`), on its
 /// own, without the state of the stream around it. H.264/HEVC input may
-/// be Annex B (start codes) or 4-byte length-prefixed (AVCC/HVCC). Use a
-/// [`CcExtractor`] for a stream: it carries what FFmpeg carries between
-/// access units, and reads the NAL length size from the extradata.
+/// be Annex B (start codes) or 4-byte length-prefixed (AVCC/HVCC): NAL
+/// units behind 4-byte lengths that fill the access unit exactly are read
+/// as length-prefixed, anything else as Annex B. Use a [`CcExtractor`] for
+/// a stream: it carries what FFmpeg carries between access units, and
+/// reads the NAL length size from the extradata.
 pub fn extract_a53(codec: &str, access_unit: &[u8]) -> Vec<[u8; 3]> {
     let Some(mut extractor) = CcExtractor::new(codec, &[]) else {
         return Vec::new();
     };
+    if extractor.carrier != CaptionCarrier::Mpeg12 && filled_by_lengths(access_unit, 4) {
+        extractor.nal_length_size = 4;
+        extractor.length_prefixed = true;
+    }
     let mut triplets = extractor.extract(access_unit);
     triplets.extend(extractor.finish());
     triplets
+}
+
+/// `buf` is NAL units behind `size`-byte big-endian lengths, back to back,
+/// and nothing else.
+fn filled_by_lengths(buf: &[u8], size: usize) -> bool {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let Some(prefix) = buf.get(pos..pos + size) else { return false };
+        let len = prefix.iter().fold(0usize, |n, &b| (n << 8) | usize::from(b));
+        pos += size;
+        if len == 0 || len > buf.len() - pos {
+            return false;
+        }
+        pos += len;
+    }
+    !buf.is_empty()
 }
 
 /// Per-stream A/53 caption extraction (see the module docs).
 #[derive(Clone, Debug)]
 pub struct CcExtractor {
     carrier: CaptionCarrier,
-    /// H.264/HEVC NAL length size from avcC/hvcC extradata; 0: Annex B.
+    /// H.264/HEVC NAL length size from avcC/hvcC extradata; 0: none.
     nal_length_size: usize,
+    /// The NAL units are length-prefixed (h264dec `is_avc`, hevcdec
+    /// `is_nalff`), not Annex B.
+    length_prefixed: bool,
     /// Caption bytes read but not yet attached to a picture
     /// (`a53_buf_ref` / `itut_t35.a53_cc`).
     pending: Vec<u8>,
@@ -165,7 +190,13 @@ impl CcExtractor {
             }
             _ => 0,
         };
-        Some(Self { carrier, nal_length_size, pending: Vec::new(), mpeg: Mpeg12State::default() })
+        Some(Self {
+            carrier,
+            nal_length_size,
+            length_prefixed: nal_length_size > 0,
+            pending: Vec::new(),
+            mpeg: Mpeg12State::default(),
+        })
     }
 
     /// The codec this extractor reads.
@@ -206,10 +237,25 @@ impl CcExtractor {
 
     fn extract_h2645(&mut self, buf: &[u8]) {
         let hevc = self.carrier == CaptionCarrier::Hevc;
-        // A packet that starts with a start code is Annex B whatever the
-        // extradata says (as h264dec's is_avc detection allows for).
-        let annex_b = self.nal_length_size == 0 || starts_with_start_code(buf);
-        let Some(nals) = split_nals(buf, if annex_b { 0 } else { self.nal_length_size }) else {
+        // h264dec.c decode_nal_units: with 4-byte lengths, a packet that
+        // starts with 00 00 00 01 and cannot be read as lengths is Annex B,
+        // one whose first length fits is length-prefixed, and any other
+        // keeps the last packet's choice. HEVC keeps its extradata's.
+        if !hevc && self.nal_length_size == 4 {
+            let size = buf.len() as u64;
+            let rb32 = |at: usize| buf.get(at..at + 4).map_or(0, |b| u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])));
+            if buf.len() > 8 && rb32(0) == 1 && rb32(5) > size {
+                self.length_prefixed = false;
+            } else if buf.len() > 3 && rb32(0) > 1 && rb32(0) <= size {
+                self.length_prefixed = true;
+            }
+        }
+        let nal_length_size = if self.length_prefixed { self.nal_length_size } else { 0 };
+        // Only SEI NAL units are read: the others are scanned for their
+        // extent, not copied. Escapes never touch the header bytes, so the
+        // type can be read before the RBSP is.
+        let sei = |nal: &[u8]| nal.first().is_some_and(|&h| if hevc { (h >> 1) & 0x3f == 39 } else { h & 0x1f == 6 });
+        let Some(nals) = split_nals(buf, nal_length_size, sei) else {
             // h2645_parse.c: an invalid NAL length fails the whole packet.
             return;
         };
@@ -778,15 +824,12 @@ fn parse_a53_cc(data: &[u8], pending: &mut Vec<u8>) -> Result<(), ()> {
     Ok(())
 }
 
-fn starts_with_start_code(buf: &[u8]) -> bool {
-    buf.starts_with(&[0, 0, 1]) || buf.starts_with(&[0, 0, 0, 1])
-}
-
-/// h2645_parse.c ff_h2645_packet_split: the NAL units of a packet, each as
-/// its RBSP (emulation prevention removed) and whether its trailing zero
-/// bytes count as padding. `nal_length_size` 0 means Annex B. `None` when a
-/// length prefix is invalid, which fails the whole packet.
-fn split_nals(buf: &[u8], nal_length_size: usize) -> Option<Vec<(Vec<u8>, bool)>> {
+/// h2645_parse.c ff_h2645_packet_split: the NAL units of a packet that
+/// `wanted` picks (by their first bytes), each as its RBSP (emulation
+/// prevention removed) and whether its trailing zero bytes count as
+/// padding. `nal_length_size` 0 means Annex B. `None` when a length prefix
+/// is invalid, which fails the whole packet.
+fn split_nals(buf: &[u8], nal_length_size: usize, wanted: impl Fn(&[u8]) -> bool) -> Option<Vec<(Vec<u8>, bool)>> {
     let mut nals = Vec::new();
     let length = buf.len();
     let mut pos = 0usize;
@@ -833,12 +876,16 @@ fn split_nals(buf: &[u8], nal_length_size: usize) -> Option<Vec<(Vec<u8>, bool)>
             }
             extract_length = (length - pos).min(next_avc - pos);
         }
-        let (rbsp, consumed) = extract_rbsp(&buf[pos..pos + extract_length]);
-        // As h2645_parse.c checks after the NAL ("see commit 3566042a0"):
-        // zeros before a following PES video header (00 00 01 E0) belong
-        // to the NAL.
-        let skip_trailing_zeros = !buf[pos + consumed..].starts_with(&[0, 0, 1, 0xe0]);
-        nals.push((rbsp, skip_trailing_zeros));
+        let nal = &buf[pos..pos + extract_length];
+        let keep = wanted(nal);
+        let (rbsp, consumed) = extract_rbsp(nal, keep);
+        if keep {
+            // As h2645_parse.c checks after the NAL ("see commit
+            // 3566042a0"): zeros before a following PES video header
+            // (00 00 01 E0) belong to the NAL.
+            let skip_trailing_zeros = !buf[pos + consumed..].starts_with(&[0, 0, 1, 0xe0]);
+            nals.push((rbsp, skip_trailing_zeros));
+        }
         pos += consumed;
     }
     Some(nals)
@@ -846,8 +893,9 @@ fn split_nals(buf: &[u8], nal_length_size: usize) -> Option<Vec<(Vec<u8>, bool)>
 
 /// h2645_parse.c ff_h2645_extract_rbsp (its byte-wise first pass): the
 /// NAL's RBSP, escapes (00 00 03) removed, ending before the next start
-/// code, and how many input bytes it took.
-fn extract_rbsp(src: &[u8]) -> (Vec<u8>, usize) {
+/// code, and how many input bytes it took. Without `keep`, only the count:
+/// the RBSP comes back empty.
+fn extract_rbsp(src: &[u8], keep: bool) -> (Vec<u8>, usize) {
     let mut length = src.len();
     // First pass: the first escape or start code.
     let mut i = 0usize;
@@ -869,29 +917,37 @@ fn extract_rbsp(src: &[u8]) -> (Vec<u8>, usize) {
         i += 2;
     }
     let i = i.min(length);
-    let mut dst = Vec::with_capacity(length);
-    dst.extend_from_slice(&src[..i]);
+    let mut dst = Vec::with_capacity(if keep { length } else { 0 });
+    if keep {
+        dst.extend_from_slice(&src[..i]);
+    }
     let mut si = i;
     while si + 2 < length {
         if src[si + 2] > 3 {
-            dst.push(src[si]);
-            dst.push(src[si + 1]);
+            if keep {
+                dst.extend_from_slice(&src[si..si + 2]);
+            }
             si += 2;
         } else if src[si] == 0 && src[si + 1] == 0 && src[si + 2] != 0 {
             if src[si + 2] == 3 {
-                dst.push(0);
-                dst.push(0);
+                if keep {
+                    dst.extend_from_slice(&[0, 0]);
+                }
                 si += 3;
                 continue;
             }
             // The next start code.
             return (dst, si);
         } else {
-            dst.push(src[si]);
+            if keep {
+                dst.push(src[si]);
+            }
             si += 1;
         }
     }
-    dst.extend_from_slice(&src[si..length]);
+    if keep {
+        dst.extend_from_slice(&src[si..length]);
+    }
     (dst, length)
 }
 
@@ -990,6 +1046,16 @@ mod tests {
         out
     }
 
+    /// NAL units behind 4-byte big-endian lengths (AVCC/HVCC).
+    fn length_prefixed(nals: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for nal in nals {
+            out.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            out.extend_from_slice(nal);
+        }
+        out
+    }
+
     #[test]
     fn h264_sei_triplets_in_annex_b_and_avcc() {
         let cc = [[0xfc, 0x94, 0x2c], [0xfd, 0x80, 0x80]];
@@ -997,16 +1063,59 @@ mod tests {
         sei_nal.extend(sei_t35(&cc));
         sei_nal.push(0x80);
         let slice = vec![0x65, 0x88, 0x84, 0x00, 0x33];
-        let au = annex_b(&[sei_nal.clone(), slice.clone()]);
-        assert_eq!(extract_a53("h264", &au), cc);
-        let mut avcc = Vec::new();
-        for nal in [&sei_nal, &slice] {
-            avcc.extend_from_slice(&(nal.len() as u32).to_be_bytes());
-            avcc.extend_from_slice(nal);
+        let nals = [sei_nal, slice];
+        assert_eq!(extract_a53("h264", &annex_b(&nals)), cc);
+        let mut three_byte_start_codes = Vec::new();
+        for nal in &nals {
+            three_byte_start_codes.extend_from_slice(&[0, 0, 1]);
+            three_byte_start_codes.extend_from_slice(nal);
         }
+        assert_eq!(extract_a53("h264", &three_byte_start_codes), cc);
+        let avcc = length_prefixed(&nals);
+        assert_eq!(extract_a53("h264", &avcc), cc, "AVCC without extradata");
         let avcc_extradata = [1, 0x64, 0, 0x1f, 0xff, 0xe1, 0];
         let mut extractor = CcExtractor::new("h264", &avcc_extradata).unwrap();
         assert_eq!(extractor.extract(&avcc), cc);
+    }
+
+    /// A stream with 4-byte lengths: a first NAL unit of 256 to 511 bytes
+    /// starts the packet with 00 00 01, and the packet is still read as
+    /// lengths (h264dec.c decode_nal_units; HEVC keeps its extradata's
+    /// framing). An Annex B packet in an H.264 AVCC stream is read as
+    /// Annex B, and the next AVCC packet as lengths again.
+    #[test]
+    fn length_prefixed_streams_read_packets_as_ffmpeg_does() {
+        let cc = [[0xfc, 0x94, 0x2c]];
+        let filler = |header: &[u8]| {
+            let mut nal = header.to_vec();
+            nal.resize(299, 0xff);
+            nal.push(0x80);
+            nal
+        };
+
+        let mut sei_nal = vec![0x06];
+        sei_nal.extend(sei_t35(&cc));
+        sei_nal.push(0x80);
+        let nals = [filler(&[0x0c]), sei_nal, vec![0x65, 0x88, 0x84, 0x00, 0x33]];
+        let avcc = length_prefixed(&nals);
+        assert_eq!(avcc[..3], [0, 0, 1], "the first length reads like a start code");
+        let avcc_extradata = [1, 0x64, 0, 0x1f, 0xff, 0xe1, 0];
+        let mut extractor = CcExtractor::new("h264", &avcc_extradata).unwrap();
+        assert_eq!(extractor.extract(&avcc), cc);
+        assert_eq!(extractor.extract(&annex_b(&nals)), cc);
+        assert_eq!(extractor.extract(&avcc), cc);
+        assert_eq!(extract_a53("h264", &avcc), cc);
+
+        let mut prefix = vec![39 << 1, 1];
+        prefix.extend(sei_t35(&cc));
+        prefix.push(0x80);
+        let hvcc = length_prefixed(&[filler(&[38 << 1, 1]), prefix]);
+        let mut hvcc_extradata = vec![0u8; 23];
+        hvcc_extradata[0] = 1;
+        hvcc_extradata[21] = 0x0f;
+        let mut extractor = CcExtractor::new("hevc", &hvcc_extradata).unwrap();
+        assert_eq!(extractor.extract(&hvcc), cc);
+        assert_eq!(extract_a53("hevc", &hvcc), cc);
     }
 
     #[test]
@@ -1029,7 +1138,9 @@ mod tests {
         let mut suffix = vec![40 << 1, 1];
         suffix.extend(sei_t35(&[[0xfc, 0x11, 0x22]]));
         suffix.push(0x80);
-        assert_eq!(extract_a53("hevc", &annex_b(&[prefix, suffix])), cc);
+        let nals = [prefix, suffix];
+        assert_eq!(extract_a53("hevc", &annex_b(&nals)), cc);
+        assert_eq!(extract_a53("hevc", &length_prefixed(&nals)), cc, "HVCC without extradata");
     }
 
     #[test]

@@ -64,7 +64,8 @@ fn mutate(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Mutated video packets through a stream's extractor and timeline.
+/// Mutated video packets through a stream's extractor and timeline, and
+/// through `extract_a53` on its own (no extradata: the framing is guessed).
 fn extraction_survives(path: &std::path::Path, seed: u64) {
     let (stream, packets) = video_packets(path);
     let codec = stream.params.codec_id.as_str().to_string();
@@ -81,6 +82,7 @@ fn extraction_survives(path: &std::path::Path, seed: u64) {
                 packet.data.clone()
             };
             let triplets = extractor.extract(&data);
+            let _ = subs_cc::extract_a53(&codec, &data);
             let pts = packet.pts.map(|p| if rng.below(50) == 0 { p ^ (rng.next() as i64) } else { p });
             let _ = timeline.push(pts, packet.dts, triplets);
             if rng.below(500) == 0 {

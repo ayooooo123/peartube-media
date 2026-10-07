@@ -8,11 +8,13 @@
 //! and an open first GOP; `sub/scte20.ts`, SCTE-20 user data in TS), and
 //! the rollup sample re-encoded by libx264 (B-frames) and libx265, its
 //! captions carried in SEI, in Matroska (length-prefixed NAL units) and TS
-//! (Annex B).
+//! (Annex B). For H.264 and HEVC, `extract_a53` on each packet alone,
+//! without the extradata, takes what the stream's extractor takes.
 
 mod support;
 
-use support::{ffmpeg_captions, generated, hex, our_captions, rollup, same_time, scte20};
+use subs_cc::{extract_a53, CcExtractor};
+use support::{ffmpeg_captions, generated, hex, our_captions, rollup, same_time, scte20, video_packets};
 
 fn assert_same_as_ffmpeg(path: &std::path::Path, what: &str) {
     let theirs = ffmpeg_captions(path);
@@ -51,14 +53,33 @@ fn scte20_user_data_in_ts() {
     assert_same_as_ffmpeg(&scte20(), "scte20.ts");
 }
 
+/// `extract_a53` on each packet of `path` (H.264/HEVC: every access unit
+/// stands alone) equals the stream extractor's take from it.
+fn assert_alone_as_in_stream(path: &std::path::Path, what: &str) {
+    let (stream, packets) = video_packets(path);
+    let codec = stream.params.codec_id.as_str();
+    let mut extractor = CcExtractor::new(codec, &stream.params.extradata).unwrap();
+    let mut found = 0;
+    for (i, packet) in packets.iter().enumerate() {
+        let in_stream = extractor.extract(&packet.data);
+        assert_eq!(extract_a53(codec, &packet.data), in_stream, "{what}: packet {i} alone");
+        found += in_stream.len();
+    }
+    assert!(found > 0, "{what}: no captions");
+}
+
 #[test]
 fn h264_sei_in_matroska_and_ts() {
-    assert_same_as_ffmpeg(&generated("h264.mkv"), "H.264 (B-frames) in Matroska");
-    assert_same_as_ffmpeg(&generated("h264.ts"), "H.264 (B-frames) in TS");
+    for (name, what) in [("h264.mkv", "H.264 (B-frames) in Matroska"), ("h264.ts", "H.264 (B-frames) in TS")] {
+        assert_same_as_ffmpeg(&generated(name), what);
+        assert_alone_as_in_stream(&generated(name), what);
+    }
 }
 
 #[test]
 fn hevc_sei_in_matroska_and_ts() {
-    assert_same_as_ffmpeg(&generated("hevc.mkv"), "HEVC in Matroska");
-    assert_same_as_ffmpeg(&generated("hevc.ts"), "HEVC in TS");
+    for (name, what) in [("hevc.mkv", "HEVC in Matroska"), ("hevc.ts", "HEVC in TS")] {
+        assert_same_as_ffmpeg(&generated(name), what);
+        assert_alone_as_in_stream(&generated(name), what);
+    }
 }

@@ -32,6 +32,9 @@ use subs_cc::cea708::Cea708;
 use subs_cc::eia608::ticks_to_us;
 use subs_cc::{CaptionTimeline, CcExtractor};
 
+/// One realtime playback at a time, as headless.rs runs them.
+static REALTIME: Mutex<()> = Mutex::new(());
+
 /// The synthetic caption streams the Player lists.
 const CAPTIONS_608: u32 = 0x1_0000;
 const CAPTIONS_708: u32 = 0x1_0001;
@@ -64,15 +67,36 @@ fn ffmpeg(args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// The FATE roll-up captions in H.264 (`container`: mkv or ts).
+/// The FATE roll-up captions in H.264 (`container`: mkv or ts), scaled to
+/// 160x96 like the other realtime subtitle tests' video: the caption data
+/// rides on the frames through the scaler.
 fn captioned(scratch: &Scratch, container: &str) -> PathBuf {
     let path = scratch.file(&format!("captions.{container}"));
     let source = refcheck::fate("sub/Closedcaption_rollup.m2v");
     ffmpeg(&[
-        "-i", source.to_str().unwrap(), "-an", "-c:v", "libx264", "-preset", "veryfast", "-bf", "3",
-        "-a53cc", "1", path.to_str().unwrap(),
+        "-i", source.to_str().unwrap(), "-an", "-vf", "scale=160:96", "-c:v", "libx264", "-preset", "veryfast",
+        "-bf", "3", "-a53cc", "1", path.to_str().unwrap(),
     ]);
     path
+}
+
+/// When `path`'s video ends, in seconds: its last packet's time plus its
+/// duration, as ffprobe reads them.
+fn video_end(path: &Path) -> f64 {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .expect("ffprobe on PATH");
+    assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let (pts, duration) = line.split_once(',')?;
+            Some(pts.parse::<f64>().ok()? + duration.trim_end_matches(',').parse::<f64>().unwrap_or(0.0))
+        })
+        .fold(f64::MIN, f64::max)
 }
 
 /// FFmpeg's live EIA-608 events for `path`: each event's start
@@ -221,8 +245,10 @@ const LATE: f64 = 0.300;
 
 /// The Player's shows against the screens a caption track puts up,
 /// `(start µs, visible)` in order (see the module docs); `rounding`: how far
-/// the screens' times may run past ours (FFmpeg's centiseconds: 5 ms).
-fn assert_shows(what: &str, shows: &[(Duration, bool)], screens: &[(i64, bool)], rounding: f64) {
+/// the screens' times may run past ours (FFmpeg's centiseconds: 5 ms). The
+/// last screen lasts until the video's end, when the playback takes the
+/// screen down.
+fn assert_shows(what: &str, shows: &[(Duration, bool)], screens: &[(i64, bool)], rounding: f64, end: f64) {
     let starts: Vec<f64> = screens.iter().map(|(us, _)| *us as f64 / 1e6).collect();
     assert!(screens.iter().any(|(_, up)| *up), "{what}: no caption to show");
     let mut shown = vec![false; screens.len()];
@@ -243,7 +269,7 @@ fn assert_shows(what: &str, shows: &[(Duration, bool)], screens: &[(i64, bool)],
         shown[k] = true;
     }
     for (i, start) in starts.iter().enumerate() {
-        let lasting = starts.get(i + 1).is_none_or(|next| next - start >= LATE);
+        let lasting = starts.get(i + 1).copied().unwrap_or(end) - start >= LATE;
         assert!(!lasting || shown[i] || !screens[i].1, "{what}: the caption of {start:.3} s never came up");
     }
     assert!(shows.last().is_some_and(|(_, up)| !up), "{what}: the screen is clear at the end");
@@ -254,6 +280,7 @@ fn assert_shows(what: &str, shows: &[(Duration, bool)], screens: &[(i64, bool)],
 #[test]
 fn eia608_captions_come_up_at_ffmpegs_times() {
     let scratch = Scratch::new();
+    let _realtime = REALTIME.lock();
     for container in ["mkv", "ts"] {
         let path = captioned(&scratch, container);
         let screens: Vec<(i64, bool)> = ffmpeg_events(&path).into_iter().map(|(cs, up)| (cs * 10_000, up)).collect();
@@ -272,7 +299,7 @@ fn eia608_captions_come_up_at_ffmpegs_times() {
             "{container}: the caption tracks listed"
         );
         assert_eq!(state.subtitle, Some(CAPTIONS_608), "{container}: the selected caption track");
-        assert_shows(&format!("EIA-608 in {container}"), &observation.lock().shows, &screens, 0.005);
+        assert_shows(&format!("EIA-608 in {container}"), &observation.lock().shows, &screens, 0.005, video_end(&path));
         drop(player);
     }
 }
@@ -280,10 +307,11 @@ fn eia608_captions_come_up_at_ffmpegs_times() {
 #[test]
 fn cea708_captions_come_up_at_the_decoders_times() {
     let scratch = Scratch::new();
+    let _realtime = REALTIME.lock();
     let path = captioned(&scratch, "mkv");
     let screens = cea708_screens(&path);
     let (player, observation) = play(&path, CAPTIONS_708);
     wait_end(&player, "mkv");
-    assert_shows("CEA-708 in mkv", &observation.lock().shows, &screens, 0.0);
+    assert_shows("CEA-708 in mkv", &observation.lock().shows, &screens, 0.0, video_end(&path));
     drop(player);
 }
