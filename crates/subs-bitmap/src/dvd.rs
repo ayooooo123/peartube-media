@@ -1,7 +1,11 @@
 //! DVD/HD subpictures, ported from FFmpeg libavcodec/dvdsubdec.c and
 //! dvdsub.c at 2da55bf (both headers verified LGPL-2.1-or-later).
 //! Default FFmpeg behavior: all subtitles, palette from codec extradata,
-//! guessed grayscale otherwise; no implicit filesystem/IFO access.
+//! guessed grayscale otherwise; no implicit filesystem/IFO access. The
+//! extradata is read as dvdsub_parse_extradata reads it: `size:` with
+//! sscanf("%dx%d"), the palette with strtoul. Deliberate difference: a
+//! canvas (`size:`, the stream's or a subpicture's own) larger than
+//! 4096x4096 is refused where FFmpeg would take it.
 
 use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result};
 use crate::colorspace::{Matrix, ycbcr_to_rgb};
@@ -70,7 +74,18 @@ struct DvdDecoder {
     canvas: CanvasFrames,
 }
 
-enum Decoded { More, Empty, Subtitle(Subtitle<'static>) }
+/// What decoding a subpicture unit leaves.
+enum Decoded {
+    /// The unit continues in the next packet.
+    More,
+    /// No subtitle, and dvdsub_decode drops its reassembly buffer.
+    Empty,
+    /// No subtitle, but dvdsub_decode keeps the buffer it reassembled: a
+    /// unit it discards, or one without a visible pixel. A packet that
+    /// stood alone left nothing to keep.
+    Nothing,
+    Subtitle(Subtitle<'static>),
+}
 
 impl DvdDecoder {
     fn palette(&self) -> Vec<[u8; 4]> {
@@ -105,7 +120,7 @@ impl DvdDecoder {
         let size = offset(data, if big { 2 } else { 0 }, size_bytes)?;
         let mut command = offset(data, if big { 6 } else { 2 }, size_bytes)?;
         if command > data.len() - 2 - size_bytes {
-            return Ok(if command > size { Decoded::Empty } else { Decoded::More });
+            return Ok(if command > size { Decoded::Nothing } else { Decoded::More });
         }
         let mut subtitle = Subtitle::for_packet(pts);
         let mut menu = false;
@@ -190,7 +205,7 @@ impl DvdDecoder {
                     }
                 }
             }
-            if left == width { return Ok(Decoded::Empty); }
+            if left == width { return Ok(Decoded::Nothing); }
             let cropped_width = right - left;
             let pixels = rect.pixels.to_mut();
             for y in top..bottom { pixels.copy_within(y * width + left..y * width + right, (y - top) * cropped_width); }
@@ -202,25 +217,97 @@ impl DvdDecoder {
     }
 }
 
-pub(crate) fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    let mut palette = None;
-    let (mut width, mut height) = (params.width.unwrap_or(0) as i32, params.height.unwrap_or(0) as i32);
-    for line in String::from_utf8_lossy(&params.extradata).split(['\n', '\r']) {
-        if let Some(value) = line.strip_prefix("palette:") {
-            let mut colors = [[0; 3]; 16];
-            for (color, hex) in colors.iter_mut().zip(value.split(|c: char| c == ',' || c.is_ascii_whitespace()).filter(|v| !v.is_empty())) {
-                let rgb = u32::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0);
-                *color = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8];
-            }
-            palette = Some(colors);
-        } else if let Some(value) = line.strip_prefix("size:") {
-            if let Some((w, h)) = value.trim().split_once('x') {
-                width = w.trim().parse().map_err(|_| invalid())?;
-                height = h.trim().parse().map_err(|_| invalid())?;
-                if width <= 0 || height <= 0 || width as usize > MAX_SIDE || height as usize > MAX_SIDE || width as usize * height as usize * 4 > MAX_CANVAS_BYTES { return Err(invalid()); }
-            }
-        }
+/// C's isspace in the "C" locale, as av_isspace tests it.
+fn is_space(byte: u8) -> bool { matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') }
+
+/// `strtoul(s, &end, 16)` stored to a uint32_t: leading space, a sign, a
+/// `0x`/`0X` prefix before hex digits, ULONG_MAX (64-bit) on overflow.
+/// `None` when nothing converts: strtoul returns 0 and `end` stays at `s`.
+fn strtoul_hex(s: &[u8]) -> Option<(u32, usize)> {
+    let mut at = s.iter().take_while(|&&byte| is_space(byte)).count();
+    let negative = s.get(at) == Some(&b'-');
+    if matches!(s.get(at), Some(b'+' | b'-')) { at += 1; }
+    if s.get(at) == Some(&b'0') && matches!(s.get(at + 1), Some(b'x' | b'X')) && s.get(at + 2).is_some_and(u8::is_ascii_hexdigit) {
+        at += 2;
     }
+    let digits = at;
+    let mut value = Some(0u64);
+    while let Some(digit) = s.get(at).and_then(|&byte| char::from(byte).to_digit(16)) {
+        value = value.and_then(|v| v.checked_mul(16)).and_then(|v| v.checked_add(u64::from(digit)));
+        at += 1;
+    }
+    if at == digits { return None; }
+    let value = match value { None => u64::MAX, Some(v) if negative => v.wrapping_neg(), Some(v) => v };
+    Some((value as u32, at))
+}
+
+/// ff_dvdsub_parse_palette: 16 strtoul values separated by commas and
+/// space. A value that does not convert leaves the parse where it is, so
+/// it and every later entry read 0.
+fn parse_palette(mut s: &[u8]) -> [[u8; 3]; 16] {
+    let mut palette = [[0; 3]; 16];
+    for color in &mut palette {
+        let (value, used) = strtoul_hex(s).unwrap_or((0, 0));
+        s = &s[used..];
+        while s.first().is_some_and(|&byte| byte == b',' || is_space(byte)) { s = &s[1..]; }
+        // dvdsubdec.c uses the low 24 bits as RGB.
+        *color = [(value >> 16) as u8, (value >> 8) as u8, value as u8];
+    }
+    palette
+}
+
+/// One sscanf `%d`: leading space, a sign, decimal digits (saturating).
+fn scan_int(s: &[u8]) -> Option<(i64, usize)> {
+    let mut at = s.iter().take_while(|&&byte| is_space(byte)).count();
+    let negative = s.get(at) == Some(&b'-');
+    if matches!(s.get(at), Some(b'+' | b'-')) { at += 1; }
+    let digits = at;
+    let mut value = 0i64;
+    while let Some(&byte) = s.get(at).filter(|byte| byte.is_ascii_digit()) {
+        value = value.saturating_mul(10).saturating_add(i64::from(byte - b'0'));
+        at += 1;
+    }
+    (at > digits).then_some((if negative { -value } else { value }, at))
+}
+
+/// `sscanf(s, "%dx%d") == 2`: the `x` must follow the width directly;
+/// whatever follows the height is ignored.
+fn scan_size(s: &[u8]) -> Option<(i64, i64)> {
+    let (width, at) = scan_int(s)?;
+    let rest = s.get(at..)?.strip_prefix(b"x")?;
+    Some((width, scan_int(rest)?.0))
+}
+
+/// dvdsub_parse_extradata: the extradata as a C string (it ends at a NUL),
+/// line by line. `palette:` and `size:` read on past their own line, as the
+/// C parsers do. Returns the last palette and the last size; a size that
+/// scans but ff_set_dimensions refuses fails the decoder's opening, as do
+/// sizes over the 4096x4096 canvas cap.
+fn parse_extradata(extradata: &[u8]) -> Result<(Option<[[u8; 3]; 16]>, Option<(i32, i32)>)> {
+    let text = extradata.split(|&byte| byte == 0).next().unwrap_or_default();
+    let (mut palette, mut size) = (None, None);
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        if let Some(value) = rest.strip_prefix(b"palette:") {
+            palette = Some(parse_palette(value));
+        } else if let Some((width, height)) = rest.strip_prefix(b"size:").and_then(scan_size) {
+            // av_image_check_size2 refuses a side of 0 or below; within
+            // the cap nothing else can fail.
+            let side = 1..=MAX_SIDE as i64;
+            if !side.contains(&width) || !side.contains(&height) { return Err(invalid()); }
+            size = Some((width as i32, height as i32));
+        }
+        at += rest.iter().position(|&byte| byte == b'\n' || byte == b'\r').unwrap_or(rest.len());
+        at += text[at..].iter().take_while(|&&byte| byte == b'\n' || byte == b'\r').count();
+    }
+    Ok((palette, size))
+}
+
+pub(crate) fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    let (palette, size) = parse_extradata(&params.extradata)?;
+    // avctx starts with the stream's size; the extradata's replaces it.
+    let (width, height) = size.unwrap_or((params.width.unwrap_or(0) as i32, params.height.unwrap_or(0) as i32));
     Ok(Box::new(DvdDecoder { codec_id: params.codec_id.clone(), palette, colormap: [0; 4], alpha: [0; 256], pending: Vec::new(), width, height, canvas: CanvasFrames::new(params.width, params.height) }))
 }
 
@@ -241,6 +328,7 @@ impl Decoder for DvdDecoder {
                 self.pending = cached;
             }
             Decoded::Empty => { cached.clear(); self.pending = cached; }
+            Decoded::Nothing => self.pending = cached,
             Decoded::Subtitle(subtitle) => {
                 cached.clear(); self.pending = cached;
                 self.canvas.push(subtitle, packet, self.width, self.height)?;
@@ -251,4 +339,43 @@ impl Decoder for DvdDecoder {
     fn receive_frame(&mut self) -> Result<Frame> { self.canvas.pop().ok_or(Error::NeedMore) }
     fn flush(&mut self) -> Result<()> { Ok(()) }
     fn reset(&mut self) -> Result<()> { self.pending.clear(); self.canvas.clear(); Ok(()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_core::TimeBase;
+
+    /// A 2x2 subpicture of colour 1, opaque or wholly transparent.
+    fn spu(opaque: bool) -> Vec<u8> {
+        let mut spu = vec![0, 0, 0, 8, 0x00, 0x01, 0x00, 0x01];
+        spu.extend_from_slice(&[0, 0, 0, 8, 0x03, 0x00, 0x10, 0x04, 0x00, if opaque { 0xf0 } else { 0x00 }]);
+        spu.extend_from_slice(&[0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x06, 0x00, 0x04, 0x00, 0x06, 0x01, 0xff]);
+        let size = spu.len() as u16;
+        spu[..2].copy_from_slice(&size.to_be_bytes());
+        spu
+    }
+
+    fn frames(decoder: &mut dyn Decoder, data: &[u8]) -> usize {
+        let mut packet = Packet::new(0, TimeBase::new(1, 90_000), data.to_vec());
+        packet.pts = Some(0);
+        decoder.send_packet(&packet).unwrap();
+        std::iter::from_fn(|| decoder.receive_frame().ok()).count()
+    }
+
+    /// dvdsub_decode keeps the units it reassembled when they show nothing
+    /// (dvdsubdec.c:546-553): what follows is appended to them, and that
+    /// first unit decodes again, here hiding the next subtitle as FFmpeg
+    /// does. A lone packet that shows nothing leaves nothing behind.
+    #[test]
+    fn reassembled_unit_without_visible_pixels_stays_buffered() {
+        let mut decoder = make_decoder(&CodecParameters::subtitle(CodecId::new("dvd_subtitle"))).unwrap();
+        let (transparent, opaque) = (spu(false), spu(true));
+        assert_eq!(frames(&mut *decoder, &opaque), 1, "a lone opaque unit shows");
+        assert_eq!(frames(&mut *decoder, &transparent), 0);
+        assert_eq!(frames(&mut *decoder, &opaque), 1, "a lone transparent unit keeps nothing");
+        assert_eq!(frames(&mut *decoder, &transparent[..10]), 0, "the unit continues");
+        assert_eq!(frames(&mut *decoder, &transparent[10..]), 0);
+        assert_eq!(frames(&mut *decoder, &opaque), 0, "appended to the kept unit, which decodes again");
+    }
 }

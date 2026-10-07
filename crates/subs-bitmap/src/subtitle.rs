@@ -16,10 +16,13 @@ use std::time::Duration;
 
 use oxideav_core::{Error, Frame, Packet, Result, TimeBase, VideoFrame, VideoPlane};
 
-/// Largest canvas side accepted from a stream.
-pub(crate) const MAX_SIDE: usize = 16384;
+/// Largest canvas side accepted from a stream. Subtitle planes are at most
+/// UHD in practice; FFmpeg would take up to its 16384 image limit, but here
+/// every display state is a whole RGBA canvas, so a few bytes of packet
+/// would buy a frame of hundreds of megabytes.
+pub(crate) const MAX_SIDE: usize = 4096;
 /// Largest canvas accepted from a stream, in RGBA bytes.
-pub(crate) const MAX_CANVAS_BYTES: usize = 256 << 20;
+pub(crate) const MAX_CANVAS_BYTES: usize = MAX_SIDE * MAX_SIDE * 4;
 
 /// One `AVSubtitleRect` of type `SUBTITLE_BITMAP`.
 #[derive(Clone, Debug, Default)]

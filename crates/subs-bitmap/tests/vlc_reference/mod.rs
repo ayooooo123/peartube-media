@@ -1,7 +1,11 @@
 //! Independent native VLC oracle, not FFmpeg parity. The adapter includes
-//! original C decoder and converter source files without rewriting their
-//! parsing/rendering logic. Encoded input, native output and exact commands
-//! remain under CARGO_TARGET_TMPDIR/subs-bitmap-vlc-<pid> for replay.
+//! original C decoder and YUVP converter source files without rewriting
+//! their parsing, RLE or palette logic. Placing the decoded regions on the
+//! canvas, clipped at its edges, is the adapter's own code mirroring the
+//! port's: VLC's renderer geometry (its aspect-ratio scaling of regions) is
+//! not part of the comparison. Encoded input, native output and exact
+//! commands remain under CARGO_TARGET_TMPDIR/subs-bitmap-vlc-<pid> for
+//! replay.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;

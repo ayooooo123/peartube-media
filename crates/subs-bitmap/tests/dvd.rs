@@ -94,6 +94,41 @@ fn matroska_dvd_all_tracks_match_ffmpeg() {
 #[test]
 fn mpeg_program_stream_dvd_matches_ffmpeg() { let _serial = SERIAL.lock(); compare(&refcheck::fate("sub/vobsub.sub"), 0); }
 
+/// FFmpeg reads the index's `size:` line with sscanf("%dx%d") and its
+/// palette with strtoul (dvdsubdec.c dvdsub_parse_extradata, dvdsub.c):
+/// text after the height is ignored, `0X` prefixes parse, a value wider
+/// than 32 bits keeps its low 32 bits, and an entry ending in garbage
+/// leaves every later entry 0. Each variant must decode as FFmpeg decodes it.
+#[test]
+fn index_size_and_palette_parse_like_sscanf_and_strtoul() {
+    let _serial = SERIAL.lock();
+    let source = refcheck::fate("sub/vobsub.idx");
+    let text = std::fs::read_to_string(&source).unwrap();
+    let palette = text.lines().find(|line| line.starts_with("palette: ")).unwrap();
+    let entries: Vec<&str> = palette["palette: ".len()..].split(", ").collect();
+    assert_eq!(entries.len(), 16);
+    let upper = format!("palette: {}", entries.iter().map(|entry| format!("0X{entry}")).collect::<Vec<_>>().join(", "));
+    let mut stuck = entries.clone();
+    let wide = format!("123{}", entries[0]);
+    let garbage = format!("{}zz", entries[1]);
+    stuck[0] = &wide;
+    stuck[1] = &garbage;
+    let stuck = format!("palette: {}", stuck.join(", "));
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("dvd-extradata-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, from, to) in [
+        ("size-junk", "size: 720x480", "size: 720x480junk".to_string()),
+        ("palette-upper-prefix", palette, upper),
+        ("palette-wide-and-garbage", palette, stuck),
+    ] {
+        assert!(text.contains(from));
+        let idx = dir.join(format!("{name}.idx"));
+        std::fs::write(&idx, text.replacen(from, &to, 1)).unwrap();
+        std::fs::copy(source.with_extension("sub"), idx.with_extension("sub")).unwrap();
+        compare(&idx, 0);
+    }
+}
+
 fn random(state: &mut u64) -> usize { *state ^= *state << 13; *state ^= *state >> 7; *state ^= *state << 17; *state as usize }
 fn drain(decoder: &mut dyn oxideav_core::Decoder) {
     for _ in 0..64 {

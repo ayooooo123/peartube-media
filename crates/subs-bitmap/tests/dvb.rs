@@ -198,3 +198,204 @@ fn dvb_ts_and_matroska_4800_stateful_mutations() {
     mutations(&mkv, "matroska");
     std::fs::remove_file(mkv).unwrap();
 }
+
+/// CRC-32/MPEG-2 of a PSI section.
+fn crc32_mpeg2(data: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in data {
+        crc ^= u32::from(byte) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ 0x04C1_1DB7 } else { crc << 1 };
+        }
+    }
+    crc
+}
+
+/// `payload` on `pid` as 188-byte transport packets; the first starts the
+/// unit. Bytes past a PES's declared length are stuffing, not data.
+fn ts_unit(out: &mut Vec<u8>, pid: u16, continuity: &mut u8, payload: &[u8], section: bool) {
+    let mut unit = Vec::new();
+    if section {
+        unit.push(0);
+    }
+    unit.extend_from_slice(payload);
+    for (index, chunk) in unit.chunks(184).enumerate() {
+        out.extend_from_slice(&[0x47, if index == 0 { 0x40 } else { 0 } | (pid >> 8) as u8, pid as u8, 0x10 | *continuity]);
+        *continuity = (*continuity + 1) & 15;
+        out.extend_from_slice(chunk);
+        out.resize(out.len() + 184 - chunk.len(), 0xff);
+    }
+}
+
+/// A transport stream with one DVB subtitle PID (0x101) whose subtitling
+/// descriptor (0x59) holds `services`, and one PES per `(pts, segments)`
+/// with its data identifier, stream id and end marker.
+fn subtitle_ts(path: &Path, services: &[u8], units: &[(u64, Vec<u8>)]) {
+    let mut out = Vec::new();
+    let mut pat = vec![0x00, 0xb0, 0x0d, 0, 1, 0xc1, 0, 0, 0, 1, 0xe1, 0x00];
+    pat.extend_from_slice(&crc32_mpeg2(&pat).to_be_bytes());
+    let mut pmt = vec![0x02, 0xb0, 0, 0, 1, 0xc1, 0, 0, 0xe1, 0x01, 0xf0, 0, 0x06, 0xe1, 0x01, 0xf0, 2 + services.len() as u8, 0x59, services.len() as u8];
+    pmt.extend_from_slice(services);
+    pmt[2] = (pmt.len() - 3 + 4) as u8;
+    pmt.extend_from_slice(&crc32_mpeg2(&pmt).to_be_bytes());
+    let (mut pat_cc, mut pmt_cc, mut sub_cc) = (0, 0, 0);
+    ts_unit(&mut out, 0, &mut pat_cc, &pat, true);
+    ts_unit(&mut out, 0x100, &mut pmt_cc, &pmt, true);
+    // Null packets: FFmpeg's probe wants more transport packets than a few
+    // short subtitles fill.
+    for _ in 0..32 {
+        out.extend_from_slice(&[0x47, 0x1f, 0xff, 0x10]);
+        out.resize(out.len() + 184, 0xff);
+    }
+    for &(pts, ref segments) in units {
+        let payload = [&[0x20u8, 0x00][..], segments.as_slice(), &[0xff]].concat();
+        let mut pes = vec![0, 0, 1, 0xbd];
+        pes.extend_from_slice(&((3 + 5 + payload.len()) as u16).to_be_bytes());
+        pes.extend_from_slice(&[0x81, 0x80, 5]);
+        pes.extend_from_slice(&[
+            0x21 | ((pts >> 29) & 0x0e) as u8,
+            (pts >> 22) as u8,
+            ((pts >> 14) & 0xfe) as u8 | 1,
+            (pts >> 7) as u8,
+            ((pts << 1) & 0xfe) as u8 | 1,
+        ]);
+        pes.extend_from_slice(&payload);
+        ts_unit(&mut out, 0x101, &mut sub_cc, &pes, false);
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// A transport stream whose one subtitle PID carries two DVB services:
+/// the original FATE pages (composition page 1, ancillary page 0x152,
+/// declared first) and a second service on page 7 that re-composes the
+/// same regions 16 pixels lower and to the right, in every packet. Only
+/// the declared first service may reach the screen, as VLC's decoder
+/// filters by the service's page ids (dvbsub.c); FFmpeg decodes every
+/// page unless told a substream (dvbsubdec.c).
+fn two_services_on_one_pid(source: &Path, path: &Path) {
+    let (_, packets) = packets(source, "mpegts");
+    let mut units = Vec::new();
+    for packet in &packets {
+        let data = &packet.data;
+        let mut segments = Vec::new();
+        let mut at = 2;
+        while at + 6 <= data.len() && data[at] == 0x0f {
+            let len = usize::from(u16::from_be_bytes([data[at + 4], data[at + 5]]));
+            let segment = &data[at..at + 6 + len];
+            segments.extend_from_slice(segment);
+            if segment[1] == 0x10 && segment[2..4] == [0, 1] {
+                // The same composition on page 7: a newer version, every
+                // region moved by (16, 16).
+                let mut page = segment.to_vec();
+                page[2..4].copy_from_slice(&[0, 7]);
+                page[7] = (page[7] & 0x0f) | (page[7].wrapping_add(0x80) & 0xf0);
+                for region in page[8..].chunks_exact_mut(6) {
+                    let x = u16::from_be_bytes([region[2], region[3]]) + 16;
+                    let y = u16::from_be_bytes([region[4], region[5]]) + 16;
+                    region[2..4].copy_from_slice(&x.to_be_bytes());
+                    region[4..6].copy_from_slice(&y.to_be_bytes());
+                }
+                segments.extend_from_slice(&page);
+            }
+            at += 6 + len;
+        }
+        units.push((packet.pts.expect("subtitle PTS") as u64, segments));
+    }
+    assert!(units.iter().any(|(_, segments)| segments.windows(4).any(|w| w == [0x0f, 0x10, 0, 7])), "page-7 twins");
+    let services = [b'e', b'n', b'g', 0x10, 0x00, 0x01, 0x01, 0x52, b'f', b'r', b'a', 0x10, 0x00, 0x07, 0x00, 0x07];
+    subtitle_ts(path, &services, &units);
+}
+
+#[test]
+fn dvb_pid_with_two_services_shows_only_the_declared_first() {
+    let _serial = SERIAL.lock();
+    let source = fate("sub/dvbsubtest_filter.ts");
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("dvb-two-services-{}.ts", std::process::id()));
+    two_services_on_one_pid(&source, &path);
+    let (stream, _) = packets(&path, "mpegts");
+    assert_eq!(stream.params.extradata, [0, 1, 0x01, 0x52, 0x10, 0, 7, 0, 7, 0x10]);
+    let reference = ffmpeg_reference(&source, 0);
+    let decoded = decode_subtitles(&path, REGISTRARS, 0);
+    assert!(decoded.errors.is_empty(), "{:?}", decoded.errors);
+    let want = reference_cues(&reference);
+    let got = decoded_cues(&decoded.frames, decoded.stream.time_base, reference.width, reference.height);
+    let diffs = cue_diffs(&want, &got, reference.width, Match::Exact);
+    assert!(diffs.is_empty(), "page 7 reached the screen:\n{}", diffs.join("\n"));
+    std::fs::remove_file(path).unwrap();
+}
+
+/// One DVB subtitling segment of page 1.
+fn page_segment(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x0f, kind, 0, 1];
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// Malformed input where FFmpeg's choices are cheap to share, against
+/// FFmpeg itself: a display definition whose window is cut short still
+/// records its version (the next one of that version is skipped,
+/// dvbsubdec.c:1415-1428); a region 20000 pixels wide passes, as FFmpeg
+/// checks only its area (1191-1199); and an object whose pixel data ends
+/// in a cut-off map table still makes the computed CLUT recompute (961-986).
+#[test]
+fn dvb_malformed_segments_follow_ffmpeg() {
+    let _serial = SERIAL.lock();
+    let seg = page_segment;
+    let end = || seg(0x80, &[]);
+    // Region 0 (64x8, CLUT 0) at (16, 16) on a mode-change page, painted
+    // with two rows of colour 2; then a display definition (720x576) whose
+    // window is too short: FFmpeg fails the packet after recording it.
+    let first = [
+        seg(0x10, &[10, 0x08, 0, 0xff, 0x00, 0x10, 0x00, 0x10]),
+        seg(0x11, &[0, 0x08, 0x00, 0x40, 0x00, 0x08, 0x08, 0, 0x00, 0x10, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]),
+        seg(0x12, &[0, 0x00, 1, 0x41, 0x80, 0x80, 0x80, 0x00, 2, 0x41, 0xc0, 0x60, 0x60, 0x00]),
+        seg(0x13, &[0x00, 0x01, 0x00, 0x00, 7, 0x00, 0x00, 0x11, 0x22, 0x22, 0x22, 0x22, 0x00, 0xf0]),
+        seg(0x14, &[0x08, 0x02, 0xcf, 0x02, 0x3f]),
+        end(),
+    ];
+    // The same definition version, now with a window at (100, 100).
+    let definition = [
+        seg(0x14, &[0x08, 0x02, 0xcf, 0x02, 0x3f, 0x00, 0x64, 0x02, 0x6b, 0x00, 0x64, 0x01, 0xdb]),
+        seg(0x10, &[10, 0x10, 0, 0xff, 0x00, 0x10, 0x00, 0x10]),
+        end(),
+    ];
+    // Region 3, 20000x10, joins the page.
+    let wide = [
+        seg(0x10, &[10, 0x20, 0, 0xff, 0x00, 0x10, 0x00, 0x10, 3, 0xff, 0x00, 0x00, 0x00, 0x40]),
+        seg(0x11, &[3, 0x00, 0x4e, 0x20, 0x00, 0x0a, 0x08, 0, 0, 0]),
+        end(),
+    ];
+    // A new epoch: region 1 (32x4) with CLUT 5, which never arrives, so its
+    // palette is computed from colours 1 and 2.
+    let computed = [
+        seg(0x10, &[10, 0x38, 1, 0xff, 0x00, 0x00, 0x00, 0x40]),
+        seg(0x11, &[1, 0x08, 0x00, 0x20, 0x00, 0x04, 0x08, 5, 0, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]),
+        seg(0x13, &[0x00, 0x02, 0x00, 0x00, 7, 0x00, 0x00, 0x11, 0x11, 0x22, 0x11, 0x22, 0x00, 0xf0]),
+        end(),
+    ];
+    // Colour 3 painted over it, then a 2-to-4 map table cut off by the end.
+    let recomputed = [
+        seg(0x13, &[0x00, 0x02, 0x00, 0x00, 6, 0x00, 0x00, 0x11, 0x33, 0x33, 0x00, 0x20, 0x34]),
+        seg(0x10, &[10, 0x40, 1, 0xff, 0x00, 0x00, 0x00, 0x40]),
+        end(),
+    ];
+    // FFmpeg's DVB parser has no timestamp yet for a stream's first PES and
+    // passes it on unparsed, which its decoder refuses; an empty first PES
+    // keeps the cases off that path. Both decoders refuse the empty one.
+    let units: Vec<(u64, Vec<u8>)> = [&[][..], &first[..], &definition[..], &wide[..], &computed[..], &recomputed[..]]
+        .iter()
+        .enumerate()
+        .map(|(second, segments)| (90_000 * second as u64, segments.concat()))
+        .collect();
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("dvb-malformed-{}.ts", std::process::id()));
+    subtitle_ts(&path, &[b'e', b'n', b'g', 0x10, 0x00, 0x01, 0x00, 0x01], &units);
+    let reference = ffmpeg_reference(&path, 0);
+    assert_eq!(reference.cues.len(), 4, "FFmpeg fails the empty packet and the cut-off window's");
+    let decoded = decode_subtitles(&path, REGISTRARS, 0);
+    let want = reference_cues(&reference);
+    let got = decoded_cues(&decoded.frames, decoded.stream.time_base, reference.width, reference.height);
+    let diffs = cue_diffs(&want, &got, reference.width, Match::Exact);
+    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+    std::fs::remove_file(path).unwrap();
+}

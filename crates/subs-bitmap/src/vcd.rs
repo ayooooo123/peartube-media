@@ -11,15 +11,17 @@
 //! Valid streams decode as VLC decodes them, including its reading of
 //! truncated data as zeros and its clipping of regions at the canvas
 //! edges. Deliberate differences, only on damaged input: the decoder
-//! starts zeroed (VLC's CVD state is uninitialised memory); sizes are
-//! capped; an OGT header is read from the assembled unit, not only its
-//! first packet; and an unfinished OGT image is replaced by a new one, an
-//! orphan continuation rejected, where VLC concatenates or reuses the
-//! previous header.
+//! starts zeroed (VLC's CVD state is uninitialised memory); a region wider
+//! or taller than the canvas is rejected (VLC would decode it all and blend
+//! only what fits), and rows below the canvas are decoded only as far as
+//! CVD's sequential fields need; an OGT header is read from the assembled
+//! unit, not only its first packet; and an unfinished OGT image is
+//! replaced by a new one, an orphan continuation rejected, where VLC
+//! concatenates or reuses the previous header.
 
 use std::{borrow::Cow, time::Duration};
 use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result};
-use crate::subtitle::{CanvasFrames, MAX_CANVAS_BYTES, MAX_SIDE, Rect, Subtitle};
+use crate::subtitle::{CanvasFrames, MAX_SIDE, Rect, Subtitle};
 
 const MAX_SPU: usize = u16::MAX as usize + 4;
 fn invalid() -> Error { Error::invalid("CVD/OGT: malformed subtitle packet") }
@@ -59,10 +61,17 @@ struct Image {
     duration: u32,
     palette: [[u8; 4]; 4],
 }
-fn allocate(image: &Image) -> Result<Vec<u8>> {
-    if image.width == 0 || image.height == 0 || image.width > MAX_SIDE || image.height > MAX_SIDE || image.width * image.height * 4 > MAX_CANVAS_BYTES { return Err(invalid()); }
+/// The region's pixel buffer, refusing a region larger than the canvas (or
+/// the canvas cap, past which nothing renders): no part of it beyond the
+/// canvas is ever shown, so a few header bytes must not buy its decode.
+fn allocate(image: &Image, (width, height): (usize, usize)) -> Result<Vec<u8>> {
+    if image.width == 0 || image.height == 0 || image.width > width.min(MAX_SIDE) || image.height > height.min(MAX_SIDE) {
+        return Err(invalid());
+    }
     Ok(vec![0; image.width * image.height])
 }
+/// Rows of `image` that land on a `height`-row canvas.
+fn visible_rows(image: &Image, height: usize) -> usize { image.height.min(height.saturating_sub(image.y)) }
 fn emit(canvas: &mut CanvasFrames, image: &Image, pixels: &[u8], packet: &Packet, pts: Option<i64>) -> Result<()> {
     let palette = image.palette.map(rgba);
     let mut sub = Subtitle::for_packet(pts);
@@ -83,7 +92,7 @@ fn emit(canvas: &mut CanvasFrames, image: &Image, pixels: &[u8], packet: &Packet
     Ok(())
 }
 
-fn cvd_image(data: &[u8], image: &mut Image) -> Result<Vec<u8>> {
+fn cvd_image(data: &[u8], image: &mut Image, canvas: (usize, usize)) -> Result<Vec<u8>> {
     // ParseHeader/ParseMetaInfo: four-byte fields between the metadata
     // offset and the SPU size; absent fields keep their previous values.
     let end = be16(data, 0)? + 4;
@@ -111,12 +120,15 @@ fn cvd_image(data: &[u8], image: &mut Image) -> Result<Vec<u8>> {
             _ => {}
         }
     }
-    let mut pixels = allocate(image)?;
+    let mut pixels = allocate(image, canvas)?;
     // RenderImage reads both fields sequentially from byte 4 to the end of
-    // the assembled SPU, byte-aligning each row; it needs image data.
+    // the assembled SPU, byte-aligning each row; it needs image data. The
+    // top field is read whole to find where the bottom one starts; bottom
+    // rows below the canvas are not read.
     let mut bits = Bits { data: data.get(4..).filter(|rest| !rest.is_empty()).ok_or_else(invalid)?, at: 0 };
+    let rows = [image.height, visible_rows(image, canvas.1)];
     for field in 0..2 {
-        for y in (field..image.height).step_by(2) {
+        for y in (field..rows[field]).step_by(2) {
             let mut x = 0;
             while x < image.width {
                 let value = bits.get(4);
@@ -133,7 +145,7 @@ fn cvd_image(data: &[u8], image: &mut Image) -> Result<Vec<u8>> {
     Ok(pixels)
 }
 
-fn ogt_image(data: &[u8]) -> Result<(Image, Vec<u8>)> {
+fn ogt_image(data: &[u8], canvas: (usize, usize)) -> Result<(Image, Vec<u8>)> {
     if data.len() < 4 { return Err(invalid()); }
     let mut at = 4;
     let mut image = Image::default();
@@ -149,11 +161,13 @@ fn ogt_image(data: &[u8]) -> Result<(Image, Vec<u8>)> {
     let command = *data.get(at).ok_or_else(invalid)?; at += 1;
     if command != 0 { at += 4; }
     let second = be16(data, at)?; at += 2;
-    let mut pixels = allocate(&image)?;
+    let mut pixels = allocate(&image, canvas)?;
+    // Each field starts at its own offset: rows below the canvas are not read.
+    let rows = visible_rows(&image, canvas.1);
     for field in 0..2 {
         let start = at + if field == 0 { 0 } else { second };
         let mut bits = Bits { data: data.get(start..).unwrap_or_default(), at: 0 };
-        for y in (field..image.height).step_by(2) {
+        for y in (field..rows).step_by(2) {
             let mut x = 0;
             while x < image.width {
                 let color = bits.get(2);
@@ -177,7 +191,7 @@ struct VcdDecoder {
 impl VcdDecoder {
     fn display(&mut self, data: &[u8], packet: &Packet, pts: Option<i64>) -> Result<()> {
         if self.cvd {
-            let pixels = cvd_image(data, &mut self.image)?;
+            let pixels = cvd_image(data, &mut self.image, self.canvas.size())?;
             // CVD's legacy coordinate convention adjusts x only, not width.
             let x = self.image.x;
             self.image.x = x * 3 / 4;
@@ -185,7 +199,7 @@ impl VcdDecoder {
             self.image.x = x;
             result
         } else {
-            let (image, pixels) = ogt_image(data)?;
+            let (image, pixels) = ogt_image(data, self.canvas.size())?;
             emit(&mut self.canvas, &image, &pixels, packet, pts)
         }
     }

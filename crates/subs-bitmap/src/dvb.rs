@@ -1,10 +1,28 @@
 //! DVB subtitle decoder, ported from FFmpeg `libavcodec/dvbsubdec.c`
 //! (commit 2da55bf; header verified LGPL-2.1-or-later).
 //!
-//! Implements FFmpeg's default options: timeout-based end times, computed
-//! palettes when no CLUT is supplied, and all subtitle pages. Region pixels
-//! survive composition updates; acquisition/mode-change pages replace the
-//! epoch. Both bare Matroska segments and DVB private-PES framing are accepted.
+//! Implements FFmpeg's default options: timeout-based end times and
+//! computed palettes when no CLUT is supplied. Region pixels survive
+//! composition updates; acquisition/mode-change pages replace the epoch.
+//! Both bare Matroska segments and DVB private-PES framing are accepted.
+//!
+//! Deliberate differences from FFmpeg:
+//! - Only the stream's first service is decoded: the composition and
+//!   ancillary pages of the first record in the extradata (MPEG-TS
+//!   descriptor 0x59, Matroska CodecPrivate), as VLC's dvbsub.c filters a
+//!   PID by its service's pages and as FFmpeg does with `dvb_substream` 0.
+//!   FFmpeg's default decodes every page, so two services sharing a PID
+//!   would draw over each other. Without valid extradata every page is
+//!   decoded, as in FFmpeg.
+//! - Hostile-input bounds FFmpeg does not have: canvases (display
+//!   definitions) of at most 4096x4096, at most 4096x4096 region pixels in
+//!   all, at most 1024 object placements, and per packet at most
+//!   `PAINT_WORK_PER_PACKET` of object painting; one display end with no
+//!   bitmap renders its blank canvas once per packet.
+//! - A segment shorter than the fields its parser reads ends the packet
+//!   with an error, and pixel strings read zeros past their block; FFmpeg
+//!   reads on into the bytes that follow (the next segment, then zero
+//!   padding). Both only happen on truncated segments.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -12,10 +30,17 @@ use std::collections::HashMap;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result};
 
 use crate::colorspace::{Matrix, ycbcr_to_rgb};
-use crate::subtitle::{CanvasFrames, MAX_CANVAS_BYTES, MAX_SIDE, Rect, Subtitle};
+use crate::subtitle::{CanvasFrames, MAX_SIDE, Rect, Subtitle};
 
+/// dvbsubdec.c's region limit: `width * height * 2 > 320 * 1024 * 8` fails.
 const MAX_REGION_PIXELS: usize = 320 * 1024 * 4;
-const MAX_OBJECT_DISPLAYS: usize = 65_536;
+/// Pixels of all regions together: a canvas' worth.
+const MAX_REGION_BYTES: usize = MAX_SIDE * MAX_SIDE;
+/// Object placements (an object shown in a region) at any time.
+const MAX_OBJECT_DISPLAYS: usize = 1024;
+/// Painting one packet's objects may cost at most this much: for each
+/// placement, its field data plus every pixel of its region.
+const PAINT_WORK_PER_PACKET: usize = 16 << 20;
 
 fn invalid() -> Error {
     Error::invalid("DVB subtitle: invalid or truncated segment")
@@ -118,6 +143,8 @@ struct Context {
     height: i32,
     pixel_bytes: usize,
     object_displays: usize,
+    /// Object painting this packet may still do (`PAINT_WORK_PER_PACKET`).
+    paint_left: usize,
     // Allocated only for streams without an explicit CLUT, then reused.
     adjacency: Vec<u32>,
 }
@@ -136,6 +163,7 @@ impl Context {
             height: params.height.and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
             pixel_bytes: 0,
             object_displays: 0,
+            paint_left: PAINT_WORK_PER_PACKET,
             adjacency: Vec::new(),
         }
     }
@@ -184,8 +212,10 @@ impl Context {
         let width = be16(&data[2..]);
         let height = be16(&data[4..]);
         let area = width * height;
-        if width == 0 || height == 0 || width > MAX_SIDE || height > MAX_SIDE || area > MAX_REGION_PIXELS
-            || self.pixel_bytes - region.pixels.len() + area > MAX_CANVAS_BYTES
+        // dvbsubdec.c checks the area (av_image_check_size2 cannot fail
+        // within it for 16-bit sides); the total is this port's bound.
+        if width == 0 || height == 0 || area > MAX_REGION_PIXELS
+            || self.pixel_bytes - region.pixels.len() + area > MAX_REGION_BYTES
         {
             region.width = 0;
             region.height = 0;
@@ -307,6 +337,11 @@ impl Context {
         let bottom = if bottom_len == 0 { top } else { &data[7 + top_len..7 + top_len + bottom_len] };
         for display in displays.iter().rev() {
             if let Some(region) = self.regions.get_mut(&display.region) {
+                // Painting a placement reads its field data and writes at
+                // most every pixel of its region.
+                let work = top.len() + bottom.len() + region.pixels.len();
+                self.paint_left = self.paint_left.checked_sub(work)
+                    .ok_or(Error::invalid("DVB subtitle: object painting exceeds the per-packet bound"))?;
                 region.paint_block(display, top, 0, data[2] & 2 != 0);
                 region.paint_block(display, bottom, 1, data[2] & 2 != 0);
             }
@@ -322,24 +357,24 @@ impl Context {
         if self.definition.as_ref().is_some_and(|d| d.version == version) {
             return Ok(());
         }
+        // dvbsubdec.c records the version and a zero offset before it checks
+        // the size or the window: a failed definition is not parsed again.
+        self.definition = Some(DisplayDefinition { version, x: 0, y: 0 });
         let width = be16(&data[1..]) + 1;
         let height = be16(&data[3..]) + 1;
         if self.width == 0 || self.height == 0 {
-            if width > MAX_SIDE || height > MAX_SIDE || width * height * 4 > MAX_CANVAS_BYTES {
+            if width > MAX_SIDE || height > MAX_SIDE {
                 return Err(invalid());
             }
             self.width = width as i32;
             self.height = height as i32;
         }
-        let (x, y) = if data[0] & 8 != 0 {
+        if data[0] & 8 != 0 {
             if data.len() < 13 {
                 return Err(invalid());
             }
-            (be16(&data[5..]) as i32, be16(&data[9..]) as i32)
-        } else {
-            (0, 0)
-        };
-        self.definition = Some(DisplayDefinition { version, x, y });
+            self.definition = Some(DisplayDefinition { version, x: be16(&data[5..]) as i32, y: be16(&data[9..]) as i32 });
+        }
         Ok(())
     }
 
@@ -407,18 +442,21 @@ impl Region {
                     x = next_x;
                     at = (at + used).min(data.len());
                 }
+                // A map table cut off by the end of the block ends it.
+                // dvbsubdec.c reads the table from the bytes that follow
+                // and stops there too, still invalidating the computed CLUT.
                 0x20 => {
-                    let Some(bytes) = data.get(at..at + 2) else { return };
+                    let Some(bytes) = data.get(at..at + 2) else { break };
                     map_two_four = [bytes[0] >> 4, bytes[0] & 15, bytes[1] >> 4, bytes[1] & 15];
                     at += 2;
                 }
                 0x21 => {
-                    let Some(bytes) = data.get(at..at + 4) else { return };
+                    let Some(bytes) = data.get(at..at + 4) else { break };
                     map_two_eight.copy_from_slice(bytes);
                     at += 4;
                 }
                 0x22 => {
-                    let Some(bytes) = data.get(at..at + 16) else { return };
+                    let Some(bytes) = data.get(at..at + 16) else { break };
                     map_four_eight.copy_from_slice(bytes);
                     at += 16;
                 }
@@ -496,7 +534,9 @@ struct Bits<'a> {
 }
 
 impl Bits<'_> {
-    // FFmpeg's padded bitreader yields zeros beyond the segment's end.
+    // Bits past the block read as zeros. dvbsubdec.c's reader goes on into
+    // the bytes that follow it (the next segment, then zero padding); the
+    // two differ only on a truncated pixel string.
     fn get(&mut self, count: usize) -> usize {
         let byte = self.at >> 3;
         let word = (u16::from(self.data.get(byte).copied().unwrap_or(0)) << 8)
@@ -578,22 +618,43 @@ struct DvbDecoder {
     codec_id: CodecId,
     context: Context,
     canvas: CanvasFrames,
+    /// The decoded service's composition and ancillary page ids; `None`
+    /// decodes every page.
+    pages: Option<[u16; 2]>,
 }
 
 pub(crate) fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    // dvbsubdec_init's extradata check: one 4-byte record, or 5-byte
+    // records (composition page, ancillary page, subtitling type).
+    let extradata = &params.extradata;
+    let pages = (extradata.len() >= 4 && (extradata.len() % 5 == 0 || extradata.len() == 4))
+        .then(|| [be16(extradata) as u16, be16(&extradata[2..]) as u16]);
     Ok(Box::new(DvbDecoder {
         codec_id: params.codec_id.clone(),
         context: Context::new(params),
         canvas: CanvasFrames::new(params.width, params.height),
+        pages,
     }))
 }
 
+/// What a display end outputs: its canvas, rendered at once when it has
+/// bitmaps (later segments of the packet may still change the regions), or
+/// a blank state, rendered once the packet ends: dvbsubdec.c saves a blank
+/// set again at every display end and only the packet's last one is output.
+enum Output {
+    Bitmaps(Frame),
+    Blank { pts: Option<i64>, end_display_time: u32, width: i32, height: i32 },
+}
+
 impl DvbDecoder {
-    fn render(&mut self, packet: &Packet) -> Result<(Frame, bool)> {
+    fn output(&mut self, packet: &Packet) -> Result<Output> {
         let (width, height) = (self.context.width, self.context.height);
         let subtitle = self.context.subtitle(packet.pts);
-        let has_rects = !subtitle.rects.is_empty();
-        Ok((self.canvas.render(subtitle, packet, width, height)?, has_rects))
+        if subtitle.rects.is_empty() {
+            let (pts, end_display_time) = (subtitle.pts, subtitle.end_display_time);
+            return Ok(Output::Blank { pts, end_display_time, width, height });
+        }
+        Ok(Output::Bitmaps(self.canvas.render(subtitle, packet, width, height)?))
     }
 }
 
@@ -612,28 +673,32 @@ impl Decoder for DvbDecoder {
         if data.len() <= 6 || data.first() != Some(&0x0f) {
             return Err(invalid());
         }
+        self.context.paint_left = PAINT_WORK_PER_PACKET;
         let (mut page, mut region, mut object, mut definition) = (false, false, false, false);
-        let mut output: Option<(Frame, bool)> = None;
+        let mut output: Option<Output> = None;
         while data.len() >= 6 && data[0] == 0x0f {
             let kind = data[1];
+            let page_id = be16(&data[2..]) as u16;
             let len = be16(&data[4..]);
             if len > data.len() - 6 {
                 return Err(invalid());
             }
             let body = &data[6..6 + len];
-            match kind {
-                0x10 => { self.context.page(body)?; page = true; }
-                0x11 => { self.context.region(body)?; region = true; }
-                0x12 => self.context.clut(body)?,
-                0x13 => { self.context.object(body)?; object = true; }
-                0x14 => { self.context.display_definition(body)?; definition = true; }
-                0x80 => {
-                    if output.as_ref().is_some_and(|(_, rects)| *rects) {
-                        return Err(Error::invalid("DVB subtitle: repeated display end with bitmap rectangles"));
+            if self.pages.is_none_or(|pages| pages.contains(&page_id)) {
+                match kind {
+                    0x10 => { self.context.page(body)?; page = true; }
+                    0x11 => { self.context.region(body)?; region = true; }
+                    0x12 => self.context.clut(body)?,
+                    0x13 => { self.context.object(body)?; object = true; }
+                    0x14 => { self.context.display_definition(body)?; definition = true; }
+                    0x80 => {
+                        if matches!(output, Some(Output::Bitmaps(_))) {
+                            return Err(Error::invalid("DVB subtitle: repeated display end with bitmap rectangles"));
+                        }
+                        output = Some(self.output(packet)?);
                     }
-                    output = Some(self.render(packet)?);
+                    _ => {}
                 }
-                _ => {}
             }
             data = &data[6 + len..];
         }
@@ -643,12 +708,18 @@ impl Decoder for DvbDecoder {
                 self.context.height = 576;
             }
             if output.is_none() {
-                output = Some(self.render(packet)?);
+                output = Some(self.output(packet)?);
             }
         }
-        if let Some((frame, _)) = output {
-            self.canvas.queue(frame);
-        }
+        let frame = match output {
+            None => return Ok(()),
+            Some(Output::Bitmaps(frame)) => frame,
+            Some(Output::Blank { pts, end_display_time, width, height }) => {
+                let blank = Subtitle { pts, start_display_time: 0, end_display_time, rects: Vec::new() };
+                self.canvas.render(blank, packet, width, height)?
+            }
+        };
+        self.canvas.queue(frame);
         Ok(())
     }
 

@@ -28,23 +28,27 @@
 //!
 //! Reference tests compare complete PGS canvases and their timing with
 //! FFmpeg through SUP, Matroska and M2TS, DVB through MPEG-TS and Matroska
-//! (all 46 display states of FATE `sub/dvbsubtest_filter.ts`), and DVD
-//! through paired VobSub, MPEG-PS and ordinary/zlib Matroska. Mutation
-//! tests exercise 7200 seeded PGS, 4800 DVB and 4800 DVD packet mutations
-//! in real decoder epochs, including truncations and header/RLE bit flips,
-//! plus 2000 VobSub index mutations. Every PGS and DVD reset is followed by
-//! a complete FFmpeg comparison.
+//! (all 46 display states of FATE `sub/dvbsubtest_filter.ts`, FFmpeg's one
+//! DVB sample, plus generated streams for two services on one PID and for
+//! malformed segments), and DVD through paired VobSub, MPEG-PS and
+//! ordinary/zlib Matroska, with index variants for `size:` and palette
+//! parsing. Mutation tests exercise 7200 seeded PGS, 4800 DVB and 4800 DVD
+//! packet mutations in real decoder epochs, including truncations and
+//! header/RLE bit flips, plus 2000 VobSub index mutations. Every PGS and
+//! DVD reset is followed by a complete FFmpeg comparison. Budget tests feed
+//! hostile packets that would buy oversized canvases or paint work.
 //!
 //! CVD/OGT tests compare complete canvases and intervals with an
-//! independently compiled original VLC C decoder/renderer, not FFmpeg
-//! (which has neither decoder): hand-authored structural packets, and
-//! files authored by dvdauthor's spumux read through the MPEG-PS demuxer.
-//! Neither is an archived disc stream; real-disc interoperability is
-//! unproven.
+//! independently compiled original VLC C decoder, not FFmpeg (which has
+//! neither decoder): hand-authored structural packets, and files authored
+//! by dvdauthor's spumux read through the MPEG-PS demuxer. The harness
+//! places the decoded regions itself, so VLC's on-screen geometry (its
+//! renderer scales regions by their aspect ratio) is not compared. Neither
+//! input is an archived disc stream; real-disc interoperability is unproven.
 
 #![forbid(unsafe_code)]
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag, MediaType, RuntimeContext};
+use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, ContainerRegistry, MediaType, RuntimeContext};
 
 mod bytes;
 mod colorspace;
@@ -92,8 +96,16 @@ fn caps(implementation: &str) -> CodecCapabilities {
 
 /// Installs the decoders and demuxers of this crate.
 pub fn register(ctx: &mut RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+    register_containers(&mut ctx.containers);
+}
+
+/// Installs the decoders. `CodecRegistry::first_decoder` takes the first
+/// factory registered for an id: install these before upstream subtitle
+/// decoders (oxideav-sub-image claims PGS, DVB and DVD ids too).
+pub fn register_codecs(codecs: &mut CodecRegistry) {
     for id in [PGS_CODEC_ID, OXIDEAV_PGS_CODEC_ID] {
-        ctx.codecs.register(
+        codecs.register(
             CodecInfo::new(CodecId::new(id))
                 .capabilities(caps("pgssub_ffmpeg_port"))
                 .with_resolution_priority(RESOLUTION_PRIORITY)
@@ -102,7 +114,7 @@ pub fn register(ctx: &mut RuntimeContext) {
         );
     }
     for id in [DVB_CODEC_ID, DVB_DECODER_NAME] {
-        ctx.codecs.register(
+        codecs.register(
             CodecInfo::new(CodecId::new(id))
                 .capabilities(caps("dvbsub_ffmpeg_port"))
                 .with_resolution_priority(RESOLUTION_PRIORITY)
@@ -111,7 +123,7 @@ pub fn register(ctx: &mut RuntimeContext) {
         );
     }
     for id in [DVD_CODEC_ID, "dvdsub", "vobsub"] {
-        ctx.codecs.register(
+        codecs.register(
             CodecInfo::new(CodecId::new(id))
                 .capabilities(caps("dvdsub_ffmpeg_port"))
                 .with_resolution_priority(RESOLUTION_PRIORITY)
@@ -119,19 +131,24 @@ pub fn register(ctx: &mut RuntimeContext) {
                 .tag(CodecTag::matroska("S_VOBSUB")),
         );
     }
-    ctx.codecs.register(
+    codecs.register(
         CodecInfo::new(CodecId::new(CVD_CODEC_ID))
             .capabilities(caps("cvdsub_vlc_port"))
             .with_resolution_priority(RESOLUTION_PRIORITY)
             .decoder(vcd::make_cvd),
     );
-    ctx.codecs.register(
+    codecs.register(
         CodecInfo::new(CodecId::new(OGT_CODEC_ID))
             .capabilities(caps("ogt_vlc_port"))
             .with_resolution_priority(RESOLUTION_PRIORITY)
             .decoder(vcd::make_ogt),
     );
-    sup::register(&mut ctx.containers);
+}
+
+/// Installs the `sup` demuxer. Container factories are keyed by name: install
+/// it after upstream containers (oxideav-sub-image registers its own).
+pub fn register_containers(containers: &mut ContainerRegistry) {
+    sup::register(containers);
 }
 
 oxideav_core::register!("subs-bitmap", register);
