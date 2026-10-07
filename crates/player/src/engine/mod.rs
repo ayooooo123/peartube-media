@@ -2004,6 +2004,7 @@ fn run_video_thread(
     let mut starved = false;
     let mut primed: Option<u64> = None;
     let mut last_end = Duration::ZERO;
+    let mut frame_clock = FrameClock::default();
     let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
     if !compressed {
@@ -2045,6 +2046,7 @@ fn run_video_thread(
             seen_seek = gen_now;
             sink.flush();
             last_end = Duration::ZERO;
+            frame_clock = FrameClock::default();
             if sw_decoder.is_some() {
                 match make_decoder(&shared.ctx, &stream.params) {
                     Ok(d) => sw_decoder = Some(d),
@@ -2078,7 +2080,7 @@ fn run_video_thread(
                         let recv = std::panic::catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
                         match recv {
                             Ok(Ok(Frame::Video(vf))) => {
-                                let ticks = vf.pts.unwrap_or(0).max(0);
+                                let ticks = frame_clock.time(vf.pts, None);
                                 let secs = stream.time_base.seconds_of(ticks).max(0.0);
                                 if before_seek_target(&shared, secs, seen_seek, &mut shown_seek) {
                                     continue;
@@ -2121,6 +2123,7 @@ fn run_video_thread(
         if let Some(end) = packet_end_secs(&packet) {
             last_end = last_end.max(Duration::from_secs_f64(end.max(0.0)));
         }
+        frame_clock.note_duration(packet.duration);
 
         let random_access = packet.flags.keyframe || metadata.container_keyframe;
         if need_keyframe && !random_access {
@@ -2255,7 +2258,7 @@ fn run_video_thread(
                 };
                 let Frame::Video(vf) = frame else { continue };
 
-                let frame_ticks = vf.pts.or(packet.pts).unwrap_or(0).max(0);
+                let frame_ticks = frame_clock.time(vf.pts, packet.pts);
                 let frame_pts_secs = stream.time_base.seconds_of(frame_ticks).max(0.0);
 
                 // Drop everything before the seek target, for seeks this
@@ -2274,6 +2277,35 @@ fn run_video_thread(
                 }
             }
         }
+    }
+}
+
+/// Timestamps for decoded pictures that carry none. FFmpeg leaves many
+/// pictures untimed (raw and MPEG-PS H.264 time only some access units);
+/// its consumers continue the timeline from the previous picture's time
+/// plus its duration (fftools `ffmpeg_dec.c` video_frame_process). A
+/// timed picture always keeps its own time.
+#[derive(Default)]
+struct FrameClock {
+    /// Where the next untimed picture goes: the last picture plus `duration`.
+    next: Option<i64>,
+    /// The latest positive packet duration, in stream ticks.
+    duration: Option<i64>,
+}
+
+impl FrameClock {
+    fn note_duration(&mut self, duration: Option<i64>) {
+        if let Some(d) = duration.filter(|&d| d > 0) {
+            self.duration = Some(d);
+        }
+    }
+
+    /// The picture's time in stream ticks: its own, else the continued
+    /// timeline, else (first picture) the packet's, else zero.
+    fn time(&mut self, frame_pts: Option<i64>, packet_pts: Option<i64>) -> i64 {
+        let ticks = frame_pts.or(self.next).or(packet_pts).unwrap_or(0).max(0);
+        self.next = self.duration.map(|d| ticks.saturating_add(d));
+        ticks
     }
 }
 
