@@ -38,10 +38,11 @@ const MAX_WAIT: Duration = Duration::from_millis(100);
 const END_SLACK: Duration = Duration::from_millis(5);
 /// A running clock that stands still this long has played all its output.
 const DRAINED: Duration = Duration::from_millis(100);
-/// Past the queue horizon at the moment the demuxer reached the end, no
-/// tail wait trusts a timestamp: a bogus far-future stamp (corrupt or
-/// hostile input) must not hold `Ended`.
+/// Slack past the end of what was delivered before a tail wait gives up.
 const TAIL_SLACK: Duration = Duration::from_secs(1);
+/// A packet more than this past the delivered timeline is a discontinuity
+/// (corrupt or hostile stamp), not the stream's end.
+const MAX_JUMP_SECS: f64 = 10.0;
 
 /// The pipelines whose data the clock waits for (subtitles never hold it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +63,9 @@ struct PipeState {
     /// End (seconds) of the newest packet demuxed for the pipeline since the
     /// demuxer last seeked.
     horizon: Option<f64>,
+    /// The same, ignoring packets that jump more than `MAX_JUMP_SECS` past
+    /// it: where the stream's continuous timeline ends.
+    trusted_end: Option<f64>,
 }
 
 /// The clock's run state; `SharedState::transport` guards it.
@@ -277,6 +281,7 @@ impl SharedState {
             self.master.seek(to, t.seek_gen);
             for p in &mut t.pipes {
                 p.horizon = None;
+                p.trusted_end = None;
             }
             t.demux_eof = false;
             t.tail_limit = None;
@@ -330,8 +335,13 @@ impl SharedState {
     /// The demuxer queued media for `pipe` up to `end` seconds.
     pub(super) fn demuxed(&self, pipe: Pipe, end: f64) {
         self.update(|t| {
-            let h = &mut t.pipe(pipe).horizon;
-            *h = Some(h.map_or(end, |h| h.max(end)));
+            let p = t.pipe(pipe);
+            p.horizon = Some(p.horizon.map_or(end, |h| h.max(end)));
+            match p.trusted_end {
+                None => p.trusted_end = Some(end),
+                Some(e) if end <= e + MAX_JUMP_SECS => p.trusted_end = Some(e.max(end)),
+                Some(_) => {}
+            }
         });
     }
 
@@ -341,6 +351,7 @@ impl SharedState {
             t.demux_gen = generation;
             for p in &mut t.pipes {
                 p.horizon = None;
+                p.trusted_end = None;
             }
             t.demux_eof = false;
             t.tail_limit = None;
@@ -349,11 +360,17 @@ impl SharedState {
     }
 
     pub(super) fn demux_eof(&self, eof: bool) {
-        let horizon = Duration::from_secs_f64(super::QUEUE_MAX_SECS) + TAIL_SLACK;
-        let limit = eof.then(|| self.master.now().unwrap_or_default() + horizon);
+        // Whatever is still queued or held in a decoder ends no later than
+        // the continuous timeline the demuxer delivered; a hostile stamp
+        // that jumped away from it is not trusted.
+        let now = self.master.now().unwrap_or_default();
+        let queued = now + Duration::from_secs_f64(super::QUEUE_MAX_SECS);
         self.update(|t| {
             t.demux_eof = eof;
-            t.tail_limit = limit;
+            t.tail_limit = eof.then(|| {
+                let delivered = t.pipes.iter().filter_map(|p| p.trusted_end).fold(0.0, f64::max);
+                queued.max(Duration::from_secs_f64(delivered.max(0.0))) + TAIL_SLACK
+            });
         });
     }
 

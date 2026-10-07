@@ -1702,4 +1702,28 @@ fn far_future_final_timestamp_does_not_hold_the_end() {
     assert!(state.position < Duration::from_secs(6), "position ran to {:?}", state.position);
 }
 
+#[test]
+fn decoder_held_frames_play_after_demux_eof() {
+    let _cpu = realtime_test();
+    // The pinned MPEG-2 decoder emits its pictures only at flush, after the
+    // demuxer has reached the end with the clock still held at zero.
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25:duration=6",
+        "-c:v", "mpeg2video", "-g", "25", "-bf", "0",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let video = &backend.capture().video[0];
+    assert_eq!(state.dropped_frames, 0, "frames past the EOF horizon were dropped ({} shown)", video.pts.len());
+    // The pinned decoder loses its last two pictures and stamps the rest
+    // itself; the transport must still show every picture it outputs.
+    assert!(video.pts.len() >= 148, "only {} frames shown", video.pts.len());
+}
+
 
