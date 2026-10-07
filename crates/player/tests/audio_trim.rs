@@ -142,3 +142,25 @@ fn a_seek_restarts_the_trims_from_the_landing_packet() {
     let capture = play(&spec, Some(Duration::ZERO));
     assert_eq!(played(&capture), range(2220, 40 * 1024 - 340));
 }
+
+#[test]
+fn excessive_padding_reports_an_error_without_reaching_the_sink() {
+    // One stereo f32 frame already owns 32 MiB before retained-object
+    // overhead. A hostile padding count must not retain it indefinitely.
+    let mut spec = Spec::new(2, 48000, 1 << 22, 1);
+    spec.packets[0].discard = u32::MAX;
+    let path = write_spec(&spec);
+    let backend = Headless::new();
+    let p = Player::open(
+        path.to_str().unwrap(),
+        backend.clone(),
+        context(),
+        PlayerOptions { realtime: false, ..PlayerOptions::default() },
+        |_| {},
+    );
+    let state = p.wait();
+    drop(p);
+    let _ = std::fs::remove_file(&path);
+    assert!(state.error.is_some(), "oversized PCM retention was accepted");
+    assert!(backend.capture().audio.iter().all(|a| a.pcm.is_empty()), "padding reached the sink");
+}
