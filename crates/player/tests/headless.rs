@@ -1932,3 +1932,29 @@ fn untimed_pictures_continue_the_timeline_in_realtime() {
     assert!(video.pts.windows(2).all(|w| w[0] < w[1]), "pictures out of order: {:?}", video.pts);
     assert!(video.pts.last().copied().unwrap_or_default() >= Duration::from_millis(1880), "timeline ended at {:?}", video.pts.last());
 }
+fn video_without_container_size_plays_at_the_decoded_size() {
+    // A raw H.264 stream declares no picture size; only the decoder knows
+    // it. Every picture must still reach the sink at that size, matching
+    // FFmpeg, and the player state must report it.
+    let bytes = ffmpeg_file("h264", &[
+        "-f", "lavfi", "-i", "testsrc=size=176x144:rate=25:duration=1",
+        "-c:v", "libx264", "-bf", "0", "-pix_fmt", "yuv420p",
+    ]);
+    let path = tempfile("h264");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let options = PlayerOptions { realtime: false, ..PlayerOptions::default() };
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), options, |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    assert_eq!(state.video_size, Some((176, 144)), "decoded size not published");
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    assert_eq!((video.width, video.height), (176, 144), "sink not opened at the decoded size");
+    let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &[]);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(expected.len(), 25);
+    assert_eq!(video.frame_md5, expected, "pictures differ from FFmpeg");
+}
+

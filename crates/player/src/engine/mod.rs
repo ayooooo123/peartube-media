@@ -2004,6 +2004,8 @@ fn run_video_thread(
 ) {
     let mut compressed = sink.open_compressed(&stream.params);
     let mut sw_decoder: Option<Box<dyn Decoder>> = None;
+    // What the frame sink was last opened with (see `sync_frame_format`).
+    let mut frame_format: Option<CodecParameters> = None;
     let mut need_keyframe = !compressed;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
@@ -2020,6 +2022,7 @@ fn run_video_thread(
         match make_decoder(&shared.ctx, &stream.params) {
             Ok(d) => {
                 let _ = sink.open_frames(&stream.params);
+                frame_format = Some(stream.params.clone());
                 sw_decoder = Some(d);
             }
             Err(e) => {
@@ -2151,6 +2154,7 @@ fn run_video_thread(
                 Some(d) => Some(d),
                 None => return,
             };
+            frame_format = Some(stream.params.clone());
             if !random_access {
                 need_keyframe = true;
                 continue;
@@ -2192,6 +2196,7 @@ fn run_video_thread(
                         Some(d) => Some(d),
                         None => return,
                     };
+                    frame_format = Some(stream.params.clone());
                 }
                 Err(SinkError::Fatal(f)) => {
                     set_error(&shared, format!("video fatal error: {f}"));
@@ -2266,6 +2271,7 @@ fn run_video_thread(
                     }
                 };
                 let Frame::Video(vf) = frame else { continue };
+                sync_frame_format(&mut *sink, &shared, &stream.params, &**decoder, &mut frame_format);
 
                 let frame_ticks = frame_clock.time(vf.pts, packet.pts);
                 let frame_pts_secs = stream.time_base.seconds_of(frame_ticks).max(0.0);
@@ -2340,6 +2346,44 @@ fn sync_video_sink(sink: &mut dyn VideoSink, shared: &SharedState, applied: &mut
         sink.set_playing(running);
         *applied = Some(running);
     }
+}
+
+/// (Re)opens the frame sink at the size and pixel layout the decoder reports
+/// for the frame it just returned, when those differ from what the sink was
+/// opened with. The container's values stand in only where the decoder
+/// reports none: a raw elementary stream declares no size, and a stream may
+/// change size mid-way. The size is published as `State::video_size`.
+fn sync_frame_format(
+    sink: &mut dyn VideoSink,
+    shared: &SharedState,
+    params: &CodecParameters,
+    decoder: &dyn Decoder,
+    opened: &mut Option<CodecParameters>,
+) {
+    let mut want = params.clone();
+    if let Some((w, h)) = decoder.output_video_dimensions() {
+        want.width = Some(w);
+        want.height = Some(h);
+    }
+    if let Some(format) = decoder.output_pixel_format() {
+        want.pixel_format = Some(format);
+    }
+    let unchanged = opened.as_ref().is_some_and(|o| {
+        (o.width, o.height, o.pixel_format) == (want.width, want.height, want.pixel_format)
+    });
+    if unchanged {
+        return;
+    }
+    let _ = sink.open_frames(&want);
+    if let (Some(w), Some(h)) = (want.width, want.height) {
+        if w > 0 && h > 0 {
+            let changed = std::mem::replace(&mut shared.state.lock().video_size, Some((w, h))) != Some((w, h));
+            if changed {
+                notify_changed(shared);
+            }
+        }
+    }
+    *opened = Some(want);
 }
 
 /// `SharedState::preroll` for a video sink: applies the clock's run state
