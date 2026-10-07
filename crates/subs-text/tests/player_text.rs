@@ -265,6 +265,12 @@ fn mp4_mov_text_from_srt() {
 }
 
 #[test]
+fn mp4_mov_text_from_ass_with_styles() {
+    let path = ffmpeg_file("styled.ass", "mov_text", "ass.mp4");
+    assert_plays_like_ffmpeg(&path, "mov_text", false, &[(1, YELLOW), (2, AZURE)]);
+}
+
+#[test]
 fn mov_mov_text_from_ass() {
     let path = ffmpeg_file("styled.ass", "mov_text", "ass.mov");
     assert_plays_like_ffmpeg(&path, "mov_text", false, &[(1, YELLOW), (2, AZURE)]);

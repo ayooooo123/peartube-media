@@ -80,35 +80,64 @@ impl RunStyle {
         }
     }
 
-    fn wrap(&self, segment: Segment) -> Segment {
-        let mut s = segment;
-        if self.strike {
-            s = Segment::Strike(vec![s]);
+    /// Whether `self` and `other` agree at one nesting level: font, colour,
+    /// bold, italic, underline, strike, outermost first.
+    fn same_at(&self, other: &Self, level: usize) -> bool {
+        match level {
+            0 => self.font_name == other.font_name && self.font_size == other.font_size,
+            1 => self.color == other.color,
+            2 => self.bold == other.bold,
+            3 => self.italic == other.italic,
+            4 => self.underline == other.underline,
+            _ => self.strike == other.strike,
         }
-        if self.underline {
-            s = Segment::Underline(vec![s]);
-        }
-        if self.italic {
-            s = Segment::Italic(vec![s]);
-        }
-        if self.bold {
-            s = Segment::Bold(vec![s]);
-        }
-        if let Some(rgb) = self.color {
-            s = Segment::Color { rgb, children: vec![s] };
-        }
-        if self.font_name.is_some() || self.font_size.is_some() {
-            s = Segment::Font { family: self.font_name.clone(), size: self.font_size, children: vec![s] };
-        }
-        s
     }
+}
+
+/// Shown text and the line breaks between it, each with the style in force.
+enum Leaf {
+    Text(String),
+    LineBreak,
+}
+
+/// The segment tree of styled leaves: consecutive leaves sharing a level's
+/// style share its wrapper (a line break inside a styled span stays inside,
+/// as FFmpeg's SubRip encoder writes it), and adjacent text joins.
+fn tree(items: &[(RunStyle, Leaf)], level: usize) -> Vec<Segment> {
+    let mut out = Vec::new();
+    if level == 6 {
+        for (_, leaf) in items {
+            match (leaf, out.last_mut()) {
+                (Leaf::Text(t), Some(Segment::Text(last))) => last.push_str(t),
+                (Leaf::Text(t), _) => out.push(Segment::Text(t.clone())),
+                (Leaf::LineBreak, _) => out.push(Segment::LineBreak),
+            }
+        }
+        return out;
+    }
+    for group in items.chunk_by(|a, b| a.0.same_at(&b.0, level)) {
+        let s = &group[0].0;
+        let children = tree(group, level + 1);
+        match level {
+            0 if s.font_name.is_some() || s.font_size.is_some() => {
+                out.push(Segment::Font { family: s.font_name.clone(), size: s.font_size, children })
+            }
+            1 if s.color.is_some() => out.push(Segment::Color { rgb: s.color.unwrap_or_default(), children }),
+            2 if s.bold => out.push(Segment::Bold(children)),
+            3 if s.italic => out.push(Segment::Italic(children)),
+            4 if s.underline => out.push(Segment::Underline(children)),
+            5 if s.strike => out.push(Segment::Strike(children)),
+            _ => out.extend(children),
+        }
+    }
+    out
 }
 
 struct Builder<'h> {
     header: &'h AssHeader,
     base: RunStyle,
     state: RunStyle,
-    segments: Vec<Segment>,
+    items: Vec<(RunStyle, Leaf)>,
     alignment: i32,
     aligned_inline: bool,
 }
@@ -116,11 +145,11 @@ struct Builder<'h> {
 impl OverrideCallbacks for Builder<'_> {
     fn text(&mut self, text: &[u8]) {
         let text = String::from_utf8_lossy(text).into_owned();
-        self.segments.push(self.state.wrap(Segment::Text(text)));
+        self.items.push((self.state.clone(), Leaf::Text(text)));
     }
 
     fn new_line(&mut self, _forced: bool) {
-        self.segments.push(Segment::LineBreak);
+        self.items.push((self.state.clone(), Leaf::LineBreak));
     }
 
     fn style(&mut self, style: u8, close: i32) {
@@ -178,7 +207,7 @@ pub fn event_to_cue(header: &AssHeader, style: &[u8], text: &[u8], start_us: i64
         header,
         state: base.clone(),
         base,
-        segments: Vec::new(),
+        items: Vec::new(),
         alignment: event_style.map_or(DEFAULT_ALIGNMENT, |s| s.alignment),
         aligned_inline: false,
     };
@@ -195,7 +224,7 @@ pub fn event_to_cue(header: &AssHeader, style: &[u8], text: &[u8], start_us: i64
         end_us,
         style_ref: None,
         positioning: align.map(|align| CuePosition { x: None, y: None, align, size: None }),
-        segments: builder.segments,
+        segments: tree(&builder.items, 0),
     }
 }
 
@@ -256,11 +285,12 @@ impl<S: EventSource + 'static> Decoder for AssEventDecoder<S> {
         if packet.data.len() > MAX_CUE_BYTES {
             return Err(Error::invalid("subtitle packet exceeds 1 MiB"));
         }
-        let text = packet_text(packet);
-        if text.is_empty() {
+        // FFmpeg's text decoders return no subtitle for an empty packet; a
+        // packet starting with NUL is an event with no text.
+        if packet.data.is_empty() {
             return Ok(());
         }
-        let Some(event) = self.source.event(packet, text)? else { return Ok(()) };
+        let Some(event) = self.source.event(packet, packet_text(packet))? else { return Ok(()) };
         let style = checked_utf8(&event.style)?;
         let ass = checked_utf8(&event.text)?;
         let start_us = packet.time_base.rescale(packet.pts.unwrap_or(0), TimeBase::new(1, 1_000_000));
@@ -315,14 +345,18 @@ mod tests {
         );
         let cue = event_to_cue(&header, b"Sign", br"{\pos(1,2)}A{\b0}B{\r}C{\rDefault}D\Ne", 0, 1);
         assert_eq!(shown(&cue), "ABCD\ne");
-        let yellow = |s: Segment| Segment::Color { rgb: (255, 255, 0), children: vec![s] };
+        // Runs sharing a style share its wrapper; line breaks sit inside.
+        let text = |s: &str| Segment::Text(s.into());
         let expected = [
-            yellow(Segment::Bold(vec![Segment::Text("A".into())])),
-            yellow(Segment::Text("B".into())),
-            yellow(Segment::Bold(vec![Segment::Text("C".into())])),
-            Segment::Text("D".into()),
+            Segment::Color {
+                rgb: (255, 255, 0),
+                children: vec![Segment::Bold(vec![text("A")]), text("B"), Segment::Bold(vec![text("C")])],
+            },
+            text("D"),
+            Segment::LineBreak,
+            text("e"),
         ];
-        assert_eq!(format!("{:?}", &cue.segments[..4]), format!("{expected:?}"));
+        assert_eq!(format!("{:?}", cue.segments), format!("{expected:?}"));
         assert_eq!(cue.positioning.map(|p| p.align), Some(TextAlign::Right));
         // The first alignment override wins over the style's.
         let cue = event_to_cue(&header, b"Sign", br"{\an7}x{\an3}", 0, 1);
