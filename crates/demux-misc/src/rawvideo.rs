@@ -17,11 +17,12 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{Demuxer, Error, Packet, ReadSeek, Result, StreamInfo};
 
 use crate::parser::{Combine, Parser, Split, END_NOT_FOUND};
+use crate::seek::Index;
 
 /// ff_raw_demuxer_class raw_packet_size
 const RAW_PACKET_SIZE: usize = 1024;
@@ -33,14 +34,29 @@ pub(crate) struct RawVideoDemuxer<S> {
     streams: Vec<StreamInfo>,
     parser: Parser<S>,
     queue: VecDeque<Packet>,
+    /// Where each queued unit starts in the input (its frame_offset).
+    positions: VecDeque<i64>,
     pos: i64,
     count: i64,
     eof: bool,
+    /// AVFMT_GENERIC_INDEX: the key units returned so far.
+    index: Index,
 }
 
 impl<S: Split + Units> RawVideoDemuxer<S> {
     pub fn new(format: &'static str, input: Box<dyn ReadSeek>, stream: StreamInfo, split: S) -> Self {
-        Self { format, input, streams: vec![stream], parser: Parser::new(split), queue: VecDeque::new(), pos: 0, count: 0, eof: false }
+        Self {
+            format,
+            input,
+            streams: vec![stream],
+            parser: Parser::new(split),
+            queue: VecDeque::new(),
+            positions: VecDeque::new(),
+            pos: 0,
+            count: 0,
+            eof: false,
+            index: Index::default(),
+        }
     }
 
     /// ff_raw_read_partial_packet into the parser.
@@ -74,8 +90,23 @@ impl<S: Split + Units> RawVideoDemuxer<S> {
             packet.flags.keyframe = stamp.key;
             self.count += 1;
             self.queue.push_back(packet);
+            self.positions.push_back(unit.pos);
         }
         self.parser.split.read_done();
+        Ok(())
+    }
+
+    /// Reads on from `pos` with a new parser (ff_read_frame_flush) and
+    /// the clock at `ts` (avpriv_update_cur_dts), or where a flush leaves
+    /// it (no `ts`, the seek to the start of the data).
+    fn restart(&mut self, pos: i64, ts: Option<i64>) -> Result<()> {
+        let split = self.parser.split.reset(ts).ok_or_else(|| Error::unsupported("raw video: no seek"))?;
+        self.input.seek(SeekFrom::Start(pos as u64))?;
+        self.parser = Parser::new(split);
+        self.queue.clear();
+        self.positions.clear();
+        self.pos = pos;
+        self.eof = false;
         Ok(())
     }
 }
@@ -92,6 +123,11 @@ impl<S: Split + Units + Send> Demuxer for RawVideoDemuxer<S> {
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
             if let Some(packet) = self.queue.pop_front() {
+                let pos = self.positions.pop_front().unwrap_or(-1);
+                // av_read_frame indexes every key packet it returns.
+                if let (true, Some(dts)) = (packet.flags.keyframe, packet.dts) {
+                    self.index.add(pos, dts, 0, 0, true);
+                }
                 return Ok(packet);
             }
             if self.eof {
@@ -99,6 +135,54 @@ impl<S: Split + Units + Send> Demuxer for RawVideoDemuxer<S> {
             }
             self.read_piece()?;
         }
+    }
+
+    /// seek.c seek_frame_generic with AVSEEK_FLAG_BACKWARD (rawdec.h
+    /// FF_DEF_RAWVIDEO_DEMUXER: AVFMT_GENERIC_INDEX): the last key unit at
+    /// or before the target among those returned so far; past the last of
+    /// them units are read on, bounded by the input, until a key unit
+    /// starts after the target or more than 1000 others did. FFmpeg cannot
+    /// seek raw H.264 or HEVC: compute_pkt_fields gives their packets no
+    /// dts (demux.c:993, onein_oneout), ff_add_index_entry rejects an entry
+    /// without one (seek.c:76), so seek_frame_generic finds no index entry
+    /// (seek.c:581) and fails, as `ffprobe -read_intervals` reports.
+    fn seek_to(&mut self, _stream_index: u32, timestamp: i64) -> Result<i64> {
+        if self.parser.split.reset(None).is_none() {
+            return Err(Error::unsupported(format!(
+                "{}: FFmpeg's raw demuxer gives these packets no timestamps to seek by",
+                self.format
+            )));
+        }
+        let mut found = self.index.search(timestamp, true);
+        let entries = self.index.entries();
+        if found.is_none() && entries.first().is_some_and(|e| timestamp < e.timestamp) {
+            return Err(Error::invalid("raw video: seek before the first key frame"));
+        }
+        if found.is_none() || found == Some(entries.len() - 1) {
+            match entries.last().copied() {
+                Some(last) => self.restart(last.pos, Some(last.timestamp))?,
+                None => self.restart(0, None)?,
+            }
+            let mut nonkey = 0;
+            while let Ok(packet) = self.next_packet() {
+                if packet.dts.is_some_and(|dts| dts > timestamp) {
+                    if packet.flags.keyframe {
+                        break;
+                    }
+                    nonkey += 1;
+                    if nonkey > 1001 {
+                        break;
+                    }
+                }
+            }
+            found = self.index.search(timestamp, true);
+        }
+        let Some(i) = found else {
+            return Err(Error::invalid("raw video: no key frame to seek to"));
+        };
+        let e = self.index.entries()[i];
+        self.restart(e.pos, Some(e.timestamp))?;
+        Ok(e.timestamp)
     }
 }
 
@@ -111,6 +195,16 @@ pub(crate) trait Units {
     fn unit(&mut self, unit: &[u8], index: i64) -> Stamp;
     /// The 1024-byte read whose units were just stamped is over.
     fn read_done(&mut self) {}
+    /// The splitter a seek leaves (ff_read_frame_flush makes a new parser;
+    /// the codec context and the stream's timing state stay), its clock
+    /// at `ts` (avpriv_update_cur_dts) when the seek sets one. `None`
+    /// where FFmpeg cannot seek these units.
+    fn reset(&self, _ts: Option<i64>) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 /// A unit's key flag, and its pts, dts and duration in the stream time
@@ -561,6 +655,31 @@ impl Units for MpegVideo {
             clock.mpeg2 = set.mpeg2;
             clock.discovery = Discovery::Done;
         }
+    }
+
+    /// After a seek FFmpeg's new parser knows no sequence yet (its
+    /// frame_rate, progressive_sequence, repeat_pict; pict_type I), while
+    /// the codec context keeps the frame rate, B-frame delay and codec and
+    /// the stream its last_IP_duration. The dts runs on from `ts`, now
+    /// absolute, or, back at the start of the data, from where
+    /// ff_read_frame_flush leaves it (RELATIVE_TS_BASE).
+    fn reset(&self, ts: Option<i64>) -> Option<Self> {
+        let c = &self.clock;
+        let clock = MpegClock {
+            frame_rate: (0, 0),
+            progressive_sequence: false,
+            repeat_pict: 0,
+            cur_dts: ts.unwrap_or(RELATIVE_TS_BASE),
+            frame_rate_code: c.frame_rate_code,
+            frame_rate_ext: c.frame_rate_ext,
+            framerate: c.framerate,
+            mpeg2: c.mpeg2,
+            has_b_frames: c.has_b_frames,
+            low_delay: c.low_delay,
+            discovery: c.discovery,
+            last_ip_duration: c.last_ip_duration,
+        };
+        Some(Self { pc: Combine::default(), frame_start_found: 0, pict_type: 1, clock })
     }
 }
 
