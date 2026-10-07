@@ -14,14 +14,20 @@
 // Packets are the PES payloads FFmpeg's demuxer returns: private stream
 // 1 is split by substream id with FFmpeg's substream headers stripped,
 // the program stream map types elementary streams, DVD navigation
-// packets surface once DVD PCI/DSI structures are recognised. Two kinds
-// of stream differ from FFmpeg's raw PES output:
+// packets surface once DVD PCI/DSI structures are recognised. Three
+// kinds of stream differ from FFmpeg's raw PES output:
+// - MPEG audio and AC-3 / E-AC-3 come out as frames, as FFmpeg's
+//   mpegaudio and ac3 parsers cut them, timed as FFmpeg's demuxer layer
+//   times them (a frame without a PES timestamp follows the one before);
+//   their decoders take one frame per packet.
 // - DVD subpictures (substreams 0x20-0x3f) are reassembled into whole
 //   units across PES packets by FFmpeg's dvdsub parser, each unit keeping
 //   the timestamps of its first PES.
 // - CVD (substreams 0x00-0x03) and SVCD OGT (0x70) subpictures, which
 //   FFmpeg skips, are carried as VLC carries them: the PES payload with
 //   its leading substream id.
+// Video stays in PES payloads: its decoders take the elementary stream
+// in pieces.
 
 use std::collections::VecDeque;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -32,7 +38,7 @@ use oxideav_core::{
     PROBE_SCORE_EXTENSION,
 };
 
-use crate::parser::{DvdSub, Parser, Unit};
+use crate::parser::{mpa_decode_header, returned, Ac3, AudioClock, DvdSub, MpegAudio, Parser, Unit};
 
 const PACK_START_CODE: u32 = 0x1BA;
 const SYSTEM_HEADER_START_CODE: u32 = 0x1BB;
@@ -155,6 +161,10 @@ enum Framing {
     SubstreamId(u8),
     /// DVD subpicture units reassembled by the dvdsub parser.
     Spu(Parser<DvdSub>),
+    /// MPEG audio frames from the mpegaudio parser.
+    Mpa(Parser<MpegAudio>, AudioClock),
+    /// AC-3 / E-AC-3 frames from the ac3 parser.
+    Ac3(Parser<Ac3>, AudioClock),
 }
 
 struct Track {
@@ -610,6 +620,14 @@ impl MpegPsDemuxer {
                 return Ok(None);
             }
             data.truncate(got);
+            let buffered = match &self.tracks[track].framing {
+                Framing::Mpa(parser, _) => parser.split.buffered_bytes(),
+                Framing::Ac3(parser, _) => parser.split.buffered_bytes(),
+                _ => 0,
+            };
+            if buffered + data.len() > 8 * 1024 * 1024 {
+                return Err(Error::invalid("mpeg: audio access unit exceeds 8 MiB"));
+            }
             self.deliver(track, data, pts, dts, pos);
             return Ok(Some((track, dts.or(pts))));
         }
@@ -682,6 +700,8 @@ impl MpegPsDemuxer {
         let framing = match codec {
             Some("dvd_subtitle") => Framing::Spu(Parser::new(DvdSub::default())),
             Some("cvd_subtitle" | "ogt") => Framing::SubstreamId(startcode as u8),
+            Some(codec @ ("mp2" | "mp3")) => Framing::Mpa(Parser::new(MpegAudio::new(codec)), AudioClock::new(1, 90_000, 33)),
+            Some("ac3") => Framing::Ac3(Parser::new(Ac3::new("ac3")), AudioClock::new(1, 90_000, 33)),
             _ => Framing::Pes,
         };
         self.tracks.push(Track {
@@ -731,6 +751,16 @@ impl MpegPsDemuxer {
                 parser.push(&data, pts, dts, pos, &mut units);
                 self.queue.extend(units.into_iter().map(|u| unit_packet(index, u)));
             }
+            Framing::Mpa(parser, clock) => {
+                let mut units = Vec::new();
+                parser.push(&data, pts, dts, pos, &mut units);
+                stamp_all(units, clock, index, &mut self.queue);
+            }
+            Framing::Ac3(parser, clock) => {
+                let mut units = Vec::new();
+                parser.push(&data, pts, dts, pos, &mut units);
+                stamp_all(units, clock, index, &mut self.queue);
+            }
         }
     }
 
@@ -738,10 +768,22 @@ impl MpegPsDemuxer {
     fn end_of_input(&mut self) {
         self.eof = true;
         for (index, t) in self.tracks.iter_mut().enumerate() {
-            if let Framing::Spu(parser) = &mut t.framing {
-                let mut units = Vec::new();
-                parser.flush(&mut units);
-                self.queue.extend(units.into_iter().map(|u| unit_packet(index as u32, u)));
+            let index = index as u32;
+            let mut units = Vec::new();
+            match &mut t.framing {
+                Framing::Spu(parser) => {
+                    parser.flush(&mut units);
+                    self.queue.extend(units.into_iter().map(|u| unit_packet(index, u)));
+                }
+                Framing::Mpa(parser, clock) => {
+                    parser.flush(&mut units);
+                    stamp_all(units, clock, index, &mut self.queue);
+                }
+                Framing::Ac3(parser, clock) => {
+                    parser.flush(&mut units);
+                    stamp_all(units, clock, index, &mut self.queue);
+                }
+                Framing::Pes | Framing::SubstreamId(_) => {}
             }
         }
     }
@@ -799,6 +841,14 @@ fn packet(index: u32, data: Vec<u8>, pts: Option<i64>, dts: Option<i64>) -> Pack
 fn unit_packet(index: u32, unit: Unit) -> Packet {
     let ts = unit.pts.or(unit.dts);
     packet(index, unit.data, ts, ts)
+}
+
+/// Parsed audio frames, timed by their stream's clock and queued.
+fn stamp_all(units: Vec<Unit>, clock: &mut AudioClock, index: u32, queue: &mut VecDeque<Packet>) {
+    for unit in units {
+        let packet = clock.stamp(unit, index, TIME_BASE, queue);
+        queue.push_back(packet);
+    }
 }
 
 /// floor(log2(x)), 0 for 0 (av_log2).
@@ -964,54 +1014,6 @@ fn cavs_sequence(es: &[u8]) -> Option<(u32, u32)> {
     Some(((bits >> 17) & 0x3FFF, (bits >> 3) & 0x3FFF))
 }
 
-/// One MPEG audio header (ff_mpa_check_header + ff_mpa_decode_header):
-/// codec, sample rate, channels and frame size; free format is not a
-/// frame here, as for FFmpeg's parser.
-fn mpa_header(h: u32) -> Option<(&'static str, u32, u16, usize)> {
-    if (h & 0xFFE0_0000) != 0xFFE0_0000
-        || (h & (3 << 19)) == 1 << 19
-        || (h & (3 << 17)) == 0
-        || (h & (0xF << 12)) == 0xF << 12
-        || (h & (3 << 10)) == 3 << 10
-    {
-        return None;
-    }
-    const FREQ: [u32; 3] = [44100, 48000, 32000];
-    const BITRATE: [[[u32; 15]; 3]; 2] = [
-        [
-            [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448],
-            [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384],
-            [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
-        ],
-        [
-            [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256],
-            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
-            [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
-        ],
-    ];
-    let (lsf, mpeg25) = if h & (1 << 20) != 0 { (u32::from(h & (1 << 19) == 0), 0) } else { (1, 1) };
-    let layer = 4 - ((h >> 17) & 3);
-    let sample_rate = FREQ[((h >> 10) & 3) as usize] >> (lsf + mpeg25);
-    let bitrate_index = ((h >> 12) & 0xF) as usize;
-    let padding = (h >> 9) & 1;
-    if bitrate_index == 0 {
-        return None;
-    }
-    let kbps = BITRATE[lsf as usize][(layer - 1) as usize][bitrate_index];
-    let frame_size = match layer {
-        1 => (kbps * 12000 / sample_rate + padding) * 4,
-        2 => kbps * 144_000 / sample_rate + padding,
-        _ => kbps * 144_000 / (sample_rate << lsf) + padding,
-    };
-    let codec = match layer {
-        1 => "mp1",
-        2 => "mp2",
-        _ => "mp3",
-    };
-    let channels = if (h >> 6) & 3 == 3 { 1 } else { 2 };
-    Some((codec, sample_rate, channels, frame_size as usize))
-}
-
 /// What FFmpeg's mpegaudio parser reports once two consecutive headers
 /// agree (its header_count threshold): codec, sample rate, channels.
 fn mpeg_audio(es: &[u8]) -> Option<(&'static str, u32, u16)> {
@@ -1020,10 +1022,10 @@ fn mpeg_audio(es: &[u8]) -> Option<(&'static str, u32, u16)> {
     let word = |i: usize| es.get(i..i + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     (0..es.len()).find_map(|i| {
         let h = word(i)?;
-        let (codec, rate, channels, size) = mpa_header(h)?;
-        let next = word(i + size)?;
-        mpa_header(next)?;
-        ((next & SAME_HEADER_MASK) == (h & SAME_HEADER_MASK)).then_some((codec, rate, channels))
+        let first = mpa_decode_header(h)?;
+        let next = word(i + first.frame_bytes)?;
+        mpa_decode_header(next)?;
+        ((next & SAME_HEADER_MASK) == (h & SAME_HEADER_MASK)).then_some((first.codec, first.sample_rate, first.channels))
     })
 }
 
@@ -1107,7 +1109,9 @@ impl Demuxer for MpegPsDemuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
-            if let Some(packet) = self.queue.pop_front() {
+            if let Some(mut packet) = self.queue.pop_front() {
+                packet.pts = returned(packet.pts);
+                packet.dts = returned(packet.dts);
                 return Ok(packet);
             }
             if self.eof {

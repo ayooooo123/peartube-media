@@ -1,17 +1,24 @@
-// Ported from FFmpeg libavformat/ac3dec.c and libavcodec/ac3_parser.c
-// (and the tables in libavcodec/ac3tab.c), commit 2da55bf.
+// Ported from FFmpeg libavformat/ac3dec.c, rawdec.c
+// (ff_raw_audio_read_header, ff_raw_read_partial_packet) and
+// libavcodec/ac3_parser.c (and the tables in libavcodec/ac3tab.c),
+// commit 2da55bf.
 // License: LGPL-2.1-or-later
 //
-// Raw AC-3 / E-AC-3 demuxers. A syncframe is one packet; the parser is the
-// FFmpeg ac3 parser (bitstream layout of ATSC A/52 and E-AC-3) so packet
-// boundaries and stream parameters match FFmpeg's exactly.
+// Raw AC-3 / E-AC-3 demuxers. As in FFmpeg the input is read in 1024-byte
+// pieces and FFmpeg's ac3 parser cuts the packets: one per frame, an
+// E-AC-3 frame with its dependent substreams, bytes between frames kept
+// with the frame before them. Timestamps are FFmpeg's for a raw stream:
+// 1/90000, counted from zero in frame durations.
 
+use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
     Packet, ProbeData, ProbeScore, ReadSeek, Result, SampleFormat,
     StreamInfo, TimeBase, PROBE_SCORE_EXTENSION,
 };
+
+use crate::parser::{returned, Ac3, AudioClock, Parser};
 
 const SYNCWORD_AC3: u16 = 0x0B77;
 
@@ -61,6 +68,9 @@ pub(crate) fn crc16_ansi(data: &[u8]) -> u16 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ac3Header {
     pub bitstream_id: u8,
+    /// E-AC-3 frame type: 0 independent, 1 dependent, 2 AC-3 convert
+    /// (every AC-3 frame).
+    pub frame_type: u8,
     /// Bytes of the whole syncframe.
     pub frame_size: usize,
     pub sample_rate: u32,
@@ -120,6 +130,7 @@ pub fn parse_ac3_header(buf: &[u8]) -> Option<Ac3Header> {
         let channels = ACMOD_CHANNELS[acmod as usize] + u16::from(lfeon);
         Some(Ac3Header {
             bitstream_id: bsid,
+            frame_type: 2,
             frame_size,
             sample_rate,
             channels,
@@ -128,9 +139,13 @@ pub fn parse_ac3_header(buf: &[u8]) -> Option<Ac3Header> {
         })
     } else {
         // Enhanced AC-3
+        let frame_type = buf[2] >> 6;
+        if frame_type == 3 {
+            return None;
+        }
         let frmsiz = ((u16::from(buf[2] & 0x07) << 8) | u16::from(buf[3])) as usize;
         let frame_size = (frmsiz + 1) * 2;
-        if frame_size < 6 {
+        if frame_size < 7 {
             return None;
         }
         let fscod = (buf[4] >> 6) & 3;
@@ -149,6 +164,7 @@ pub fn parse_ac3_header(buf: &[u8]) -> Option<Ac3Header> {
         let channels = ACMOD_CHANNELS[acmod as usize] + u16::from(lfeon);
         Some(Ac3Header {
             bitstream_id: bsid,
+            frame_type,
             frame_size,
             sample_rate,
             channels,
@@ -270,47 +286,50 @@ pub fn probe_eac3(probe: &ProbeData) -> ProbeScore {
     probe_ac3_or_eac3(probe, true)
 }
 
+/// ff_raw_demuxer_class raw_packet_size
+const RAW_PACKET_SIZE: usize = 1024;
+
+/// avformat_new_stream's default: 33-bit timestamps in 1/90000.
+const TIME_BASE: TimeBase = TimeBase::new(1, 90_000);
+
 pub struct Ac3Demuxer {
     format_name: &'static str,
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    /// samples per frame in stream time base (1 / sample_rate)
-    frame_samples: i64,
-    pts: i64,
+    codec: &'static str,
+    parser: Parser<Ac3>,
+    clock: AudioClock,
+    queue: VecDeque<Packet>,
+    pos: i64,
+    eof: bool,
 }
 
-/// ff_raw_audio_read_header + ff_raw_read_partial_packet semantics: one
-/// syncframe per packet, timestamps in samples.
+/// ff_raw_audio_read_header: one stream, parameters from the first
+/// syncframe whose CRC holds, as find_stream_info reports them.
 fn open_ac3_inner(
     mut input: Box<dyn ReadSeek>,
     format_name: &'static str,
-    codec_id: CodecId,
+    codec: &'static str,
 ) -> Result<Box<dyn Demuxer>> {
     let mut head = vec![0u8; 64 * 1024];
-    let n = input.read(&mut head)?;
-    if n < 7 {
-        return Err(Error::invalid("ac3: file too short"));
+    let mut n = 0;
+    while n < head.len() {
+        let got = input.read(&mut head[n..])?;
+        if got == 0 {
+            break;
+        }
+        n += got;
     }
+    let hdr = (0..n.saturating_sub(6))
+        .filter(|&i| head[i] == 0x0B && head[i + 1] == 0x77)
+        .find_map(|i| {
+            let hdr = parse_ac3_header(&head[i..n])?;
+            (i + hdr.frame_size <= n && crc16_ansi(&head[i + 2..i + hdr.frame_size]) == 0).then_some(hdr)
+        })
+        .ok_or_else(|| Error::invalid("ac3: no valid syncframe found"))?;
+    input.seek(SeekFrom::Start(0))?;
 
-    let mut first_hdr = None;
-    let mut sync_offset = 0;
-    for i in 0..n.saturating_sub(6) {
-        if head[i] == 0x0B && head[i + 1] == 0x77
-            && let Some(hdr) = parse_ac3_header(&head[i..n]) {
-                // require the whole first frame to be present and CRC-valid
-                if i + hdr.frame_size <= n
-                    && crc16_ansi(&head[i + 2..i + hdr.frame_size]) == 0
-                {
-                    first_hdr = Some(hdr);
-                    sync_offset = i;
-                    break;
-                }
-            }
-    }
-    let hdr = first_hdr.ok_or_else(|| Error::invalid("ac3: no valid syncframe found"))?;
-    input.seek(SeekFrom::Start(sync_offset as u64))?;
-
-    let mut params = CodecParameters::audio(codec_id);
+    let mut params = CodecParameters::audio(CodecId::new(codec));
     params.sample_rate = Some(hdr.sample_rate);
     params.channels = Some(hdr.channels);
     params.sample_format = Some(SampleFormat::F32);
@@ -318,7 +337,7 @@ fn open_ac3_inner(
     let stream = StreamInfo {
         index: 0,
         params,
-        time_base: TimeBase::from_rate(hdr.sample_rate),
+        time_base: TIME_BASE,
         duration: None,
         start_time: Some(0),
     };
@@ -326,83 +345,53 @@ fn open_ac3_inner(
         format_name,
         input,
         streams: vec![stream],
-        frame_samples: i64::from(hdr.num_blocks) * 256,
-        pts: 0,
+        codec,
+        parser: Parser::new(Ac3::new(codec)),
+        clock: AudioClock::new(1, 90_000, 33),
+        queue: VecDeque::new(),
+        pos: 0,
+        eof: false,
     }))
 }
 
 pub fn open_ac3(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
-    open_ac3_inner(input, "ac3", CodecId::new("ac3"))
+    open_ac3_inner(input, "ac3", "ac3")
 }
 
 pub fn open_eac3(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
-    open_ac3_inner(input, "eac3", CodecId::new("eac3"))
+    open_ac3_inner(input, "eac3", "eac3")
 }
 
 impl Ac3Demuxer {
-    /// Read and validate the next syncframe; returns its header and bytes.
-    /// A truncated final frame (file cut mid-frame, as in cut-down FATE
-    /// samples) is returned as-is, like FFmpeg's av_get_packet partial
-    /// read; anything else is an error.
-    fn next_syncframe(&mut self) -> Result<(Ac3Header, Vec<u8>)> {
-        let mut data = Vec::with_capacity(4096);
-        // Read the 7 header bytes incrementally, searching for sync.
-        let mut head = [0u8; 7];
-        let mut got = 0usize;
-        let mut window: u16 = 0;
-        loop {
-            let mut byte = [0u8; 1];
-            match self.input.read(&mut byte) {
-                Ok(0) => return Err(Error::Eof),
-                Ok(_) => {}
-                Err(e) => return Err(e.into()),
+    /// ff_raw_read_partial_packet into the parser: the frames it
+    /// completes, timed, join the queue; at the end of the input the
+    /// parser hands over the last one.
+    fn read_piece(&mut self) -> Result<()> {
+        let mut piece = [0u8; RAW_PACKET_SIZE];
+        let mut n = 0;
+        while n < piece.len() {
+            let got = self.input.read(&mut piece[n..])?;
+            if got == 0 {
+                break;
             }
-            window = (window << 8) | u16::from(byte[0]);
-            if got < 7 {
-                head[got] = byte[0];
-                got += 1;
-            } else {
-                head.copy_within(1.., 0);
-                head[6] = byte[0];
-            }
-            if window != SYNCWORD_AC3 {
-                continue;
-            }
-            // We have a syncword; make sure 7 header bytes are buffered.
-            if got < 7 {
-                self.input.read_exact(&mut head[got..])?;
-            }
-            let Some(hdr) = parse_ac3_header(&head) else {
-                // Not a real frame; keep scanning from after the syncword.
-                continue;
-            };
-            if hdr.frame_size > 4096 || hdr.frame_size < 7 {
-                return Err(Error::invalid("ac3: invalid frame size"));
-            }
-            data.extend_from_slice(&head);
-            data.resize(hdr.frame_size, 0);
-            match self.input.read(&mut data[7..]) {
-                Ok(n) if n == hdr.frame_size - 7 => {}
-                // Short read at EOF: the file ends mid-frame. FFmpeg's
-                // av_get_packet returns the partial packet; emit it once.
-                Ok(0) => return Ok((hdr, data[..7].to_vec())),
-                Ok(n) => {
-                    // Fill the rest until EOF, tolerating a truncated tail.
-                    let have = 7 + n;
-                    let mut got2 = have;
-                    while got2 < hdr.frame_size {
-                        let r = self.input.read(&mut data[got2..])?;
-                        if r == 0 {
-                            break;
-                        }
-                        got2 += r;
-                    }
-                    data.truncate(got2);
-                }
-                Err(e) => return Err(e.into()),
-            }
-            return Ok((hdr, data));
+            n += got;
         }
+        let mut units = Vec::new();
+        if n == 0 {
+            self.eof = true;
+            self.parser.flush(&mut units);
+        } else {
+            if self.parser.split.buffered_bytes() + n > 8 * 1024 * 1024 {
+                return Err(Error::invalid("ac3: access unit exceeds 8 MiB"));
+            }
+            self.parser.push(&piece[..n], None, None, self.pos, &mut units);
+            self.pos += n as i64;
+        }
+        for unit in units {
+            let packet = self.clock.stamp(unit, 0, TIME_BASE, &mut self.queue);
+            self.queue.push_back(packet);
+        }
+        Ok(())
     }
 }
 
@@ -416,28 +405,40 @@ impl Demuxer for Ac3Demuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
-        let (_hdr, data) = self.next_syncframe()?;
-        let mut pkt = Packet::new(0, self.streams[0].time_base, data);
-        pkt.pts = Some(self.pts);
-        pkt.dts = Some(self.pts);
-        pkt.duration = Some(self.frame_samples);
-        pkt.flags.keyframe = true;
-        self.pts += self.frame_samples;
-        Ok(pkt)
+        loop {
+            if let Some(mut packet) = self.queue.pop_front() {
+                packet.pts = returned(packet.pts);
+                packet.dts = returned(packet.dts);
+                return Ok(packet);
+            }
+            if self.eof {
+                return Err(Error::Eof);
+            }
+            self.read_piece()?;
+        }
     }
 
+    /// Raw streams have no index: read again from the start up to the
+    /// first frame at or after `pts`.
     fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
-        // Linear scan from the start; raw streams have no index.
         self.input.seek(SeekFrom::Start(0))?;
-        self.pts = 0;
-        while self.pts < pts {
-            match self.next_packet() {
-                Ok(_) => {}
-                Err(Error::Eof) => break,
+        self.parser = Parser::new(Ac3::new(self.codec));
+        self.clock = AudioClock::new(1, 90_000, 33);
+        self.queue.clear();
+        self.pos = 0;
+        self.eof = false;
+        loop {
+            let packet = match self.next_packet() {
+                Ok(packet) => packet,
+                Err(Error::Eof) => return Ok(pts),
                 Err(e) => return Err(e),
+            };
+            let at = packet.pts.unwrap_or(i64::MIN);
+            if at >= pts {
+                self.queue.push_front(packet);
+                return Ok(at);
             }
         }
-        Ok(self.pts)
     }
 }
 

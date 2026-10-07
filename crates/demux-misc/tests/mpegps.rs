@@ -9,11 +9,13 @@
 //! Streams exist at open and demuxing never changes them; they match
 //! ffprobe's in order, type, codec and the parameters FFmpeg reports.
 //! FFmpeg's demuxer returns PES payloads that its parsers then re-frame.
-//! This demuxer re-frames DVD subpictures only, with FFmpeg's dvdsub
-//! parser, so those streams compare with ffprobe's parsed packet table
-//! and every other stream with the unparsed one (`-fflags
-//! +noparse+nofillin`): every packet's payload MD5, size, pts and dts,
-//! and the interleaving of the unparsed streams.
+//! This demuxer re-frames what its decoders need whole, with FFmpeg's
+//! parsers: DVD subpictures (dvdsub), MPEG audio (mpegaudio) and AC-3 /
+//! E-AC-3 (ac3). Those streams compare with ffprobe's parsed packet
+//! table, timestamps FFmpeg fills in included; every other stream
+//! compares with the unparsed one (`-fflags +noparse+nofillin`). Every
+//! packet's payload MD5, size, pts and dts, and the interleaving of the
+//! unparsed streams.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -139,9 +141,9 @@ fn demux(path: &Path) -> (Vec<StreamInfo>, Vec<StreamInfo>, Vec<Pkt>) {
     (at_open, demuxer.streams().to_vec(), packets)
 }
 
-/// The streams whose packets are reassembled units.
+/// The streams whose packets are parsed units.
 fn reframed(stream: &StreamInfo) -> bool {
-    stream.params.codec_id.as_str() == "dvd_subtitle"
+    matches!(stream.params.codec_id.as_str(), "dvd_subtitle" | "mp1" | "mp2" | "mp3" | "ac3" | "eac3")
 }
 
 fn check(rel: &str) {
