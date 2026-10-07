@@ -1,6 +1,6 @@
 [package]
 name = "subs-text"
-description = "In-container text subtitle decoders: mov_text (3GPP Timed Text), USF, CMML, Kate"
+description = "Text subtitle demuxers and decoders: SubRip, ASS/SSA, WebVTT, MicroDVD, SubViewer, SAMI, VPlayer, mov_text, USF, CMML, Kate"
 version.workspace = true
 edition.workspace = true
 license = "LGPL-2.1-or-later"
@@ -12,6 +12,8 @@ oxideav-subtitle.workspace = true
 
 [dev-dependencies]
 codecs = { path = "../codecs" }
+player = { path = "../player" }
+parking_lot = "0.12"
 refcheck.workspace = true
 oxideav-mkv.workspace = true
 oxideav-mp4.workspace = true

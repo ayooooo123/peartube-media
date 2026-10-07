@@ -97,8 +97,8 @@ laces now match strict FFprobe packet comparisons on nine generated/real
 fixtures, including millisecond time bases. AAC 960-sample/LD/ELD/USAC and
 14-bit/substream-only DTS frame timing are not inferred.
 
-Matroska/WebM WebVTT packets carry raw cue text to the registered subtitle
-adapter, which uses packet timestamps rather than an in-band timing line.
+Matroska/WebM WebVTT packets carry raw cue text to the `subs-text` WebVTT
+decoder (the FFmpeg port standalone `.vtt` files use), timed by the packet.
 `Demuxer::packet_metadata().webvtt` replaces the typed-only accessor and
 preserves each cue's identifier/settings through lacing and seeks. The
 accessor clears before the next read/seek, including errors and EOF;
@@ -206,9 +206,11 @@ SubViewer 1 and VPlayer reference checks compare every decoded cue's text, start
 
 Codec-version rows require genuine inputs: generated `wmv1_wma1.asf` covers WMV1/WMA1, FATE `vc1/SMM0005.rcv` covers WMV3, and `sipr/sipr_5k0.rm` covers RV10. WMV2, VC-1 and RV20 files are not evidence for those earlier or different codecs.
 
-Standalone subtitle acceptance (`cargo test -p subs-text --test reference standalone_`) compares every cue's visible text, start, end and count through the production registry with FFmpeg. It does not normalize away raw tags the player would display, and does not claim style fidelity from text equality. These checks expose existing parser/renderer failures rather than printing errors and passing. Container probing is a separate diagnostic: `cargo run -p demux-misc --example check_oxideav`; opening a container is not proof of correct packets or playback.
+Standalone subtitle acceptance (`cargo test -p subs-text --test reference standalone_`) compares every cue's visible text, start, end and count through the production registry with FFmpeg's `text` encode of its decode. It does not normalize away raw tags the player would display, and does not claim style fidelity from text equality. All 13 fixtures pass (SubRip ×5, MicroDVD ×2, SubViewer, MPL2, WebVTT ×2, ASS, SSA). Container probing is a separate diagnostic: `cargo run -p demux-misc --example check_oxideav`; opening a container is not proof of correct packets or playback.
 
-The MPL2 capability fixture now matches all four FFmpeg cues through the pinned subtitle fork, including omitted end timestamps and italic/bold/underline line prefixes. Other newly strict standalone fixtures still require parser/rendering fixes; MPL2 does not establish general subtitle or style-rendering parity.
+SubRip, ASS/SSA, WebVTT, MicroDVD and SubViewer demuxing and decoding are LGPL ports of FFmpeg's in `subs-text`, registered ahead of OxideAV's (containers by name, so `.srt`, `.ass`, `.vtt`, `microdvd` and `subviewer2` files open with them). Each decoder converts a cue to an ASS event as FFmpeg does, and one conversion decides what it shows and how: the text FFmpeg's `text` encoder keeps (override blocks hidden; `\h`, `\{` and brace text without a backslash stay literal, as in FFmpeg) styled by the event's style from the script header or CodecPrivate and its `\b \i \u \s`, primary colour, font, first alignment and `\r` overrides. The compositor draws colour, bold, italic and horizontal alignment; vertical alignment, outline, font face/size, `\pos`/`\move` and karaoke timing are not drawn. MPL2 still decodes through the pinned subtitle fork, including omitted end timestamps and italic/bold/underline line prefixes.
+
+Text subtitles inside containers play through the Player (`cargo test -p subs-text --test player_text`). FFmpeg- and mkvmerge-generated Matroska SubRip (copied, and converted from ASS), ASS (copied, converted from SubRip, from SSA), mkvmerge `S_TEXT/SSA`, MP4 `mov_text` and WebM/Matroska WebVTT files decode to FFmpeg's cue text and times (Matroska and WebM to the microsecond of `ffprobe -show_packets`), and every cue reaches the subtitle sink rendered exactly as FFmpeg's SubRip conversion of it renders, CodecPrivate style colours included. QuickTime `.mov` text tracks still fail: the pinned oxideav-mov demuxer exposes them as data streams, so neither the registry nor the Player selects them.
 
 Legacy subtitle demuxing bounds each SubViewer1/VPlayer timestamp component to the format's signed 32-bit field before 64-bit arithmetic. SubViewer1, VPlayer and SAMI order cues by timestamp and original file order, fill missing durations, then remove adjacent exact duplicates, as FFmpeg does. Equal-text cues with different durations remain distinct.
 

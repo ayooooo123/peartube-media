@@ -67,15 +67,15 @@ pub fn decode_subtitle_text(bytes: &[u8]) -> String {
     }
 
     // Fallback: Windows-1250
-    let mut out = String::with_capacity(bytes.len());
-    for &b in bytes {
-        if b < 0x80 {
-            out.push(b as char);
-        } else {
-            out.push(CP1250_TABLE[(b - 0x80) as usize]);
-        }
-    }
-    normalize_newlines(&out)
+    normalize_newlines(&decode_windows_1250(bytes))
+}
+
+/// Windows-1250 bytes as text.
+pub fn decode_windows_1250(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| if b < 0x80 { b as char } else { CP1250_TABLE[(b - 0x80) as usize] })
+        .collect()
 }
 
 /// Normalizes line endings to `\n`.

@@ -30,14 +30,14 @@ const MAX_CUE_BYTES: usize = 1 << 20;
 // Demuxer
 // ---------------------------------------------------------------------------
 
-/// Probe for SubViewer 1: look for "******** START SCRIPT ********", "[DELAY]", or "[00:".
+/// `subviewer1_probe`: the start-of-script marker anywhere in the probe
+/// buffer (up to its first NUL), at FFmpeg's extension score. SubViewer 2
+/// headers also carry `[DELAY]`, so that alone does not identify version 1.
 pub fn probe(data: &ProbeData) -> ProbeScore {
-    let s = String::from_utf8_lossy(data.buf);
-    if s.contains("******** START SCRIPT ********")
-        || s.contains("**START SCRIPT**")
-        || s.contains("[DELAY]")
-    {
-        85
+    const MARKER: &[u8] = b"******** START SCRIPT ********";
+    let head = &data.buf[..data.buf.iter().position(|&b| b == 0).unwrap_or(data.buf.len())];
+    if head.windows(MARKER.len()).any(|w| w == MARKER) {
+        50
     } else {
         0
     }

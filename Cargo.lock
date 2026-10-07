@@ -1647,6 +1647,8 @@ dependencies = [
  "oxideav-mp4",
  "oxideav-ogg",
  "oxideav-subtitle",
+ "parking_lot",
+ "player",
  "refcheck",
 ]
 

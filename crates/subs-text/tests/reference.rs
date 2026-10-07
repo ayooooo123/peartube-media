@@ -1,86 +1,13 @@
-use std::path::Path;
-use std::process::Command;
+mod common;
 
+use std::path::Path;
+
+use common::{ffmpeg_cues, format_srt_time, visible_text};
 use oxideav_core::{Frame, MediaType, Packet, TimeBase};
 use refcheck::fate;
 
-fn format_srt_time(us: i64) -> String {
-    let ms = (us / 1000).max(0);
-    let s = ms / 1000;
-    let m = s / 60;
-    let h = m / 60;
-    format!(
-        "{:02}:{:02}:{:02},{:03}",
-        h,
-        m % 60,
-        s % 60,
-        ms % 1000
-    )
-}
-
 fn ffmpeg_srt_cues(path: &Path) -> Vec<(String, String)> {
-    ffmpeg_srt_cues_with_options(path, &[])
-}
-
-fn ffmpeg_srt_cues_with_options(path: &Path, options: &[&str]) -> Vec<(String, String)> {
-    ffmpeg_cues(path, options, "srt")
-}
-
-fn ffmpeg_cues(path: &Path, options: &[&str], encoder: &str) -> Vec<(String, String)> {
-    let output = Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error"])
-        .args(options)
-        .args([
-            "-i",
-            path.to_str().unwrap(),
-            "-map",
-            "0:s:0",
-            "-c:s",
-            encoder,
-            "-f",
-            "srt",
-            "-",
-        ])
-        .output()
-        .expect("run ffmpeg");
-    assert!(output.status.success(), "ffmpeg failed: {:?}", output);
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_srt_text(&text)
-}
-
-fn parse_srt_text(text: &str) -> Vec<(String, String)> {
-    let mut cues = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim();
-        if !line.is_empty()
-            && line.chars().all(|c| c.is_ascii_digit())
-            && i + 1 < lines.len()
-            && lines[i + 1].contains("-->")
-        {
-            let timing = lines[i + 1].trim().to_string();
-            i += 2;
-            let mut body_lines = Vec::new();
-            while i < lines.len() {
-                let cur = lines[i].trim();
-                if !cur.is_empty()
-                    && cur.chars().all(|c| c.is_ascii_digit())
-                    && i + 1 < lines.len()
-                    && lines[i + 1].contains("-->")
-                {
-                    break;
-                }
-                body_lines.push(lines[i]);
-                i += 1;
-            }
-            let body = body_lines.join("\n").trim().to_string();
-            cues.push((timing, body));
-        } else {
-            i += 1;
-        }
-    }
-    cues
+    ffmpeg_cues(path, &[], "srt")
 }
 
 #[test]
@@ -315,30 +242,6 @@ fn test_sami_reference() {
             } else {
                 panic!("expected Subtitle frame, got {:?}", frame);
             }
-        }
-    }
-}
-
-fn visible_text(segments: &[oxideav_core::subtitle::Segment], out: &mut String) {
-    use oxideav_core::subtitle::Segment;
-    for segment in segments {
-        match segment {
-            // Raw segments are rendered literally by the compositor. Stripping
-            // their markup here would conceal decoder errors.
-            Segment::Text(text) | Segment::Raw(text) => out.push_str(text),
-            Segment::LineBreak => out.push('\n'),
-            Segment::Voice { name, children } => {
-                out.push_str(name);
-                out.push_str(": ");
-                visible_text(children, out);
-            }
-            Segment::Bold(children) | Segment::Italic(children)
-            | Segment::Underline(children) | Segment::Strike(children)
-            | Segment::Color { children, .. } | Segment::Font { children, .. }
-            | Segment::Class { children, .. } | Segment::Karaoke { children, .. } => {
-                visible_text(children, out);
-            }
-            Segment::Timestamp { .. } => {}
         }
     }
 }
