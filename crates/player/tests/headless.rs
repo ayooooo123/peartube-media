@@ -1716,4 +1716,29 @@ fn audio_clock_presents_each_write_at_its_pts_across_a_gap() {
     }
     assert!(crossed_gap, "the gap was not played within one continuous run");
 }
+#[test]
+fn far_future_final_timestamp_does_not_hold_the_end() {
+    let _cpu = realtime_test();
+    // A hostile last video packet stamped a minute after the rest.
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25:duration=2",
+        "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=2",
+        "-c:v", "libx264", "-bf", "0", "-g", "25", "-c:a", "pcm_s16le",
+        "-bsf:v", "setts=pts=if(gte(N\\,49)\\,PTS+60/TB\\,PTS):dts=if(gte(N\\,49)\\,DTS+60/TB\\,DTS)",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let opened = Instant::now();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    let elapsed = opened.elapsed();
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    // Two seconds of media, then at most the queue horizon and a second.
+    assert!(elapsed < Duration::from_secs(8), "end held {elapsed:?} by a bogus timestamp");
+    assert!(state.position < Duration::from_secs(6), "position ran to {:?}", state.position);
+}
+
 

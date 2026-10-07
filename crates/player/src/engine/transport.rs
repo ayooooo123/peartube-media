@@ -38,6 +38,10 @@ const MAX_WAIT: Duration = Duration::from_millis(100);
 const END_SLACK: Duration = Duration::from_millis(5);
 /// A running clock that stands still this long has played all its output.
 const DRAINED: Duration = Duration::from_millis(100);
+/// Past the queue horizon at the moment the demuxer reached the end, no
+/// tail wait trusts a timestamp: a bogus far-future stamp (corrupt or
+/// hostile input) must not hold `Ended`.
+const TAIL_SLACK: Duration = Duration::from_secs(1);
 
 /// The pipelines whose data the clock waits for (subtitles never hold it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +85,9 @@ pub(super) struct Transport {
     source_starved: bool,
     /// The demuxer reached the end of the input.
     demux_eof: bool,
+    /// When the demuxer reached the end: the latest media time any tail
+    /// wait still waits for.
+    tail_limit: Option<Duration>,
     /// The demuxer waits because a lane is full: it cannot buffer more.
     demux_full: bool,
     pipes: [PipeState; 2],
@@ -98,6 +105,7 @@ impl Transport {
             demux_gen: 0,
             source_starved: false,
             demux_eof: false,
+            tail_limit: None,
             demux_full: false,
             pipes: Default::default(),
         }
@@ -271,6 +279,7 @@ impl SharedState {
                 p.horizon = None;
             }
             t.demux_eof = false;
+            t.tail_limit = None;
             t.demux_full = false;
             t.buffering = true;
         });
@@ -334,12 +343,18 @@ impl SharedState {
                 p.horizon = None;
             }
             t.demux_eof = false;
+            t.tail_limit = None;
             t.demux_full = false;
         });
     }
 
     pub(super) fn demux_eof(&self, eof: bool) {
-        self.update(|t| t.demux_eof = eof);
+        let horizon = Duration::from_secs_f64(super::QUEUE_MAX_SECS) + TAIL_SLACK;
+        let limit = eof.then(|| self.master.now().unwrap_or_default() + horizon);
+        self.update(|t| {
+            t.demux_eof = eof;
+            t.tail_limit = limit;
+        });
     }
 
     pub(super) fn demux_full(&self, full: bool) {
@@ -370,7 +385,8 @@ impl SharedState {
                 return Due::Resync;
             }
             let now = self.master.now().unwrap_or_default();
-            if now > pts + VIDEO_LEAD {
+            // Past the end's horizon a frame's stamp is bogus: drop it.
+            if now > pts + VIDEO_LEAD || t.tail_limit.is_some_and(|limit| pts > limit) {
                 return Due::Late;
             }
             if due <= now {
@@ -419,6 +435,8 @@ impl SharedState {
                 return Preroll::Resync;
             }
             let now = self.master.now().unwrap_or_default();
+            // Nothing waits for a stamp past the end's horizon.
+            let pts = t.tail_limit.map_or(pts, |limit| pts.min(limit));
             if t.running {
                 if let Some(ahead) = ahead {
                     if pts > now + ahead {
@@ -455,7 +473,7 @@ impl SharedState {
             }
             apply_running(t.running);
             let now = self.master.now().unwrap_or_default();
-            if now + END_SLACK >= at {
+            if now + END_SLACK >= at.min(t.tail_limit.unwrap_or(at)) {
                 return true;
             }
             if !t.running {
