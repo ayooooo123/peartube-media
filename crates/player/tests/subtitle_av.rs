@@ -19,7 +19,7 @@ use oxideav_core::{CodecParameters, Packet, VideoFrame};
 use parking_lot::Mutex;
 use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleImage, SubtitleSink, VideoSink};
 use player::{Headless, Player, PlayerOptions, State};
-use scripted::Mode;
+use scripted::{Hold, Mode};
 
 /// One subtitle sink call: when on the playback clock, how many images and
 /// how many RGBA bytes.
@@ -105,12 +105,16 @@ impl SubtitleSink for WatchedSubtitles {
 }
 
 fn play(path: &Path, subtitle: impl Into<Option<u32>>) -> (Player, Arc<Watched>) {
+    play_with(path, subtitle, true)
+}
+
+fn play_with(path: &Path, subtitle: impl Into<Option<u32>>, realtime: bool) -> (Player, Arc<Watched>) {
     let headless = Headless::new();
-    headless.set_active_streams(None, None, None, true);
+    headless.set_active_streams(None, None, None, realtime);
     let backend = Arc::new(Watched { headless, watch: Arc::new(Watch::default()) });
     let player = Player::open(
         path.to_str().unwrap(), backend.clone(), Arc::new(scripted::context()),
-        PlayerOptions { subtitle: subtitle.into(), realtime: true, ..PlayerOptions::default() }, |_| {},
+        PlayerOptions { subtitle: subtitle.into(), realtime, ..PlayerOptions::default() }, |_| {},
     );
     (player, backend)
 }
@@ -214,22 +218,22 @@ fn subtitles_demuxed_ahead_of_the_audio_never_stall_it() {
     }
 }
 
-/// Switching subtitle tracks re-reads from the clock's position when the
-/// demuxer can seek. When it cannot (`seek_to` unsupported) or the seek
-/// fails, nothing of the playback may change: no audio or video is
-/// flushed or skipped, the inter-coded video decodes on unbroken (one
-/// keyframe in four seconds), and the new track shows its cues from where
-/// the demuxer reads.
+/// A subtitle switch never seeks, whether the demuxer can seek, cannot
+/// (`seek_to` unsupported) or fails: no audio or video is flushed or
+/// skipped, the inter-coded video decodes on unbroken (one keyframe in five
+/// seconds), and the new track shows from its next cue past what the
+/// demuxer had read ahead (up to two seconds) at the switch. Its cue up at
+/// the switch (0.3 s to 3.5 s) is not shown; its cue from 4.0 s is.
 #[test]
-fn a_subtitle_switch_that_cannot_seek_leaves_audio_and_video_untouched() {
-    for mode in [Mode::Unseekable, Mode::SeekFails] {
+fn a_subtitle_switch_never_seeks() {
+    for mode in [Mode::Seekable, Mode::Unseekable, Mode::SeekFails] {
         let scratch = Scratch::new();
         let first = scratch.file("first.srt");
         let second = scratch.file("second.srt");
         srt(&first, &[(200, 800), (2600, 3200)]);
-        srt(&second, &[(300, 3500), (3600, 3900)]);
+        srt(&second, &[(300, 3500), (4000, 4800)]);
         let mkv = scratch.file("two-tracks.mkv");
-        movie(&mkv, 4, Some(("testsrc2=size=160x90:rate=10", "1000")), &[440], &[&first, &second]);
+        movie(&mkv, 5, Some(("testsrc2=size=160x90:rate=10", "1000")), &[440], &[&first, &second]);
         let path = scratch.file("two-tracks.ptscript");
         scripted::write(&path, &mkv, mode);
         let (player, backend) = play(&path, 2);
@@ -240,10 +244,11 @@ fn a_subtitle_switch_that_cannot_seek_leaves_audio_and_video_untouched() {
         let flushes = || (watch.audio_flushes.load(Ordering::SeqCst), watch.video_flushes.load(Ordering::SeqCst));
         // The audio pipeline flushes its output once as it starts.
         let before = flushes();
+        let shown_before = watch.shows.lock().len();
         player.select_subtitle(Some(3));
         let state = wait_until(&player, Duration::from_secs(20), &format!("{mode:?}: playback end"), |state| state.ended);
-        assert_eq!(flushes(), before, "{mode:?}: the failed refresh flushed audio or video");
-        assert_audio_and_video_complete(&mkv, &backend, &state, Some(40), &format!("{mode:?}"));
+        assert_eq!(flushes(), before, "{mode:?}: the subtitle switch flushed audio or video");
+        assert_audio_and_video_complete(&mkv, &backend, &state, Some(50), &format!("{mode:?}"));
         let expected = refcheck::ffmpeg_video_md5s(&mkv, 0, "yuv420p");
         let presented = backend.headless.capture().video[0].frame_md5.clone();
         let mut remaining = expected.iter();
@@ -251,24 +256,26 @@ fn a_subtitle_switch_that_cannot_seek_leaves_audio_and_video_untouched() {
             presented.iter().all(|md5| remaining.any(|want| want == md5)),
             "{mode:?}: every presented frame is FFmpeg's, in order",
         );
-        let shows = watch.shows.lock().clone();
+        let shows = watch.shows.lock()[shown_before..].to_vec();
+        let visible: Vec<_> = shows.iter().filter(|show| show.images > 0).collect();
         assert!(
-            shows.iter().any(|show| show.images > 0 && show.at >= Duration::from_millis(3600)),
-            "{mode:?}: the second track's cue from 3.6 s: {shows:?}",
+            !visible.is_empty() && visible.iter().all(|show| show.at >= Duration::from_millis(4000)),
+            "{mode:?}: after the switch only the second track's next cue, from 4.0 s: {shows:?}",
         );
         drop(player);
     }
 }
 
 /// The default audio track, chosen at open, stays selected and playing
-/// when a subtitle track is selected afterwards.
+/// when a subtitle track is selected afterwards; the track shows from its
+/// next cue past the demuxer's read-ahead.
 #[test]
 fn selecting_a_subtitle_keeps_the_default_audio_track() {
     let scratch = Scratch::new();
     let cues = scratch.file("cues.srt");
-    srt(&cues, &[(200, 3800)]);
+    srt(&cues, &[(200, 1500), (4000, 5800)]);
     let mkv = scratch.file("default-audio.mkv");
-    movie(&mkv, 4, None, &[440], &[&cues]);
+    movie(&mkv, 6, None, &[440], &[&cues]);
     let (player, backend) = play(&mkv, None::<u32>);
     let state = wait_until(&player, Duration::from_secs(10), "media time 1 s", |state| state.position >= Duration::from_secs(1));
     assert_eq!(state.audio, Some(0), "the default audio track");
@@ -277,10 +284,11 @@ fn selecting_a_subtitle_keeps_the_default_audio_track() {
     player.select_subtitle(Some(1));
     let state = wait_until(&player, Duration::from_secs(20), "playback end", |state| state.ended);
     assert_eq!((state.audio, state.subtitle), (Some(0), Some(1)), "audio kept, subtitles added");
-    // The rest of the four seconds, less what the device took ahead.
+    // The rest of the six seconds, less what the device took ahead.
     let after = pcm() - before;
-    assert!(after >= 2 * 48_000 * 2, "{after} PCM samples after the switch");
-    assert!(backend.watch.shows.lock().iter().any(|show| show.images > 0), "the cue up since 0.2 s shows");
+    assert!(after >= 4 * 48_000 * 2, "{after} PCM samples after the switch");
+    let shows = backend.watch.shows.lock().clone();
+    assert!(shows.iter().any(|show| show.images > 0 && show.at >= Duration::from_millis(4000)), "the next cue, from 4.0 s: {shows:?}");
     drop(player);
 }
 
@@ -344,150 +352,98 @@ fn overlapping_text_cues_stay_bounded_beside_1080p_video() {
     drop(player);
 }
 
-/// Tests that hold a seek inside the demuxer (`scripted::arm`) share one
-/// gate: they run one at a time.
+/// Tests that hold a demuxer (`scripted::arm`) share one gate: they run
+/// one at a time.
 static GATE_TESTS: Mutex<()> = Mutex::new(());
 
-/// What a test switches while the refresh seek is held.
-#[derive(Clone, Copy, Debug)]
-enum Switch {
-    Subtitle,
-    Audio,
-}
-
-/// `seconds` of 10 fps H.264 with a keyframe every second, a 440 Hz and an
-/// 880 Hz PCM track and two WebVTT tracks (streams 0 video, 1 and 2 audio,
-/// 3 and 4 subtitles), wrapped so its seeks land only once the test lets
-/// them: the Matroska file and the wrapped one.
-fn gated_movie(scratch: &Scratch, seconds: u32) -> (std::path::PathBuf, std::path::PathBuf) {
-    let first = scratch.file("first.srt");
-    let second = scratch.file("second.srt");
-    srt(&first, &[(100, seconds * 1000 - 100)]);
-    srt(&second, &[(200, seconds * 1000 - 100)]);
-    let mkv = scratch.file("gated.mkv");
-    movie(&mkv, seconds, Some(("testsrc2=size=160x90:rate=10", "10")), &[440, 880], &[&first, &second]);
-    let path = scratch.file("gated.ptscript");
-    scripted::write(&path, &mkv, Mode::Gated);
-    (mkv, path)
-}
-
-fn switch(player: &Player, switch: Switch) {
-    match switch {
-        Switch::Subtitle => player.select_subtitle(Some(4)),
-        Switch::Audio => player.select_audio(Some(2)),
-    }
-}
-
-/// The pts of every video frame presented so far.
-fn presented(backend: &Watched) -> Vec<Duration> {
-    backend.headless.capture().video.first().map(|video| video.pts.clone()).unwrap_or_default()
-}
-
-fn pcm_len(backend: &Watched) -> usize {
-    backend.headless.capture().audio.iter().map(|audio| audio.pcm.len()).sum()
-}
-
-/// A track switch re-reads from the clock's position. A seek the user asks
-/// for while that refresh seek is still inside the demuxer is the newer
-/// request and wins: once the refresh lands, playback goes on from the
-/// user's target, not the refresh's. For a subtitle switch and an audio
-/// switch.
-#[test]
-fn a_user_seek_during_a_refresh_wins() {
-    let _gate = GATE_TESTS.lock();
-    for kind in [Switch::Subtitle, Switch::Audio] {
-        let scratch = Scratch::new();
-        let (_mkv, path) = gated_movie(&scratch, 6);
-        let (player, backend) = play(&path, 3);
-        wait_until(&player, Duration::from_secs(10), &format!("{kind:?}: media time 1 s"), |state| {
-            state.position >= Duration::from_secs(1)
-        });
-        scripted::arm();
-        switch(&player, kind);
-        assert!(scripted::entered(Duration::from_secs(10)), "{kind:?}: the refresh seek started");
-        player.seek(Duration::from_secs(4));
-        // The user's seek stops the pipelines' output until the demuxer
-        // reads from 4 s.
-        std::thread::sleep(Duration::from_millis(300));
-        let before = presented(&backend).len();
-        scripted::release();
-        wait_until(&player, Duration::from_secs(20), &format!("{kind:?}: playback end"), |state| state.ended);
-        let after = presented(&backend)[before..].to_vec();
-        assert!(
-            after.first().is_some_and(|&pts| pts >= Duration::from_secs(4)),
-            "{kind:?}: after the refresh landed, playback went on from {:?}, not the user's 4 s", after.first(),
-        );
-        drop(player);
-    }
-}
-
-/// Video and audio that reach their end while a refresh seek is still
-/// inside the demuxer stay for it: once it lands, the frames and samples
-/// from its target play. For a subtitle switch and an audio switch.
-#[test]
-fn pipelines_at_their_end_wait_for_a_refresh_that_lands() {
-    let _gate = GATE_TESTS.lock();
-    for kind in [Switch::Subtitle, Switch::Audio] {
-        let scratch = Scratch::new();
-        let (_mkv, path) = gated_movie(&scratch, 3);
-        let (player, backend) = play(&path, 3);
-        // The demuxer reads two seconds ahead: by 1.2 s it has met the end.
-        wait_until(&player, Duration::from_secs(10), &format!("{kind:?}: media time 1.2 s"), |state| {
-            state.position >= Duration::from_millis(1200)
-        });
-        scripted::arm();
-        switch(&player, kind);
-        assert!(scripted::entered(Duration::from_secs(10)), "{kind:?}: the refresh seek started");
-        // The media plays out while the refresh is held: its pipelines meet
-        // their end.
-        let begun = Instant::now();
-        while presented(&backend).last().is_none_or(|&pts| pts < Duration::from_millis(2900)) {
-            assert!(begun.elapsed() < Duration::from_secs(10), "{kind:?}: the last frame never came");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        std::thread::sleep(Duration::from_millis(500));
-        let (frames, samples) = (presented(&backend).len(), pcm_len(&backend));
-        scripted::release();
-        wait_until(&player, Duration::from_secs(20), &format!("{kind:?}: playback end"), |state| state.ended);
-        let after = presented(&backend)[frames..].to_vec();
-        assert!(
-            after.first().is_some_and(|&pts| pts < Duration::from_secs(2)) && after.len() >= 10,
-            "{kind:?}: frames from the refresh target once it landed: {after:?}",
-        );
-        assert!(pcm_len(&backend) - samples >= 3 * 48_000 * 2 / 2, "{kind:?}: samples from the refresh target");
-        drop(player);
-    }
-}
-
-/// Subtitle selections made while the Player opens (over and over, until
-/// the tracks are known) never cost the audio track chosen by default; an
-/// explicit audio choice made then stands.
+/// Subtitle selections made while the Player opens never cost the audio
+/// track chosen by default, and an explicit audio choice made then
+/// stands. The demuxer is held, deterministically, while the selections
+/// are made: inside its open (before the Player reads the selection), and
+/// before its first packet (after it has, before its first switch). The
+/// test waits for the whole selection to be applied.
 #[test]
 fn subtitle_selections_while_opening_keep_the_audio_choice() {
+    let _gate = GATE_TESTS.lock();
     let scratch = Scratch::new();
     let cues = scratch.file("cues.srt");
     srt(&cues, &[(100, 3900)]);
     let mkv = scratch.file("opening.mkv");
     movie(&mkv, 4, None, &[440, 880], &[&cues]);
-    for attempt in 0..40 {
-        let explicit = attempt % 4 == 3;
-        let (player, _backend) = play(&mkv, None::<u32>);
-        let opened = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                if explicit {
-                    player.select_audio(Some(1));
-                }
-                while !opened.load(Ordering::SeqCst) {
-                    player.select_subtitle(Some(2));
-                }
+    let path = scratch.file("opening.ptscript");
+    scripted::write_gated(&path, &mkv, Mode::Seekable);
+    for at in [Hold::Open, Hold::FirstPacket] {
+        for explicit in [false, true] {
+            let what = format!("held at {at:?}, explicit audio {explicit}");
+            scripted::arm(at);
+            let (player, backend) = play(&path, None::<u32>);
+            assert!(scripted::entered(Duration::from_secs(10)), "{what}: the demuxer held");
+            player.select_subtitle(Some(2));
+            if explicit {
+                player.select_audio(Some(1));
+            }
+            player.select_subtitle(Some(2));
+            scripted::release();
+            let want = if explicit { Some(1) } else { Some(0) };
+            let state = wait_until(&player, Duration::from_secs(20), &format!("{what}: the selection applied"), |state| {
+                state.subtitle == Some(2) && state.audio == want
             });
-            wait_until(&player, Duration::from_secs(10), "the tracks", |state| !state.tracks.is_empty());
-            opened.store(true, Ordering::SeqCst);
-        });
-        let state = wait_until(&player, Duration::from_secs(10), "the subtitle selected", |state| state.subtitle == Some(2));
-        let want = if explicit { Some(1) } else { Some(0) };
-        assert_eq!(state.audio, want, "attempt {attempt}: the audio choice");
+            assert!(!state.ended, "{what}: still playing");
+            let begun = Instant::now();
+            while backend.headless.capture().audio.iter().all(|audio| audio.pcm.is_empty()) {
+                assert!(begun.elapsed() < Duration::from_secs(10), "{what}: no audio played");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(player);
+        }
+    }
+}
+
+/// A subtitle-only playback (audio switched off at once) whose audio is
+/// switched on while its subtitle pipeline runs: the playback now has
+/// audio, so it ends with the open-ended PGS state down, realtime or not.
+/// The demuxer is held before its first packet while audio is switched off
+/// and on again.
+#[test]
+fn subtitles_joined_by_audio_end_cleared() {
+    let _gate = GATE_TESTS.lock();
+    let scratch = Scratch::new();
+    let sup = scratch.file("open-ended.sup");
+    let subtitles = scratch.file("open-ended.mks");
+    let mkv = scratch.file("joined.mkv");
+    bitmap::pgs_states(&sup, &[(200, true)]);
+    ffmpeg(&["-copyts", "-i", sup.to_str().unwrap(), "-map", "0:s", "-c:s", "copy", "-f", "matroska", subtitles.to_str().unwrap()]);
+    ffmpeg(&[
+        "-copyts", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1", "-i", subtitles.to_str().unwrap(),
+        "-map", "0:a", "-map", "1:s", "-c:a", "pcm_s16le", "-ac", "2", "-c:s", "copy", mkv.to_str().unwrap(),
+    ]);
+    let path = scratch.file("joined.ptscript");
+    scripted::write_gated(&path, &mkv, Mode::Seekable);
+    for realtime in [false, true] {
+        let attempts = 5;
+        let mut tried = 0;
+        let (player, backend) = loop {
+            tried += 1;
+            scripted::arm(Hold::FirstPacket);
+            let (player, backend) = play_with(&path, Some(1), realtime);
+            player.select_audio(None);
+            assert!(scripted::entered(Duration::from_secs(10)), "realtime {realtime}: the demuxer held");
+            let state = player.state();
+            if state.audio.is_none() && !state.tracks.is_empty() {
+                break (player, backend);
+            }
+            // Switched off too late to take effect before the hold.
+            assert!(tried < attempts, "realtime {realtime}: audio never off before the first packet");
+            scripted::release();
+            drop(player);
+        };
+        player.select_audio(Some(0));
+        scripted::release();
+        let state = wait_until(&player, Duration::from_secs(20), &format!("realtime {realtime}: playback end"), |state| state.ended);
+        assert_eq!(state.audio, Some(0), "realtime {realtime}: audio on");
+        let shows = backend.watch.shows.lock().clone();
+        assert!(shows.iter().any(|show| show.images > 0), "realtime {realtime}: the state shows: {shows:?}");
+        assert!(shows.last().is_some_and(|show| show.images == 0), "realtime {realtime}: cleared at Ended: {shows:?}");
         drop(player);
     }
 }

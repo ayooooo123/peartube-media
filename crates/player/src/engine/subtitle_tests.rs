@@ -219,8 +219,7 @@ fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Refere
         seek_generation: Box::new(|| 0),
         // Subtitles alone: the lane is the only bound on the read-ahead.
         paced: Box::new(|| false),
-        beside_media: false,
-        refreshing: Box::new(|| false),
+        beside_media: Box::new(|| false),
         stopped: stopped.clone(),
         retired: Arc::new(AtomicBool::new(false)),
     };
@@ -373,7 +372,7 @@ fn pipeline(stream: &StreamInfo, packets: &[Packet], setup: Setup) -> (TestThrea
     *clock.state.lock() = (setup.start, 0);
     let stopped = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let paced = setup.paced;
+    let (paced, beside_media) = (setup.paced, setup.beside_media);
     let pipe = SubtitlePipeline {
         decoder,
         new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
@@ -386,8 +385,7 @@ fn pipeline(stream: &StreamInfo, packets: &[Packet], setup: Setup) -> (TestThrea
         demux_cv,
         seek_generation: Box::new(|| 0),
         paced: Box::new(move || paced),
-        beside_media: setup.beside_media,
-        refreshing: Box::new(|| false),
+        beside_media: Box::new(move || beside_media),
         stopped: stopped.clone(),
         retired: Arc::new(AtomicBool::new(false)),
     };

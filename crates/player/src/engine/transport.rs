@@ -213,7 +213,7 @@ impl SharedState {
         }
     }
 
-    pub(super) fn wake_lanes(&self) {
+    fn wake_lanes(&self) {
         for lane in self.lanes.lock().iter() {
             drop(lane.queue.lock());
             lane.cv.notify_all();
@@ -272,16 +272,12 @@ impl SharedState {
         self.update(|t| t.paused = paused);
     }
 
-    /// Seek `generation` was published: the clock jumps to `to` and holds
-    /// until the pipelines have output from there and enough is buffered.
-    /// The free clock leads until the audio plays from `to`. A seek
-    /// published since moves the clock itself.
-    pub(super) fn seek_clock(&self, to: Duration, generation: u64) {
+    /// `seek()`: the clock jumps to `to` and holds until the pipelines have
+    /// output from there and enough is buffered. The free clock leads until
+    /// the audio plays from `to`.
+    pub(super) fn seek_clock(&self, to: Duration) {
         self.update(|t| {
-            if self.seek_gen.load(Ordering::SeqCst) != generation {
-                return;
-            }
-            t.seek_gen = generation;
+            t.seek_gen = self.seek_gen.load(Ordering::SeqCst);
             self.master.seek(to, t.seek_gen);
             for p in &mut t.pipes {
                 p.horizon = None;

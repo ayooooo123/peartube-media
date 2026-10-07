@@ -10,7 +10,7 @@ mod bitmap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use bitmap::{Scratch, Show, ffmpeg, oracle, pgs_states, pgs_with_clears};
+use bitmap::{Scratch, Show, ffmpeg, oracle, pgs_states};
 use oxideav_core::{CodecId, CodecInfo, CodecParameters, Decoder, Packet, RuntimeContext, VideoFrame};
 use parking_lot::{Condvar, Mutex};
 use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleImage, SubtitleSink, VideoSink};
@@ -266,25 +266,27 @@ fn a_subtitle_worker_starting_after_the_video_still_ends_cleared() {
     drop(player);
 }
 
-/// Selecting a PGS track while one of its cues is up shows that cue at
-/// once, as an audio switch resumes at the clock; seeking into a cue shows
-/// it at once too. The track is a real FATE display set (`pgs_with_clears`:
-/// visible from 0.2 s until 2.5 s, from 3.0 s until 3.4 s).
+/// Selecting a PGS track never seeks: the track shows from its next display
+/// set past what the demuxer had read ahead (up to two seconds) at the
+/// switch, not the one up at the switch. Seeking into a cue shows it at
+/// once. The track repeats a real FATE display set: visible from 0.2 s,
+/// cleared at 1.5 s, visible from 4.5 s, cleared at 5.0 s, visible from
+/// 5.5 s, cleared at 5.9 s.
 #[test]
-fn subtitle_switch_and_seek_show_the_current_state_at_once() {
+fn subtitle_switch_shows_the_next_state_and_seek_the_current_one() {
     let scratch = Scratch::new();
     let sup = scratch.file("switch.sup");
     let subtitles = scratch.file("switch.mks");
     let movie = scratch.file("switch.mkv");
-    pgs_with_clears(&sup);
+    pgs_states(&sup, &[(200, true), (1500, false), (4500, true), (5000, false), (5500, true), (5900, false)]);
     ffmpeg(&["-copyts", "-i", sup.to_str().unwrap(), "-map", "0:s", "-c:s", "copy", "-f", "matroska", subtitles.to_str().unwrap()]);
     ffmpeg(&[
-        "-copyts", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=3.8",
+        "-copyts", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=6.2",
         "-i", subtitles.to_str().unwrap(), "-map", "0:v", "-map", "1:s", "-map", "1:s",
         "-c:v", "libx264", "-preset", "ultrafast", "-c:s", "copy", movie.to_str().unwrap(),
     ]);
     let reference = oracle::ffmpeg_reference(&subtitles, 0);
-    assert_eq!(reference.cues.iter().map(|cue| cue.sub.num_rects).collect::<Vec<_>>(), [2, 2, 0, 2, 0]);
+    assert_eq!(reference.cues.iter().map(|cue| cue.sub.num_rects).collect::<Vec<_>>(), [2, 0, 2, 0, 2, 0]);
 
     let (player, _backend, observation) = open(&movie, None);
     let switch_at = Duration::from_millis(1000);
@@ -299,13 +301,13 @@ fn subtitle_switch_and_seek_show_the_current_state_at_once() {
         if let Some(show) = shown(0) {
             break show;
         }
-        assert!(begun.elapsed() < Duration::from_secs(5), "the selected track's current cue never showed");
+        assert!(begun.elapsed() < Duration::from_secs(10), "the selected track's next state never showed");
         std::thread::sleep(Duration::from_millis(5));
     };
-    assert!(at < Duration::from_millis(2000), "the cue up since 0.2 s showed at {at:?}, not at once after the {switch_at:?} switch");
-    assert_eq!(oracle::canvas_diff(&reference.cues[0].canvas, &canvas, reference.width, oracle::Match::Visible), None);
+    assert!(at >= Duration::from_millis(4500), "a state showed at {at:?}: the switch must not seek back to the state up since 0.2 s");
+    assert_eq!(oracle::canvas_diff(&reference.cues[2].canvas, &canvas, reference.width, oracle::Match::Visible), None);
 
-    let seek_to = Duration::from_millis(3100);
+    let seek_to = Duration::from_millis(5600);
     let before = observation.lock().shows.len();
     player.seek(seek_to);
     let begun = Instant::now();
@@ -316,7 +318,7 @@ fn subtitle_switch_and_seek_show_the_current_state_at_once() {
         assert!(begun.elapsed() < Duration::from_secs(5), "the cue up at the seek target never showed");
         std::thread::sleep(Duration::from_millis(5));
     };
-    assert!(at < Duration::from_millis(3400), "the cue up since 3.0 s showed at {at:?} after seeking to {seek_to:?}");
-    assert_eq!(oracle::canvas_diff(&reference.cues[3].canvas, &canvas, reference.width, oracle::Match::Visible), None);
+    assert!(at < Duration::from_millis(5900), "the cue up since 5.5 s showed at {at:?} after seeking to {seek_to:?}");
+    assert_eq!(oracle::canvas_diff(&reference.cues[4].canvas, &canvas, reference.width, oracle::Match::Visible), None);
     drop(player);
 }

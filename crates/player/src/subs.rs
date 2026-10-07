@@ -50,12 +50,16 @@ const MAX_TEXT_UP_BYTES: usize = 64 << 20;
 /// then stays within 64 MiB.
 pub fn text_space(video_width: u32, video_height: u32) -> (u32, u32) {
     let (width, height) = (u64::from(video_width.max(320)), u64::from(video_height.max(240)));
-    let pixels = width * height;
-    if pixels <= MAX_CANVAS_PIXELS as u64 {
+    let max = MAX_CANVAS_PIXELS as u64;
+    if width * height <= max {
         return (width as u32, height as u32);
     }
-    let scale = (MAX_CANVAS_PIXELS as f64 / pixels as f64).sqrt();
-    (((width as f64 * scale) as u32).max(1), ((height as f64 * scale) as u32).max(1))
+    let scale = (max as f64 / (width * height) as f64).sqrt();
+    // Each side at least a pixel, and their product within the bound: an
+    // extreme shape gives up width for the pixel of height it keeps.
+    let width = ((width as f64 * scale) as u64).clamp(1, max);
+    let height = ((height as f64 * scale) as u64).clamp(1, max / width);
+    (width as u32, height as u32)
 }
 
 /// Renders one text/ASS cue on a canvas of `text_space(video_width,
@@ -356,12 +360,10 @@ pub(crate) struct SubtitlePipeline {
     /// Video or audio pipelines bound the demuxer's read-ahead (they drain
     /// their own lanes); otherwise only this lane does.
     pub(crate) paced: Box<dyn Fn() -> bool + Send>,
-    /// The playback has video or audio pipelines: it ends with nothing up,
-    /// even when they ended before this pipeline first ran.
-    pub(crate) beside_media: bool,
-    /// A refresh seek is inside the demuxer: at its end this pipeline waits
-    /// for it, as it may land and start the pipeline over.
-    pub(crate) refreshing: Box<dyn Fn() -> bool + Send>,
+    /// The playback has video or audio pipelines, playing or played out:
+    /// it ends with nothing up, even when they ended before this pipeline
+    /// first ran or joined it after it started.
+    pub(crate) beside_media: Box<dyn Fn() -> bool + Send>,
     pub(crate) stopped: Arc<AtomicBool>,
     pub(crate) retired: Arc<AtomicBool>,
 }
@@ -478,9 +480,8 @@ impl SubtitlePipeline {
 /// up). Beside video or audio it drains its lane as packets come, and the
 /// playback ends with the screen clear: in realtime it stays until they
 /// have played, then clears (the engine also retires it then); otherwise
-/// it clears at the lane's end. At its end it waits for a refresh seek
-/// inside the demuxer, which may start it over. It also ends when the
-/// player stops or a selection switch sets `retired`, clearing the screen.
+/// it clears at the lane's end. It also ends when the player stops or a
+/// selection switch sets `retired`, clearing the screen.
 pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn SubtitleSink>) {
     let (video_width, video_height) = text_space(pipe.video_width, pipe.video_height);
     let mut screen = Screen {
@@ -511,15 +512,9 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
         let paced = (pipe.paced)();
         if !pipe.realtime {
             if eof {
-                // A refresh seek inside the demuxer may still start this
-                // pipeline over.
-                if (pipe.refreshing)() {
-                    pipe.wait(None, false, seen_seek);
-                    continue;
-                }
                 // The last state goes at its end; beside video or audio the
                 // playback ends with nothing up, an open-ended state too.
-                if on.next_end().is_some() || pipe.beside_media {
+                if on.next_end().is_some() || (pipe.beside_media)() {
                     screen.clear();
                 }
                 return;
@@ -559,13 +554,13 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
         // short of the audio the clock needs to reach that cue. The decoded
         // cues wait in `pending`, bounded.
         let take = !eof && (paced || pending.is_empty());
-        if !take && next.is_none() && !paced && !(pipe.refreshing)() {
-            // Nothing more is due, and no video or audio plays on (nor may a
-            // refresh seek restart this pipeline). Alone, the last state
-            // stays up as the playback ends; beside video or audio it comes
-            // down with them, even when they ended before this pipeline first
-            // ran (in realtime the engine also retires it then).
-            if pipe.beside_media {
+        if !take && next.is_none() && !paced {
+            // Nothing more is due, and no video or audio plays on. Alone, the
+            // last state stays up as the playback ends; beside video or audio
+            // it comes down with them, even when they ended before this
+            // pipeline first ran (in realtime the engine also retires it
+            // then).
+            if (pipe.beside_media)() {
                 on.clear();
                 screen.clear();
             }
@@ -681,5 +676,30 @@ mod tests {
         let image = bitmap.image.unwrap();
         assert_eq!((image.x, image.y, image.width, image.height), (2, 1, 1, 1));
         assert_eq!(image.rgba, [20, 30, 40, 128]);
+    }
+
+    /// Text renders in at most MAX_CANVAS_PIXELS, whatever the video's size
+    /// or shape, and in the video's own size when that fits.
+    #[test]
+    fn text_space_stays_within_the_canvas_bound() {
+        let max = u32::MAX;
+        for (video, want) in [
+            ((0, 0), Some((320, 240))),
+            ((1920, 1080), Some((1920, 1080))),
+            ((4096, 4096), Some((4096, 4096))),
+            ((7680, 4320), Some((5461, 3072))),
+            ((max, 240), None),
+            ((320, max), None),
+            ((max, max), None),
+            ((max, 1), None),
+            ((4097, 4096), None),
+        ] {
+            let (width, height) = text_space(video.0, video.1);
+            assert!(width >= 1 && height >= 1, "{video:?}: {width}x{height}");
+            assert!(u64::from(width) * u64::from(height) <= MAX_CANVAS_PIXELS as u64, "{video:?}: {width}x{height}");
+            if let Some(want) = want {
+                assert_eq!((width, height), want, "{video:?}");
+            }
+        }
     }
 }

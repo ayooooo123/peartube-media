@@ -361,19 +361,10 @@ struct SharedState {
     last_changed: Mutex<Instant>,
     /// The demuxer's source, for suspend/resume.
     source: Mutex<Option<SourceMonitor>>,
-    /// Generation of the newest seek published: every `seek` publishes its
-    /// own, a selection switch's refresh publishes the one it took once its
-    /// `seek_to` lands. The demux loop applies the newest; decoder threads
-    /// compare their local copy against it to detect a seek they have not
-    /// yet honoured.
+    /// Monotonic counter bumped by every `seek`. The demux loop applies the
+    /// newest request; decoder threads compare their local copy against it to
+    /// detect a seek they have not yet honoured.
     seek_gen: AtomicU64,
-    /// Generation of the newest seek request, published or not: a refresh
-    /// takes one before its `seek_to`, so a `seek` asked for meanwhile is
-    /// newer. Locked while a seek is requested or a refresh publishes.
-    seek_requested: Mutex<u64>,
-    /// A refresh seek is inside the demuxer (`refresh_seek`): pipelines at
-    /// their end wait for it, as it may land and start them over.
-    refreshing: AtomicBool,
     /// Target of the latest `seek`; the demux loop applies it once per
     /// generation.
     seek_target: Mutex<Option<Duration>>,
@@ -387,6 +378,10 @@ struct SharedState {
     wanted_subtitle: Mutex<Option<u32>>,
     /// Bumped on every selection change; the demux loop compares to detect it.
     select_gen: AtomicU64,
+    /// The playback has video or audio pipelines (playing or played out),
+    /// as its selection stands: subtitles beside them end with the screen
+    /// clear. Set by the demux thread whenever it starts or retires them.
+    beside_media: AtomicBool,
     backend: Arc<dyn Backend>,
     /// The playback's clock (see `MasterClock`); `transport` decides when
     /// it runs.
@@ -436,37 +431,11 @@ impl SharedState {
     /// Moves playback to `to`: the demux loop applies the newest request,
     /// and each pipeline starts over when it sees the generation change.
     fn request_seek(&self, to: Duration) {
-        let generation = {
-            let mut requested = self.seek_requested.lock();
-            *requested += 1;
-            *self.seek_target.lock() = Some(to);
-            self.seek_gen.store(*requested, Ordering::SeqCst);
-            *requested
-        };
-        self.seek_published(to, generation);
-    }
-
-    /// Seek `generation` to `to` is published: the clock and the position
-    /// move there, unless a newer seek has been published since.
-    fn seek_published(&self, to: Duration, generation: u64) {
-        self.seek_clock(to, generation);
-        {
-            let mut state = self.state.lock();
-            if self.seek_gen.load(Ordering::SeqCst) == generation {
-                state.position = to;
-            }
-        }
+        *self.seek_target.lock() = Some(to);
+        self.seek_gen.fetch_add(1, Ordering::SeqCst);
+        self.seek_clock(to);
+        self.state.lock().position = to;
         notify_changed(self);
-    }
-
-    /// A refresh seek inside the demuxer may land and start a pipeline over:
-    /// one at its end (seek generation `seen_seek`) waits until the refresh
-    /// lands or fails, or another seek comes.
-    fn await_refresh(&self, seen_seek: u64, quit: impl Fn() -> bool) {
-        let mut transport = self.transport.lock();
-        while self.refreshing.load(Ordering::SeqCst) && self.seek_gen.load(Ordering::SeqCst) == seen_seek && !quit() {
-            self.transport_cv.wait_for(&mut transport, Duration::from_millis(50));
-        }
     }
 }
 
@@ -505,14 +474,13 @@ impl Player {
             last_changed: Mutex::new(Instant::now() - Duration::from_secs(1)),
             source: Mutex::new(None),
             seek_gen: AtomicU64::new(0),
-            seek_requested: Mutex::new(0),
-            refreshing: AtomicBool::new(false),
             seek_target: Mutex::new(None),
             active_seek: Mutex::new(None),
             wanted_audio: Mutex::new(options.audio.map_or(AudioChoice::Default, |stream| AudioChoice::Chosen(Some(stream)))),
             wanted_video: Mutex::new(options.video),
             wanted_subtitle: Mutex::new(options.subtitle),
             select_gen: AtomicU64::new(1),
+            beside_media: AtomicBool::new(false),
             backend,
             master: Arc::new(MasterClock::new()),
             audio_sink: Mutex::new(None),
@@ -914,9 +882,9 @@ fn run_player_pipeline(
         video_stream.map(|stream| spawn_video(&shared, stream, &video_lane, &demux_cv, realtime));
     run.audio_thread =
         audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
-    let beside_media = run.video_thread.is_some() || run.audio_thread.is_some();
+    shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
     run.sub_thread = find_stream(&streams, current_subtitle)
-        .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime, beside_media));
+        .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime));
 
     // 8. From here the buffering hold follows the pipelines' data.
     shared.pipelines_started();
@@ -1060,15 +1028,12 @@ impl Drop for AudioOutput {
     }
 }
 
-/// The subtitle pipeline for `stream`; `beside_media` when the playback has
-/// video or audio pipelines.
 fn spawn_subtitles(
     shared: &Arc<SharedState>,
     stream: StreamInfo,
     lane: &Arc<Lane>,
     demux_cv: &Arc<Condvar>,
     realtime: bool,
-    beside_media: bool,
 ) -> PipelineThread {
     let consumer = Consumer::new(lane, demux_cv);
     let sink = shared.backend.subtitles();
@@ -1096,7 +1061,7 @@ fn spawn_subtitles(
             Err(_) => return,
         };
         let ctx = Arc::clone(&shared.ctx);
-        let (seeks, refreshes) = (Arc::clone(&shared), Arc::clone(&shared));
+        let (seeks, members) = (Arc::clone(&shared), Arc::clone(&shared));
         let pipeline = SubtitlePipeline {
             decoder,
             new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
@@ -1111,8 +1076,7 @@ fn spawn_subtitles(
             // A video or audio pipeline drains its lane: the demuxer's
             // read-ahead is bounded by theirs.
             paced: Box::new(move || lanes.iter().take(2).any(|lane| lane.consumed.load(Ordering::SeqCst))),
-            beside_media,
-            refreshing: Box::new(move || refreshes.refreshing.load(Ordering::SeqCst)),
+            beside_media: Box::new(move || members.beside_media.load(Ordering::SeqCst)),
             stopped: shared.stopped.clone(),
             retired,
         };
@@ -1207,7 +1171,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
         let gen_now = shared.select_gen.load(Ordering::SeqCst);
         if gen_now != run.select_gen {
             run.select_gen = gen_now;
-            apply_selection_switch(run, &mut active, &mut eof);
+            apply_selection_switch(run, &mut active);
             if eof {
                 eof = false;
                 shared.demux_eof(false);
@@ -1248,7 +1212,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
             // Leaving ends `run_player_pipeline`, which joins the pipelines
             // and sets Ended. A seek or a selection switch clears lanes and
             // reopens `eof` at the top of this loop. In realtime, subtitles
-            // behind video or audio do not hold the end: their last state
+            // beside video or audio do not hold the end: their last state
             // comes down when those have played (`run_player_pipeline`).
             let paced = run.options.realtime && (run.video_thread.is_some() || run.audio_thread.is_some());
             let subtitles = run.sub_thread.as_ref().filter(|_| !paced);
@@ -1325,9 +1289,10 @@ fn lanes_full(run: &Run<'_>) -> bool {
         || full(run.sub_lane, run.sub_tb, SUB_MAX_BYTES)
 }
 
-/// The stream the demuxer seeks (video when present, else audio, else
-/// stream 0) and `target` in its time base.
-fn seek_point(run: &Run<'_>, target: Duration) -> (u32, i64) {
+fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool) {
+    let shared = run.shared;
+    // Convert to the seek stream's time base. The demuxer seeks the video
+    // stream when present, else audio, else stream 0.
     let seek_stream = run.current_video.or(run.current_audio).unwrap_or(0);
     let tb = run
         .streams
@@ -1335,13 +1300,8 @@ fn seek_point(run: &Run<'_>, target: Duration) -> (u32, i64) {
         .find(|s| s.index == seek_stream)
         .map(|s| s.time_base)
         .unwrap_or_else(|| TimeBase::new(1, 1000));
-    (seek_stream, tb.ticks_of(target.as_secs_f64()))
-}
+    let ticks = tb.ticks_of(target.as_secs_f64());
 
-/// The lanes start over for seek `generation`: what the demuxer queues next
-/// comes from `target`.
-fn start_over(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool) {
-    let shared = run.shared;
     // `seek_target` keeps the newest request: the generation decides what
     // has been applied, so a seek arriving meanwhile is not lost.
     *shared.active_seek.lock() = Some(Seek {
@@ -1353,74 +1313,25 @@ fn start_over(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bo
     run.sub_lane.clear_for_seek(generation);
     *eof = false;
     shared.demux_seeked(generation);
-}
 
-fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool) {
-    let (seek_stream, ticks) = seek_point(run, target);
-    start_over(run, target, generation, eof);
     let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
         run.demuxer.seek_to(seek_stream, ticks)
     }));
     match res {
         Ok(Ok(_)) | Ok(Err(_)) => {}
         Err(_) => {
-            set_error(run.shared, "demuxer panicked during seek".into());
+            set_error(shared, "demuxer panicked during seek".into());
         }
     }
-}
-
-/// A selection switch's refresh: the demuxer re-reads from the clock's
-/// position, so the new track starts where playback is. The refresh takes
-/// its seek generation before `seek_to`, so a `seek` asked for meanwhile
-/// is newer and wins, and pipelines at their end wait for it
-/// (`await_refresh`). Nothing is cleared or flushed before the seek lands:
-/// when `seek_to` is unsupported or fails, or a newer seek came, the
-/// generation is dropped and playback goes on from where the demuxer
-/// reads. True when the refresh landed and stands.
-fn refresh_seek(run: &mut Run<'_>, eof: &mut bool) -> bool {
-    let shared = run.shared;
-    let target = shared.master.now().unwrap_or_default();
-    let generation = {
-        let mut requested = shared.seek_requested.lock();
-        *requested += 1;
-        *requested
-    };
-    shared.refreshing.store(true, Ordering::SeqCst);
-    let (seek_stream, ticks) = seek_point(run, target);
-    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        run.demuxer.seek_to(seek_stream, ticks)
-    }));
-    let stands = matches!(res, Ok(Ok(_))) && {
-        let requested = shared.seek_requested.lock();
-        let newest = *requested == generation;
-        if newest {
-            *shared.seek_target.lock() = Some(target);
-            shared.seek_gen.store(generation, Ordering::SeqCst);
-        }
-        newest
-    };
-    if stands {
-        shared.seek_published(target, generation);
-        start_over(run, target, generation, eof);
-    }
-    shared.refreshing.store(false, Ordering::SeqCst);
-    // Pipelines waiting at their end look again.
-    shared.wake_clock_waiters();
-    shared.wake_lanes();
-    if res.is_err() {
-        set_error(shared, "demuxer panicked during seek".into());
-    }
-    stands
 }
 
 /// `select_audio` / `select_subtitle` took effect: retire the replaced
 /// pipeline, start the new one, and refresh the headless registry entry. A
-/// new audio or subtitle track resumes where playback is: the demuxer
-/// re-reads from the clock's position (a refresh seek) instead of starting
-/// the track wherever it has read ahead to, so a subtitle up at that
-/// position shows at once. A demuxer that cannot seek leaves the playback
-/// as it is (`refresh_seek`).
-fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>, eof: &mut bool) {
+/// new audio track resumes where playback is: the demuxer re-reads from the
+/// clock's position (a refresh seek) instead of starting the track wherever
+/// it has read ahead to. A subtitle switch never seeks: the new track shows
+/// from its next cue the demuxer reads.
+fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let shared = run.shared;
 
     // The default audio track stays whatever else changes.
@@ -1481,34 +1392,30 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>, eof: &mut bo
         );
     }
 
-    // The demuxer learns the new selection before the refresh seek, as it
-    // did when the seek ran on the loop's next turn.
+    let realtime = run.options.realtime;
+    if audio_changed {
+        let stream = find_stream(run.streams, run.current_audio)
+            .filter(|s| s.params.media_type == MediaType::Audio);
+        if let Some(stream) = stream {
+            shared.request_seek(shared.master.now().unwrap_or_default());
+            run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
+        }
+    }
+    // Subtitles beside video or audio, running or new, end with them.
+    shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
+    if sub_changed {
+        let stream = find_stream(run.streams, run.current_subtitle)
+            .filter(|s| s.params.media_type == MediaType::Subtitle);
+        if let Some(stream) = stream {
+            run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime));
+        }
+    }
+
     *active = [run.current_video, run.current_audio, run.current_subtitle]
         .into_iter()
         .flatten()
         .collect();
     let _ = run.demuxer.set_active_streams(active);
-
-    let realtime = run.options.realtime;
-    // One refresh serves both switches.
-    let mut refreshed: Option<bool> = None;
-    if audio_changed {
-        let stream = find_stream(run.streams, run.current_audio)
-            .filter(|s| s.params.media_type == MediaType::Audio);
-        if let Some(stream) = stream {
-            refreshed.get_or_insert_with(|| refresh_seek(run, eof));
-            run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
-        }
-    }
-    if sub_changed {
-        let stream = find_stream(run.streams, run.current_subtitle)
-            .filter(|s| s.params.media_type == MediaType::Subtitle);
-        if let Some(stream) = stream {
-            refreshed.get_or_insert_with(|| refresh_seek(run, eof));
-            let beside_media = run.video_thread.is_some() || run.audio_thread.is_some();
-            run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime, beside_media));
-        }
-    }
 }
 
 /// Packet lanes → decoder → sink, for one audio stream. The sink follows the
@@ -1633,9 +1540,6 @@ fn run_audio_thread(
                         });
                     }
                 }
-                // A refresh seek inside the demuxer may start this pipeline
-                // over.
-                shared.await_refresh(seen_seek, &quit);
                 if shared.seek_gen.load(Ordering::SeqCst) != seen_seek { continue; }
                 break;
             }
@@ -2122,9 +2026,6 @@ fn run_video_thread(
                         }
                     }
                 }
-                // A refresh seek inside the demuxer may start this pipeline
-                // over.
-                shared.await_refresh(seen_seek, &quit);
                 if shared.seek_gen.load(Ordering::SeqCst) != seen_seek { continue; }
                 break;
             }
