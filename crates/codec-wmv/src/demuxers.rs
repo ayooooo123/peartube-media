@@ -52,7 +52,7 @@ fn seek_generic<D: GenericSeek>(d: &mut D, ts: i64) -> Result<i64> {
     let reading = d.take_reading()?;
     d.allowance().start();
     let landed = land(d, ts, found);
-    d.allowance().stop();
+    let landed = d.allowance().finish(landed);
     if landed.is_err() {
         d.give_back(reading)?;
     }
@@ -160,14 +160,15 @@ impl Vc1TestDemuxer {
         };
 
         let data_offset = input.stream_position().map_err(Error::Io)?;
+        let allowance = Allowance::default();
         Ok(Self {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             fps,
             pts: 0,
             data_offset,
             index: Index::default(),
-            allowance: Allowance::default(),
+            allowance,
         })
     }
 
@@ -184,7 +185,7 @@ impl Vc1TestDemuxer {
         let frame_size = (hdr[0] as usize) | ((hdr[1] as usize) << 8) | ((hdr[2] as usize) << 16);
         let keyframe = (hdr[3] & 0x80) != 0;
         let file_pts = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-        self.allowance.spend(1, 8 + frame_size as u64)?;
+        self.allowance.spend(1, 0)?;
 
         let mut data = vec![0u8; frame_size];
         self.input.read_exact(&mut data).map_err(Error::Io)?;
@@ -555,8 +556,9 @@ impl Vc1Demuxer {
             duration: None,
             start_time: Some(0),
         };
+        let allowance = Allowance::default();
         Ok(Self {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             buffer,
             buffer_pos,
@@ -566,7 +568,7 @@ impl Vc1Demuxer {
             headers: Vc1EsHeaders::default(),
             next_dts: 0,
             index: Index::default(),
-            allowance: Allowance::default(),
+            allowance,
         })
     }
 
@@ -708,7 +710,7 @@ impl Demuxer for Vc1Demuxer {
                 return Err(Error::Eof);
             }
             let n = self.input.read(&mut chunk).map_err(Error::Io)?;
-            self.allowance.spend(1, n as u64)?;
+            self.allowance.spend(1, 0)?;
             if n == 0 {
                 self.eof_reached = true;
             } else {

@@ -529,7 +529,7 @@ trait FrameSeek: Demuxer {
         let reading = self.take_reading()?;
         self.allowance().start();
         let landed = self.land(ts, found);
-        self.allowance().stop();
+        let landed = self.allowance().finish(landed);
         if landed.is_err() {
             self.give_back(reading)?;
         }
@@ -623,14 +623,15 @@ impl RawDtsDemuxer {
 
         let mut split = FrameSplitter::default();
         split.push(&head);
+        let allowance = Allowance::default();
         Ok(Box::new(RawDtsDemuxer {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             split,
             clock: FrameClock::default(),
             eof: false,
             index: Index::default(),
-            allowance: Allowance::default(),
+            allowance,
         }))
     }
 
@@ -648,7 +649,7 @@ impl RawDtsDemuxer {
             }
             filled += n;
         }
-        self.allowance.spend(1, filled as u64)?;
+        self.allowance.spend(1, 0)?;
         self.split.push(&buf[..filled]);
         Ok(())
     }
@@ -1009,8 +1010,9 @@ impl DtshdDemuxer {
             params,
         };
 
+        let allowance = Allowance::default();
         Ok(Box::new(DtshdDemuxer {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             split: FrameSplitter::starting_at(data_start),
             data_start,
@@ -1021,7 +1023,7 @@ impl DtshdDemuxer {
             eof: false,
             clock: FrameClock::default(),
             index: Index::default(),
-            allowance: Allowance::default(),
+            allowance,
         }))
     }
 }
@@ -1070,7 +1072,7 @@ impl Demuxer for DtshdDemuxer {
                 continue;
             }
             let mut buf = [0u8; RAW_PACKET_SIZE];
-            self.allowance.spend(1, chunk as u64)?;
+            self.allowance.spend(1, 0)?;
             self.input.read_exact(&mut buf[..chunk])?;
             self.split.push(&buf[..chunk]);
             self.pos += chunk as u64;

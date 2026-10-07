@@ -358,9 +358,10 @@ fn open_ac3_inner(
         duration: None,
         start_time: Some(0),
     };
+    let allowance = Allowance::default();
     Ok(Box::new(Ac3Demuxer {
         format_name,
-        input,
+        input: Box::new(allowance.meter(input)),
         streams: vec![stream],
         parser: Parser::new(Ac3::new(codec)),
         clock: AudioClock::new(1, 90_000, 33),
@@ -369,7 +370,7 @@ fn open_ac3_inner(
         pos: 0,
         eof: false,
         index: Index::default(),
-        allowance: Allowance::default(),
+        allowance,
     }))
 }
 
@@ -395,7 +396,7 @@ impl Ac3Demuxer {
             }
             n += got;
         }
-        self.allowance.spend(1, n as u64)?;
+        self.allowance.spend(1, 0)?;
         let mut units = Vec::new();
         if n == 0 {
             self.eof = true;
@@ -516,7 +517,7 @@ impl Demuxer for Ac3Demuxer {
         let reading = self.take_reading()?;
         self.allowance.start();
         let landed = self.land(timestamp, found);
-        self.allowance.stop();
+        let landed = self.allowance.finish(landed);
         if landed.is_err() {
             self.give_back(reading)?;
         }

@@ -679,8 +679,9 @@ pub fn open(
         return Err(Error::invalid("not a RealMedia file"));
     }
 
+    let allowance = Allowance::default();
     Ok(Box::new(RmDemuxer {
-        io: input,
+        io: Box::new(allowance.meter(input)),
         streams,
         metadata,
         duration_micros,
@@ -697,7 +698,7 @@ pub fn open(
         sync_pos: 0,
         last_audio_pts: HashMap::new(),
         cur_dts: HashMap::new(),
-        allowance: Allowance::default(),
+        allowance,
     }))
 }
 
@@ -886,7 +887,6 @@ impl RmDemuxer {
                 Err(e) => return Err(Error::from(e)),
             }
         } {
-            self.allowance.spend(0, 1)?;
             self.sync_state = (self.sync_state << 8) | (b1[0] as u32);
 
             if self.sync_state == u32::from_be_bytes(*b"INDX") {
@@ -909,7 +909,6 @@ impl RmDemuxer {
                     len
                 };
                 if real_len >= 14 {
-                    self.allowance.spend(0, real_len as u64)?;
                     self.io
                         .seek(SeekFrom::Current((real_len - 14) as i64))?;
                 }
@@ -960,7 +959,7 @@ impl RmDemuxer {
             let s_idx = match self.stream_id_to_index.get(&full_id) {
                 Some(&i) => i,
                 None => {
-                    self.allowance.spend(1, len as u64)?;
+                    self.allowance.spend(1, 0)?;
                     self.io.seek(SeekFrom::Current(len as i64))?;
                     continue;
                 }
@@ -1397,7 +1396,7 @@ impl RmDemuxer {
                 Err(e) if demux_seek_core::is_exhausted(&e) => return Err(e),
                 _ => return Ok(None),
             };
-            self.allowance.spend(1, len as u64)?;
+            self.allowance.spend(1, 0)?;
             let at = self.sync_pos as i64;
             let mut len = len as i64;
             let mut seq = 1;
@@ -1565,8 +1564,8 @@ impl Demuxer for RmDemuxer {
     /// rm_read_seek: ff_seek_frame_binary over rm_read_dts, bounded by the
     /// INDX entries and the key packets earlier searches met. Lands on the
     /// last key packet of `stream_index` at or before `pts`. The search
-    /// reads within the seek's allowance; one that fails leaves reading
-    /// where it was.
+    /// reads within the seek's allowance; a seek that fails, its
+    /// reposition to the landing included, leaves reading where it was.
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         if self.old_format {
             // rm_read_dts returns AV_NOPTS_VALUE for RealAudio (.ra) files,
@@ -1583,16 +1582,18 @@ impl Demuxer for RmDemuxer {
         let data_offset = self.data_offset as i64;
         self.allowance.start();
         let found = gen_search(pts, bounds, data_offset, file_size, &mut |pos, _| self.read_dts(stream, pos));
-        self.allowance.stop();
-        let (pos, ts) = match found {
-            Ok(Some((pos, ts))) if pos >= 0 => (pos as u64, ts),
+        let landed = match self.allowance.finish(found) {
+            Ok(Some((pos, ts))) if pos >= 0 => self.io.seek(SeekFrom::Start(pos as u64)).map(|_| Some(ts)).map_err(Error::from),
+            other => other.map(|_| None),
+        };
+        let ts = match landed {
+            Ok(Some(ts)) => ts,
             failed => {
                 (self.remaining_len, self.sync_state, self.sync_pos) = (resume.1, resume.2, resume.3);
                 self.io.seek(SeekFrom::Start(resume.0))?;
                 return Err(failed.err().unwrap_or_else(|| Error::invalid("rm: no key frame to seek to")));
             }
         };
-        self.io.seek(SeekFrom::Start(pos))?;
 
         // ff_read_frame_flush and rm->audio_pkt_cnt = 0: queued frames and
         // the parsers go. FFmpeg keeps the audio deinterleaver and the

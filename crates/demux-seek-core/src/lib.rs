@@ -13,8 +13,10 @@
 //! modelled).
 //!
 //! Bounds FFmpeg does not have:
-//! - One [`Allowance`] per seek: 1,048,576 packets and 256 MiB read, over
-//!   every scan and timestamp read the seek makes. Running out is
+//! - One [`Allowance`] per seek: 1,048,576 packets and 256 MiB read or
+//!   skipped, over every scan and timestamp read the seek makes. The
+//!   demuxer's input is [metered](Allowance::meter): each read and forward
+//!   skip is charged before it is made. Running out is
 //!   [`Error::ResourceExhausted`], never the end of the input.
 //! - At most [`MAX_SEARCH_STEPS`] bisection steps.
 //! - Search arithmetic in 128 bits, and index positions outside the
@@ -22,6 +24,11 @@
 //! - An index keeps [`MAX_INDEX_ENTRIES`] entries (see [`Reduce`]).
 
 #![forbid(unsafe_code)]
+
+use std::fmt;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::Arc;
 
 use oxideav_core::{Error, Result};
 
@@ -35,53 +42,174 @@ pub const MAX_SEARCH_STEPS: usize = 4096;
 
 /// Packets one seek may read.
 pub const SEEK_PACKETS: u64 = 1 << 20;
-/// Bytes one seek may read.
+/// Bytes one seek may read or skip.
 pub const SEEK_BYTES: u64 = 256 << 20;
 
-/// What one seek may read, over every scan and timestamp read it makes.
-/// Inactive (spending nothing) outside a seek.
-#[derive(Debug, Default)]
+/// What one seek may read, over every scan and timestamp read it makes:
+/// [`SEEK_PACKETS`] packets and [`SEEK_BYTES`] bytes read or skipped.
+/// Inactive (spending nothing) outside a seek. A handle: its clones are
+/// the same allowance, so the demuxer counts packets on the one its input
+/// is [metered](Allowance::meter) by.
+#[derive(Clone, Debug, Default)]
 pub struct Allowance {
-    left: Option<(u64, u64)>,
+    state: Arc<State>,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    active: AtomicBool,
+    /// Whether the seek under way ran out.
+    out: AtomicBool,
+    packets: AtomicU64,
+    bytes: AtomicU64,
+    /// Seeks started, for a metered input to find the input's length once
+    /// in each.
+    seeks: AtomicU64,
 }
 
 impl Allowance {
     /// A seek starts: [`SEEK_PACKETS`] packets and [`SEEK_BYTES`] bytes.
-    pub fn start(&mut self) {
-        self.left = Some((SEEK_PACKETS, SEEK_BYTES));
+    pub fn start(&self) {
+        let s = &self.state;
+        s.packets.store(SEEK_PACKETS, Relaxed);
+        s.bytes.store(SEEK_BYTES, Relaxed);
+        s.out.store(false, Relaxed);
+        s.seeks.fetch_add(1, Relaxed);
+        s.active.store(true, Relaxed);
     }
 
-    /// The seek is over: reading is no longer counted.
-    pub fn stop(&mut self) {
-        self.left = None;
-    }
-
-    /// Count `packets` read and `bytes` read or skipped; an error once
-    /// either runs out (and from then on until [`Allowance::stop`]).
-    pub fn spend(&mut self, packets: u64, bytes: u64) -> Result<()> {
-        let Some((p, b)) = &mut self.left else { return Ok(()) };
-        if packets > *p || bytes > *b {
-            (*p, *b) = (0, 0);
+    /// The seek is over, reading no longer counted: its `result`, or
+    /// ResourceExhausted where the allowance ran out on the way, whatever
+    /// the demuxer made of the read that failed.
+    pub fn finish<T>(&self, result: Result<T>) -> Result<T> {
+        self.state.active.store(false, Relaxed);
+        if self.state.out.load(Relaxed) {
             return Err(exhausted());
         }
-        *p -= packets;
-        *b -= bytes;
-        Ok(())
+        result
+    }
+
+    /// Count `packets` read and `bytes` read or skipped other than through
+    /// the metered input; an error once either runs out (and from then on
+    /// until the seek finishes).
+    pub fn spend(&self, packets: u64, bytes: u64) -> Result<()> {
+        if self.take(packets, bytes) {
+            Ok(())
+        } else {
+            Err(exhausted())
+        }
+    }
+
+    /// `inner`, its reads and forward skips charged to this allowance.
+    pub fn meter<R: Read + Seek>(&self, inner: R) -> Metered<R> {
+        Metered { inner, allowance: self.clone(), length: None }
+    }
+
+    fn active(&self) -> bool {
+        self.state.active.load(Relaxed)
+    }
+
+    /// Whether `packets` and `bytes` are left to spend, spending them.
+    fn take(&self, packets: u64, bytes: u64) -> bool {
+        let s = &self.state;
+        if !self.active() {
+            return true;
+        }
+        let (p, b) = (s.packets.load(Relaxed), s.bytes.load(Relaxed));
+        if packets > p || bytes > b {
+            s.packets.store(0, Relaxed);
+            s.bytes.store(0, Relaxed);
+            s.out.store(true, Relaxed);
+            return false;
+        }
+        s.packets.store(p - packets, Relaxed);
+        s.bytes.store(b - bytes, Relaxed);
+        true
+    }
+
+    /// Give back `bytes` taken for a read that got fewer.
+    fn refund(&self, bytes: u64) {
+        if self.active() && !self.state.out.load(Relaxed) {
+            self.state.bytes.fetch_add(bytes, Relaxed);
+        }
+    }
+}
+
+/// An input whose reads and forward skips are charged to an [`Allowance`]
+/// before they are made: a read takes the bytes it asks for (those it
+/// does not get are given back), a skip forward the bytes it passes, up
+/// to the input's end. Other positioning is free. One the allowance does
+/// not cover fails, the input left where it was, with an error
+/// [`is_exhausted`] recognises.
+pub struct Metered<R> {
+    inner: R,
+    allowance: Allowance,
+    /// The input's length, and the seek it was found in.
+    length: Option<(u64, u64)>,
+}
+
+/// What a metered input's read or skip past the allowance fails with.
+#[derive(Debug)]
+struct Exhausted;
+
+impl fmt::Display for Exhausted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "seek: read allowance ({SEEK_PACKETS} packets, {} MiB) used up", SEEK_BYTES >> 20)
+    }
+}
+
+impl std::error::Error for Exhausted {}
+
+impl<R: Read> Read for Metered<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let asked = buf.len() as u64;
+        if !self.allowance.take(0, asked) {
+            return Err(io::Error::other(Exhausted));
+        }
+        let read = self.inner.read(buf);
+        let got = read.as_ref().map_or(0, |&n| n as u64);
+        self.allowance.refund(asked.saturating_sub(got));
+        read
+    }
+}
+
+impl<R: Seek> Seek for Metered<R> {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        if let SeekFrom::Current(skip @ 1..) = to {
+            if self.allowance.active() {
+                let pos = self.inner.stream_position()?;
+                let seek = self.allowance.state.seeks.load(Relaxed);
+                let end = match self.length {
+                    Some((found_in, end)) if found_in == seek => end,
+                    _ => {
+                        let end = self.inner.seek(SeekFrom::End(0))?;
+                        self.inner.seek(SeekFrom::Start(pos))?;
+                        self.length = Some((seek, end));
+                        end
+                    }
+                };
+                if !self.allowance.take(0, (skip as u64).min(end.saturating_sub(pos))) {
+                    return Err(io::Error::other(Exhausted));
+                }
+            }
+        }
+        self.inner.seek(to)
     }
 }
 
 /// The error of a seek whose allowance ran out.
 pub fn exhausted() -> Error {
-    Error::resource_exhausted(format!(
-        "seek: read allowance ({SEEK_PACKETS} packets, {} MiB) used up",
-        SEEK_BYTES >> 20
-    ))
+    Error::resource_exhausted(Exhausted.to_string())
 }
 
 /// Whether `error` ends a seek rather than a read: an exhausted
-/// allowance.
+/// allowance, as the demuxer or its metered input reports it.
 pub fn is_exhausted(error: &Error) -> bool {
-    matches!(error, Error::ResourceExhausted(_))
+    match error {
+        Error::ResourceExhausted(_) => true,
+        Error::Io(e) => e.get_ref().is_some_and(|inner| inner.is::<Exhausted>()),
+        _ => false,
+    }
 }
 
 /// A read inside a seek, as FFmpeg's read loops take it: a value, or
@@ -550,22 +678,106 @@ mod tests {
         }
     }
 
-    /// An allowance counts packets and bytes from start to stop; past
-    /// either it fails, and keeps failing, with ResourceExhausted.
+    /// An allowance counts packets and bytes from start to finish; past
+    /// either it fails, and keeps failing, with ResourceExhausted, and so
+    /// does the seek it finishes, whatever that made of the failure.
     #[test]
     fn an_allowance_runs_out_on_packets_or_bytes() {
-        let mut a = Allowance::default();
+        let a = Allowance::default();
         assert!(a.spend(u64::MAX, u64::MAX).is_ok(), "inactive");
         a.start();
         assert!(a.spend(SEEK_PACKETS - 1, SEEK_BYTES - 1).is_ok());
         assert!(a.spend(1, 1).is_ok());
+        assert!(matches!(a.finish(Ok(7)), Ok(7)), "a seek within its allowance keeps its result");
+        a.start();
+        assert!(a.spend(SEEK_PACKETS, 0).is_ok());
         assert!(matches!(a.spend(1, 0), Err(Error::ResourceExhausted(_))));
         assert!(matches!(a.spend(0, 0), Ok(())), "nothing more to spend");
         a.start();
         assert!(matches!(a.spend(0, SEEK_BYTES + 1), Err(Error::ResourceExhausted(_))));
         assert!(matches!(a.spend(1, 0), Err(Error::ResourceExhausted(_))));
-        a.stop();
-        assert!(a.spend(1, 1).is_ok());
+        assert!(matches!(a.finish(Ok(7)), Err(Error::ResourceExhausted(_))), "a seek that ran out fails");
+        assert!(a.spend(1, 1).is_ok(), "inactive again");
+    }
+
+    /// `len` zero bytes.
+    struct Zeros {
+        len: u64,
+        pos: u64,
+    }
+
+    impl Read for Zeros {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = (buf.len() as u64).min(self.len.saturating_sub(self.pos)) as usize;
+            buf[..n].fill(0);
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl Seek for Zeros {
+        fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+            let pos = match to {
+                SeekFrom::Start(p) => Some(p),
+                SeekFrom::End(d) => self.len.checked_add_signed(d),
+                SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            };
+            self.pos = pos.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "before the start"))?;
+            Ok(self.pos)
+        }
+    }
+
+    /// A metered input charges each read the bytes it asks for and each
+    /// skip forward the bytes it passes, before making them; going back or
+    /// to a position is free, and so is everything outside a seek. A seek
+    /// spending its allowance to the byte keeps its result; a read or skip
+    /// of one byte more is not made, the input staying where it was, and
+    /// the seek fails.
+    #[test]
+    fn a_metered_input_is_charged_before_each_read_and_skip() {
+        let a = Allowance::default();
+        let mut input = a.meter(Zeros { len: 2 * SEEK_BYTES, pos: 0 });
+        let mut mib = vec![0u8; 1 << 20];
+        for one_more in ["", "read", "skip"] {
+            input.seek(SeekFrom::Start(0)).unwrap();
+            input.read_exact(&mut mib).unwrap();
+            a.start();
+            input.seek(SeekFrom::Current((SEEK_BYTES - (2 << 20)) as i64)).unwrap();
+            input.seek(SeekFrom::Current(-(1 << 20))).unwrap();
+            input.seek(SeekFrom::End(-(4 << 20))).unwrap();
+            input.seek(SeekFrom::Start(1 << 20)).unwrap();
+            input.read_exact(&mut mib).unwrap();
+            input.read_exact(&mut mib).unwrap();
+            let at = input.stream_position().unwrap();
+            let failed = match one_more {
+                "read" => input.read(&mut mib[..1]).err(),
+                "skip" => input.seek(SeekFrom::Current(1)).err(),
+                _ => {
+                    assert!(matches!(a.finish(Ok(())), Ok(())), "the allowance spent to the byte");
+                    continue;
+                }
+            };
+            let failed = failed.expect("one byte past the allowance fails");
+            assert!(is_exhausted(&Error::from(failed)), "{one_more}: fails as the allowance's");
+            assert_eq!(input.stream_position().unwrap(), at, "{one_more}: the input stays where it was");
+            assert!(matches!(a.finish(Ok(())), Err(Error::ResourceExhausted(_))), "{one_more}: the seek fails");
+        }
+    }
+
+    /// A read is charged the bytes it gets, a skip forward those it passes
+    /// before the input's end.
+    #[test]
+    fn a_metered_input_charges_short_reads_and_skips_to_the_end_only() {
+        let a = Allowance::default();
+        let len = 1 << 20;
+        let mut input = a.meter(Zeros { len, pos: 0 });
+        a.start();
+        input.seek(SeekFrom::Start(len - 10)).unwrap();
+        assert_eq!(input.read(&mut vec![0u8; 1 << 20]).unwrap(), 10);
+        input.seek(SeekFrom::Start(len - 10)).unwrap();
+        assert_eq!(input.seek(SeekFrom::Current(1 << 40)).unwrap(), len - 10 + (1 << 40));
+        assert!(a.spend(0, SEEK_BYTES - 20).is_ok(), "20 bytes charged");
+        assert!(a.spend(0, 1).is_err(), "not fewer");
     }
 
     /// read_on stops at the first key packet after the target, after more

@@ -211,15 +211,13 @@ fn read_packet_header(
     Ok((size, size > 4096))
 }
 
-/// find_any_startcode from the current position, each byte scanned spent
-/// from `allowance`; returns (startcode, pos of the startcode's first
-/// byte).
-fn find_any_startcode(input: &mut Box<dyn ReadSeek>, allowance: &mut Allowance) -> Result<Option<(u64, u64)>> {
+/// find_any_startcode from the current position; returns (startcode, pos
+/// of the startcode's first byte).
+fn find_any_startcode(input: &mut Box<dyn ReadSeek>) -> Result<Option<(u64, u64)>> {
     let mut state: u64 = 0;
     let start: u64 = input.stream_position()?;
     let mut i: u64 = 0;
     loop {
-        allowance.spend(0, 1)?;
         let mut b = [0u8; 1];
         match input.read(&mut b) {
             Ok(0) => return Ok(None),
@@ -617,7 +615,7 @@ impl NutDemuxer {
     fn find_startcode(&mut self, code: u64, from: i64) -> Result<Option<i64>> {
         self.input.seek(std::io::SeekFrom::Start(from.max(0) as u64))?;
         loop {
-            match find_any_startcode(&mut self.input, &mut self.allowance)? {
+            match find_any_startcode(&mut self.input)? {
                 Some((found, at)) if found == code => return Ok(Some(at as i64)),
                 Some(_) => {}
                 None => return Ok(None),
@@ -661,7 +659,6 @@ impl NutDemuxer {
         read_packet_size(&mut self.input, INDEX_STARTCODE)?;
         let left = file_size as u64 - self.input.stream_position()?.min(file_size as u64);
         let len = left.min(MAX_INDEX_BYTES as u64);
-        self.allowance.spend(0, len)?;
         let mut data = vec![0u8; len as usize];
         self.input.read_exact(&mut data)?;
         Ok(Some(data))
@@ -913,8 +910,9 @@ fn open_nut(
 ) -> Result<Box<dyn Demuxer>> {
     // nut_read_header: find MAIN_STARTCODE and parse the main header,
     // then stream headers, then skip info headers until a syncpoint.
+    let allowance = Allowance::default();
     let mut nut = NutDemuxer {
-        input,
+        input: Box::new(allowance.meter(input)),
         streams: Vec::new(),
         states: Vec::new(),
         time_bases: Vec::new(),
@@ -926,7 +924,7 @@ fn open_nut(
         index: Vec::new(),
         syncpoints: Vec::new(),
         skip_until_key: Vec::new(),
-        allowance: Allowance::default(),
+        allowance,
     };
 
     // main header: FFmpeg loops find+decode until decode succeeds; errors
@@ -934,7 +932,7 @@ fn open_nut(
     let mut found_main = false;
     let mut first_err = None;
     for _ in 0..64 {
-        match find_any_startcode(&mut nut.input, &mut nut.allowance)? {
+        match find_any_startcode(&mut nut.input)? {
             Some((code, _)) if code == MAIN_STARTCODE => {
                 match nut.decode_main_header() {
                     Ok(true) => {
@@ -962,7 +960,7 @@ fn open_nut(
     // stream headers
     let mut last_err = None;
     while nut.streams.len() < nut.states.len() {
-        match find_any_startcode(&mut nut.input, &mut nut.allowance)? {
+        match find_any_startcode(&mut nut.input)? {
             Some((code, _)) if code == STREAM_STARTCODE => {
                 match nut.decode_stream_header(codecs) {
                     Ok(true) => continue,
@@ -985,7 +983,7 @@ fn open_nut(
     // info headers / skip to syncpoint
     let mut sync = false;
     loop {
-        match find_any_startcode(&mut nut.input, &mut nut.allowance)? {
+        match find_any_startcode(&mut nut.input)? {
             Some((code, at)) if code == SYNCPOINT_STARTCODE => {
                 nut.data_offset = at as i64;
                 sync = true;
@@ -1105,8 +1103,9 @@ impl Demuxer for NutDemuxer {
     /// within the syncpoints read so far, then the landing syncpoint's
     /// back pointer. Reading resumes at a syncpoint and drops each
     /// stream's frames until its first key frame. The seek reads within
-    /// its allowance; one that fails leaves reading where it was, with the
-    /// stream timestamps the syncpoints it decoded reset.
+    /// its allowance; one that fails, its reposition to the landing
+    /// included, leaves reading where it was, with the stream timestamps
+    /// the syncpoints it decoded reset.
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         let stream = stream_index as usize;
         let Some(info) = self.streams.get(stream) else {
@@ -1117,10 +1116,12 @@ impl Demuxer for NutDemuxer {
         let states = self.states.clone();
         self.allowance.start();
         let landed = self.land(stream, tb, pts);
-        self.allowance.stop();
+        let landed = match self.allowance.finish(landed) {
+            Ok((pos, landed)) => self.input.seek(std::io::SeekFrom::Start(pos)).map(|_| landed).map_err(Error::from),
+            Err(e) => Err(e),
+        };
         match landed {
-            Ok((pos, landed)) => {
-                self.input.seek(std::io::SeekFrom::Start(pos))?;
+            Ok(landed) => {
                 self.skip_until_key.iter_mut().for_each(|skip| *skip = true);
                 Ok(landed)
             }

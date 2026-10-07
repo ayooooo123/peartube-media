@@ -219,7 +219,6 @@ impl VocDemuxer {
             }
             let mut len3 = [0u8; 3];
             self.input.read_exact(&mut len3)?;
-            self.allowance.spend(0, 4)?;
             let mut remaining = i64::from(len3[0]) | (i64::from(len3[1]) << 8) | (i64::from(len3[2]) << 16);
             if remaining == 0 {
                 // FFmpeg reads to EOF; we cap that at MAX_BLOCK_SIZE.
@@ -314,7 +313,6 @@ impl VocDemuxer {
                     // VOC_TYPE_SILENCE / MARKER / ASCII / REPETITION_*:
                     // skip the payload, like FFmpeg's default branch.
                     let skip = usize::try_from(remaining).unwrap_or(usize::MAX).min(MAX_BLOCK_SIZE);
-                    self.allowance.spend(0, skip as u64)?;
                     std::io::copy(
                         &mut self.input.by_ref().take(skip as u64),
                         &mut std::io::sink(),
@@ -345,7 +343,7 @@ impl VocDemuxer {
         self.ensure_stream(codec)?;
 
         let size = self.remaining_size.clamp(0, 2048) as usize;
-        self.allowance.spend(1, size as u64)?;
+        self.allowance.spend(1, 0)?;
         self.remaining_size -= size as i64;
 
         let mut data = vec![0u8; size];
@@ -516,7 +514,7 @@ impl Demuxer for VocDemuxer {
         };
         self.allowance.start();
         let landed = self.land(timestamp);
-        self.allowance.stop();
+        let landed = self.allowance.finish(landed);
         if landed.is_err() {
             self.input.seek(SeekFrom::Start(reading.at))?;
             self.first = reading.first;
@@ -555,8 +553,9 @@ pub fn open_voc(
     // AVFMTCTX_NOHEADER) and avformat_find_stream_info reads that packet
     // before anyone sees the stream; read the first block here so the
     // stream and its parameters exist from open on.
+    let allowance = Allowance::default();
     let mut demuxer = VocDemuxer {
-        input,
+        input: Box::new(allowance.meter(input)),
         stream: None,
         first: None,
         remaining_size: 0,
@@ -568,7 +567,7 @@ pub fn open_voc(
         sample_format: None,
         index: VocIndex::new(),
         data_offset,
-        allowance: Allowance::default(),
+        allowance,
     };
     demuxer.first = demuxer.next_block()?;
     if demuxer.first.is_none() {

@@ -58,9 +58,10 @@ struct Reading<S> {
 
 impl<S: Split + Units + Send> RawVideoDemuxer<S> {
     pub fn new(format: &'static str, input: Box<dyn ReadSeek>, stream: StreamInfo, split: S) -> Self {
+        let allowance = Allowance::default();
         Self {
             format,
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             parser: Parser::new(split),
             queue: VecDeque::new(),
@@ -69,7 +70,7 @@ impl<S: Split + Units + Send> RawVideoDemuxer<S> {
             count: 0,
             eof: false,
             index: Index::default(),
-            allowance: Allowance::default(),
+            allowance,
         }
     }
 
@@ -84,7 +85,7 @@ impl<S: Split + Units + Send> RawVideoDemuxer<S> {
             }
             n += got;
         }
-        self.allowance.spend(1, n as u64)?;
+        self.allowance.spend(1, 0)?;
         let mut units = Vec::new();
         if n == 0 {
             self.eof = true;
@@ -202,7 +203,7 @@ impl<S: Split + Units + Send> Demuxer for RawVideoDemuxer<S> {
         };
         self.allowance.start();
         let landed = self.land(timestamp, found);
-        self.allowance.stop();
+        let landed = self.allowance.finish(landed);
         if landed.is_err() {
             self.input.seek(SeekFrom::Start(reading.at))?;
             (self.parser, self.queue, self.positions) = (reading.parser, reading.queue, reading.positions);

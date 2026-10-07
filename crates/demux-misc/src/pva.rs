@@ -93,12 +93,13 @@ pub fn open_pva(
     for stream in &mut index {
         stream.add(0, 0, 0, 0, true);
     }
+    let allowance = Allowance::default();
     Ok(Box::new(PvaDemuxer {
-        input,
+        input: Box::new(allowance.meter(input)),
         streams,
         continue_pes: 0,
         index,
-        allowance: Allowance::default(),
+        allowance,
     }))
 }
 
@@ -122,7 +123,7 @@ impl PvaDemuxer {
     /// a new PES expected): the packet's pts, payload length and stream
     /// id, `None` where FFmpeg returns an error.
     fn read_part(&mut self) -> Result<Option<(Option<i64>, i64, u8)>> {
-        self.allowance.spend(1, 8)?;
+        self.allowance.spend(1, 0)?;
         let startpos = self.input.stream_position()? as i64;
         let (hdr, _) = read_padded::<8>(&mut *self.input)?;
         let syncword = u16::from_be_bytes([hdr[0], hdr[1]]);
@@ -186,6 +187,9 @@ impl PvaDemuxer {
             };
             res = pts;
             if usize::from(streamid - 1) != stream || pts.is_none() {
+                // The payload is passed by an absolute seek, which the
+                // metered input does not charge.
+                self.allowance.spend(0, length.max(0) as u64)?;
                 *pos = self.input.stream_position()? as i64 + length;
                 continue;
             }
@@ -308,8 +312,8 @@ impl Demuxer for PvaDemuxer {
     /// AVSEEK_FLAG_BACKWARD) within the bounds of the stream's index. Video
     /// pts come in display order, so the landing follows every step of
     /// the search. The search reads within the seek's allowance; a failed
-    /// one leaves reading where it was, the audio PES in progress
-    /// (continue_pes) included.
+    /// seek, its reposition to the landing included, leaves reading where
+    /// it was, the audio PES in progress (continue_pes) included.
     fn seek_to(&mut self, stream_index: u32, timestamp: i64) -> Result<i64> {
         let stream = stream_index as usize;
         let Some(index) = self.index.get(stream) else {
@@ -319,10 +323,12 @@ impl Demuxer for PvaDemuxer {
         let (resume, continue_pes) = (self.input.stream_position()?, self.continue_pes);
         self.allowance.start();
         let found = self.search(stream, timestamp, bounds);
-        self.allowance.stop();
-        match found {
-            Ok(Some((pos, ts))) => {
-                self.input.seek(SeekFrom::Start(pos as u64))?;
+        let landed = match self.allowance.finish(found) {
+            Ok(Some((pos, ts))) => self.input.seek(SeekFrom::Start(pos as u64)).map(|_| Some(ts)).map_err(Error::from),
+            other => other.map(|_| None),
+        };
+        match landed {
+            Ok(Some(ts)) => {
                 self.continue_pes = 0;
                 Ok(ts)
             }

@@ -226,8 +226,9 @@ impl RawMlpDemuxer {
             params,
         };
 
+        let allowance = Allowance::default();
         Ok(Box::new(RawMlpDemuxer {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             format_name,
             next_offset: base_offset,
@@ -236,7 +237,7 @@ impl RawMlpDemuxer {
             start_offset: base_offset,
             num_substreams: 0,
             index: Index::default(),
-            allowance: Allowance::default(),
+            allowance,
         }))
     }
 }
@@ -270,7 +271,6 @@ impl RawMlpDemuxer {
             self.input.seek(SeekFrom::Start(from))?;
             let mut buf = vec![0u8; window];
             let n = read_up_to(&mut self.input, &mut buf)?;
-            self.allowance.spend(0, n as u64)?;
             if n < 8 {
                 return Err(Error::Eof);
             }
@@ -343,7 +343,7 @@ impl Demuxer for RawMlpDemuxer {
                 self.next_offset = self.find_sync(self.next_offset + 1)?;
                 continue;
             }
-            self.allowance.spend(1, len as u64)?;
+            self.allowance.spend(1, 0)?;
             let mut data = vec![0u8; len + PARITY_LOOKAHEAD];
             self.input.seek(SeekFrom::Start(self.next_offset))?;
             let got = read_up_to(&mut self.input, &mut data)?;
@@ -393,7 +393,7 @@ impl Demuxer for RawMlpDemuxer {
         let reading = (self.next_offset, self.next_pts, self.num_substreams);
         self.allowance.start();
         let landed = self.land(pts, found);
-        self.allowance.stop();
+        let landed = self.allowance.finish(landed);
         if landed.is_err() {
             (self.next_offset, self.next_pts, self.num_substreams) = reading;
         }

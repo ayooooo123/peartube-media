@@ -13,7 +13,7 @@ use oxideav_core::{
 };
 
 use crate::guid::*;
-use demux_seek_core::{gen_search, rescale, Allowance, Index, Reduce};
+use demux_seek_core::{gen_search, is_exhausted, rescale, Allowance, Index, Reduce};
 
 /// Maximum supported number of streams in an ASF file.
 const MAX_STREAMS: usize = 128;
@@ -195,8 +195,9 @@ impl AsfDemuxer {
         let _reserved1 = read_u8(&mut *input)?;
         let _reserved2 = read_u8(&mut *input)?;
 
+        let allowance = Allowance::default();
         let mut demuxer = Self {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: Vec::new(),
             asf_id_to_stream_idx: [None; MAX_STREAMS],
             asf_streams: (0..MAX_STREAMS).map(|_| StreamState::default()).collect(),
@@ -212,7 +213,7 @@ impl AsfDemuxer {
             seek_index: Vec::new(),
             index_read: 0,
             simple_index: None,
-            allowance: Allowance::default(),
+            allowance,
             packet_pos: 0,
             last_pos: 0,
             packet_size_left: 0,
@@ -399,8 +400,9 @@ impl AsfDemuxer {
             params,
         };
 
+        let allowance = Allowance::default();
         let demuxer = Self {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             asf_id_to_stream_idx: [None; MAX_STREAMS],
             asf_streams: (0..MAX_STREAMS).map(|_| StreamState::default()).collect(),
@@ -416,7 +418,7 @@ impl AsfDemuxer {
             seek_index: Vec::new(),
             index_read: 0,
             simple_index: None,
-            allowance: Allowance::default(),
+            allowance,
             packet_pos: 0,
             last_pos: 0,
             packet_size_left: 0,
@@ -1260,7 +1262,6 @@ impl AsfDemuxer {
         'scan: loop {
             let start = end.saturating_sub(4095);
             let n = (end - start + 1) as usize;
-            self.allowance.spend(0, 6 * n as u64)?;
             self.input.seek(SeekFrom::Start(si.entries + 6 * u64::from(start)))?;
             self.input.read_exact(&mut buf[..6 * n])?;
             for k in (0..n).rev() {
@@ -1325,7 +1326,7 @@ impl AsfDemuxer {
             // "asf_read_pts failed"; an exhausted allowance ends the seek.
             let packet = match self.next_packet() {
                 Ok(packet) => packet,
-                Err(e) if demux_seek_core::is_exhausted(&e) => return Err(e),
+                Err(e) if is_exhausted(&e) => return Err(e),
                 Err(_) => return Ok(None),
             };
             if !packet.flags.keyframe {
@@ -1348,10 +1349,16 @@ impl AsfDemuxer {
 
     /// asf_read_seek after its checks: the Simple Index Object where it is
     /// usable, else ff_seek_frame_binary over asf_read_pts. `(pos, ts)` of
-    /// the landing, `None` where FFmpeg returns -1.
+    /// the landing, `None` where FFmpeg returns -1. A Simple Index Object
+    /// the allowance does not cover ends the seek, not just the index.
     fn search(&mut self, stream: usize, pts: i64) -> Result<Option<(u64, i64)>> {
-        if self.index_read == 0 && self.build_simple_index(stream).is_err() {
-            self.index_read = -1;
+        if self.index_read == 0 {
+            if let Err(e) = self.build_simple_index(stream) {
+                if is_exhausted(&e) {
+                    return Err(e);
+                }
+                self.index_read = -1;
+            }
         }
         // avformat_seek_file seeks backward to a target after 0.
         let backward = pts > 0;
@@ -1699,10 +1706,12 @@ impl Demuxer for AsfDemuxer {
             let reading = self.take_reading()?;
             self.allowance.start();
             let found = self.search(stream, pts);
-            self.allowance.stop();
-            match found {
-                Ok(Some((pos, ts))) => {
-                    self.restart(pos)?;
+            let landed = match self.allowance.finish(found) {
+                Ok(Some((pos, ts))) => self.restart(pos).map(|()| Some(ts)),
+                other => other.map(|_| None),
+            };
+            match landed {
+                Ok(Some(ts)) => {
                     self.skip_to_key();
                     ts
                 }
@@ -1757,7 +1766,7 @@ impl Demuxer for AsfDemuxer {
                 {
                     return Err(Error::Eof);
                 }
-                self.allowance.spend(1, u64::from(self.hdr.max_pktsize))?;
+                self.allowance.spend(1, 0)?;
                 self.get_packet()?;
                 self.packet_time_start = 0;
                 continue;

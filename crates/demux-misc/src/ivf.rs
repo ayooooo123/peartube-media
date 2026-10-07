@@ -171,13 +171,14 @@ pub fn open_ivf(
     };
 
     let keys = KeyParser::new(&stream.params.codec_id);
+    let allowance = Allowance::default();
     Ok(Box::new(IvfDemuxer {
-        input,
+        input: Box::new(allowance.meter(input)),
         stream,
         left: None,
         keys,
         index: Index::default(),
-        allowance: Allowance::default(),
+        allowance,
     }))
 }
 
@@ -207,7 +208,7 @@ impl IvfDemuxer {
         if size > MAX_FRAME_SIZE {
             return Err(Error::invalid("ivf: frame size exceeds maximum"));
         }
-        self.allowance.spend(1, (IVF_FRAME_HEADER + size) as u64)?;
+        self.allowance.spend(1, 0)?;
         if let Some(left) = &mut self.left {
             *left = left.saturating_sub((IVF_FRAME_HEADER + size) as u64);
         }
@@ -297,7 +298,7 @@ impl Demuxer for IvfDemuxer {
         let left = self.left;
         self.allowance.start();
         let landed = self.land(timestamp, found);
-        self.allowance.stop();
+        let landed = self.allowance.finish(landed);
         if landed.is_err() {
             self.input.seek(SeekFrom::Start(at))?;
             (self.keys, self.left) = (keys, left);
