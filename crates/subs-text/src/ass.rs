@@ -1,3 +1,26 @@
+// Copyright (c) 2008 Michael Niedermayer
+// Copyright (c) 2010 Aurelien Jacobs <aurel@gnuage.org>
+// Copyright (c) 2014 Clément Bœsch
+//
+// Derived from FFmpeg at commit 2da55bf: libavformat/assdec.c and
+// libavcodec/assdec.c.
+// Changed for PearTube on 2026-10-07: ported to safe Rust and modified.
+//
+// This file is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this file (crates/subs-text/LICENSE); if not,
+// write to the Free Software Foundation, Inc., 51 Franklin Street,
+// Fifth Floor, Boston, MA 02110-1301 USA
+
 //! ASS/SSA: standalone `.ass`/`.ssa` demuxer and the `ass`/`ssa` decoders.
 //!
 //! Ported to safe Rust from FFmpeg at commit 2da55bf (LGPL-2.1-or-later —
@@ -153,7 +176,9 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     if !matches!(params.codec_id.as_str(), ASS_CODEC_ID | SSA_CODEC_ID) {
         return Err(Error::unsupported(format!("not an ASS codec id: {}", params.codec_id)));
     }
-    let header = split_header(&params.extradata);
+    // The script header's character set is decided like a cue's, so its
+    // style names match events read the same way.
+    let header = split_header(&crate::text_common::cue_text(&params.extradata));
     Ok(Box::new(AssEventDecoder::new(params.codec_id.clone(), header, AssEvents)))
 }
 

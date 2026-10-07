@@ -1,3 +1,24 @@
+// Copyright (c) 2012 Philip Langdale <philipl@overt.org>
+//
+// Derived from FFmpeg at commit 2da55bf: libavcodec/movtextdec.c.
+// Changed for PearTube on 2026-10-06 and 2026-10-07 (ported to safe Rust
+// and modified).
+//
+// This file is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this file (crates/subs-text/LICENSE); if not,
+// write to the Free Software Foundation, Inc., 51 Franklin Street,
+// Fifth Floor, Boston, MA 02110-1301 USA
+
 //! 3GPP TS 26.245 Timed Text (`mov_text`) decoder.
 //!
 //! Ported to safe Rust from FFmpeg's `libavcodec/movtextdec.c` (commit
@@ -7,6 +28,8 @@
 //! highlight (`hlit`, `hclr`) and wrap (`twrp`) boxes becomes an ASS event
 //! (`text_to_ass`). The event is shown through [`crate::ass_text`] like
 //! every other format FFmpeg decodes to ASS.
+
+use std::collections::HashMap;
 
 use oxideav_core::{CodecParameters, Decoder, Error, Packet, Result};
 
@@ -40,12 +63,6 @@ struct StyleBox {
     font_id: u16,
 }
 
-#[derive(Clone, Default, Debug)]
-struct FontRecord {
-    font_id: u16,
-    font: Vec<u8>,
-}
-
 #[derive(Clone, Debug)]
 struct MovTextDefault {
     style: StyleBox,
@@ -59,7 +76,10 @@ struct MovTextContext {
     hlit_start: u16,
     hlit_end: u16,
     hlit_color: [u8; 4],
-    fonts: Vec<FontRecord>,
+    /// The `ftab` names by font id. FFmpeg writes a `\fn` for every entry
+    /// with a style's id and the renderer keeps the last; the last is kept
+    /// here, so duplicate ids cost one override, not one per entry.
+    fonts: HashMap<u16, Vec<u8>>,
     wrap_flag: u8,
     d: MovTextDefault,
     box_flags: u8,
@@ -72,7 +92,7 @@ impl Default for MovTextContext {
             hlit_start: 0,
             hlit_end: 0,
             hlit_color: [0; 4],
-            fonts: Vec::new(),
+            fonts: HashMap::new(),
             wrap_flag: 0,
             d: MovTextDefault { style: StyleBox::default(), font: crate::ass_text::DEFAULT_FONT.as_bytes().to_vec(), alignment: 0 },
             box_flags: 0,
@@ -182,23 +202,19 @@ fn parse_tx3g(extradata: &[u8], m: &mut MovTextContext) -> Result<()> {
     if remaining < 0 {
         return Err(Error::invalid("tx3g font table truncated"));
     }
-    let mut default_font = None;
-    for i in 0..usize::from(entries) {
+    for _ in 0..entries {
         let font_id = cur.be16()?;
-        if font_id == m.d.style.font_id {
-            default_font = Some(i);
-        }
         let length = usize::from(cur.u8()?);
         remaining -= length as i64;
         if remaining < 0 {
             m.fonts.clear();
             return Err(Error::invalid("tx3g font name truncated"));
         }
-        let font = cur.take(length)?.to_vec();
-        m.fonts.push(FontRecord { font_id, font });
+        m.fonts.insert(font_id, cur.take(length)?.to_vec());
     }
-    if let Some(i) = default_font {
-        m.d.font = m.fonts[i].font.clone();
+    // FFmpeg takes the last entry with the default style's id.
+    if let Some(font) = m.fonts.get(&m.d.style.font_id) {
+        m.d.font = font.clone();
     }
     Ok(())
 }
@@ -301,9 +317,9 @@ fn text_to_ass(m: &MovTextContext, text: &[u8]) -> Vec<u8> {
                     out.extend_from_slice(format!("{{\\fs{}}}", style.fontsize).as_bytes());
                 }
                 if style.font_id != d.font_id {
-                    for font in m.fonts.iter().filter(|f| f.font_id == style.font_id) {
+                    if let Some(font) = m.fonts.get(&style.font_id) {
                         out.extend_from_slice(b"{\\fn");
-                        out.extend_from_slice(&font.font);
+                        out.extend_from_slice(font);
                         out.push(b'}');
                     }
                 }

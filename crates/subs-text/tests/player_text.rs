@@ -238,6 +238,42 @@ const YELLOW: (u8, u8, u8) = (255, 255, 0);
 const RED: (u8, u8, u8) = (255, 0, 0);
 const AZURE: (u8, u8, u8) = (0, 128, 255);
 const CYAN: (u8, u8, u8) = (0, 255, 255);
+const BLUE: (u8, u8, u8) = (0, 0, 255);
+const WHITE: (u8, u8, u8) = (255, 255, 255);
+
+/// Which of `palette` libass draws at `t` seconds of the ASS script `path`
+/// over black (FFmpeg's `ass` filter, RGB throughout).
+fn libass_colours(path: &Path, t: f64, palette: &[(u8, u8, u8)]) -> Vec<(u8, u8, u8)> {
+    let output = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=384x288:r=10,format=rgb24", "-vf"])
+        .arg(format!("ass=filename={}", path.display()))
+        .args(["-ss", &t.to_string(), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(output.status.success() && !output.stdout.is_empty(), "libass render: {}", String::from_utf8_lossy(&output.stderr));
+    palette
+        .iter()
+        .copied()
+        .filter(|&(r, g, b)| output.stdout.chunks_exact(3).filter(|p| *p == [r, g, b]).count() >= 50)
+        .collect()
+}
+
+/// A style reset (`\r`) returns to the event's own style, and so does a
+/// reset naming a style the script lacks: what libass, the reference ASS
+/// renderer, draws. FFmpeg's SubRip conversion maps both to `Default`
+/// instead, so it cannot be the oracle here; libass's own render is.
+#[test]
+fn ass_style_resets_render_as_libass_renders_them() {
+    let path = data("reset.ass");
+    let palette = [YELLOW, BLUE, WHITE, RED];
+    let shown = play(&path, 0, "ass");
+    assert_eq!(shown.len(), 3, "cues shown");
+    for (i, t) in [1.0, 2.5, 4.0].into_iter().enumerate() {
+        let expected = libass_colours(&path, t, &palette);
+        let ours: Vec<(u8, u8, u8)> = palette.iter().copied().filter(|&c| pixels_of(&shown[i].images[0], c) >= 20).collect();
+        assert_eq!(ours, expected, "cue {i}: text colours drawn vs libass");
+    }
+}
 
 #[test]
 fn matroska_subrip_copied_from_srt() {

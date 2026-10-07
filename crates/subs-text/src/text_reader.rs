@@ -1,3 +1,25 @@
+// Copyright (c) 2000,2001 Fabrice Bellard
+// Copyright (c) 2012-2013 Clément Bœsch <u pkh me>
+//
+// Derived from FFmpeg at commit 2da55bf: libavformat/subtitles.c and
+// libavformat/aviobuf.c.
+// Changed for PearTube on 2026-10-07: ported to safe Rust and modified.
+//
+// This file is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this file (crates/subs-text/LICENSE); if not,
+// write to the Free Software Foundation, Inc., 51 Franklin Street,
+// Fifth Floor, Boston, MA 02110-1301 USA
+
 //! Text input and event queue shared by the standalone subtitle demuxers.
 //!
 //! Ported to safe Rust from FFmpeg's `libavformat/subtitles.c` and
@@ -8,10 +30,9 @@
 //! merging, `ff_subtitles_queue_finalize`: sort, duration fill, duplicate
 //! drop).
 //!
-//! The whole input is read up front (capped at [`MAX_FILE_BYTES`]). Unlike
-//! FFmpeg without `-sub_charenc`, input that is not valid UTF-8 is
-//! converted from Windows-1250 rather than having every cue rejected by the
-//! decoder; valid UTF-8 (every FFmpeg reference fixture) is untouched.
+//! The whole input is read up front (capped at [`MAX_FILE_BYTES`]) and its
+//! bytes are kept; each cue's decoder decides that cue's character set
+//! (see [`crate::text_common::cue_text`]).
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -32,37 +53,13 @@ pub(crate) fn read_input(input: &mut dyn ReadSeek, what: &str) -> Result<Vec<u8>
 
 /// FFmpeg's text reader over a whole file: a UTF-8 BOM is skipped and
 /// UTF-16 (LE/BE, by BOM) is converted to UTF-8, as `ff_text_init_avio`
-/// does. Bytes that are not UTF-8 are converted from Windows-1250.
+/// does; other bytes are kept.
 pub(crate) fn decode_text(raw: &[u8]) -> Vec<u8> {
-    let utf16 = |big_endian: bool| {
-        let units = raw[2..].chunks_exact(2).map(|c| {
-            if big_endian { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }
-        });
-        // GET_UTF16 stops the text at an invalid surrogate sequence.
-        let mut out = String::new();
-        for c in char::decode_utf16(units) {
-            match c {
-                Ok(c) => out.push(c),
-                Err(_) => break,
-            }
-        }
-        out.into_bytes()
-    };
-    if raw.starts_with(b"\xff\xfe") {
-        return utf16(false);
-    }
-    if raw.starts_with(b"\xfe\xff") {
-        return utf16(true);
-    }
-    let body = raw.strip_prefix(b"\xef\xbb\xbf").unwrap_or(raw);
-    if std::str::from_utf8(body).is_ok() {
-        return body.to_vec();
-    }
-    crate::text_common::decode_windows_1250(body).into_bytes()
+    crate::text_common::file_bytes(raw)
 }
 
 /// The head of a probe buffer as text: probes read a few lines, so only the
-/// first 16 KiB are converted.
+/// first 16 KiB are read.
 pub(crate) fn probe_text(buf: &[u8]) -> Vec<u8> {
     decode_text(&buf[..buf.len().min(16 << 10)])
 }

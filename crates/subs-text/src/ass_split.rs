@@ -1,3 +1,23 @@
+// Copyright (c) 2010 Aurelien Jacobs <aurel@gnuage.org>
+//
+// Derived from FFmpeg at commit 2da55bf: libavcodec/ass_split.c.
+// Changed for PearTube on 2026-10-07: ported to safe Rust and modified.
+//
+// This file is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this file (crates/subs-text/LICENSE); if not,
+// write to the Free Software Foundation, Inc., 51 Franklin Street,
+// Fifth Floor, Boston, MA 02110-1301 USA
+
 //! ASS script header, dialogue and override-code splitting.
 //!
 //! Ported to safe Rust from FFmpeg's `libavcodec/ass_split.c` at commit
@@ -8,14 +28,33 @@
 //! `ff_ass_style_get`, and `ff_ass_split_override_codes`, whose callbacks
 //! decide what text a cue shows and how it is styled.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::scan::{strcspn, Scan};
+
+/// Longest font name kept, in bytes. FFmpeg's `\fn` override reads at most
+/// 127 (`%127[^\\}]`); header names are kept to the same length, so a cue
+/// costs the same whatever font names a script declares.
+pub const MAX_FONT_NAME: usize = 127;
+
+/// A font name as cues share it: lossy UTF-8, at most [`MAX_FONT_NAME`]
+/// bytes (cut at a character boundary).
+pub fn font_name(bytes: &[u8]) -> Arc<str> {
+    let name = String::from_utf8_lossy(bytes);
+    let mut end = name.len().min(MAX_FONT_NAME);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    Arc::from(&name[..end])
+}
 
 /// `ASSStyle`: the fields a cue's rendering uses. Absent fields are zero,
 /// as FFmpeg's zeroed structure leaves them.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AssStyle {
     pub name: Option<String>,
-    pub font_name: Option<String>,
+    pub font_name: Option<Arc<str>>,
     pub font_size: i32,
     /// `&HAABBGGRR` as parsed.
     pub primary_color: u32,
@@ -27,10 +66,12 @@ pub struct AssStyle {
     pub alignment: i32,
 }
 
-/// The style table of a script header.
+/// The style table of a script header, indexed by name.
 #[derive(Clone, Debug, Default)]
 pub struct AssHeader {
     pub styles: Vec<AssStyle>,
+    /// The first style of each name, as `ff_ass_style_get`'s scan finds it.
+    by_name: HashMap<String, usize>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -186,7 +227,7 @@ struct SectionState {
 pub fn split_header(header: &[u8]) -> AssHeader {
     let buf = header.strip_prefix(b"\xef\xbb\xbf").unwrap_or(header);
     let buf = crate::scan::c_str(buf);
-    let mut out = AssHeader::default();
+    let mut styles = Vec::new();
     let mut states: [SectionState; 4] = std::array::from_fn(|_| SectionState { order: None });
     let mut i = 0usize;
     while i < buf.len() {
@@ -200,18 +241,18 @@ pub fn split_header(header: &[u8]) -> AssHeader {
         if let Some(name) = header {
             for (index, (_, section_name, _)) in SECTIONS.iter().enumerate() {
                 if name == section_name.as_bytes() {
-                    i = split_section(buf, i, index, &mut states, &mut out);
+                    i = split_section(buf, i, index, &mut states, &mut styles);
                 }
             }
         }
     }
-    out
+    AssHeader::new(styles)
 }
 
 /// `ass_split_section`: parses lines until the next `[` line. The current
 /// section can change on a key that prefixes another section's line key,
 /// as FFmpeg's `strncmp(buf, fields_header, len)` does.
-fn split_section(buf: &[u8], mut i: usize, mut current: usize, states: &mut [SectionState; 4], out: &mut AssHeader) -> usize {
+fn split_section(buf: &[u8], mut i: usize, mut current: usize, states: &mut [SectionState; 4], out: &mut Vec<AssStyle>) -> usize {
     while i < buf.len() {
         let line = &buf[i..];
         if line[0] == b'[' {
@@ -234,7 +275,7 @@ fn split_section(buf: &[u8], mut i: usize, mut current: usize, states: &mut [Sec
     i
 }
 
-fn parse_line(line: &[u8], current: usize, states: &mut [SectionState; 4], out: &mut AssHeader) {
+fn parse_line(line: &[u8], current: usize, states: &mut [SectionState; 4], out: &mut Vec<AssStyle>) {
     let (section, _, fields_header) = SECTIONS[current];
     let fields = fields_of(section);
     let state = &mut states[current];
@@ -273,7 +314,7 @@ fn parse_line(line: &[u8], current: usize, states: &mut [SectionState; 4], out: 
                 let rest = &line[p..];
                 match field {
                     Field::Name => style.name = Some(String::from_utf8_lossy(value).into_owned()),
-                    Field::Fontname => style.font_name = Some(String::from_utf8_lossy(value).into_owned()),
+                    Field::Fontname => style.font_name = Some(font_name(value)),
                     Field::Fontsize => style.font_size = convert_int(rest).unwrap_or(style.font_size),
                     Field::PrimaryColour => style.primary_color = convert_color(rest).unwrap_or(style.primary_color),
                     Field::Bold => style.bold = convert_int(rest).unwrap_or(style.bold),
@@ -301,17 +342,27 @@ fn parse_line(line: &[u8], current: usize, states: &mut [SectionState; 4], out: 
         p = skip_space(line, p);
         k += 1;
     }
-    if section != Section::Events && out.styles.len() < crate::text_common::MAX_CUES {
-        out.styles.push(style);
+    if section != Section::Events && out.len() < crate::text_common::MAX_CUES {
+        out.push(style);
     }
 }
 
 impl AssHeader {
+    pub fn new(styles: Vec<AssStyle>) -> Self {
+        let mut by_name = HashMap::with_capacity(styles.len());
+        for (i, style) in styles.iter().enumerate() {
+            if let Some(name) = &style.name {
+                by_name.entry(name.clone()).or_insert(i);
+            }
+        }
+        Self { styles, by_name }
+    }
+
     /// `ff_ass_style_get`: the first style named `style` ("Default" when
     /// empty).
     pub fn style(&self, style: &str) -> Option<&AssStyle> {
         let style = if style.is_empty() { "Default" } else { style };
-        self.styles.iter().find(|s| s.name.as_deref() == Some(style))
+        self.by_name.get(style).map(|&i| &self.styles[i])
     }
 }
 

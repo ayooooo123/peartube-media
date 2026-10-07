@@ -191,11 +191,15 @@ fn mutate_packets(codec: &str, params: &CodecParameters, packets: &[Packet], see
         let k = trial % packets.len();
         let mut mutated = packets[k].clone();
         mutated.data = mutate(&mut rng, &mutated.data);
-        // Every fourth trial the container's times are at their edges too.
+        // Every fourth trial the container's times and time base are at
+        // their edges too.
         if trial % 4 == 3 {
             const TIMES: [Option<i64>; 7] = [None, Some(i64::MIN), Some(i64::MIN + 1), Some(-1), Some(0), Some(i64::MAX - 1), Some(i64::MAX)];
+            const BASES: [(i64, i64); 8] = [(1, 1000), (1, 1), (1, i64::MAX), (i64::MAX, 1), (0, 1), (1, 0), (-1, 1000), (i64::MIN, 1)];
             mutated.pts = TIMES[rng.below(TIMES.len())];
             mutated.duration = TIMES[rng.below(TIMES.len())];
+            let (num, den) = BASES[rng.below(BASES.len())];
+            mutated.time_base = TimeBase::new(num, den);
         }
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut decoder = ctx.codecs.first_decoder(params).unwrap();
@@ -210,9 +214,10 @@ fn mutate_packets(codec: &str, params: &CodecParameters, packets: &[Packet], see
         }));
         assert!(
             result.is_ok(),
-            "{codec} trial {trial}: packet {k} (pts {:?}, duration {:?}) mutated to {:?} panicked",
+            "{codec} trial {trial}: packet {k} (pts {:?}, duration {:?}, time base {:?}) mutated to {:?} panicked",
             mutated.pts,
             mutated.duration,
+            mutated.time_base,
             String::from_utf8_lossy(&mutated.data)
         );
     }

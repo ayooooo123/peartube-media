@@ -1,3 +1,29 @@
+// Copyright (c) 2010 Aurelien Jacobs <aurel@gnuage.org>
+// Copyright (c) 2012 Clément Bœsch
+// Copyright (c) 2012-2013 Clément Bœsch <u pkh me>
+// Copyright (c) 2017 Clément Bœsch <u@pkh.me>
+//
+// Derived from FFmpeg at commit 2da55bf: libavformat/samidec.c,
+// libavcodec/samidec.c, libavformat/subtitles.c,
+// libavcodec/htmlsubtitles.c and libavcodec/srtenc.c.
+// Changed for PearTube on 2026-10-06 and 2026-10-07 (ported to safe Rust
+// and modified).
+//
+// This file is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this file (crates/subs-text/LICENSE); if not,
+// write to the Free Software Foundation, Inc., 51 Franklin Street,
+// Fifth Floor, Boston, MA 02110-1301 USA
+
 //! SAMI (Synchronized Accessible Media Interchange) subtitle demuxer & decoder.
 //!
 //! Ported to safe Rust from FFmpeg's:
@@ -23,7 +49,7 @@ use oxideav_core::{
     MAX_PROBE_SCORE,
 };
 
-use crate::text_common::{decode_subtitle_text, TextSubtitleDemuxer, MAX_CUES, MAX_FILE_BYTES};
+use crate::text_common::{decode_subtitle_text, file_bytes_of, file_text, TextSubtitleDemuxer, MAX_CUES, MAX_FILE_BYTES};
 
 pub const CODEC_ID: &str = "sami";
 pub const CONTAINER_NAME: &str = "sami";
@@ -62,7 +88,7 @@ pub fn open_demuxer(
         return Err(Error::invalid("SAMI file exceeds maximum supported size"));
     }
 
-    let text = decode_subtitle_text(&raw);
+    let text = file_text(&raw);
     let packets = demux_sami_text(&text)?;
 
     let time_base = TimeBase::new(1, 1_000); // milliseconds
@@ -160,7 +186,7 @@ fn demux_sami_text(text: &str) -> Result<VecDeque<Packet>> {
     let time_base = TimeBase::new(1, 1_000);
     let mut packets = VecDeque::with_capacity(raw_packets.len());
     for p in raw_packets {
-        let mut pkt = Packet::new(0, time_base, p.data.into_bytes());
+        let mut pkt = Packet::new(0, time_base, file_bytes_of(&p.data));
         pkt.pts = Some(p.pts);
         pkt.dts = Some(p.pts);
         if p.duration >= 0 {

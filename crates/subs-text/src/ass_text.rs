@@ -1,3 +1,24 @@
+// Copyright (c) 2010 Aurelien Jacobs <aurel@gnuage.org>
+//
+// Derived from FFmpeg at commit 2da55bf: libavcodec/srtenc.c,
+// libavcodec/ass.c and libavcodec/ass.h.
+// Changed for PearTube on 2026-10-07: ported to safe Rust and modified.
+//
+// This file is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this file (crates/subs-text/LICENSE); if not,
+// write to the Free Software Foundation, Inc., 51 Franklin Street,
+// Fifth Floor, Boston, MA 02110-1301 USA
+
 //! ASS events to displayed cues, and the decoder shared by every text
 //! format FFmpeg decodes to ASS.
 //!
@@ -7,15 +28,24 @@
 //! `ff_ass_split_override_codes`, every override block hidden. Styling uses
 //! the callbacks FFmpeg's SubRip encoder maps to markup — the event style
 //! from the script header (`srt_style_apply`), `\b \i \u \s`, primary
-//! colour, font name and size, alignment and `\r` — with the renderer's
-//! state semantics: a style switch holds until it is switched back, `\r`
-//! returns to the event's style and the first alignment override wins.
+//! colour, font name and size, alignment and `\r` — with libass's state
+//! semantics: a style switch holds until it is switched back, the first
+//! alignment override wins, and `\r` returns to the event's own style (a
+//! `\rName` naming no style does too). FFmpeg's SubRip encoder resets to
+//! `Default` instead; libass, the renderer players and FFmpeg's own `ass`
+//! filter use, is followed here.
+//!
+//! A cue's character set is decided per cue: text that is valid UTF-8 is
+//! shown as UTF-8, as in FFmpeg; text that is not, which FFmpeg rejects
+//! without `-sub_charenc` ("Invalid UTF-8 in decoded subtitles text"), is
+//! read as Windows-1250.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use oxideav_core::{CodecId, CuePosition, Decoder, Error, Frame, Packet, Result, Segment, SubtitleCue, TextAlign, TimeBase};
 
-use crate::ass_split::{split_override_codes, AssHeader, AssStyle, OverrideCallbacks};
+use crate::ass_split::{font_name, split_override_codes, AssHeader, AssStyle, OverrideCallbacks};
 
 /// FFmpeg's `ASS_DEFAULT_*` style values.
 pub const DEFAULT_FONT: &str = "Arial";
@@ -29,19 +59,17 @@ pub const MAX_CUE_BYTES: usize = 1 << 20;
 /// The `Default` style `ff_ass_subtitle_header` writes for decoders that
 /// convert other formats to ASS.
 pub fn default_header(font: &str, font_size: i32, color: u32, bold: bool, italic: bool, underline: bool, alignment: i32) -> AssHeader {
-    AssHeader {
-        styles: vec![AssStyle {
-            name: Some("Default".into()),
-            font_name: Some(font.into()),
-            font_size,
-            primary_color: color,
-            bold: -i32::from(bold),
-            italic: -i32::from(italic),
-            underline: -i32::from(underline),
-            strikeout: 0,
-            alignment,
-        }],
-    }
+    AssHeader::new(vec![AssStyle {
+        name: Some("Default".into()),
+        font_name: Some(font_name(font.as_bytes())),
+        font_size,
+        primary_color: color,
+        bold: -i32::from(bold),
+        italic: -i32::from(italic),
+        underline: -i32::from(underline),
+        strikeout: 0,
+        alignment,
+    }])
 }
 
 /// `ff_ass_subtitle_header_default`.
@@ -49,6 +77,8 @@ pub fn ffmpeg_default_header() -> AssHeader {
     default_header(DEFAULT_FONT, DEFAULT_FONT_SIZE, DEFAULT_COLOR, false, false, false, DEFAULT_ALIGNMENT)
 }
 
+/// The style in force for a run. Font names are shared, not copied: a run
+/// costs the same whatever the font name's length.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct RunStyle {
     bold: bool,
@@ -56,7 +86,7 @@ struct RunStyle {
     underline: bool,
     strike: bool,
     color: Option<(u8, u8, u8)>,
-    font_name: Option<String>,
+    font_name: Option<Arc<str>>,
     font_size: Option<f32>,
 }
 
@@ -75,7 +105,7 @@ impl RunStyle {
             underline: st.underline != 0,
             strike: st.strikeout != 0,
             color: (c != DEFAULT_COLOR).then(|| bgr(c)),
-            font_name: st.font_name.clone().filter(|f| f != DEFAULT_FONT),
+            font_name: st.font_name.clone().filter(|f| &**f != DEFAULT_FONT),
             font_size: (st.font_size != DEFAULT_FONT_SIZE).then_some(st.font_size as f32),
         }
     }
@@ -119,9 +149,11 @@ fn tree(items: &[(RunStyle, Leaf)], level: usize) -> Vec<Segment> {
         let s = &group[0].0;
         let children = tree(group, level + 1);
         match level {
-            0 if s.font_name.is_some() || s.font_size.is_some() => {
-                out.push(Segment::Font { family: s.font_name.clone(), size: s.font_size, children })
-            }
+            0 if s.font_name.is_some() || s.font_size.is_some() => out.push(Segment::Font {
+                family: s.font_name.as_deref().map(str::to_owned),
+                size: s.font_size,
+                children,
+            }),
             1 if s.color.is_some() => out.push(Segment::Color { rgb: s.color.unwrap_or_default(), children }),
             2 if s.bold => out.push(Segment::Bold(children)),
             3 if s.italic => out.push(Segment::Italic(children)),
@@ -170,7 +202,7 @@ impl OverrideCallbacks for Builder<'_> {
 
     fn font_name(&mut self, name: Option<&[u8]>) {
         self.state.font_name = match name {
-            Some(name) => Some(String::from_utf8_lossy(name).into_owned()),
+            Some(name) => Some(font_name(name)),
             None => self.base.font_name.clone(),
         };
     }
@@ -230,12 +262,6 @@ pub fn event_to_cue(header: &AssHeader, style: &[u8], text: &[u8], start_us: i64
     }
 }
 
-/// FFmpeg's checks before a decoded subtitle is returned: the event must be
-/// UTF-8 (`utf8_check`, without `-sub_charenc`).
-fn checked_utf8(bytes: &[u8]) -> Result<&[u8]> {
-    std::str::from_utf8(bytes).map(|_| bytes).map_err(|_| Error::invalid("invalid UTF-8 in decoded subtitle text"))
-}
-
 /// A packet's text as FFmpeg's decoders read it: up to the first NUL.
 pub fn packet_text(packet: &Packet) -> &[u8] {
     crate::scan::c_str(&packet.data)
@@ -292,12 +318,15 @@ impl<S: EventSource + 'static> Decoder for AssEventDecoder<S> {
         if packet.data.is_empty() {
             return Ok(());
         }
-        let Some(event) = self.source.event(packet, packet_text(packet))? else { return Ok(()) };
-        let style = checked_utf8(&event.style)?;
-        let ass = checked_utf8(&event.text)?;
+        // The character set is decided for this cue alone.
+        let text = crate::text_common::cue_text(packet_text(packet));
+        let Some(event) = self.source.event(packet, &text)? else { return Ok(()) };
+        // Formats that read the packet itself (mov_text) still hand over
+        // their own bytes.
+        let ass = crate::text_common::cue_text(&event.text);
         let start_us = packet.time_base.rescale(packet.pts.unwrap_or(0), TimeBase::new(1, 1_000_000));
         let end_us = crate::text_common::subtitle_end_us(packet, start_us);
-        let cue = event_to_cue(&self.header, style, ass, start_us, end_us);
+        let cue = event_to_cue(&self.header, &event.style, &ass, start_us, end_us);
         self.pending.push_back(Frame::Subtitle(cue));
         Ok(())
     }

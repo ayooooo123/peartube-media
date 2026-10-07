@@ -1,3 +1,26 @@
+// Copyright (c) 2003 Michael Niedermayer <michaelni@gmx.at>
+// Copyright (c) 2010 Aurelien Jacobs <aurel@gnuage.org>
+// Copyright (c) 2012 Clément Bœsch <u pkh me>
+//
+// Derived from FFmpeg at commit 2da55bf: libavformat/microdvddec.c,
+// libavcodec/microdvddec.c and libavutil/rational.c.
+// Changed for PearTube on 2026-10-07: ported to safe Rust and modified.
+//
+// This file is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this file (crates/subs-text/LICENSE); if not,
+// write to the Free Software Foundation, Inc., 51 Franklin Street,
+// Fifth Floor, Boston, MA 02110-1301 USA
+
 //! MicroDVD: standalone `.sub` demuxer and the `microdvd` decoder.
 //!
 //! Ported to safe Rust from FFmpeg at commit 2da55bf (LGPL-2.1-or-later —
@@ -489,7 +512,8 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     if params.codec_id.as_str() != CODEC_ID {
         return Err(Error::unsupported(format!("not a MicroDVD codec id: {}", params.codec_id)));
     }
-    Ok(Box::new(AssEventDecoder::new(params.codec_id.clone(), header(&params.extradata), MicroDvd)))
+    let header = header(&crate::text_common::cue_text(&params.extradata));
+    Ok(Box::new(AssEventDecoder::new(params.codec_id.clone(), header, MicroDvd)))
 }
 
 #[cfg(test)]
