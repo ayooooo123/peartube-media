@@ -149,20 +149,24 @@ impl Output {
                 Err(e) => panic!("decode: {e}"),
             };
             let reported = decoder.output_audio_format();
-            let layout = reported.map(|f| (f.sample_format, f.channels as usize, f.sample_rate)).or_else(|| {
-                let p = &stream.params;
-                Some((p.sample_format?, p.channels.unwrap_or(1) as usize, p.sample_rate.unwrap_or(0)))
-            });
-            match (frame, layout) {
-                (Frame::Audio(frame), Some((format, channels, rate))) => {
-                    let piece = Piece { frame, reported, format, channels, rate, time_base: stream.time_base };
+            match frame {
+                Frame::Audio(frame) => {
+                    let layout = read_layout(reported, &stream.params, &frame);
+                    let piece = Piece {
+                        frame,
+                        reported,
+                        format: layout.sample_format,
+                        channels: layout.channels as usize,
+                        rate: layout.sample_rate,
+                        time_base: stream.time_base,
+                    };
                     self.trimmer.frame(piece, &mut self.kept);
                     for piece in self.kept.drain(..) {
                         self.frames.push(Frame::Audio(piece.frame));
                         self.frame_formats.push(piece.reported);
                     }
                 }
-                (frame, _) => {
+                frame => {
                     self.frames.push(frame);
                     self.frame_formats.push(reported);
                 }
@@ -177,7 +181,6 @@ struct Piece {
     reported: Option<AudioFormat>,
     format: SampleFormat,
     channels: usize,
-    /// 0 when neither the decoder nor the container says.
     rate: u32,
     time_base: TimeBase,
 }
@@ -359,25 +362,33 @@ pub fn ffmpeg_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
     out.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
+/// The layout refcheck reads (and trims) a frame in: the decoder's report,
+/// else the container's declared format, else, when the container declares
+/// none, what the player infers from the frame (`audio_trim::frame_layout`).
+fn read_layout(reported: Option<AudioFormat>, params: &CodecParameters, frame: &AudioFrame) -> AudioFormat {
+    match (reported, params.sample_format) {
+        (Some(f), _) => f,
+        (None, Some(sample_format)) => AudioFormat {
+            sample_format,
+            sample_rate: params.sample_rate.unwrap_or(48000),
+            channels: params.channels.unwrap_or(1),
+        },
+        (None, None) => audio_trim::frame_layout(None, params, frame),
+    }
+}
+
 /// Every audio frame converted to interleaved f32 in [-1, 1]. Each frame is
 /// read in the layout the decoder reported for it through
 /// `Decoder::output_audio_format` (see [`Decoded::frame_formats`]), else in
-/// the container's declared one. Panics when a frame's buffers are shorter
-/// than its sample count in that layout.
+/// the container's declared one, else in the one the player infers from
+/// the frame. Panics when a frame's buffers are shorter than its sample
+/// count in that layout.
 pub fn interleaved_f32(decoded: &Decoded) -> Vec<f32> {
-    let declared = || {
-        (
-            decoded.params.sample_format.expect("audio stream without sample_format"),
-            decoded.params.channels.unwrap_or(1) as usize,
-        )
-    };
     let mut out = Vec::new();
     for (index, frame) in decoded.frames.iter().enumerate() {
         let Frame::Audio(a) = frame else { continue };
-        let (format, channels) = match decoded.frame_formats.get(index).copied().flatten() {
-            Some(f) => (f.sample_format, f.channels as usize),
-            None => declared(),
-        };
+        let layout = read_layout(decoded.frame_formats.get(index).copied().flatten(), &decoded.params, a);
+        let (format, channels) = (layout.sample_format, layout.channels as usize);
         let n = a.samples as usize;
         let w = format.bytes_per_sample();
         let (planes, per_plane) = if format.is_planar() { (channels, n * w) } else { (1, n * channels * w) };

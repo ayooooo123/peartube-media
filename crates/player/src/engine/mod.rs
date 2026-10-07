@@ -1599,8 +1599,8 @@ fn decoded_chunk(
     packet_pts: &mut Option<i64>,
     decoded_end: &mut Option<f64>,
 ) -> Chunk {
-    let (format, rate, channels) = audio_layout(decoder, &stream.params, af);
-    let channels = channels as usize;
+    let layout = audio_trim::frame_layout(decoder.output_audio_format(), &stream.params, af);
+    let (format, rate, channels) = (layout.sample_format, layout.sample_rate, layout.channels as usize);
     let pcm = convert_audio_to_f32(af, format, channels);
     let pts = match (af.pts.or(packet_pts.take()), *decoded_end) {
         (Some(ticks), _) => stream.time_base.seconds_of(ticks),
@@ -1827,54 +1827,6 @@ fn write_pcm(
         }
     }
     true
-}
-
-/// The layout of `af`: what the decoder says it emits, else the container's
-/// declaration corrected by the frame's actual plane count and byte length.
-/// Containers often declare a different format, rate or channel count than
-/// the decoder produces (HE-AAC, parametric stereo, S16 decoders), and
-/// reading S16 bytes as f32 yields garbage and NaNs.
-fn audio_layout(
-    decoder: &dyn oxideav_core::Decoder,
-    params: &oxideav_core::CodecParameters,
-    af: &oxideav_core::AudioFrame,
-) -> (SampleFormat, u32, u16) {
-    if let Some(f) = decoder.output_audio_format() {
-        return (f.sample_format, f.sample_rate, f.channels);
-    }
-    let rate = params.sample_rate.unwrap_or(48000);
-    let declared = params.sample_format;
-    let planar = af.data.len() > 1;
-    let channels = if planar { af.data.len() as u16 } else { params.channels.unwrap_or(1).max(1) };
-    let per_plane = if planar { 1 } else { channels as usize };
-    let samples = (af.samples as usize).max(1);
-    let bytes = af.data.first().map_or(0, Vec::len);
-    let width = bytes / (samples * per_plane);
-    let fits = |f: SampleFormat| f.is_planar() == planar && f.bytes_per_sample() == width;
-    let format = match declared {
-        Some(f) if fits(f) => f,
-        _ => {
-            // 4-byte samples are f32 or s32: keep the declared family.
-            let float = declared.map_or(true, |f| {
-                matches!(f, SampleFormat::F32 | SampleFormat::F32P | SampleFormat::F64 | SampleFormat::F64P)
-            });
-            match (width, planar, float) {
-                (1, false, _) => SampleFormat::U8,
-                (1, true, _) => SampleFormat::U8P,
-                (2, false, _) => SampleFormat::S16,
-                (2, true, _) => SampleFormat::S16P,
-                (3, false, _) => SampleFormat::S24,
-                (4, false, true) => SampleFormat::F32,
-                (4, false, false) => SampleFormat::S32,
-                (4, true, true) => SampleFormat::F32P,
-                (4, true, false) => SampleFormat::S32P,
-                (8, false, _) => SampleFormat::F64,
-                (8, true, _) => SampleFormat::F64P,
-                _ => declared.unwrap_or(SampleFormat::F32),
-            }
-        }
-    };
-    (format, rate, channels)
 }
 
 fn convert_audio_to_f32(

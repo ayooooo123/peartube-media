@@ -37,7 +37,53 @@
 
 use std::collections::VecDeque;
 
-use oxideav_core::AudioTrim;
+use oxideav_core::{AudioFormat, AudioFrame, AudioTrim, CodecParameters, SampleFormat};
+
+/// The layout a decoded frame is read (and trimmed) in: what the decoder
+/// `reported` (`Decoder::output_audio_format`), else the container's
+/// declaration corrected by the frame's actual plane count and byte length.
+/// Containers often declare a different format, rate or channel count than
+/// the decoder produces (HE-AAC, parametric stereo, S16 decoders), and
+/// reading S16 bytes as f32 yields garbage and NaNs. Without a declared
+/// rate, 48 kHz.
+pub fn frame_layout(reported: Option<AudioFormat>, params: &CodecParameters, frame: &AudioFrame) -> AudioFormat {
+    if let Some(f) = reported {
+        return f;
+    }
+    let sample_rate = params.sample_rate.unwrap_or(48000);
+    let declared = params.sample_format;
+    let planar = frame.data.len() > 1;
+    let channels = if planar { frame.data.len() as u16 } else { params.channels.unwrap_or(1).max(1) };
+    let per_plane = if planar { 1 } else { channels as usize };
+    let samples = (frame.samples as usize).max(1);
+    let bytes = frame.data.first().map_or(0, Vec::len);
+    let width = bytes / (samples * per_plane);
+    let fits = |f: SampleFormat| f.is_planar() == planar && f.bytes_per_sample() == width;
+    let sample_format = match declared {
+        Some(f) if fits(f) => f,
+        _ => {
+            // 4-byte samples are f32 or s32: keep the declared family.
+            let float = declared.map_or(true, |f| {
+                matches!(f, SampleFormat::F32 | SampleFormat::F32P | SampleFormat::F64 | SampleFormat::F64P)
+            });
+            match (width, planar, float) {
+                (1, false, _) => SampleFormat::U8,
+                (1, true, _) => SampleFormat::U8P,
+                (2, false, _) => SampleFormat::S16,
+                (2, true, _) => SampleFormat::S16P,
+                (3, false, _) => SampleFormat::S24,
+                (4, false, true) => SampleFormat::F32,
+                (4, false, false) => SampleFormat::S32,
+                (4, true, true) => SampleFormat::F32P,
+                (4, true, false) => SampleFormat::S32P,
+                (8, false, _) => SampleFormat::F64,
+                (8, true, _) => SampleFormat::F64P,
+                _ => declared.unwrap_or(SampleFormat::F32),
+            }
+        }
+    };
+    AudioFormat { sample_format, sample_rate, channels }
+}
 
 /// Decoded audio a [`Trimmer`] cuts: consecutive samples (per channel) at
 /// one rate.
