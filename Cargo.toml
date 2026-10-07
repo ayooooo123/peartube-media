@@ -141,7 +141,7 @@ oxideav-scribe = { git = "https://github.com/OxideAV/oxideav-scribe", rev = "bc2
 oxideav-source = { git = "https://github.com/OxideAV/oxideav-source", rev = "7577057231b8e650d0690b762cf189eca16f1ed7" }
 oxideav-speex = { git = "https://github.com/OxideAV/oxideav-speex", rev = "8886c67204b1464a5ed1bd32c29f5501dd3cae91" }
 oxideav-sub-image = { git = "https://github.com/OxideAV/oxideav-sub-image", rev = "18a79e94675bf5acab88b3e06b82d117b53659c0" }
-oxideav-subtitle = { git = "https://github.com/ayooooo123/oxideav-subtitle", rev = "bad972cd4ec94fa1cbf3fff188783054d61bfca6" }
+oxideav-subtitle = { git = "https://github.com/ayooooo123/oxideav-subtitle", rev = "53df836f596bb4ce8391bb821b2100d3e7f94f1b" }
 oxideav-svq = { git = "https://github.com/OxideAV/oxideav-svq", rev = "afb738670f7c73735142d7ef49d529918bce84fe" }
 oxideav-theora = { git = "https://github.com/OxideAV/oxideav-theora", rev = "bd07b92ecfe0781de8fb1278fbf26e642e2311ad" }
 oxideav-tta = { git = "https://github.com/OxideAV/oxideav-tta", rev = "53432dc2b2de77f0b6de6e55f7e742fbdd11b04f" }

@@ -1302,7 +1302,7 @@ dependencies = [
 [[package]]
 name = "oxideav-subtitle"
 version = "0.1.2"
-source = "git+https://github.com/ayooooo123/oxideav-subtitle?rev=bad972cd4ec94fa1cbf3fff188783054d61bfca6#bad972cd4ec94fa1cbf3fff188783054d61bfca6"
+source = "git+https://github.com/ayooooo123/oxideav-subtitle?rev=53df836f596bb4ce8391bb821b2100d3e7f94f1b#53df836f596bb4ce8391bb821b2100d3e7f94f1b"
 dependencies = [
  "oxideav-core",
  "oxideav-pixfmt",
