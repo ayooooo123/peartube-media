@@ -19,6 +19,9 @@
 #                    never a verified pass
 #   diag:audio:snr:<dB>  SNR against a floor, reported, never accepting (keeps
 #                    the measurement of formats below the contract floor)
+#           Under video:md5 and audio:*, a stream that plays but outputs
+#           nothing passes only when FFmpeg's demuxer reads no packet of it
+#           either (a PMT can declare streams that never carry one).
 #           Records of one sample and stream selection merge; two different
 #           policies for one kind are an error.
 # stream selection: `streams` lists the stream indices to play per kind when

@@ -373,10 +373,22 @@ fn map_to_ffmpeg(track: &TrackInfo, disc: &Discovery, ff: &[oracle::FfStream]) -
     Ok(theirs[nth].clone())
 }
 
+/// An empty capture matches FFmpeg only when FFmpeg's demuxer reads no
+/// packet of the stream either: it then decodes nothing and its `-map`
+/// output is empty (FATE's dvbsubtest_filter.ts declares MPEG-2 video and
+/// MPEG audio that never carry a packet).
+fn empty_capture(path: &Path, ff: &oracle::FfStream, output: String, what: &str) -> Compare {
+    match oracle::packet_count(path, ff.index) {
+        Ok(0) => Compare::pass(format!("{output}, FFmpeg demuxes no packets")),
+        Ok(n) => Compare::fail(output, format!("no {what} captured; FFmpeg demuxes {n} packets")),
+        Err(e) => Compare::fail(output, format!("no {what} captured; {e}")),
+    }
+}
+
 fn compare_video(path: &Path, cap: &player::VideoCapture, ff: &oracle::FfStream) -> Compare {
     let output = format!("frames={}", cap.frame_md5.len());
     if cap.frame_md5.is_empty() {
-        return Compare::fail(output, "no frames captured");
+        return empty_capture(path, ff, output, "frames");
     }
     let Some(pix) = refcheck::ffmpeg_pix_fmt_name(cap.pixel_format) else {
         return Compare::fail(output, format!("FFmpeg has no pixel format for {:?}", cap.pixel_format));
@@ -641,6 +653,7 @@ fn judge_track(
                 &output,
                 |policy, ff| match usable() {
                     Ok(cap) => compare_audio(path, cap, ff, policy),
+                    Err(_) if cap.is_some_and(|c| c.pcm.is_empty()) => empty_capture(path, ff, output.clone(), "PCM"),
                     Err(fail) => fail,
                 },
                 || match usable() {
@@ -1360,6 +1373,29 @@ mod tests {
         let (disc, _) = two_audio_tracks();
         let wrong = manifest::Selection { audio: Some(0), ..Default::default() };
         assert!(select(&entry(wrong), &disc).is_err(), "stream 0 is video");
+    }
+
+    #[test]
+    fn an_empty_capture_passes_only_when_ffmpeg_demuxes_no_packets() {
+        let empty = player::VideoCapture {
+            stream: 0,
+            codec: String::new(),
+            pixel_format: oxideav_core::PixelFormat::Yuv420P,
+            width: 0,
+            height: 0,
+            frame_md5: Vec::new(),
+            pts: Vec::new(),
+            shown_at: Vec::new(),
+            flushes: Vec::new(),
+        };
+        // The MPEG-2 video dvbsubtest_filter.ts declares never carries a
+        // packet; h264small.ts's video carries 74.
+        let none = refcheck::fate("sub/dvbsubtest_filter.ts");
+        let cmp = compare_video(&none, &empty, &ff(0, "video", "mpeg2video", false));
+        assert!(matches!(cmp.verdict, Verdict::Pass), "{:?}", cmp.error);
+        let some = refcheck::fate("mpegts/h264small.ts");
+        let cmp = compare_video(&some, &empty, &ff(0, "video", "h264", false));
+        assert!(matches!(cmp.verdict, Verdict::Fail));
     }
 
 }

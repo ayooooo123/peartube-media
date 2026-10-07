@@ -80,6 +80,31 @@ pub fn of_type<'a>(streams: &'a [FfStream], codec_type: &str) -> Vec<&'a FfStrea
     streams.iter().filter(|s| s.codec_type == codec_type && !s.attached_pic).collect()
 }
 
+/// How many packets FFmpeg's demuxer reads for stream `index` of `path`.
+/// With `-count_packets`, ffprobe states `N/A` for a stream it read no
+/// packet of, and lists a program's streams again in its program.
+pub fn packet_count(path: &Path, index: u32) -> Result<u64, String> {
+    let out = tool::ffprobe(
+        &[
+            "-count_packets".to_string(),
+            "-select_streams".into(),
+            index.to_string(),
+            "-show_entries".into(),
+            "stream=nb_read_packets".into(),
+            "-of".into(),
+            "csv=p=0".into(),
+            path_arg(path)?,
+        ],
+        Duration::from_secs(60),
+    )?;
+    let text = String::from_utf8_lossy(&out);
+    match text.lines().next().map(str::trim) {
+        Some("N/A") => Ok(0),
+        Some(n) => n.parse().map_err(|e| format!("ffprobe nb_read_packets {n:?}: {e}")),
+        None => Err(format!("ffprobe lists no stream {index}")),
+    }
+}
+
 /// MD5 of every frame FFmpeg decodes from stream `map`, through refcheck's
 /// video oracle. FFmpeg's C IDCT is pinned for every stream (`-idct simple`,
 /// 6ac540e): the IDCT codecs port FFmpeg's C `simple_idct`, which arm64
