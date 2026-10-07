@@ -1,4 +1,5 @@
-// Ported from FFmpeg libavformat/rmdec.c, rmsipr.c, rm.c, commit 2da55bf
+// Ported from FFmpeg libavformat/rmdec.c, rmsipr.c, rm.c and the seek.c
+// search rm_read_seek uses, commit 2da55bf
 // License: GNU Lesser General Public License (LGPL) version 2.1 or later
 
 #![forbid(unsafe_code)]
@@ -7,6 +8,7 @@ pub mod demuxer;
 pub mod rm_tags;
 pub mod rv34;
 pub mod rmsipr;
+mod seek;
 
 pub use demuxer::{open, RmDemuxer};
 pub use rm_tags::codec_id_from_rm_tag;
