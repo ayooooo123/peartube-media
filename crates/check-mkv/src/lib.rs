@@ -6,12 +6,15 @@
 //!
 //! The acceptance surface is in `tests/`: packet equality with `ffprobe`
 //! over every FATE Matroska / WebM sample and the generated corpus
-//! (`packets.rs`), the bytes read to open a 50 MB file and return its first
-//! packets (`incremental.rs`), seeks against `ffprobe -read_intervals`
-//! (`seek.rs`), and container mutations (`mutations.rs`).
+//! (`packets.rs`) and over laced audio without DefaultDuration
+//! (`lace_timing.rs`), the bytes read to open a 50 MB file and return its
+//! first packets (`incremental.rs`), seeks against `ffprobe
+//! -read_intervals` (`seek.rs`), container mutations (`mutations.rs`) and
+//! Player seeks to container random-access points (`player_seek.rs`).
 
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -203,6 +206,46 @@ pub fn our_packets(path: &Path) -> Demuxed {
             Err(e) => return Demuxed { packets, error: Some(e.to_string()) },
         }
     }
+}
+
+/// Every contracted field compared directly with the oracle, per stream:
+/// empty when `ours` equals `theirs`. All failures are kept, so a
+/// timestamp difference cannot hide a payload or count regression.
+pub fn differences(ours: &[Pkt], theirs: &[Pkt], error: &Option<String>) -> String {
+    let mut parts = Vec::new();
+    if let Some(e) = error {
+        parts.push(format!("error: {e}"));
+    }
+    let streams: BTreeSet<u32> = ours.iter().chain(theirs).map(|p| p.stream).collect();
+    for s in streams {
+        let a: Vec<&Pkt> = ours.iter().filter(|p| p.stream == s).collect();
+        let b: Vec<&Pkt> = theirs.iter().filter(|p| p.stream == s).collect();
+        let mut diffs = Vec::new();
+        if a.len() != b.len() {
+            diffs.push(format!("count {}/{}", a.len(), b.len()));
+        }
+        let n = a.len().min(b.len());
+        let fields: [(&str, fn(&Pkt, &Pkt) -> bool); 5] = [
+            ("pts", |x, y| x.pts == y.pts),
+            ("dts", |x, y| x.dts == y.dts),
+            ("size", |x, y| x.size == y.size),
+            ("key", |x, y| x.keyframe == y.keyframe),
+            ("md5", |x, y| x.md5 == y.md5),
+        ];
+        for (name, same) in fields {
+            let k = (0..n).filter(|&i| !same(a[i], b[i])).count();
+            if k > 0 {
+                diffs.push(format!("{name} {k}/{n}"));
+            }
+        }
+        if !diffs.is_empty() {
+            parts.push(format!("s{s}: {}", diffs.join(", ")));
+        }
+    }
+    if ours.iter().map(|p| p.stream).ne(theirs.iter().map(|p| p.stream)) {
+        parts.push("order".into());
+    }
+    parts.join("; ")
 }
 
 /// The reads a [`Counting`] reader served, as `(offset, length)`.

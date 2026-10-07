@@ -44,6 +44,75 @@ let state = player.state(); // position, duration, playing, buffering, ended, er
 
 OxideAV crates are used at pinned git revisions; their crates.io releases lag their repositories. When a crate needs a fix, it is forked to `ayooooo123/oxideav-<name>` and `[patch.crates-io]` points the whole dependency graph at the fork. Fixes go upstream where OxideAV's clean-room rule allows.
 
+### Matroska packet compatibility
+
+The MKV fork follows at most two SeekHeads (one target per other master),
+recovers complete packets from damaged Cluster tails, reconstructs ProRes/WavPack
+payloads, and derives lace timing, TrackTimestampScale and H.264/HEVC decode
+timestamps. Untrusted input is bounded: 256 tracks, 4 MiB per CodecPrivate and
+16 MiB in total, and 32 MiB retained per Block (payload capacity, laces,
+header stripping, copies, side data and packet slots). BlockGroup children
+must fit their parents, and their stored bytes (read into buffers of exact
+size) and records are charged to that budget before they are read or held; a
+Block waiting for queue room stays within it. Duplicate BlockAddIDs are
+dropped in linear time. A Top-Level master is read for a CRC-32 only when its
+first child is one, then in fixed chunks; a third SeekHead, or a SeekHead,
+Tracks or Tags master larger than its budget (about 184 KiB, 32 MiB, 32 MiB),
+is refused before any of it is read. A CRC-32 on an Info, Cues, Chapters or
+Attachments master is still checked over its whole body (small heap, but a
+known network cost: these masters have no size budget). Every element in a
+Tracks or Tags tree must fit its parent. Only a Segment or Cluster may use the
+unknown size; any other Top-Level element doing so is InvalidData (a resilient
+open skips it, and between Clusters playback resumes at the next Cluster).
+SegmentUUID, PrevUUID and NextUUID must be 16 octets, each Info text field
+holds at most 64 KiB, and the Info masters keep at most 1 MiB. The Cues index
+keeps at most 32 MiB: past that it keeps the CuePoints that fit and records a
+damage event, and a seek past the last point kept for its track scans the
+Clusters from the first one (a known read cost on large remote files). Cluster
+records, their index, and the EncryptedBlocks and SilentTracks numbers they
+keep share one 32 MiB budget, lists included, and are recorded once even when
+a seek revisits them. A block past the budget is damage and the walk resumes
+at the next Cluster; a Cluster past it gets no record while playback and seeks
+go on. At most 4096 damage events are kept, and the rest are counted exactly.
+The 1024-packet cap counts
+virtual-track copies and the frames a lace actually holds (a one-frame EBML
+lace is InvalidData): compliant Blocks wait until held packets drain, and one
+that then fails recovers from its own offset; an individual Block needing more
+than 1024 packets is InvalidData and queues nothing. Startup analysis also
+stops at a 512 KiB retained-byte threshold, plus the bounded current Block.
+Source errors propagate, including ordinary InvalidInput reads,
+source-generated UnexpectedEof and failures met in trailing Tags, Cluster
+CRC-32s or seek landings; physical truncation remains recoverable.
+
+Packets keep FFmpeg's parser keyframe flags. The shared
+`Demuxer::packet_metadata()` snapshot separately carries the container's
+random-access signal on lace 0. The producer test checks all four Cues
+points, including parser-keyframe=false/container-keyframe=true at 4 s.
+The actual Player regression compares every one of FFmpeg's 100 post-seek
+frame MD5s. **The engine/native-gate consumer integration is separate and
+not included on this branch**; the unchanged engine still fails this test.
+
+Duration-less AAC/HE-AAC, MP3 (including MPEG-2), AC-3/E-AC-3 and DTS core
+laces now match strict FFprobe packet comparisons on nine generated/real
+fixtures, including millisecond time bases. AAC 960-sample/LD/ELD/USAC and
+14-bit/substream-only DTS frame timing are not inferred.
+
+Matroska/WebM WebVTT packets carry raw cue text to the registered subtitle
+adapter, which uses packet timestamps rather than an in-band timing line.
+`Demuxer::packet_metadata().webvtt` replaces the typed-only accessor and
+preserves each cue's identifier/settings through lacing and seeks. The
+accessor clears before the next read/seek, including errors and EOF;
+previously captured owned snapshots remain valid.
+**WebVTT settings/layout still need consumer rendering integration**; cue
+text and timing work, but exposing side data alone is not end-to-end support.
+
+`cargo test -p check-mkv -p player --no-fail-fast` compares packet fields
+directly with FFmpeg 9, checks incremental reads and malformed input, and
+exercises player subtitle dispatch. Known-wrong packet digests are not accepted:
+outstanding CodecDelay timestamp differences remain failing assertions until
+the separate AudioTrim work supplies the missing behavior.
+
+
 ## Licenses
 
 Code in this repository is MIT unless a crate says otherwise. Decoders with no public specification (TrueHD/MLP, several Windows Media and RealMedia codecs) are ports of FFmpeg's LGPL-2.1-or-later decoders; each such crate is LGPL-2.1-or-later, carries its own LICENSE, and ports only FFmpeg files whose headers say LGPL.
