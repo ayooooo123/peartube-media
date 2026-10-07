@@ -32,6 +32,14 @@ pub enum Mode {
     Delayed,
     /// Two frames per packet (halves), right after it is sent.
     Split,
+    /// As `Direct`, but the first packet decodes to nothing (an Opus
+    /// decoder whose pre-skip covers it does that).
+    DropFirst,
+}
+
+impl Mode {
+    const ALL: [(Mode, &'static str); 4] =
+        [(Mode::Direct, "direct"), (Mode::Delayed, "delayed"), (Mode::Split, "split"), (Mode::DropFirst, "dropfirst")];
 }
 
 /// One packet: its duration at the declared rate, and its trim.
@@ -63,11 +71,16 @@ pub struct Spec {
     /// the first packet's skip, `max(skip - (pts - start_pts), 0)`, as
     /// FFmpeg's mov demuxer does (`mov_get_skip_samples`).
     pub skip_after_seek: bool,
+    /// The decoder stamps each frame with the pts of the packet it decoded.
+    pub stamp: bool,
+    /// Packets declare their durations.
+    pub durations: bool,
 }
 
 impl Spec {
-    /// `count` packets of `duration` declared samples, decoded at the
-    /// declared rate, without trims.
+    /// `count` packets of `duration` declared samples with durations,
+    /// decoded at the declared rate into frames without pts, without
+    /// trims.
     pub fn new(channels: u16, rate: u32, duration: u32, count: usize) -> Spec {
         Spec {
             channels,
@@ -77,6 +90,8 @@ impl Spec {
             start_pts: 0,
             packets: vec![FixturePacket { duration, skip: 0, discard: 0, trim_rate: rate }; count],
             skip_after_seek: false,
+            stamp: false,
+            durations: true,
         }
     }
 
@@ -92,14 +107,16 @@ impl Spec {
 
     /// The fixture file's bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mode = match self.mode {
-            Mode::Direct => "direct",
-            Mode::Delayed => "delayed",
-            Mode::Split => "split",
-        };
+        let mode = Mode::ALL.iter().find(|m| m.0 == self.mode).map_or("direct", |m| m.1);
         let mut s = format!(
-            "{} {} {} {mode} {} {}\n",
-            self.channels, self.declared_rate, self.output_rate, self.start_pts, self.skip_after_seek as u8
+            "{} {} {} {mode} {} {} {} {}\n",
+            self.channels,
+            self.declared_rate,
+            self.output_rate,
+            self.start_pts,
+            self.skip_after_seek as u8,
+            self.stamp as u8,
+            self.durations as u8
         );
         for p in &self.packets {
             s.push_str(&format!("{} {} {} {}\n", p.duration, p.skip, p.discard, p.trim_rate));
@@ -112,13 +129,8 @@ impl Spec {
         let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
         let mut lines = text.lines();
         let head: Vec<&str> = lines.next().ok_or_else(bad)?.split_whitespace().collect();
-        let [channels, declared, output, mode, start, seek] = head[..] else { return Err(bad()) };
-        let mode = match mode {
-            "direct" => Mode::Direct,
-            "delayed" => Mode::Delayed,
-            "split" => Mode::Split,
-            _ => return Err(bad()),
-        };
+        let [channels, declared, output, mode, start, seek, stamp, durations] = head[..] else { return Err(bad()) };
+        let mode = Mode::ALL.iter().find(|m| m.1 == mode).ok_or_else(bad)?.0;
         let mut packets = Vec::new();
         for line in lines {
             let f: Vec<u32> = line.split_whitespace().map(str::parse).collect::<std::result::Result<_, _>>().map_err(|_| bad())?;
@@ -133,6 +145,8 @@ impl Spec {
             start_pts: start.parse().map_err(|_| bad())?,
             packets,
             skip_after_seek: seek == "1",
+            stamp: stamp == "1",
+            durations: durations == "1",
         };
         if spec.channels == 0 || spec.declared_rate == 0 || spec.output_rate == 0 {
             return Err(bad());
@@ -197,12 +211,8 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     params.sample_rate = Some(spec.declared_rate);
     params.channels = Some(spec.channels);
     params.sample_format = Some(SampleFormat::F32);
-    let mode = match spec.mode {
-        Mode::Direct => 0u8,
-        Mode::Delayed => 1,
-        Mode::Split => 2,
-    };
-    params.extradata = [&[mode][..], &spec.output_rate.to_le_bytes(), &spec.channels.to_le_bytes()].concat();
+    let mode = Mode::ALL.iter().position(|m| m.0 == spec.mode).unwrap_or(0) as u8;
+    params.extradata = [&[mode, spec.stamp as u8][..], &spec.output_rate.to_le_bytes(), &spec.channels.to_le_bytes()].concat();
     let time_base = TimeBase::new(1, i64::from(spec.declared_rate));
     let stream = StreamInfo { index: 0, time_base, duration: None, start_time: None, params };
     let mut starts = Vec::with_capacity(spec.packets.len());
@@ -242,7 +252,7 @@ impl Demuxer for FixtureDemuxer {
         let mut packet = Packet::new(0, self.streams[0].time_base, data);
         packet.pts = Some(pts);
         packet.dts = Some(pts);
-        packet.duration = Some(i64::from(p.duration));
+        packet.duration = self.spec.durations.then_some(i64::from(p.duration));
         packet.flags.keyframe = true;
         let skip = self.seek_skip.take().unwrap_or(p.skip);
         if skip > 0 || p.discard > 0 {
@@ -271,29 +281,44 @@ impl Demuxer for FixtureDemuxer {
 
 struct FixtureDecoder {
     id: CodecId,
-    mode: u8,
+    mode: Mode,
+    stamp: bool,
     format: AudioFormat,
-    held: Option<(u64, u32)>,
+    /// Delayed: the packet not output yet, as (first, count, pts).
+    held: Option<(u64, u32, Option<i64>)>,
+    sent: usize,
     queue: VecDeque<Frame>,
     flushed: bool,
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let e = &params.extradata;
-    if e.len() != 7 {
-        return Err(Error::invalid("refcheck trim fixture: extradata"));
+    let bad = || Error::invalid("refcheck trim fixture: extradata");
+    if e.len() != 8 {
+        return Err(bad());
     }
+    let mode = Mode::ALL.get(usize::from(e[0])).ok_or_else(bad)?.0;
     let format = AudioFormat {
         sample_format: SampleFormat::F32,
-        sample_rate: u32::from_le_bytes([e[1], e[2], e[3], e[4]]),
-        channels: u16::from_le_bytes([e[5], e[6]]),
+        sample_rate: u32::from_le_bytes([e[2], e[3], e[4], e[5]]),
+        channels: u16::from_le_bytes([e[6], e[7]]),
     };
-    Ok(Box::new(FixtureDecoder { id: CodecId::new(CODEC), mode: e[0], format, held: None, queue: VecDeque::new(), flushed: false }))
+    Ok(Box::new(FixtureDecoder {
+        id: CodecId::new(CODEC),
+        mode,
+        stamp: e[1] == 1,
+        format,
+        held: None,
+        sent: 0,
+        queue: VecDeque::new(),
+        flushed: false,
+    }))
 }
 
 impl FixtureDecoder {
-    fn emit(&mut self, first: u64, count: u32) {
+    fn emit(&mut self, first: u64, count: u32, pts: Option<i64>) {
         let channels = self.format.channels as usize;
+        let pts = if self.stamp { pts } else { None };
         let frame = |first: u64, count: u32| {
             let mut bytes = Vec::with_capacity(count as usize * channels * 4);
             for i in 0..u64::from(count) {
@@ -301,9 +326,9 @@ impl FixtureDecoder {
                     bytes.extend_from_slice(&value(first + i, c).to_le_bytes());
                 }
             }
-            Frame::Audio(AudioFrame { samples: count, pts: None, data: vec![bytes] })
+            Frame::Audio(AudioFrame { samples: count, pts, data: vec![bytes] })
         };
-        if self.mode == 2 {
+        if self.mode == Mode::Split {
             let half = count / 2;
             self.queue.push_back(frame(first, half));
             self.queue.push_back(frame(first + u64::from(half), count - half));
@@ -325,12 +350,15 @@ impl Decoder for FixtureDecoder {
         }
         let first = u64::from_le_bytes(d[..8].try_into().unwrap());
         let count = u32::from_le_bytes(d[8..].try_into().unwrap());
-        if self.mode == 1 {
-            if let Some((f, c)) = self.held.replace((first, count)) {
-                self.emit(f, c);
+        self.sent += 1;
+        match self.mode {
+            Mode::Delayed => {
+                if let Some((f, c, pts)) = self.held.replace((first, count, packet.pts)) {
+                    self.emit(f, c, pts);
+                }
             }
-        } else {
-            self.emit(first, count);
+            Mode::DropFirst if self.sent == 1 => {}
+            _ => self.emit(first, count, packet.pts),
         }
         Ok(())
     }
@@ -344,8 +372,8 @@ impl Decoder for FixtureDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        if let Some((f, c)) = self.held.take() {
-            self.emit(f, c);
+        if let Some((f, c, pts)) = self.held.take() {
+            self.emit(f, c, pts);
         }
         self.flushed = true;
         Ok(())

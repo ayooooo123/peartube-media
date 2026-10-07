@@ -115,6 +115,14 @@ fn padding_reaches_the_tail_a_delayed_decoder_drains() {
 }
 
 #[test]
+fn mid_stream_padding_stays_with_the_packet_a_delayed_decoder_outputs_late() {
+    let mut spec = Spec::new(1, 48000, 4, 3);
+    spec.mode = Mode::Delayed;
+    spec.packets[1].discard = 1;
+    assert_plays(&spec, vec![(0, 7), (8, 12)]);
+}
+
+#[test]
 fn padding_spans_the_frames_of_one_packet() {
     let mut spec = Spec::new(1, 48000, 1024, 3);
     spec.mode = Mode::Split;

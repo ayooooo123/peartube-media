@@ -1468,7 +1468,7 @@ fn run_audio_thread(
                         break;
                     }
                     let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
-                    trimmer.frame(chunk, &mut kept);
+                    trimmer.frame(chunk, af.pts, &mut kept);
                     if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
                         break;
                     }
@@ -1499,7 +1499,7 @@ fn run_audio_thread(
         match send_res {
             Ok(Ok(())) => {
                 consecutive_errors = 0;
-                trimmer.packet(metadata.audio_trim);
+                trimmer.packet(&packet, metadata.audio_trim);
             }
             Ok(Err(_)) | Err(_) => {
                 consecutive_errors += 1;
@@ -1550,7 +1550,7 @@ fn run_audio_thread(
             };
             let Frame::Audio(af) = frame else { continue };
             let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
-            trimmer.frame(chunk, &mut kept);
+            trimmer.frame(chunk, af.pts, &mut kept);
             if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
                 // Stopped, retired or a seek: the rest of this packet is stale.
                 break;

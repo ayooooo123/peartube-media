@@ -115,7 +115,7 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
             Ok(packet) if packet.stream_index == stream.index => {
                 let metadata = demuxer.packet_metadata();
                 decoder.send_packet(&packet).unwrap_or_else(|e| panic!("send_packet: {e}"));
-                out.trimmer.packet(metadata.audio_trim);
+                out.trimmer.packet(&packet, metadata.audio_trim);
                 out.drain(&mut decoder, &stream);
             }
             Ok(_) => {}
@@ -152,6 +152,7 @@ impl Output {
             match frame {
                 Frame::Audio(frame) => {
                     let layout = read_layout(reported, &stream.params, &frame);
+                    let pts = frame.pts;
                     let piece = Piece {
                         frame,
                         reported,
@@ -160,7 +161,7 @@ impl Output {
                         rate: layout.sample_rate,
                         time_base: stream.time_base,
                     };
-                    self.trimmer.frame(piece, &mut self.kept);
+                    self.trimmer.frame(piece, pts, &mut self.kept);
                     for piece in self.kept.drain(..) {
                         self.frames.push(Frame::Audio(piece.frame));
                         self.frame_formats.push(piece.reported);
@@ -714,6 +715,37 @@ mod tests {
         spec.packets[0].skip = 1500;
         spec.packets[3].discard = 300;
         assert_eq!(decode_fixture(&spec), range(1500, 4 * 1024 - 300));
+    }
+
+    #[test]
+    fn padding_stays_with_the_packet_a_delayed_decoder_outputs_late() {
+        // The decoder returns each packet's samples after the next packet
+        // is sent: packet 1's padding is sample 7, whenever it comes out.
+        let mut spec = Spec::new(1, 48000, 4, 3);
+        spec.mode = Mode::Delayed;
+        spec.packets[1].discard = 1;
+        assert_eq!(decode_fixture(&spec), vec![(0, 7), (8, 12)]);
+    }
+
+    #[test]
+    fn stamped_frames_find_their_packet_after_one_that_decoded_to_nothing() {
+        // The first packet decodes to nothing; the frames carry their
+        // packet's pts, so packet 2's padding stays on packet 2's samples.
+        let mut spec = Spec::new(1, 48000, 1024, 4);
+        spec.mode = Mode::DropFirst;
+        spec.stamp = true;
+        spec.packets[2].discard = 100;
+        assert_eq!(decode_fixture(&spec), vec![(1024, 3 * 1024 - 100), (3 * 1024, 4 * 1024)]);
+    }
+
+    #[test]
+    fn without_durations_or_pts_output_follows_the_order_packets_were_sent() {
+        // As Ogg Opus: no packet durations, unstamped frames.
+        let mut spec = Spec::new(1, 48000, 1024, 4);
+        spec.mode = Mode::DropFirst;
+        spec.durations = false;
+        spec.packets[2].discard = 100;
+        assert_eq!(decode_fixture(&spec), vec![(1024, 3 * 1024 - 100), (3 * 1024, 4 * 1024)]);
     }
 
     #[test]
