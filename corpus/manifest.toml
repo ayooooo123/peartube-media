@@ -667,6 +667,35 @@ path = "fate:mpegts/h264small.ts"
 rows = ["container:mpeg_ts"]
 compare = ["video:md5"]
 
+# MPEG-TS with the codecs the mpegts fork's FFmpeg parser stage splits
+# besides H.264, AAC, AC-3 and MP2: DTS, TrueHD, Opus, HEVC. (AAC in LATM
+# is checked by crates/check-mpegts and check-aac: FATE's LATM sample
+# changes from stereo to 5.1, which FFmpeg's CLI output keeps at stereo.)
+[[entry]]
+path = "gen:h264_dts.ts"
+rows = ["audio:dts", "container:mpeg_ts"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:h264_truehd.ts"
+rows = ["audio:truehd", "container:mpeg_ts"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:dts/dts.ts"
+rows = ["audio:dts", "container:mpeg_ts"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:opus/test-8-7.1.opus-small.ts"
+rows = ["audio:opus", "container:mpeg_ts"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:lcevc/L_HEVC_640x360p_8bit8bit_2D_dd.ts"
+rows = ["video:hevc", "container:mpeg_ts"]
+compare = ["video:md5"]
+
 [[entry]]
 path = "gen:audio.flac"
 rows = ["container:raw_flac"]

@@ -127,7 +127,7 @@ oxideav-mp3 = { git = "https://github.com/OxideAV/oxideav-mp3", rev = "eef86cb33
 oxideav-mp4 = { git = "https://github.com/OxideAV/oxideav-mp4", rev = "2bcca725fb8d450fc4aad60cb3528a981878af41" }
 oxideav-mpeg12video = { git = "https://github.com/ayooooo123/oxideav-mpeg12video", rev = "9c4c24c2d336ffde2e23f29d55812e75c40d780a" }
 oxideav-mpeg4video = { git = "https://github.com/ayooooo123/oxideav-mpeg4video", rev = "ac636cd9e44744a17088cb6a4b02ed02ba232a49" }
-oxideav-mpegts = { git = "https://github.com/ayooooo123/oxideav-mpegts", rev = "5f6f300fd627c0e4e96a046d71e85b3aec86e059" }
+oxideav-mpegts = { git = "https://github.com/ayooooo123/oxideav-mpegts", rev = "cae69e3c911a830b07e8e35b1b88e26f2e842b62" }
 oxideav-msmpeg4 = { git = "https://github.com/OxideAV/oxideav-msmpeg4", rev = "f0de9a8c24ca29c79ee453a39f8c4a052334c8a9" }
 oxideav-musepack = { git = "https://github.com/OxideAV/oxideav-musepack", rev = "c60b07708683e0e25c6e0007bffbb887e03876f7" }
 oxideav-ogg = { git = "https://github.com/OxideAV/oxideav-ogg", rev = "0ad414f1f3db6dd28a658e63d4c83ffcb6ea4745" }
