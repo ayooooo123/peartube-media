@@ -21,7 +21,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Packet, ProbeData, RuntimeContext, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, ProbeData, RuntimeContext, Segment, SubtitleCue, TimeBase};
 use refcheck::fate;
 
 const DECODER_TRIALS: usize = 2000;
@@ -54,9 +54,15 @@ const TOKENS: &[&[u8]] = &[
     b"<SYNC Start=", b"<P Class=", b"[00:00:01]", b"WEBVTT\n", b"<text>", b"<subtitle start=\"",
 ];
 
+/// Integer edges that text parsers convert into 32- and 64-bit fields.
+const EDGES: &[&[u8]] = &[
+    b"-2147483648", b"2147483647", b"-2147483649", b"4294967295", b"4294967296", b"-9223372036854775808",
+    b"9223372036854775807", b"18446744073709551615", b"99999999999999999999", b"0", b"-1",
+];
+
 fn mutate(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
     let mut out = data.to_vec();
-    match rng.below(7) {
+    match rng.below(8) {
         0 => out.truncate(rng.below(out.len() + 1)),
         1 => {
             for _ in 0..1 + rng.below(8) {
@@ -91,6 +97,19 @@ fn mutate(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
                 let copy = out[a..b].to_vec();
                 let at = rng.below(out.len() + 1);
                 out.splice(at..at, copy);
+            }
+        }
+        6 => {
+            // One number in the data (with its sign) becomes an integer edge.
+            let starts: Vec<usize> =
+                (0..out.len()).filter(|&i| out[i].is_ascii_digit() && (i == 0 || !out[i - 1].is_ascii_digit())).collect();
+            if !starts.is_empty() {
+                let mut a = starts[rng.below(starts.len())];
+                let b = a + out[a..].iter().take_while(|c| c.is_ascii_digit()).count();
+                if a > 0 && out[a - 1] == b'-' {
+                    a -= 1;
+                }
+                out.splice(a..b, EDGES[rng.below(EDGES.len())].iter().copied());
             }
         }
         _ => {
@@ -172,6 +191,12 @@ fn mutate_packets(codec: &str, params: &CodecParameters, packets: &[Packet], see
         let k = trial % packets.len();
         let mut mutated = packets[k].clone();
         mutated.data = mutate(&mut rng, &mutated.data);
+        // Every fourth trial the container's times are at their edges too.
+        if trial % 4 == 3 {
+            const TIMES: [Option<i64>; 7] = [None, Some(i64::MIN), Some(i64::MIN + 1), Some(-1), Some(0), Some(i64::MAX - 1), Some(i64::MAX)];
+            mutated.pts = TIMES[rng.below(TIMES.len())];
+            mutated.duration = TIMES[rng.below(TIMES.len())];
+        }
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut decoder = ctx.codecs.first_decoder(params).unwrap();
             for p in &packets[..k] {
@@ -183,7 +208,13 @@ fn mutate_packets(codec: &str, params: &CodecParameters, packets: &[Packet], see
             }
             finish(&mut decoder);
         }));
-        assert!(result.is_ok(), "{codec} trial {trial}: packet {k} mutated to {:?} panicked", String::from_utf8_lossy(&mutated.data));
+        assert!(
+            result.is_ok(),
+            "{codec} trial {trial}: packet {k} (pts {:?}, duration {:?}) mutated to {:?} panicked",
+            mutated.pts,
+            mutated.duration,
+            String::from_utf8_lossy(&mutated.data)
+        );
     }
     if params.extradata.is_empty() {
         return;
@@ -291,6 +322,71 @@ fn cmml_hand_written_document() {
     mutate_packets("cmml", &params, &[packet], 14);
 }
 
+/// The one cue `packet` decodes to through the production registry.
+fn decode_one(params: &CodecParameters, packet: &Packet) -> SubtitleCue {
+    let mut decoder = codecs::context().codecs.first_decoder(params).unwrap();
+    decoder.send_packet(packet).unwrap();
+    match decoder.receive_frame() {
+        Ok(Frame::Subtitle(cue)) => cue,
+        other => panic!("{params:?} decoded to {other:?}"),
+    }
+}
+
+fn shown_text(segments: &[Segment], out: &mut String) {
+    for segment in segments {
+        match segment {
+            Segment::Text(t) | Segment::Raw(t) => out.push_str(t),
+            Segment::LineBreak => out.push('\n'),
+            Segment::Bold(c) | Segment::Italic(c) | Segment::Underline(c) | Segment::Strike(c)
+            | Segment::Color { children: c, .. } | Segment::Font { children: c, .. }
+            | Segment::Voice { children: c, .. } | Segment::Class { children: c, .. }
+            | Segment::Karaoke { children: c, .. } => shown_text(c, out),
+            Segment::Timestamp { .. } => {}
+        }
+    }
+}
+
+/// A CodecPrivate style's alignment is any 32-bit number. Numpad columns
+/// 1/4/7 and 3/6/9 align left and right; everything else, including the
+/// i32 edges a crafted header carries, is centred and still shows the cue.
+#[test]
+fn ass_style_alignment_edges_through_the_registry() {
+    use oxideav_core::TextAlign::{Left, Right};
+    for (alignment, expected) in [
+        ("-2147483648", None),
+        ("2147483647", None),
+        ("0", None),
+        ("1", Some(Left)),
+        ("2", None),
+        ("9", Some(Right)),
+        ("10", None),
+    ] {
+        let mut params = CodecParameters::subtitle(CodecId::new("ass"));
+        params.extradata = format!("[V4+ Styles]\nFormat: Name,Alignment\nStyle: Default,{alignment}\n").into_bytes();
+        let packet = Packet::new(0, TimeBase::new(1, 1000), b"0,0,Default,,0,0,0,,x".to_vec()).with_pts(0).with_duration(1000);
+        let cue = catch_unwind(AssertUnwindSafe(|| decode_one(&params, &packet)))
+            .unwrap_or_else(|_| panic!("alignment {alignment} panicked the ass decoder"));
+        let mut text = String::new();
+        shown_text(&cue.segments, &mut text);
+        assert_eq!((text.as_str(), cue.positioning.map(|p| p.align)), ("x", expected), "alignment {alignment}");
+    }
+}
+
+/// Container times at the i64 edges around an inline WebVTT cue timestamp:
+/// the timestamp is hidden and the text shows.
+#[test]
+fn webvtt_inline_timestamp_at_extreme_packet_times() {
+    let params = CodecParameters::subtitle(CodecId::new("webvtt"));
+    for (pts, duration) in [(i64::MIN + 11, i64::MAX), (i64::MAX - 20, 10), (0, i64::MAX)] {
+        let packet = Packet::new(0, TimeBase::new(1, 1000), b"a<00:00:00.006>b".to_vec()).with_pts(pts).with_duration(duration);
+        let cue = catch_unwind(AssertUnwindSafe(|| decode_one(&params, &packet)))
+            .unwrap_or_else(|_| panic!("pts {pts} duration {duration} panicked the webvtt decoder"));
+        let mut text = String::new();
+        shown_text(&cue.segments, &mut text);
+        assert_eq!(text, "ab", "pts {pts} duration {duration}");
+    }
+}
+
 /// The registered demuxer `container`, then the production decoders, over
 /// `data`; the number of cues decoded.
 fn run_file(ctx: &RuntimeContext, container: &str, data: Vec<u8>) -> usize {
@@ -349,7 +445,9 @@ const FILES: [&str; 12] = [
 ];
 
 /// Every probe the player's registry runs on an opened file sees the same
-/// mutated and truncated subtitle files.
+/// mutated and truncated subtitle files. The first trial of each file is
+/// fixed: its tail damaged into a byte-swapped AC-3 sync word followed by
+/// five bytes, which once read past the buffer in an audio probe.
 #[test]
 fn registered_probes_survive_mutated_subtitle_files() {
     let ctx = codecs::context();
@@ -359,7 +457,7 @@ fn registered_probes_survive_mutated_subtitle_files() {
         let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
         let mut rng = Rng(100 + n as u64);
         for trial in 0..FILE_TRIALS {
-            let data = mutate(&mut rng, &raw);
+            let data = if trial == 0 { [&raw[..], b"w\x0b12345"].concat() } else { mutate(&mut rng, &raw) };
             let probe = ProbeData { buf: &data, ext: ext.as_deref() };
             let result = catch_unwind(AssertUnwindSafe(|| ctx.containers.probe_candidates(&probe).len()));
             assert!(result.is_ok(), "{sample} trial {trial}: probing {:?} panicked", String::from_utf8_lossy(&data));

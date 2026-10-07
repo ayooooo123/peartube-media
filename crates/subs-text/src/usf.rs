@@ -204,7 +204,7 @@ pub fn decode_usf_payload(
     });
     let packet_end = match (packet_start, packet.duration) {
         (Some(start), Some(dur)) => {
-            Some(start + packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000)))
+            Some(start.saturating_add(packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000))))
         }
         _ => None,
     };

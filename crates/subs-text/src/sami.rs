@@ -336,12 +336,12 @@ impl SamiDecoder {
         // If duration is unset (-1), fallback to UINT32_MAX ms (matching FFmpeg)
         let end_us = if let Some(dur) = packet.duration {
             if dur >= 0 {
-                start_us + packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000))
+                start_us.saturating_add(packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000)))
             } else {
-                start_us + (u32::MAX as i64) * 1_000
+                start_us.saturating_add(i64::from(u32::MAX) * 1_000)
             }
         } else {
-            start_us + (u32::MAX as i64) * 1_000
+            start_us.saturating_add(i64::from(u32::MAX) * 1_000)
         };
 
         Ok(Some(SubtitleCue {

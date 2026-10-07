@@ -80,7 +80,7 @@ pub fn decode_cmml_payload(
     });
     let packet_end = match (packet_start, packet.duration) {
         (Some(start), Some(dur)) if dur > 0 => {
-            Some(start + packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000)))
+            Some(start.saturating_add(packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000))))
         }
         _ => None,
     };

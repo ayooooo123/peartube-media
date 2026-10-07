@@ -214,8 +214,10 @@ pub fn webvtt_to_ass(p: &[u8], cue_start_ms: i64, cue_end_ms: i64) -> Vec<u8> {
             let len = close + 1;
             if len > 2 {
                 if let Some(ts) = cue_timestamp(&p[i + 1..], len - 2, cue_start_ms, cue_end_ms, prev_ts) {
-                    let end_cs = (ts - cue_start_ms + 5) / 10;
-                    flush_segment(&mut out, &mut seg, end_cs - start_cs);
+                    // Container times reach the i64 edges; FFmpeg's sums are
+                    // kept, saturated rather than overflowing.
+                    let end_cs = ts.saturating_sub(cue_start_ms).saturating_add(5) / 10;
+                    flush_segment(&mut out, &mut seg, end_cs.saturating_sub(start_cs));
                     start_cs = end_cs;
                     prev_ts = ts;
                     i += len;
@@ -243,7 +245,11 @@ pub fn webvtt_to_ass(p: &[u8], cue_start_ms: i64, cue_end_ms: i64) -> Vec<u8> {
         }
         i += 1;
     }
-    let final_cs = if prev_ts < 0 { 0 } else { (cue_end_ms - cue_start_ms + 5) / 10 - start_cs };
+    let final_cs = if prev_ts < 0 {
+        0
+    } else {
+        (cue_end_ms.saturating_sub(cue_start_ms).saturating_add(5) / 10).saturating_sub(start_cs)
+    };
     flush_segment(&mut out, &mut seg, final_cs);
     out
 }

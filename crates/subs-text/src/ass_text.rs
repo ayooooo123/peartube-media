@@ -214,9 +214,11 @@ pub fn event_to_cue(header: &AssHeader, style: &[u8], text: &[u8], start_us: i64
     // An unterminated override block ends the shown text there, as it ends
     // FFmpeg's encode of the event.
     let _ = split_override_codes(&mut builder, text);
-    let align = match (builder.alignment - 1).rem_euclid(3) {
-        0 if (1..=9).contains(&builder.alignment) => Some(TextAlign::Left),
-        2 if (1..=9).contains(&builder.alignment) => Some(TextAlign::Right),
+    // A style's alignment is any 32-bit number from the header: only numpad
+    // columns align, everything else is centred.
+    let align = match builder.alignment {
+        1 | 4 | 7 => Some(TextAlign::Left),
+        3 | 6 | 9 => Some(TextAlign::Right),
         _ => None,
     };
     SubtitleCue {
