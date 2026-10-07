@@ -254,6 +254,7 @@ dependencies = [
  "oxideav-wavpack",
  "oxideav-wma",
  "refcheck",
+ "subs-bitmap",
  "subs-text",
 ]
 
