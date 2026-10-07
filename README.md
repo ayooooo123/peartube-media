@@ -140,3 +140,26 @@ Codec-version rows require genuine inputs: generated `wmv1_wma1.asf` covers WMV1
 WMA v1/v2 decoder opening rejects zero sample rates and channel counts before deriving block sizes. The robustness suite covers both invalid dimensions with variable-block coding enabled; valid ASF playback remains covered by the production-registry corpus.
 
 The AVI fork preserves WAVEFORMATEX block alignment for WMA v1/v2 decoder initialization. Production-registry regressions and actual Player playback cover both codecs; the existing AVI restriction requiring zero `dwSampleSize` for WMA remains. Generated regression files explicitly set that field to zero rather than claiming unsupported ordinary FFmpeg AVI headers work.
+### AAC reference oracles
+
+`cargo test -j 2 -p check-aac -- --nocapture` covers the AAC fork through
+the production demuxers/decoder. All 27 legacy and eight unaffected USAC
+FFmpeg floors are retained. Canonical `xhe_target_level.m4a` instead uses
+the independently verified libxaac reference: FFmpeg 2da55bf does not
+prime its AudioPreRoll and has a different first-channel noise seed.
+
+Sixteen external ISO/IEC 23003-7 FD vectors exercise complex coefficients,
+previous-frame prediction, short windows, TNS, STOP_START and noise filling.
+Tests compare every presented sample with ISO PCM and every raw sample
+with native libxaac, keeping MP4 edit-list trimming separate from decoding.
+Per-channel floors are the measured baseline minus 0.5 dB. A separate
+independent-window TNS equivalence fixture leaves every canonical input
+unchanged. Setup, exact native commands, hashes and limits:
+[ISO corpus](crates/check-aac/tests/data/iso-usac/README.md) and
+[canonical xhe](crates/check-aac/tests/data/libxaac/README.md).
+
+Release speed smoke on the development Mac: mono LC 300.2x, stereo LC
+154.1x, HE-AAC v2 115.1x, 96 kHz six-channel LC 31.5x, canonical xhe
+525.4x, and ISO 44.1 kHz window-switched complex prediction 211.5x real
+time (`cargo run --release -p check-aac --example speed -- <paths>`).
+These are codec measurements, not phone or full Player acceptance.
