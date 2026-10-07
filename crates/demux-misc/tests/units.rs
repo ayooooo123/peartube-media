@@ -1,9 +1,13 @@
 //! Raw elementary-stream units at the edges FFmpeg's parsers leave to
-//! chance, through the player's registry: the unit an AC-3 / E-AC-3
-//! parser hands over at the end of the input is timed from its own
-//! header, like every unit before it. A file of one frame has a timestamp
-//! and seeks to it, and a last E-AC-3 frame with fewer blocks lasts those
-//! blocks, not the frame before it.
+//! chance, through the player's registry:
+//! - the unit an AC-3 / E-AC-3 parser hands over at the end of the input
+//!   is timed from its own header, like every unit before it: a file of
+//!   one frame has a timestamp and seeks to it, and a last E-AC-3 frame
+//!   with fewer blocks lasts those blocks, not the frame before it;
+//! - H.264 SEI payload type and size codes sum without wrapping: a sum
+//!   past 32 bits rejects the SEI instead of reading a valid-looking type
+//!   or size out of the overflow, and a real recovery point still flags
+//!   its access unit key.
 
 use oxideav_core::{Demuxer, Error, Packet};
 use refcheck::fate;
@@ -86,4 +90,39 @@ fn the_last_eac3_frame_lasts_its_own_blocks() {
         [(Some(0), Some(2880)), (Some(2880), Some(2880)), (Some(5760), Some(2880)), (Some(8640), Some(2880)), (Some(11520), Some(480))],
         "pts and duration of each frame"
     );
+}
+
+// ───────────────────────── H.264 SEI ─────────────────────────
+
+/// An Annex B NAL unit.
+fn nal(header: u8, body: &[u8]) -> Vec<u8> {
+    [&[0, 0, 0, 1, header][..], body].concat()
+}
+
+/// The key flag of the access unit made of an SEI NAL carrying `message`
+/// and a P slice (first_mb 0, slice_type 0, pps 0) with no parameter
+/// sets: key only for a recovery point.
+fn key_flag(message: &[u8]) -> bool {
+    let mut stream = nal(0x06, &[message, &[0x80]].concat());
+    stream.extend(nal(0x41, &[0xE0, 0x00]));
+    let (_, packets) = demux("h264", stream);
+    assert_eq!(packets.len(), 1, "one access unit");
+    packets[0].flags.keyframe
+}
+
+/// Payload type and size are sums of bytes, 255 meaning "more follows".
+/// 16843009 bytes of 255 then 7 sum to 2^32 + 6, which a 32-bit sum reads
+/// as 6, a recovery point; then 2^32 + 1 as a size, which it reads as 1.
+/// Both are unrepresentable and reject the SEI. A recovery point stays a
+/// key, another message type does not make one.
+#[test]
+fn sei_type_and_size_sums_never_wrap() {
+    assert!(key_flag(&[6, 1, 0x80]), "recovery point with recovery_frame_cnt 0");
+    assert!(!key_flag(&[5, 1, 0x80]), "user data unregistered");
+
+    let run = vec![0xFF; 16_843_009];
+    let wrapped_type = [&run[..], &[7, 1, 0x80]].concat();
+    assert!(!key_flag(&wrapped_type), "payload type 2^32 + 6 is no recovery point");
+    let wrapped_size = [&[6][..], &run, &[2, 0x80]].concat();
+    assert!(!key_flag(&wrapped_size), "payload size 2^32 + 1 is no 1-byte recovery point");
 }

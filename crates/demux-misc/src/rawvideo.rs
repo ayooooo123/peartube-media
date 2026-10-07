@@ -426,7 +426,9 @@ fn rbsp(unit: &[u8], from: usize) -> Cow<'_, [u8]> {
 }
 
 /// ff_h264_sei_decode as far as recovery points: whether a valid one is
-/// in the SEI payload `sei` before a message FFmpeg fails on.
+/// in the SEI payload `sei` before a message FFmpeg fails on. A payload
+/// type or size is a sum of bytes; one past 32 bits is no value FFmpeg
+/// holds, and ends the SEI before anything reads it.
 fn sei_recovery_point(sei: &[u8]) -> bool {
     let mut p = 0;
     while sei.len() - p > 2 && (sei[p] != 0 || sei[p + 1] != 0) {
@@ -435,13 +437,14 @@ fn sei_recovery_point(sei: &[u8]) -> bool {
             loop {
                 let b = *sei.get(p)?;
                 p += 1;
-                v += u32::from(b);
+                v = v.checked_add(u32::from(b))?;
                 if b != 255 {
                     return Some(v);
                 }
             }
         };
-        let (Some(kind), Some(size)) = (read(), read()) else { return false };
+        let Some(kind) = read() else { return false };
+        let Some(size) = read() else { return false };
         let size = size as usize;
         if size > sei.len() - p {
             return false;
