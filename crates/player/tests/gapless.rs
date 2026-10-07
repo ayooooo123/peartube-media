@@ -4,7 +4,8 @@
 //! FATE samples (tests/fate/gapless.mak, demux.mak): Ogg Opus with end
 //! padding past the final granule, AAC in MP4 with iTunSMPB and edit-list
 //! priming and padding (HE-AAC v2 too), MP3 with LAME delay and padding
-//! (and an iTunes MP3 FFmpeg trims nothing from).
+//! (and an iTunes MP3 with iTunSMPB counts). The oracle is the FFmpeg the
+//! ports follow (2da55bf); the one on PATH predates its iTunes MP3 trims.
 
 use std::sync::Arc;
 
@@ -45,7 +46,7 @@ fn playback_has_ffmpegs_samples_and_refchecks() {
     for rel in SAMPLES {
         let path = refcheck::fate(rel);
         let (played, channels) = play(&path);
-        let ff = refcheck::ffmpeg_audio_f32(&path, 0);
+        let ff = refcheck::ffmpeg_src_audio_f32(&path, 0);
         let decoded = refcheck::decode(&path, &[codecs::register_all], MediaType::Audio, 0);
         let kept = refcheck::interleaved_f32(&decoded);
         let snr = refcheck::try_snr_db(&ff, &played, usize::MAX);
