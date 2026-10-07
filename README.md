@@ -26,7 +26,7 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 - **Native packet framing**: AVC/HEVC packet framing comes from the stream's configuration, not a per-packet start-code guess. A valid AVCC length of 256–511 starts with `00 00 01`; misreading it as Annex B corrupts the native decoder's input.
 - **Presentation**: software frames wait against the live master clock, with a sink-specific enqueue lead. Android recomputes each MediaCodec release target from the clock rather than committing a distant, uninterruptible deadline. Apple attaches the video renderer to the audio's `AVSampleBufferRenderSynchronizer`; video-only playback uses its own timebase anchored to the engine clock. Neither Apple path uses `DisplayImmediately`. Layer work stays on the main thread, and a failed layer (`requiresFlushToResumeDecoding`) is flushed and re-fed from a keyframe.
 - **Lifecycle**: `open` takes no surface; `set_surface` attaches or detaches one (Android `SurfaceView` callbacks, macOS/iOS view moves). `suspend` / `resume` follow the activity: stop audio, release the platform decoder and surface, resume at the last position.
-- **Subtitles**: text, ASS and bitmap subtitles render to RGBA on an overlay above the video (a second `SurfaceView` on Android, a `CALayer` on Apple).
+- **Subtitles**: text, ASS and bitmap subtitles render to RGBA on an overlay above the video (a second `SurfaceView` on Android, a `CALayer` on Apple). Bitmap frames are display states: `VideoFrame::display_duration` supplies a known end; otherwise the next frame replaces the state, with a blank frame clearing it. Packet duration is not a bitmap display timeout. Bitmap coordinates use the subtitle canvas size, independently of the video's resolution.
 - **Untrusted input**: every stream comes from untrusted peers. Frame dimensions, stream count and queue bytes are capped, demux and decode run under `catch_unwind`, and the corpus includes truncated and mutated files.
 
 ## API used by the app
@@ -60,20 +60,47 @@ first child is one, then in fixed chunks; a third SeekHead, or a SeekHead,
 Tracks or Tags master larger than its budget (about 184 KiB, 32 MiB, 32 MiB),
 is refused before any of it is read. A CRC-32 on an Info, Cues, Chapters or
 Attachments master is still checked over its whole body (small heap, but a
-known network cost: these masters have no size budget). Every element in a
-Tracks or Tags tree must fit its parent. Only a Segment or Cluster may use the
-unknown size; any other Top-Level element doing so is InvalidData (a resilient
-open skips it, and between Clusters playback resumes at the next Cluster).
-SegmentUUID, PrevUUID and NextUUID must be 16 octets, each Info text field
-holds at most 64 KiB, and the Info masters keep at most 1 MiB. The Cues index
-keeps at most 32 MiB: past that it keeps the CuePoints that fit and records a
-damage event, and a seek past the last point kept for its track scans the
-Clusters from the first one (a known read cost on large remote files). Cluster
-records, their index, and the EncryptedBlocks and SilentTracks numbers they
-keep share one 32 MiB budget, lists included, and are recorded once even when
-a seek revisits them. A block past the budget is damage and the walk resumes
-at the next Cluster; a Cluster past it gets no record while playback and seeks
-go on. At most 4096 damage events are kept, and the rest are counted exactly.
+known network cost: their declared size has no limit). Optional metadata never
+stops playback: damage in Chapters, Attachments, Tags, Cues, a SeekHead or any
+other Top-Level master but Info and Tracks drops it, or cuts it to the records
+before the damage, with one damage event, in strict opens too; damage in the
+EBML header, the Segment, Info or Tracks still fails a strict open. Junk where a
+Top-Level element should start, before the first Cluster, is skipped by either
+open with a forward scan, as FFmpeg's matroska_resync does, one damage event per
+run; the scans read at most 1 MiB in total, and a strict open fails only when
+one ends without finding an element. Every element in a Tracks, Tags, Chapters,
+Cues or SeekHead tree, and in the EBML header, must fit its parent, and the EBML
+header's strings and extension records keep at most 16 MiB together (FFmpeg's
+limit for one EBML string). Only a Segment or Cluster may use the unknown size;
+any other Top-Level element doing so, or running past its Segment, is damage
+(the walk rescans for what follows; between Clusters, playback and seeks resume
+at the next Cluster), and so is an AttachedFile or FileData of unknown size,
+which leaves the UIDs of the attachments kept before it. A master over its
+budget, in line or found through the SeekHead, is noted as damage too, and a
+Tags or SeekHead found through the SeekHead keeps its complete records. A
+Cluster may start with a Void.
+SegmentUUID, PrevUUID and NextUUID must be 16 octets. Text fields in Info,
+Chapters and Attachments hold at most 64 KiB, and each of these masters keeps
+at most 1 MiB. Past it, Chapters and Attachments keep the records that fit, in
+order: a long chapter list never stops playback. Attachment payloads are never
+read at open; one fetched on request grows only as bytes arrive, a payload
+reaching past its AttachedFile or the Segment is refused unread, and a source
+failure while it reads is returned as itself. Everything the open keeps from
+Tracks or Tags, including tag resolution, the per-stream views and room to
+parse or decompress a codec configuration, stays within the master's 32 MiB
+limit at its peak and after the open; a CodecPrivate decodes in the room kept
+for parsing it and its stored form's charge passes to the decoded one, and a
+Tags master replaced between Clusters frees its entries' room in one pass. The
+Cues index keeps at most 32 MiB:
+past that, or past damage, it keeps the CuePoints before it, and a seek past
+the last point kept for its track, or with no Cues, scans the Clusters from
+the first one (a known read cost on large remote files). Cluster
+records, their index, the EncryptedBlocks and SilentTracks numbers they keep,
+and the CRC-32 statuses share one 32 MiB budget, lists included, and are
+recorded once even when a seek revisits them. A block past the budget is
+damage and the walk resumes at the next Cluster; a Cluster past it gets no
+record or status while playback and seeks go on. At most 4096 damage events
+are kept, and the rest are counted exactly.
 The 1024-packet cap counts
 virtual-track copies and the frames a lace actually holds (a one-frame EBML
 lace is InvalidData): compliant Blocks wait until held packets drain, and one
@@ -97,8 +124,8 @@ laces now match strict FFprobe packet comparisons on nine generated/real
 fixtures, including millisecond time bases. AAC 960-sample/LD/ELD/USAC and
 14-bit/substream-only DTS frame timing are not inferred.
 
-Matroska/WebM WebVTT packets carry raw cue text to the registered subtitle
-adapter, which uses packet timestamps rather than an in-band timing line.
+Matroska/WebM WebVTT packets carry raw cue text to the `subs-text` WebVTT
+decoder (the FFmpeg port standalone `.vtt` files use), timed by the packet.
 `Demuxer::packet_metadata().webvtt` replaces the typed-only accessor and
 preserves each cue's identifier/settings through lacing and seeks. The
 accessor clears before the next read/seek, including errors and EOF;
@@ -108,9 +135,11 @@ text and timing work, but exposing side data alone is not end-to-end support.
 
 `cargo test -p check-mkv -p player --no-fail-fast` compares packet fields
 directly with FFmpeg 9, checks incremental reads and malformed input, and
-exercises player subtitle dispatch. Known-wrong packet digests are not accepted:
-outstanding CodecDelay timestamp differences remain failing assertions until
-the separate AudioTrim work supplies the missing behavior.
+exercises player subtitle dispatch. Known-wrong packet digests are not accepted;
+every packet field of the 69 samples equals FFmpeg's, CodecDelay-shifted
+timestamps included. The MKV demuxer exposes CodecDelay, DiscardPadding and
+SeekPreRoll as `PacketMetadata::audio_trim` for the AudioTrim consumer, which
+lives on another branch.
 
 
 ## Licenses
@@ -120,6 +149,28 @@ Code in this repository is MIT unless a crate says otherwise. Decoders with no p
 ## Verification
 
 `cargo run -p e2e --release` plays the corpus (FFmpeg's FATE samples plus generated files) through the headless backend and compares every stream with FFmpeg: `framemd5` for bit-exact codecs, PSNR/SNR thresholds for the rest. Every format on the list needs a passing file. The result is `target/e2e/codecs.json`.
+
+`cargo test -p player --lib engine::subtitle_tests` checks PGS, DVB and DVD/VobSub (paired, MPEG-PS and Matroska) show/replacement/clear media times against FFmpeg with an injected clock, pinning each boundary to FFmpeg's microsecond rounding (±0.5 µs; the engine keeps exact 90 kHz times), and compares every complete subtitle canvas with sub2video, including final DVB and DVD expirations at EOF. `cargo test -p player --test subtitle_timing` independently checks the real Player's PGS state sequence and canvases. These are logical-timing and integration checks, not a demonstrated wall-clock presentation-latency bound; under shared-machine load, a requested 5.9 ms wait took 65 ms and a 100 ms wait took 313 ms.
+
+`cargo test -p subs-bitmap` compares PGS (SUP, Matroska and M2TS), DVB (MPEG-TS and Matroska), and DVD/VobSub (paired files, MPEG-PS, ordinary and zlib-compressed Matroska) with FFmpeg, including every complete RGBA canvas and its display interval. DVB uses all 46 display states in FATE `sub/dvbsubtest_filter.ts`, the only FATE DVB sample (`tests/fate/subtitles.mak`); generated transport streams add two services on one PID and malformed segments (a display definition with a cut-off window, a region 20000 pixels wide, a cut-off map table under a computed CLUT), each compared with FFmpeg. 8-bit pixel strings, map tables, display-definition window offsets and the non-modifying colour have only unit expectations. Transport and paired VobSub tests also compare every packet's timestamps and payload MD5; index variants check FFmpeg's `size:` (sscanf) and palette (strtoul) reading. Robustness tests exercise 7200 real PGS packet mutations, 4800 real DVB packet mutations, 4800 real DVD packet mutations with full FFmpeg recovery comparisons, and 2000 VobSub index mutations. The MPEG-TS fork recognizes private-PES DVB descriptor 0x59 and retains its language, composition/ancillary page IDs and subtitle type. The existing OxideAV VobSub tests pin upstream gaps, independently of the replacement DVD decoder's differential tests.
+
+Bitmap subtitle input is bounded where FFmpeg is not: canvases (a PGS presentation, a DVB display definition, a VobSub `size:`) of at most 4096×4096, DVB regions of at most 4096×4096 pixels in all, 1024 DVB object placements and a per-packet bound on DVB painting (every pixel a region allocation or fill writes, and every object placement), one blank DVB render per packet, and CVD/OGT regions no larger than their canvas, decoded only as far as the canvas shows them. `cargo test -p subs-bitmap --test budgets` feeds the hostile cases (an 8192×8192 display definition followed by a thousand 7-byte end-of-display packets, an OGT header declaring 16383×4096, 65,280 placements painted from 64 KiB of object data, 1,024 fills or resizes of a 1024×1024 region in one 16 KiB packet) under memory and time budgets. A DVB stream decodes only its first service's composition and ancillary pages, as VLC does, and skips page compositions on an ancillary page that is not also the composition page, as VLC's dvbsub.c does; FFmpeg's default decodes every page.
+
+A blank bitmap state cancels any previous timeout and has no pending expiration of its own; even when DVB labels it with a page timeout, it must not delay EOF or emit a redundant clear.
+
+`subs_bitmap::open_vobsub(idx, sub)` accepts two explicit `Box<dyn ReadSeek>` inputs. It never guesses a sibling filename or reads a path from an untrusted index. It retains the index palette, language, timestamps and split-SPU boundaries; seeking returns the preceding indexed subtitle. `crates/codecs` installs `subs_bitmap::register_codecs` before oxideav-sub-image, whose decoders claim the same ids, and `register_containers` after it. Matroska `S_VOBSUB`, MPEG-PS DVD subpicture units and paired VobSub use decoder ID `dvd_subtitle`; `dvdsub` (FFmpeg's decoder name) and `vobsub` are also claimed.
+
+`cargo test -p subs-bitmap --test vcd --test vcd_spumux -- --nocapture` compiles the original VLC C CVD/OGT decoders, bit reader and YUVP-to-RGBA converter at revision `2e358f3098c2f2b7621d1dc568de8b61ad786322` and compares every complete RGBA canvas and display interval with the Rust ports. Set `VLC_SRC` to that checkout (default `~/projects/vlc-src`); `cc` is required. The adapter supplies callbacks/types and places converted regions on the canvas, clipped at its edges; it does not replace parsing, RLE or palette conversion. That placement is harness code mirroring the port's, so the comparison covers decoding, colours and timing, not VLC's on-screen geometry: VLC's renderer also scales each region by its sample aspect ratio (`vout_subpictures.c`), which OGT sets from the region's size (`svcdsub.c`). Test output prints exact compiler and replay commands, and retains encoded `.packets` inputs and complete timing/rectangle/RGBA `.rgba` outputs under `CARGO_TARGET_TMPDIR/subs-bitmap-vlc-<pid>`. `vcd` uses hand-authored structural packets (fragmentation, truncated image data, colours without a palette entry, unchecked OGT packet numbers, regions leaving the canvas) plus 4,800 mutations. `vcd_spumux` reads CVD and SVCD files authored by an independent encoder, dvdauthor 0.7.2 `spumux` (`tests/data/spumux/generate.sh` records the exact invocation), through the production MPEG-PS demuxer, including three-packet subtitles. Neither is an archived disc stream: none has been found, so interoperability with real discs remains unproven, and no FFmpeg CVD/OGT parity is claimed (FFmpeg has neither decoder). VLC, and therefore this port, renders spumux CVD colours with Cb and Cr exchanged (spumux writes Y, Cr, Cb; VLC reads Y, Cb, Cr) and shows each spumux CVD subtitle for 5.86 s, reading the `04 08 0c 10` spumux appends after the recorded unit size as a duration field.
+
+DVD, CVD and OGT subtitles place regions in video pixels; FFmpeg's canvas for a stream that declares no size is the video's (`fftools/ffmpeg_demux.c`), and VLC places CVD/OGT regions on the video unscaled. `spawn_subtitles` decides the canvas once, as the subtitle pipeline starts, and never waits for one: a stream declaring no canvas gets the selected video's size from `State::video_size`, and the DVD decoder's own `size:` (read as FFmpeg reads it) takes precedence over that. DVB/PGS define their canvas in-band. `State::video_size` holds the container's dimensions at open; nothing publishes decoded ones, so where those are unknown (an MPEG-2 sequence header past the MPEG-PS scan, H.264 in a VOB, a Matroska `PixelWidth` 0 without an avcC/hvcC record to read the size from) the decoders keep their 720×576, as in subtitle-only playback, with every region at FFmpeg's pixel position. FFmpeg uses the decoded video size there. Closing that gap needs the video pipeline to publish `Decoder::output_video_dimensions` (oxideav-core 96094a9; the pinned mpeg12video fork implements it) before the subtitle decoder opens, and the subtitle pipeline to wait for it without holding its lane; `unknown_at_open_ps_video_publishes_canvas_before_first_dvd_cue` is ignored with that reason.
+
+Subtitles never hold back video or audio. Behind them the subtitle lane drains as the demuxer fills it, whatever its cues' starts: a cue waiting for the clock would otherwise stop the demuxer short of the audio the clock needs to reach it. Decoded cues wait in a queue of at most 64 cues (64 MiB), the latest due going first, and come up by start time, as VLC selects subpictures by date. Subtitle-only playback keeps the clock's pace instead, one decoded cue waiting at a time. Text cues render in the video's size, scaled down to at most 4096×4096 pixels' worth (8K video renders text in 5461×3072), and are cropped to their visible pixels; at most 64 (64 MiB) are up at once, the earliest up going first. So no single cue, text or bitmap, can outgrow 64 MiB. A playback with video or audio ends with the last subtitle state down, realtime or not, however far ahead its own end is, even when its subtitle pipeline first ran after them; subtitle-only playback plays to its last end.
+
+Selecting a subtitle track never seeks: the new track shows from the next cue the demuxer reads after the switch. The demuxer has already read up to about two seconds of media ahead of playback (the queue bound) and dropped the new track's packets in it, so a cue up at the switch, and any cue starting in that read-ahead, is not shown; the cue after them is. Only an audio switch re-reads from the clock's position, as before. The audio track a playback picks by default stays selected through any selection of another kind, including one made while the Player opens. A playback whose audio is switched on after its subtitles started ends with the subtitles cleared, as any playback with video or audio does.
+
+`cargo test -p player --test subtitle_canvas -- --nocapture --test-threads=1` exercises actual video and subtitles through Player. Known-dimension cases compare all 180 CVD video frames and three 352×480 canvases, all 180 SVCD video frames and three 480×480 canvases, and ten NTSC DVD video frames plus the first 720×480 cue. A VobSub case retains its explicit 720×480 subtitle canvas over 352×240 video; one whose `size:` has no height takes the video's canvas, as FFmpeg's sscanf does. Unknown video sizes (a VOB whose MPEG-2 sequence header lies past the scan, MPEG-2 in Matroska declaring 0×0) with cues 2.6 s apart play to the end, realtime or not, with every video frame equal to FFmpeg's and both cues on the 720×576 fallback. In FFmpeg's H.264 VOB neither FFmpeg nor the PS demuxer reads a subtitle packet; selecting that stream holds nothing up and changes none of the frames decoded. Those are 19 of FFmpeg's 20 frames, with or without a subtitle: `h264_vob_plays_every_ffmpeg_frame` keeps that comparison and is ignored until the H.264-in-PS video path is fixed. The headless sink packs frames at the container's size, so these cases hash each presented frame at FFmpeg's 720×480 picture size. A DVD cue moved ten hours ahead leaves the rest of the playback intact. Video hashes match FFmpeg's simple-IDCT reference; complete subtitle canvases match native VLC or FFmpeg. Generated inputs, captured RGBA canvases and hash reports remain under `CARGO_TARGET_TMPDIR/player-subtitle-canvas-<pid>`. These are encoder/remux fixtures and logical integration evidence, not archived-disc coverage or physical presentation timing. `cargo test -p player --test subtitle_lifecycle` plays a DVB state with a 15 s timeout over 1 s of video, which ends with the video, cleared; an open-ended PGS state, cleared at Ended in realtime and without it, also when its subtitle decoder opens only after the video pipeline has ended; selecting a PGS track mid-cue, which shows the track from its next display set; and seeking into a cue, which shows the cue at once.
+
+`cargo test -p player --test subtitle_av` plays WebVTT text beside PCM audio through a test container that replays a Matroska file's packets in a staged order, seeks, refuses or fails seeks, or holds the demuxer inside its open, before its first packet, or both in turn, until the test lets it go. Subtitle packets demuxed ahead of the audio (audio through 0.5 s, then cues at 1, 3 and 5 s) leave every PCM sample and video frame played and each cue shown from its start. A subtitle switch, on a demuxer that seeks, cannot, or fails, flushes nothing: the PCM equals FFmpeg's, the single-keyframe H.264 decodes unbroken, and only the new track's next cue shows. Selecting a subtitle track keeps the default audio track. Subtitle selections made while the Player opens keep it too, and an explicit audio choice made then stands: with the demuxer held inside its open or before its first packet, and with subtitles selected over and over from before the Player reads its selection until it publishes its tracks (40 opens), so some land while it picks the default track. A subtitle-only playback (audio switched off while the demuxer is held inside its open) whose audio is switched on before its first packet ends with its open-ended PGS state cleared, realtime or not. Eighty overlapping cues beside 1080p video stay at 64 images up at once; the video and audio play on, the flood comes down at its end, two later overlapping cues show together, and a seek clears the flood. The text decoders take Matroska's WebVTT blocks; its SubRip and ASS blocks they reject ("SRT: cue has no valid timing", "ASS: cue missing Dialogue prefix"), so the tests use WebVTT.
 
 ### Audio-master timing
 
@@ -205,6 +256,18 @@ linked native library and the final app separately.
 SubViewer 1 and VPlayer reference checks compare every decoded cue's text, start and end against FFmpeg, including the final open-ended cue. SubViewer 1 keeps its native whole-second timestamps; both formats preserve FFmpeg's negative final-duration sentinel through its unsigned-millisecond display-time conversion.
 
 Codec-version rows require genuine inputs: generated `wmv1_wma1.asf` covers WMV1/WMA1, FATE `vc1/SMM0005.rcv` covers WMV3, and `sipr/sipr_5k0.rm` covers RV10. WMV2, VC-1 and RV20 files are not evidence for those earlier or different codecs.
+
+Standalone subtitle acceptance (`cargo test -p subs-text --test reference standalone_`) compares every cue's visible text, start, end and count through the production registry with FFmpeg's `text` encode of its decode. It does not normalize away raw tags the player would display, and does not claim style fidelity from text equality. All 13 fixture cases pass. They cover 7 formats: SubRip ×5, MicroDVD ×2, SubViewer, MPL2, WebVTT ×2, ASS and SSA. Container probing is a separate diagnostic: `cargo run -p demux-misc --example check_oxideav`; opening a container is not proof of correct packets or playback.
+
+SubRip, ASS/SSA, WebVTT, MicroDVD and SubViewer demuxing and decoding are LGPL ports of FFmpeg's in `subs-text`, registered ahead of OxideAV's (containers by name, so `.srt`, `.ass`, `.vtt`, `microdvd` and `subviewer2` files open with them). Each ported file, including the USF decoder ported from VLC, starts with its upstream copyright lines, the LGPL notice and the dates it was changed. Each decoder converts a cue to an ASS event as FFmpeg does, and one conversion decides what it shows and how: the text FFmpeg's `text` encoder keeps (override blocks hidden; `\h`, `\{` and brace text without a backslash stay literal, as in FFmpeg) styled by the event's style from the script header or CodecPrivate and its `\b \i \u \s`, primary colour, font, first alignment and `\r` overrides. `\r` follows libass, the renderer players and FFmpeg's `ass` filter use: a bare `\r`, or `\r` naming a style the script lacks, returns to the event's own style. FFmpeg's SubRip encoder resets differently (a bare `\r` returns to `Default`), so it is not the oracle for `\r`. Instead, `ass_style_resets_render_as_libass_renders_them` in `player_text` compares the text colours drawn for each cue with the frame FFmpeg's `ass` filter renders. The compositor draws colour, bold, italic and horizontal alignment; vertical alignment, outline, font face/size, `\pos`/`\move` and karaoke timing are not drawn. MPL2 still decodes through the pinned subtitle fork, including omitted end timestamps and italic/bold/underline line prefixes.
+
+The character set is decided per cue. A cue that is valid UTF-8 shows as UTF-8, as in FFmpeg. A cue that is not is read as Windows-1250, where FFmpeg without `-sub_charenc` rejects it. One such cue does not change how the others read. `cargo test -p subs-text --test charset` covers SubRip, ASS, WebVTT, MicroDVD, SubViewer, SAMI, VPlayer and SubViewer 1 files, and Matroska SubRip, ASS and WebVTT packets. MPL2, decoded by the fork, shows invalid bytes as U+FFFD. Font names are cut to 127 bytes, the most FFmpeg's `\fn` override reads, and all runs of a cue share one copy. A cue's memory grows with its length, not with font-name length times run count: `cargo test -p subs-text --test memory` decodes a huge style font across many runs and line breaks, repeated `\r` resets, and a mov_text font table repeating one id, each under an 8 MiB peak.
+
+Text subtitles inside containers play through the Player (`cargo test -p subs-text --test player_text`). FFmpeg- and mkvmerge-generated Matroska SubRip (copied, and converted from ASS), ASS (copied, converted from SubRip, from SSA), mkvmerge `S_TEXT/SSA`, MP4 `mov_text` (from SubRip, and from styled ASS) and WebM/Matroska WebVTT files decode to FFmpeg's cue text and times (Matroska and WebM to the microsecond of `ffprobe -show_packets`). Every cue reaches the subtitle sink, and its render there equals the render of FFmpeg's SubRip conversion of the same cue, CodecPrivate and sample-entry style colours included. That conversion is read by oxideav-subtitle's SubRip parser, not by the decoders under test. Both renders come from the same compositor, so this oracle checks the text, times and styles the decoders hand over; it does not check the compositor's pixels against an independent renderer. The mov_text decoder builds FFmpeg's ASS events too (its sample-entry default style is the `Default` style). QuickTime `.mov` text tracks still fail: the pinned oxideav-mov demuxer, which wins the probe tie with oxideav-mp4 by registration order, exposes them as data streams, so neither the registry nor the Player selects them; oxideav-mp4 exposes the same track as `mov_text`.
+
+Subtitle robustness (`cargo test -p subs-text --test robustness`) mutates real reference packets — demuxed from FATE samples, or from mkvmerge remuxes of reference sources for `S_TEXT/SSA` and USF — 2000 times per codec through the production decoders with the stream's real CodecParameters and preceding packets (ASS script header, mov_text sample entry, Kate headers), then mutates the extradata itself; and sends 1000 mutated or truncated copies of each reference file through its registered demuxer and the decoders, and through every registered probe. One mutation replaces a number in the data with a 32- or 64-bit integer edge. Every fourth packet trial also sets the packet's pts and duration to edge values (absent, `i64::MIN`, `i64::MIN + 1`, -1, 0, `i64::MAX - 1`, `i64::MAX`) and its time base to one of eight, including zero, negative and `i64`-extreme terms. CMML has no reference sample, so its trials mutate a hand-written document. The probe pass currently fails: demux-misc's AC-3 probe (`parse_ac3_header_swapped`) indexes past an odd-length buffer end.
+
+Legacy subtitle demuxing bounds each SubViewer1/VPlayer timestamp component to the format's signed 32-bit field before 64-bit arithmetic. SubViewer1, VPlayer and SAMI order cues by timestamp and original file order, fill missing durations, then remove adjacent exact duplicates, as FFmpeg does. Equal-text cues with different durations remain distinct.
 
 WMA v1/v2 decoder opening rejects zero sample rates and channel counts before deriving block sizes. The robustness suite covers both invalid dimensions with variable-block coding enabled; valid ASF playback remains covered by the production-registry corpus.
 

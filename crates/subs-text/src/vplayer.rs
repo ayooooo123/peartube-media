@@ -1,7 +1,31 @@
+// Copyright (c) 2012 Clément Bœsch
+// Copyright (c) 2012-2013 Clément Bœsch <u pkh me>
+//
+// Derived from FFmpeg at commit 2da55bf: libavformat/vplayerdec.c,
+// libavformat/subtitles.c and libavcodec/textdec.c.
+// Changed for PearTube on 2026-10-06 and 2026-10-07 (ported to safe Rust
+// and modified).
+//
+// This file is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 2.1 of the License, or (at your option) any later version.
+//
+// This file is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this file (crates/subs-text/LICENSE); if not,
+// write to the Free Software Foundation, Inc., 51 Franklin Street,
+// Fifth Floor, Boston, MA 02110-1301 USA
+
 //! VPlayer subtitle demuxer & decoder.
 //!
 //! Ported to safe Rust from FFmpeg's:
 //! - `libavformat/vplayerdec.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
+//! - `libavformat/subtitles.c` (same commit/license; queue ordering and duplicates)
 //! - `libavcodec/textdec.c` (commit 2da55bf, LGPL-2.1-or-later — header verified)
 //!
 //! VPlayer structure:
@@ -18,7 +42,7 @@ use oxideav_core::{
     MAX_PROBE_SCORE,
 };
 
-use crate::text_common::{decode_subtitle_text, TextSubtitleDemuxer, MAX_CUES, MAX_FILE_BYTES};
+use crate::text_common::{decode_subtitle_text, file_bytes_of, file_text, TextSubtitleDemuxer, MAX_CUES, MAX_FILE_BYTES};
 
 pub const CODEC_ID: &str = "vplayer";
 pub const CONTAINER_NAME: &str = "vplayer";
@@ -61,7 +85,7 @@ pub fn open_demuxer(
         return Err(Error::invalid("VPlayer file exceeds maximum size"));
     }
 
-    let text = decode_subtitle_text(&raw);
+    let text = file_text(&raw);
     let packets = demux_vplayer_text(&text)?;
 
     let time_base = TimeBase::new(1, 100); // centiseconds (10ms)
@@ -88,6 +112,7 @@ pub fn open_demuxer(
 
 struct RawVpSub {
     pts: i64,
+    order: usize,
     duration: i64,
     data: String,
 }
@@ -95,7 +120,7 @@ struct RawVpSub {
 fn demux_vplayer_text(text: &str) -> Result<VecDeque<Packet>> {
     let mut raw_subs: Vec<RawVpSub> = Vec::new();
 
-    for line in text.lines() {
+    for (order, line) in text.lines().enumerate() {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.trim().is_empty() {
             continue;
@@ -106,11 +131,14 @@ fn demux_vplayer_text(text: &str) -> Result<VecDeque<Packet>> {
             }
             raw_subs.push(RawVpSub {
                 pts: pts_start,
+                order,
                 duration: -1,
                 data: body.to_string(),
             });
         }
     }
+
+    raw_subs.sort_unstable_by_key(|s| (s.pts, s.order));
 
     // Finalize durations
     let len = raw_subs.len();
@@ -119,11 +147,12 @@ fn demux_vplayer_text(text: &str) -> Result<VecDeque<Packet>> {
             raw_subs[idx].duration = raw_subs[idx + 1].pts - raw_subs[idx].pts;
         }
     }
+    raw_subs.dedup_by(|a, b| a.pts == b.pts && a.duration == b.duration && a.data == b.data);
 
     let time_base = TimeBase::new(1, 100); // 10ms centiseconds
     let mut packets = VecDeque::with_capacity(raw_subs.len());
     for s in raw_subs {
-        let mut pkt = Packet::new(0, time_base, s.data.into_bytes());
+        let mut pkt = Packet::new(0, time_base, file_bytes_of(&s.data));
         pkt.pts = Some(s.pts);
         pkt.dts = Some(s.pts);
         pkt.duration = Some(s.duration);
@@ -168,16 +197,16 @@ fn parse_vplayer_line(line: &str) -> Option<(i64, &str)> {
         None => (ts_str, None),
     };
 
-    let parts: Vec<&str> = hms.split(':').collect();
-    if parts.len() != 3 {
+    let mut parts = hms.split(':');
+    let hh = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    let mm = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    let ss = i64::from(parts.next()?.trim().parse::<i32>().ok()?);
+    if parts.next().is_some() {
         return None;
     }
-    let hh = parts[0].trim().parse::<i64>().ok()?;
-    let mm = parts[1].trim().parse::<i64>().ok()?;
-    let ss = parts[2].trim().parse::<i64>().ok()?;
 
     let cs = if let Some(cs_part) = cs_str {
-        cs_part.trim().parse::<i64>().ok()?
+        i64::from(cs_part.trim().parse::<i32>().ok()?)
     } else {
         0
     };

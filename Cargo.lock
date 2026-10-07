@@ -257,6 +257,7 @@ dependencies = [
  "oxideav-wavpack",
  "oxideav-wma",
  "refcheck",
+ "subs-bitmap",
  "subs-text",
 ]
 
@@ -1052,7 +1053,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h265"
 version = "0.0.14"
-source = "git+https://github.com/OxideAV/oxideav-h265?rev=66097811d122959efcc9e07e20810d46ee18e3e2#66097811d122959efcc9e07e20810d46ee18e3e2"
+source = "git+https://github.com/ayooooo123/oxideav-h265?rev=29cf54638f58ee3393474a172831c9c32582b7ad#29cf54638f58ee3393474a172831c9c32582b7ad"
 dependencies = [
  "oxideav-core",
 ]
@@ -1120,7 +1121,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=aa9f12773755bca4d01340d88c3854408bc43b34#aa9f12773755bca4d01340d88c3854408bc43b34"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=5f9ac53c713d1265be26d21704e0bba77d3d1462#5f9ac53c713d1265be26d21704e0bba77d3d1462"
 dependencies = [
  "compcol",
  "oxideav-core",
@@ -1316,7 +1317,7 @@ dependencies = [
 [[package]]
 name = "oxideav-subtitle"
 version = "0.1.2"
-source = "git+https://github.com/OxideAV/oxideav-subtitle?rev=03f3aa41d2ea8d8baaadaef8030061c66c2338c9#03f3aa41d2ea8d8baaadaef8030061c66c2338c9"
+source = "git+https://github.com/ayooooo123/oxideav-subtitle?rev=53df836f596bb4ce8391bb821b2100d3e7f94f1b#53df836f596bb4ce8391bb821b2100d3e7f94f1b"
 dependencies = [
  "oxideav-core",
  "oxideav-pixfmt",
@@ -1472,6 +1473,7 @@ dependencies = [
  "oxideav-subtitle",
  "parking_lot",
  "refcheck",
+ "subs-bitmap",
  "thiserror 2.0.21",
 ]
 
@@ -1651,15 +1653,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
+name = "subs-bitmap"
+version = "0.1.0"
+dependencies = [
+ "demux-misc",
+ "oxideav-core",
+ "oxideav-mkv",
+ "oxideav-mpegts",
+ "oxideav-sub-image",
+ "parking_lot",
+ "refcheck",
+]
+
+[[package]]
 name = "subs-text"
 version = "0.1.0"
 dependencies = [
+ "codecs",
  "oxideav-ass",
  "oxideav-core",
  "oxideav-mkv",
  "oxideav-mp4",
  "oxideav-ogg",
  "oxideav-subtitle",
+ "parking_lot",
+ "player",
  "refcheck",
 ]
 

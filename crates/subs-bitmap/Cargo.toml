@@ -1,0 +1,20 @@
+[package]
+name = "subs-bitmap"
+description = "Bitmap subtitle decoders and demuxers for peartube-media"
+version.workspace = true
+edition.workspace = true
+# Ports FFmpeg/VLC bitmap decoders and SUP/VobSub demuxers (see src/lib.rs).
+# (LGPL-2.1-or-later).
+license = "LGPL-2.1-or-later"
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-sub-image.workspace = true
+oxideav-mkv.workspace = true
+oxideav-mpegts.workspace = true
+parking_lot = "0.12"
+demux-misc = { path = "../demux-misc" }
