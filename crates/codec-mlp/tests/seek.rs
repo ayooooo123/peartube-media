@@ -185,7 +185,11 @@ fn seeking_mutated_files_never_panics_or_hangs() {
         }
         let _ = done.send(());
     });
-    let finished = finished.recv_timeout(std::time::Duration::from_secs(600));
+    match finished.recv_timeout(std::time::Duration::from_secs(600)) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("seeking mutated files missed the deadline"),
+        // The worker dropped its sender without finishing: it panicked.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+    }
     worker.join().expect("a seek panicked");
-    finished.expect("seeking mutated files missed the deadline");
 }
