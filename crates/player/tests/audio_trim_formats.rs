@@ -176,6 +176,21 @@ fn opus_preskip_is_applied_once_in_mp4() { opus_in_container("mp4"); }
 #[test]
 fn opus_preskip_is_applied_once_in_matroska() { opus_in_container("mkv"); }
 
+/// FFmpeg's Vorbis decoder outputs the first packet's frame and drops it
+/// as its own delay (`vorbisdec.c`); FFmpeg's encoders declare that frame
+/// as the WebM CodecDelay, whose skip replaces the delay. OxideAV's decoder
+/// never outputs that frame, so the skip must not come off its output too.
+#[test]
+fn vorbis_in_webm_plays_ffmpegs_samples() {
+    let output = Fixture::new("webm");
+    ffmpeg(&["-f", "lavfi", "-i", "aevalsrc=0.5*sin(2*PI*(220+400*t)*t):s=48000:d=3", "-ac", "2",
+        "-c:a", "vorbis", "-strict", "-2"], &output.0);
+    exact_length(&output.0, 144_000);
+    let (played, channels) = play(&output.0, None);
+    let snr = snr_at(&refcheck::ffmpeg_src_audio_f32(&output.0, 0), &played, channels, 0, 0);
+    assert!(snr >= 90.0, "Vorbis in WebM is {snr:.1} dB from FFmpeg's samples");
+}
+
 fn long_major_sync_seek(codec: &str) {
         let input = Fixture::new(if codec == "truehd" { "thd" } else { "mlp" });
         ffmpeg(&["-f", "lavfi", "-i", "sine=frequency=997:sample_rate=48000:duration=0.4",

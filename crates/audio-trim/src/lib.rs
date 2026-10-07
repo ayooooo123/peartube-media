@@ -53,11 +53,16 @@
 //! pre-skip from its own output instead, so a container's skip (an MP4 edit
 //! list, Matroska CodecDelay) would come off on top of it:
 //! [`take_decoder_delay`] moves that delay out of the decoder's parameters
-//! and into [`Trimmer::with_decoder_delay`].
+//! and into [`Trimmer::with_decoder_delay`]. OxideAV's Vorbis decoder never
+//! outputs its first packet, the frame FFmpeg's outputs and drops as its
+//! delay, so that packet's trims are already applied
+//! ([`DecoderDelay::FirstPacket`]).
 //!
 //! [`Trimmer::reset`] forgets all of it: after a seek the decoder starts over
 //! and the demuxer says what the new position needs. A decoder's delay does
-//! not come back; libavcodec does not apply it again on a flush either.
+//! not come back; libavcodec does not apply it again on a flush either. A
+//! decoder that drops its first packet drops it again, as FFmpeg's Vorbis
+//! decoder does after a flush.
 //!
 //! Untrusted counts never drive an allocation or loop. At most
 //! [`MAX_QUEUED`] packets may await output, and retained padding (including
@@ -251,19 +256,46 @@ impl Fallbacks {
     }
 }
 
+/// A decoder's own start delay, which a container's skip replaces (see the
+/// crate docs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DecoderDelay {
+    #[default]
+    None,
+    /// Skipped from the decoder's first output: the OpusHead pre-skip (RFC
+    /// 7845 §5.1), in 48 kHz samples, which FFmpeg's decoder declares as
+    /// `AVCodecContext::delay` and OxideAV's would remove itself.
+    Skip(AudioTrim),
+    /// The decoder never outputs the first packet after it opens or resets:
+    /// OxideAV's Vorbis decoder needs a successor packet to overlap (Vorbis I
+    /// §4.3.8). FFmpeg's (`vorbisdec.c`) outputs that frame and drops it
+    /// through `skip_samples`, which a container's skip on the packet
+    /// replaces. FFmpeg's encoders declare exactly that frame (libvorbis: the
+    /// first packet's duration; its own encoder: half a long block), so the
+    /// packet's trims are already applied. A skip that differs from the
+    /// frame is not corrected.
+    FirstPacket,
+}
+
 /// Moves a decoder's own start delay out of `params`, the parameters the
-/// decoder is made from, into the trim a [`Trimmer`] starts with
-/// ([`Trimmer::with_decoder_delay`]). Only Opus has one: the OpusHead
-/// pre-skip (RFC 7845 §5.1), in 48 kHz samples, which FFmpeg's decoder
-/// declares as `AVCodecContext::delay` and OxideAV's removes itself.
-pub fn take_decoder_delay(params: &mut CodecParameters) -> Option<AudioTrim> {
-    if params.codec_id.as_str() != "opus" {
-        return None;
+/// decoder is made from, into the [`DecoderDelay`] a [`Trimmer`] starts with
+/// ([`Trimmer::with_decoder_delay`]).
+pub fn take_decoder_delay(params: &mut CodecParameters) -> DecoderDelay {
+    match params.codec_id.as_str() {
+        "vorbis" => DecoderDelay::FirstPacket,
+        "opus" => {
+            let Some(head) = params.extradata.get_mut(..12).filter(|head| head.starts_with(b"OpusHead")) else {
+                return DecoderDelay::None;
+            };
+            let pre_skip = u16::from_le_bytes([head[10], head[11]]);
+            head[10..12].fill(0);
+            match pre_skip {
+                0 => DecoderDelay::None,
+                n => DecoderDelay::Skip(AudioTrim { skip_samples: u32::from(n), discard_padding: 0, sample_rate: 48_000 }),
+            }
+        }
+        _ => DecoderDelay::None,
     }
-    let head = params.extradata.get_mut(..12).filter(|head| head.starts_with(b"OpusHead"))?;
-    let pre_skip = u16::from_le_bytes([head[10], head[11]]);
-    head[10..12].fill(0);
-    (pre_skip > 0).then_some(AudioTrim { skip_samples: u32::from(pre_skip), discard_padding: 0, sample_rate: 48_000 })
 }
 
 /// Applies [`AudioTrim`]s to a decoder's output. See the crate docs.
@@ -276,9 +308,13 @@ pub struct Trimmer<P> {
     queue: VecDeque<Queued>,
     current: Option<Span<P>>,
     /// Duration order cannot identify output after a queued packet is lost.
-    /// A matching frame timestamp or a seek restores that association.
     association_lost: bool,
     fallbacks: Fallbacks,
+    /// The decoder never outputs the first packet after it opens or resets
+    /// ([`DecoderDelay::FirstPacket`]).
+    drops_first_packet: bool,
+    /// That packet has not been sent yet.
+    awaiting_first_packet: bool,
 }
 
 impl<P: Pcm> Default for Trimmer<P> {
@@ -286,6 +322,7 @@ impl<P: Pcm> Default for Trimmer<P> {
         Trimmer {
             skip: Count::None, skip_ended: false, queue: VecDeque::new(), current: None,
             association_lost: false, fallbacks: Fallbacks::default(),
+            drops_first_packet: false, awaiting_first_packet: false,
         }
     }
 }
@@ -295,13 +332,22 @@ impl<P: Pcm> Trimmer<P> {
         Self::default()
     }
 
-    /// A trimmer whose first output loses `delay`, the decoder's own start
-    /// delay ([`take_decoder_delay`]), unless a container's nonzero skip
-    /// replaces it first.
-    pub fn with_decoder_delay(delay: Option<AudioTrim>) -> Self {
+    /// A trimmer for a decoder with its own start delay
+    /// ([`take_decoder_delay`]): a skip comes off its first output unless a
+    /// container's nonzero skip replaces it first.
+    pub fn with_decoder_delay(delay: DecoderDelay) -> Self {
         let mut trimmer = Self::default();
-        if let Some(t) = delay.filter(|t| t.sample_rate > 0) {
-            trimmer.skip = Count::declared(t.skip_samples, t.sample_rate);
+        match delay {
+            DecoderDelay::None => {}
+            DecoderDelay::Skip(t) => {
+                if t.sample_rate > 0 {
+                    trimmer.skip = Count::declared(t.skip_samples, t.sample_rate);
+                }
+            }
+            DecoderDelay::FirstPacket => {
+                trimmer.drops_first_packet = true;
+                trimmer.awaiting_first_packet = true;
+            }
         }
         trimmer
     }
@@ -315,6 +361,10 @@ impl<P: Pcm> Trimmer<P> {
     /// `packet` went to the decoder; `trim` is its `audio_trim`. Its output
     /// may come later (see the crate docs).
     pub fn packet(&mut self, packet: &Packet, trim: Option<AudioTrim>) {
+        if std::mem::take(&mut self.awaiting_first_packet) {
+            // Its output never comes, and its trims are the decoder's.
+            return;
+        }
         if self.queue.len() == MAX_QUEUED {
             self.queue.pop_front();
             self.association_lost = true;
@@ -505,6 +555,7 @@ impl<P: Pcm> Trimmer<P> {
         self.current = None;
         self.queue.clear();
         self.association_lost = false;
+        self.awaiting_first_packet = self.drops_first_packet;
     }
 }
 
@@ -678,7 +729,7 @@ mod tests {
 
     #[test]
     fn a_decoder_delay_is_the_first_skip_unless_a_container_skip_replaces_it() {
-        let delay = Some(AudioTrim { skip_samples: 312, discard_padding: 0, sample_rate: 48000 });
+        let delay = DecoderDelay::Skip(AudioTrim { skip_samples: 312, discard_padding: 0, sample_rate: 48000 });
         let mut t = Trimmer::with_decoder_delay(delay);
         assert_eq!(run(&mut t, &[(None, 0..1024), (None, 1024..2048)]), [Run(312..1024), Run(1024..2048)]);
         // An MP4 edit list's or Matroska CodecDelay's skip replaces it.
@@ -687,6 +738,25 @@ mod tests {
         // A seek does not bring it back.
         t.reset();
         assert_eq!(run(&mut t, &[(None, 9216..10240)]), [Run(9216..10240)]);
+    }
+
+    #[test]
+    fn a_first_packet_the_decoder_drops_keeps_its_skip_off_later_output() {
+        let mut t = Trimmer::with_decoder_delay(DecoderDelay::FirstPacket);
+        let mut out = Vec::new();
+        for start in [0, 9216] {
+            // A CodecDelay skip on the dropped first packet; the first output
+            // is the second packet's, by duration order, and plays whole.
+            t.packet(&packet(start as i64 - 1024), trim(1024, 0));
+            t.packet(&packet(start as i64), None);
+            t.frame(Run(start..start + 1024), None, &mut out);
+            t.packet(&packet(start as i64 + 1024), trim(0, 100));
+            t.frame(Run(start + 1024..start + 2048), None, &mut out);
+            t.finish(&mut out);
+            assert_eq!(out.drain(..).collect::<Vec<_>>(), [Run(start..start + 1024), Run(start + 1024..start + 1948)]);
+            // After a seek the new decoder drops its first packet again.
+            t.reset();
+        }
     }
 
     /// A run that records whether it begins the presentation.
@@ -739,16 +809,19 @@ mod tests {
         };
         let mut opus = CodecParameters::audio(oxideav_core::CodecId::new("opus"));
         opus.extradata = head(312);
-        assert_eq!(take_decoder_delay(&mut opus), Some(AudioTrim { skip_samples: 312, discard_padding: 0, sample_rate: 48000 }));
+        assert_eq!(take_decoder_delay(&mut opus),
+            DecoderDelay::Skip(AudioTrim { skip_samples: 312, discard_padding: 0, sample_rate: 48000 }));
         assert_eq!(opus.extradata, head(0));
-        assert_eq!(take_decoder_delay(&mut opus), None, "nothing left to move");
+        assert_eq!(take_decoder_delay(&mut opus), DecoderDelay::None, "nothing left to move");
         let mut aac = CodecParameters::audio(oxideav_core::CodecId::new("aac"));
         aac.extradata = head(312);
-        assert_eq!(take_decoder_delay(&mut aac), None);
+        assert_eq!(take_decoder_delay(&mut aac), DecoderDelay::None);
         assert_eq!(aac.extradata, head(312));
         let mut short = CodecParameters::audio(oxideav_core::CodecId::new("opus"));
         short.extradata = head(312)[..11].to_vec();
-        assert_eq!(take_decoder_delay(&mut short), None);
+        assert_eq!(take_decoder_delay(&mut short), DecoderDelay::None);
+        let mut vorbis = CodecParameters::audio(oxideav_core::CodecId::new("vorbis"));
+        assert_eq!(take_decoder_delay(&mut vorbis), DecoderDelay::FirstPacket);
     }
 
     #[test]
