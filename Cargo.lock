@@ -1179,7 +1179,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpegts"
 version = "0.0.3"
-source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=d02c19f7911b3b8c61213842bee4a0dea920b1b3#d02c19f7911b3b8c61213842bee4a0dea920b1b3"
+source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=3fcd78e3b86e90d7edca97356b3d7195dba22711#3fcd78e3b86e90d7edca97356b3d7195dba22711"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",
