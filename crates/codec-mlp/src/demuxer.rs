@@ -211,30 +211,31 @@ fn ratebits_of(buf: &[u8], sync_at: usize, is_mlp: bool) -> u32 {
 }
 
 impl RawMlpDemuxer {
-    /// Scan forward from just past the cursor for the next major sync and
-    /// resume there (mlp_parser's lost_sync path).
-    fn resync(&mut self) -> Result<Packet> {
-        const WINDOW: usize = 64 * 1024;
+    /// The offset of the access unit whose major sync comes first at or
+    /// after `from + 4` (mlp_parser's lost_sync scan). The read window
+    /// starts small and doubles to 64 KiB, so a run of false headers costs
+    /// a few hundred bytes each and a long gap a few large reads.
+    fn find_sync(&mut self, mut from: u64) -> Result<u64> {
+        const MIN_WINDOW: usize = 256;
+        const MAX_WINDOW: usize = 64 * 1024;
         let sync_byte = if self.format_name == "mlp" {
             SYNC_MLP
         } else {
             SYNC_TRUEHD
         };
-        let mut from = self.next_offset + 1;
+        let mut window = MIN_WINDOW;
         loop {
             self.input.seek(SeekFrom::Start(from))?;
-            let mut buf = vec![0u8; WINDOW];
+            let mut buf = vec![0u8; window];
             let n = read_up_to(&mut self.input, &mut buf)?;
             if n < 8 {
                 return Err(Error::Eof);
             }
-            for off in 0..=n - 8 {
-                if buf[off + 4..off + 8] == [0xf8, 0x72, 0x6f, sync_byte] {
-                    self.next_offset = from + off as u64;
-                    return self.next_packet();
-                }
+            if let Some(off) = buf[..n].windows(8).position(|w| w[4..8] == [0xf8, 0x72, 0x6f, sync_byte]) {
+                return Ok(from + off as u64);
             }
             from += (n - 7) as u64;
+            window = (window * 2).min(MAX_WINDOW);
         }
     }
 }
@@ -266,19 +267,22 @@ impl Demuxer for RawMlpDemuxer {
     fn next_packet(&mut self) -> Result<Packet> {
         // Read the 2-byte AU header at the cursor (ff_raw_read_partial_packet
         // is unstructured; the AU framing comes from the parser, which reads
-        // the length field wherever the cursor sits).
-        let mut hdr = [0u8; 2];
-        self.input.seek(SeekFrom::Start(self.next_offset))?;
-        let got = read_up_to(&mut self.input, &mut hdr)?;
-        if got < 2 {
-            return Err(Error::Eof);
-        }
-        let len = (u16::from_be_bytes(hdr) & 0xfff) as usize * 2;
-        if len < 4 {
-            // Broken length chain mid-stream: FFmpeg's parser resyncs by
-            // scanning for the next sync word. Do the same from the cursor.
-            return self.resync();
-        }
+        // the length field wherever the cursor sits). A broken length chain
+        // mid-stream loses sync: FFmpeg's parser scans on for the next sync
+        // word, and so does this loop, each turn strictly past the last.
+        let len = loop {
+            let mut hdr = [0u8; 2];
+            self.input.seek(SeekFrom::Start(self.next_offset))?;
+            let got = read_up_to(&mut self.input, &mut hdr)?;
+            if got < 2 {
+                return Err(Error::Eof);
+            }
+            let len = (u16::from_be_bytes(hdr) & 0xfff) as usize * 2;
+            if len >= 4 {
+                break len;
+            }
+            self.next_offset = self.find_sync(self.next_offset + 1)?;
+        };
 
         let mut data = vec![0u8; len];
         self.input.seek(SeekFrom::Start(self.next_offset))?;

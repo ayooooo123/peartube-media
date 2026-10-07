@@ -130,6 +130,53 @@ fn mlp_lands_on_ffmpegs_major_sync() {
     check("lossless-audio/luckynight-partial.mlp", "mlp", &["1.0", "3.333", "7.5"], 3);
 }
 
+/// The valid access units at the head of `data`: the length chain from
+/// offset 0 cut after its last whole unit.
+fn whole_units(data: &[u8]) -> &[u8] {
+    let mut end = 0;
+    while end + 2 <= data.len() {
+        let len = usize::from(u16::from_be_bytes([data[end], data[end + 1]]) & 0xfff) * 2;
+        if len < 4 || end + len > data.len() {
+            break;
+        }
+        end += len;
+    }
+    &data[..end]
+}
+
+/// A valid TrueHD head, then 200,000 false headers: a zero length field
+/// four bytes before a major-sync word, every 8 bytes. Each one loses
+/// sync and the scan finds the next. Seeking past the end and reading on
+/// cross the whole run with bounded work and memory, not one nested
+/// resync per header.
+#[test]
+fn a_run_of_false_headers_is_crossed_without_nesting() {
+    let sample = std::fs::read(fate("truehd/ticket-1726-monocut.thd")).unwrap();
+    let mut data = whole_units(&sample).to_vec();
+    let units = data.len();
+    assert!(units > 8000, "the head keeps most of the sample");
+    for _ in 0..200_000 {
+        data.extend_from_slice(&[0, 0, 0, 0, 0xF8, 0x72, 0x6F, 0xBA]);
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut demuxer = open("truehd", data).unwrap();
+        let landed = demuxer.seek_to(0, i64::MAX).unwrap();
+        assert_eq!(landed, 30_720, "the last major sync of the head");
+        let mut read = 0;
+        while demuxer.next_packet().is_ok() {
+            read += 1;
+        }
+        let _ = done.send(read);
+    });
+    let read = finished.recv_timeout(std::time::Duration::from_secs(60));
+    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = read {
+        panic!("crossing the run missed the deadline");
+    }
+    worker.join().expect("crossing the run panicked");
+    assert_eq!(read, Ok(37), "the units from the landing to the end of the head ({units} bytes)");
+}
+
 struct Rng(u64);
 
 impl Rng {
