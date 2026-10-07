@@ -15,6 +15,9 @@ pub struct Report {
     pub packets: usize,
     pub input_bytes: usize,
     pub hashes: Vec<String>,
+    pub pts: Vec<Option<i64>>,
+    pub stamped_packets: usize,
+    pub container: String,
     pub format: Option<PixelFormat>,
     pub elapsed: f64,
 }
@@ -27,7 +30,7 @@ pub fn decode(path: &Path, hashes: bool, raw: Option<&Path>) -> Result<Report,St
     let stream = demux.streams().iter().find(|s|s.params.media_type == MediaType::Video).ok_or("no video stream")?.clone();
     if !["mpeg1video","mpeg2video"].contains(&stream.params.codec_id.as_str()) { return Err(format!("not MPEG12: {:?}", stream.params.codec_id)); }
     let mut decoder = ctx.codecs.first_decoder(&stream.params).map_err(|e|e.to_string())?;
-    let mut report = Report {frames:0,before_eof:0,first_output_packet:None,geometry_packet:None,geometry_bytes:None,initial_dimensions:None,opened_dimensions:(stream.params.width,stream.params.height),packets:0,input_bytes:0,hashes:Vec::new(),format:None,elapsed:0.0};
+    let mut report = Report {frames:0,before_eof:0,first_output_packet:None,geometry_packet:None,geometry_bytes:None,initial_dimensions:None,opened_dimensions:(stream.params.width,stream.params.height),packets:0,input_bytes:0,hashes:Vec::new(),pts:Vec::new(),stamped_packets:0,container:format.clone(),format:None,elapsed:0.0};
     let mut raw = raw.map(File::create).transpose().map_err(|e|e.to_string())?;
     let drain = |decoder: &mut dyn Decoder, report: &mut Report, raw: &mut Option<File>| -> Result<(),String> {
         loop {
@@ -45,6 +48,7 @@ pub fn decode(path: &Path, hashes: bool, raw: Option<&Path>) -> Result<Report,St
                         if hashes { report.hashes.push(refcheck::md5_hex(&bytes)); }
                         if let Some(raw) = raw { raw.write_all(&bytes).map_err(|e|e.to_string())?; }
                     }
+                    report.pts.push(frame.pts);
                     std::hint::black_box(frame);
                 }
                 Ok(_) => return Err("non-video frame".into()),
@@ -58,6 +62,7 @@ pub fn decode(path: &Path, hashes: bool, raw: Option<&Path>) -> Result<Report,St
             Ok(packet) if packet.stream_index == stream.index => {
                 report.packets += 1;
                 report.input_bytes += packet.data.len();
+                report.stamped_packets += usize::from(packet.pts.is_some());
                 decoder.send_packet(&packet).map_err(|e|format!("send packet {}: {e}",report.packets))?;
                 if let Some(dims) = decoder.output_video_dimensions() {
                     if report.geometry_packet.is_none() {
@@ -84,15 +89,42 @@ pub fn compare(path: &Path, output: &Path) -> Result<Report,String> {
     let fmt = ours.format.ok_or("no decoded frames")?;
     let reference = refcheck::ffmpeg_video_md5s_with(path,0,refcheck::ffmpeg_pix_fmt(fmt),&["-idct","simple"]);
     let matching = ours.hashes.iter().zip(&reference).filter(|(a,b)|a==b).count();
-    let mut table = String::from("frame\tdecoded_md5\tffmpeg_simple_md5\n");
+    let reference_pts = ffmpeg_best_effort(path)?;
+    let mut table = String::from("frame\tdecoded_md5\tffmpeg_simple_md5\tpts\tffmpeg_best_effort\n");
     for i in 0..ours.hashes.len().max(reference.len()) {
-        table.push_str(&format!("{i}\t{}\t{}\n",ours.hashes.get(i).map_or("MISSING",String::as_str),reference.get(i).map_or("MISSING",String::as_str)));
+        table.push_str(&format!("{i}\t{}\t{}\t{:?}\t{:?}\n",ours.hashes.get(i).map_or("MISSING",String::as_str),reference.get(i).map_or("MISSING",String::as_str),ours.pts.get(i),reference_pts.get(i)));
     }
     std::fs::write(output,table).map_err(|e|e.to_string())?;
-    println!("{} frames={}/{} exact={} pre_eof={} first_packet={:?} geometry_packet={:?} geometry_bytes={:?} initial={:?} at_open={:?} packets={} bytes={} oracle={}",path.display(),ours.frames,reference.len(),matching,ours.before_eof,ours.first_output_packet,ours.geometry_packet,ours.geometry_bytes,ours.initial_dimensions,ours.opened_dimensions,ours.packets,ours.input_bytes,output.display());
+    let pts_exact = ours.pts.iter().zip(&reference_pts).filter(|(a,b)|a==b).count();
+    let ffmpeg_untimed = reference_pts.iter().filter(|t|t.is_none()).count();
+    println!("{} frames={}/{} exact={} pre_eof={} first_packet={:?} geometry_packet={:?} geometry_bytes={:?} initial={:?} at_open={:?} packets={} stamped_packets={} bytes={} pts_exact={pts_exact}/{} ffmpeg_untimed={ffmpeg_untimed} oracle={}",path.display(),ours.frames,reference.len(),matching,ours.before_eof,ours.first_output_packet,ours.geometry_packet,ours.geometry_bytes,ours.initial_dimensions,ours.opened_dimensions,ours.packets,ours.stamped_packets,ours.input_bytes,reference_pts.len(),output.display());
     if ours.hashes != reference { return Err(format!("complete MD5 mismatch: {matching}/{} matched, {} decoded", reference.len(),ours.frames)); }
     if ours.frames > 2 && ours.before_eof == 0 { return Err("no incremental output".into()); }
+    if ours.container == "mpegvideo" {
+        // The raw demuxer numbers packets in coded order (1/fps); display
+        // times must still rise by exactly one period after the first frame.
+        let times: Vec<i64> = ours.pts.iter().map(|t| t.ok_or("untimed frame")).collect::<Result<_,_>>()?;
+        if !times.windows(2).all(|w| w[0] < w[1]) || !times[1..].windows(2).all(|w| w[1] - w[0] == 1) {
+            return Err(format!("raw display times not at frame cadence: {:?}", &times[..times.len().min(12)]));
+        }
+    } else {
+        // Exact wherever FFmpeg has a time. FFmpeg leaves a flushed picture
+        // without its own PTS untimed; ours must still continue the timeline.
+        let wrong = (0..ours.pts.len().max(reference_pts.len())).find(|&i| match reference_pts.get(i) {
+            Some(Some(t)) => ours.pts.get(i) != Some(&Some(*t)),
+            Some(None) => !ours.pts.get(i).copied().flatten().is_some_and(|t| i == 0 || ours.pts[i-1].is_some_and(|p| t > p)),
+            None => true,
+        });
+        if let Some(i) = wrong {
+            return Err(format!("PTS mismatch at frame {i}: ours {:?}, FFmpeg {:?} ({pts_exact}/{} exact)", ours.pts.get(i), reference_pts.get(i), reference_pts.len()));
+        }
+    }
     Ok(ours)
+}
+fn ffmpeg_best_effort(path: &Path) -> Result<Vec<Option<i64>>,String> {
+    let out = Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries","frame=best_effort_timestamp","-of","csv=p=0"]).arg(path).output().map_err(|e|e.to_string())?;
+    if !out.status.success() { return Err(String::from_utf8_lossy(&out.stderr).into_owned()); }
+    Ok(String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().trim_end_matches(',').parse().ok()).collect())
 }
 fn frame_rate(path: &Path) -> Result<f64,String> {
     let out = Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","default=noprint_wrappers=1:nokey=1"]).arg(path).output().map_err(|e|e.to_string())?;

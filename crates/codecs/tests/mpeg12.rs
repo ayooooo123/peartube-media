@@ -39,3 +39,18 @@ fn unknown_at_open_geometry_is_published_before_eof() {
     assert!(report.before_eof > 0);
     assert_eq!(report.frames,10);
 }
+#[test]
+fn sparse_pes_timestamps_match_ffmpeg_through_production_ps() {
+    // FFmpeg's PS muxer packs several small pictures into each 2 KiB PES and
+    // stamps only the first picture commencing in it; anchors and B-pictures
+    // then lack their own PTS.
+    let path = output("sparse-pts").with_file_name("sparse-pts.mpg");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v","error","-nostdin","-y","-threads","1","-f","lavfi","-i","testsrc2=size=176x144:rate=25",
+            "-frames:v","60","-c:v","mpeg2video","-threads","1","-bf","2","-g","12","-b:v","150k","-f","mpeg"])
+        .arg(&path).status().expect("FFmpeg generates the sparse-PTS input");
+    assert!(status.success());
+    let report = runner::compare(&path,&output("sparse-pts")).unwrap();
+    assert_eq!(report.frames,60);
+    assert!(report.stamped_packets < report.frames, "{} stamped PES for {} pictures",report.stamped_packets,report.frames);
+}
