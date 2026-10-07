@@ -1805,4 +1805,106 @@ fn decoder_held_frames_play_after_demux_eof() {
     assert!(FLUSH_ONLY_OPENED.load(std::sync::atomic::Ordering::SeqCst) > 0, "the flush-only decoder was not used");
 }
 
+/// A platform-like output: takes MPEG-2 compressed and counts what it gets;
+/// software frames go to the wrapped Headless capture.
+struct CompressedOutput {
+    inner: Arc<Headless>,
+    pushed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CompressedSink {
+    inner: Box<dyn player::backend::VideoSink>,
+    pushed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl player::backend::Backend for CompressedOutput {
+    fn audio(&self) -> Box<dyn player::backend::AudioSink> {
+        player::backend::Backend::audio(&*self.inner)
+    }
+    fn video(&self, clock: Arc<dyn player::backend::Clock>) -> Box<dyn player::backend::VideoSink> {
+        let inner = player::backend::Backend::video(&*self.inner, clock);
+        Box::new(CompressedSink { inner, pushed: self.pushed.clone() })
+    }
+    fn subtitles(&self) -> Box<dyn player::backend::SubtitleSink> {
+        player::backend::Backend::subtitles(&*self.inner)
+    }
+}
+
+impl player::backend::VideoSink for CompressedSink {
+    fn open_compressed(&mut self, params: &oxideav_core::CodecParameters) -> bool {
+        params.codec_id.as_str() == "mpeg2video"
+    }
+    fn push_packet(&mut self, _: &oxideav_core::Packet, _: Duration, _: bool) -> Result<(), player::backend::SinkError> {
+        self.pushed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn open_frames(&mut self, params: &oxideav_core::CodecParameters) -> Result<(), player::backend::SinkError> {
+        self.inner.open_frames(params)
+    }
+    fn push_frame(&mut self, frame: &oxideav_core::VideoFrame, pts: Duration) -> Result<(), player::backend::SinkError> {
+        self.inner.push_frame(frame, pts)
+    }
+    fn frame_lead(&self) -> Duration {
+        self.inner.frame_lead()
+    }
+    fn finish(&mut self) -> Result<(), player::backend::SinkError> {
+        self.inner.finish()
+    }
+    fn flush(&mut self) {
+        self.inner.flush()
+    }
+    fn set_playing(&mut self, playing: bool) {
+        self.inner.set_playing(playing)
+    }
+}
+
+#[test]
+fn untimed_raw_mpeg_switches_to_software_decoding() {
+    // Raw MPEG-2 leaves I and P pictures untimed (only B pictures carry a
+    // PTS), which a platform decoder cannot present: the stream must move to
+    // the software decoder before any packet reaches the compressed sink,
+    // and play every picture with FFmpeg's pixels and times.
+    let bytes = ffmpeg_file("m2v", &[
+        "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25:duration=2",
+        "-c:v", "mpeg2video", "-g", "12", "-bf", "2",
+    ]);
+    let path = tempfile("m2v");
+    std::fs::write(&path, bytes).unwrap();
+    let inner = Headless::new();
+    inner.set_active_streams(Some((0, "mpeg2video".into())), None, None, false);
+    let pushed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = Arc::new(CompressedOutput { inner: inner.clone(), pushed: pushed.clone() });
+    let options = PlayerOptions { realtime: false, ..PlayerOptions::default() };
+    let player = Player::open(path.to_str().unwrap(), backend, test_context(), options, |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    assert_eq!(pushed.load(std::sync::atomic::Ordering::SeqCst), 0, "untimed packets reached the compressed sink");
+    let capture = inner.capture();
+    let video = &capture.video[0];
+    let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &["-idct", "simple"]);
+    assert_eq!(expected.len(), 50);
+    assert_eq!(video.frame_md5, expected, "pictures differ from FFmpeg");
+    let probe = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0"])
+        .arg(&path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    std::fs::remove_file(&path).unwrap();
+    // FFmpeg leaves a picture untimed when it cannot derive a time (N/A);
+    // there ours must still continue the timeline.
+    let theirs: Vec<Option<u128>> = String::from_utf8(probe.stdout).unwrap().lines()
+        .map(|t| t.trim().trim_end_matches(',').parse::<f64>().ok().map(|s| Duration::from_secs_f64(s).as_millis()))
+        .collect();
+    let ours: Vec<u128> = video.pts.iter().map(Duration::as_millis).collect();
+    assert_eq!(ours.len(), theirs.len());
+    assert!(theirs.iter().filter(|t| t.is_some()).count() >= 45, "FFmpeg times too few pictures: {theirs:?}");
+    for (i, (ours_t, theirs_t)) in ours.iter().zip(&theirs).enumerate() {
+        match theirs_t {
+            Some(t) => assert_eq!(ours_t, t, "picture {i}: ours {ours:?}, FFmpeg {theirs:?}"),
+            None => assert!(i == 0 || *ours_t > ours[i - 1], "picture {i} does not continue the timeline: {ours:?}"),
+        }
+    }
+}
+
 
