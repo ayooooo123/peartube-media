@@ -97,12 +97,6 @@ const QUEUE_MAX_SECS: f64 = 2.0;
 const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
-/// Audio timestamps this close to where the previous write ended are
-/// continuous (container rounding).
-const PTS_SLACK: Duration = Duration::from_millis(5);
-/// The longest audio gap filled with silence. Longer jumps are
-/// discontinuities (or hostile timestamps), not silence to play out.
-const MAX_SILENCE: Duration = Duration::from_secs(2);
 
 /// Side data travels with its packet, including across equal-PTS laces.
 pub(crate) struct QueuedPacket {
@@ -181,9 +175,13 @@ impl Lane {
         let mut last: Option<f64> = None;
         let mut bytes = 0;
         for p in q.iter() {
-            let secs = time_base.seconds_of(p.packet.pts.unwrap_or(0));
-            first.get_or_insert(secs);
-            last = Some(secs);
+            // An untimed packet (B-pictures only carry a PTS in some raw
+            // streams) says nothing about the queued span.
+            if let Some(ticks) = p.packet.pts.or(p.packet.dts) {
+                let secs = time_base.seconds_of(ticks);
+                first.get_or_insert(secs);
+                last = Some(secs);
+            }
             let side_bytes = p.metadata.webvtt.as_ref().map_or(0, |m| {
                 std::mem::size_of_val(m.as_ref())
                     + m.identifier.capacity() + m.settings.capacity()
@@ -1674,35 +1672,6 @@ fn write_pcm(
     let channels = channels.max(1);
     let rate = rate.max(1);
     let chunk = (rate as usize / 50).max(1);
-    // The output's clock counts frames from its first write, so its
-    // timeline must be contiguous: fill a gap with silence, drop what an
-    // overlap repeats. Jitter within `PTS_SLACK` is left alone; a gap past
-    // `MAX_SILENCE` (a timestamp discontinuity, or hostile input) is not
-    // filled.
-    let mut pcm = pcm;
-    let mut pts = pts;
-    if let Some(end) = written.end {
-        if pts > end + PTS_SLACK && pts - end <= MAX_SILENCE {
-            let silence = vec![0.0f32; chunk * channels];
-            let mut missing = ((pts - end).as_secs_f64() * f64::from(rate)).round() as usize;
-            while missing > 0 {
-                let frames = missing.min(chunk);
-                let at = written.end.unwrap_or(end);
-                if !write_pcm(sink, shared, &silence[..frames * channels], channels, rate, at,
-                    seen_seek, realtime, written, retired) {
-                    return false;
-                }
-                missing -= frames;
-            }
-        } else if pts + PTS_SLACK < end {
-            let repeated = ((end - pts).as_secs_f64() * f64::from(rate)).round() as usize;
-            if repeated * channels >= pcm.len() {
-                return true;
-            }
-            pcm = &pcm[repeated * channels..];
-            pts = end;
-        }
-    }
     let frames = pcm.len() / channels;
     let mut done = 0;
     while done < frames {
@@ -2009,8 +1978,11 @@ fn run_video_thread(
         need_keyframe = false;
 
         if compressed {
-            let ticks = packet.pts.unwrap_or(0).max(0);
-            let pts = Duration::from_secs_f64(stream.time_base.seconds_of(ticks).max(0.0));
+            // A packet without a timestamp follows the previous one.
+            let pts = match packet.pts.or(packet.dts) {
+                Some(ticks) => Duration::from_secs_f64(stream.time_base.seconds_of(ticks.max(0)).max(0.0)),
+                None => last_end,
+            };
             if primed != Some(seen_seek) {
                 primed = Some(seen_seek);
                 shared.pipe_primed(Pipe::Video, seen_seek);
