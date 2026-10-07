@@ -58,10 +58,14 @@ impl AudioSink for AndroidAudioSink {
         if sample_rate == 0 || sample_rate > i32::MAX as u32 || channels == 0 || channels > 64 {
             return Err(SinkError::Fatal(format!("invalid audio format {sample_rate} Hz / {channels} channels")));
         }
-        self.create_stream(sample_rate, channels)?;
+        // Suspended (app in the background): keep the format and let
+        // `resume` create the stream. Opening here would restart audio in
+        // the background; writes report `Unavailable` until then.
+        if !self.suspended {
+            self.create_stream(sample_rate, channels)?;
+        }
         self.sample_rate = sample_rate;
         self.channels = channels;
-        self.suspended = false;
         Ok(())
     }
 

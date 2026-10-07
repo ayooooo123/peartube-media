@@ -179,6 +179,12 @@ impl Backend for AndroidBackend {
         let (sink, _clock) = AndroidAudioSink::new();
         let sink_arc = Arc::new(Mutex::new(sink));
         *self.shared.active_audio.lock() = Some(Arc::downgrade(&sink_arc));
+        // Registered first: a concurrent `suspend` either finds this sink or
+        // has already set the flag read here, so no sink opens a stream in
+        // the background.
+        if self.shared.is_suspended.load(Ordering::SeqCst) {
+            sink_arc.lock().suspend();
+        }
         Box::new(AudioSinkWrapper { inner: sink_arc })
     }
 
