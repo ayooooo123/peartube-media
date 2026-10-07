@@ -145,3 +145,22 @@ fn no_panic_on_truncated_and_bit_flipped_wmavoice_19k() {
 fn no_panic_on_truncated_and_bit_flipped_wmav2() {
     mutate_and_feed("cover_art/Californication_cover.wma", 0x5EED_0F0F_1234_5678);
 }
+
+#[test]
+fn zero_audio_dimensions_are_rejected_at_open() {
+    let mut ctx = RuntimeContext::new();
+    codec_wma::register(&mut ctx);
+    for codec in ["wmav1", "wmav2"] {
+        for (sample_rate, channels) in [(44_100, 0), (0, 2)] {
+            let mut params = oxideav_core::CodecParameters::audio(oxideav_core::CodecId::new(codec));
+            params.sample_rate = Some(sample_rate);
+            params.channels = Some(channels);
+            params.bit_rate = Some(128_000);
+            params.options.insert("block_align", "512");
+            params.extradata = vec![0; 10];
+            params.extradata[if codec == "wmav1" { 2 } else { 4 }] = 0x0f;
+            assert!(ctx.codecs.first_decoder(&params).is_err(),
+                "{codec} accepted sample_rate={sample_rate}, channels={channels}");
+        }
+    }
+}

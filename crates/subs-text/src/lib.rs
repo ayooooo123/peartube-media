@@ -62,8 +62,8 @@ fn subtitle_caps(impl_name: &str) -> CodecCapabilities {
         lossless: true,
         hardware_accelerated: false,
         implementation: impl_name.into(),
-        // Our own priority: below OxideAV's software default of 100 so
-        // ours is preferred if OxideAV ever grows the same id.
+        // Capability metadata only: `first_decoder` uses registration order.
+        // Production registers these factories before upstream subtitle codecs.
         priority: 50,
         max_width: None,
         max_height: None,

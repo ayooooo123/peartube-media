@@ -24,17 +24,16 @@ pub mod vlc;
 pub mod xll;
 
 mod demuxer;
+pub use demuxer::register_containers;
 
 use crate::decoder::DcaDecoder;
 use oxideav_core::{AudioFrame, CodecCapabilities, CodecId, CodecInfo, CodecParameters, Decoder, Error as CoreError, Frame, Packet, Result as CoreResult, RuntimeContext, SampleFormat};
 
-/// OxideAV's DTS codec id — every demuxer already maps DTS tags to it, so
-/// registering under the same id with a lower priority makes this decoder
-/// win resolution without touching crates/codecs (retry guidance).
+/// OxideAV's DTS codec id. Production registers this factory before the
+/// upstream decoder: `first_decoder` selects by registration order.
 pub const CODEC_ID_STR_DCA: &str = "dts";
 
-/// Priority over OxideAV's core-only `dts` decoder (OxideAV software sits
-/// at 100+; lower wins; contract value 50).
+/// Tag-resolution priority (lower wins). This does not order decoder factories.
 pub const RESOLUTION_PRIORITY: i32 = 50;
 
 /// FFmpeg's decoder name is `dca` (`ffmpeg -decoders`: "dca — DCA (DTS

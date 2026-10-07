@@ -3,23 +3,43 @@
 # `gen:<name>` (files made by corpus/generate.sh into PEARTUBE_CORPUS_DIR,
 # default ~/projects/peartube-media-corpus).
 # rows    = yardstick rows covered (ids from corpus/yardstick.toml)
-# compare = per-stream comparison: md5 (bit-exact vs FFmpeg), snr:<dB> (audio
-#           SNR floor), decodes (must end Ended; FFmpeg itself cannot compare,
-#           e.g. synthetic or format-not-in-FFmpeg cases are NOT this: decodes
-#           is for formats whose FFmpeg reference the runner cannot produce).
+# compare = one policy per stream kind the sample has (a played stream with
+#           no policy fails):
+#   video:md5        every frame's MD5 equals FFmpeg's, same frame count
+#   audio:md5        PCM byte-identical to FFmpeg's in the decoder's sample
+#                    format, same sample count (integer/lossless decoders)
+#   audio:snr:<dB>   SNR >= floor, lengths within one decoder frame (float
+#                    decoders; the contract's floor is 90 dB, lower is refused)
+#   sub:text         every cue's timing (ms) and body equal FFmpeg's decode
+#                    re-encoded as SubRip, same count, every cue shown
+#   sub:bitmap       as many bitmaps as FFmpeg's decoder emits, same start
+#                    (and end) times, same canvas states as FFmpeg's sub2video
+#   <kind>:decodes   plays to the end with output; only for formats FFmpeg
+#                    cannot decode (the runner fails it when FFmpeg can), and
+#                    never a verified pass
+#   diag:audio:snr:<dB>  SNR against a floor, reported, never accepting (keeps
+#                    the measurement of formats below the contract floor)
+#           Records of one sample and stream selection merge; two different
+#           policies for one kind are an error.
 # stream selection: `streams` lists the stream indices to play per kind when
-# non-default; absent = the player's defaults (first of each kind).
+# non-default; absent = the player's defaults (first of each kind). Records
+# with different selections of one sample are separate entries.
 
 # ---------------- Video ----------------
 
 [[entry]]
 path = "fate:isom/vc1-wmapro.ism"
-rows = ["video:vc1", "video:wmv3", "audio:wmapro", "container:mp4"]
+rows = ["video:vc1", "audio:wmapro", "container:mp4"]
 compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "fate:vc1/SA00050.vc1"
 rows = ["video:vc1"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:vc1/SMM0005.rcv"
+rows = ["video:wmv3"]
 compare = ["video:md5"]
 
 [[entry]]
@@ -47,7 +67,7 @@ compare = ["video:md5"]
 [[entry]]
 path = "gen:mpeg4_3ivx.avi"
 rows = ["video:3ivx"]
-compare = ["decodes"]
+compare = ["video:md5"]
 
 [[entry]]
 path = "gen:video_h263i.avi"
@@ -87,7 +107,7 @@ compare = ["video:md5"]
 [[entry]]
 path = "fate:cvid/laracroft-cinepak-partial.avi"
 rows = ["video:cinepak", "container:avi"]
-compare = ["video:md5"]
+compare = ["video:md5", "audio:md5"]
 
 [[entry]]
 path = "fate:ogg/videotest.ogv"
@@ -106,7 +126,12 @@ compare = ["video:md5"]
 
 [[entry]]
 path = "fate:wmv8/wmv8_x8intra.wmv"
-rows = ["video:wmv1", "video:wmv2", "audio:wma1", "audio:wma2", "container:asf"]
+rows = ["video:wmv2", "audio:wma2", "container:asf"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:wmv1_wma1.asf"
+rows = ["video:wmv1", "audio:wma1"]
 compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
@@ -117,12 +142,12 @@ compare = ["video:md5"]
 [[entry]]
 path = "fate:svq1/marymary-shackles.mov"
 rows = ["video:svq1", "container:mov"]
-compare = ["video:md5"]
+compare = ["video:md5", "audio:md5"]
 
 [[entry]]
 path = "fate:svq3/Vertical400kbit.sorenson3.mov"
 rows = ["video:svq3"]
-compare = ["video:md5"]
+compare = ["video:md5", "audio:md5"]
 
 [[entry]]
 path = "fate:dv/dvcprohd_720p50.mov"
@@ -156,8 +181,13 @@ compare = ["video:md5"]
 
 [[entry]]
 path = "fate:real/G2_with_SVT_320_240.rm"
-rows = ["video:rv10", "video:rv20", "container:rm"]
+rows = ["video:rv20", "container:rm"]
 compare = ["video:md5"]
+
+[[entry]]
+path = "fate:sipr/sipr_5k0.rm"
+rows = ["video:rv10", "audio:sipr", "container:rm"]
+compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "fate:real/rv30.rm"
@@ -199,7 +229,7 @@ compare = ["video:md5", "audio:snr:90"]
 [[entry]]
 path = "gen:audio_mp1.mpa"
 rows = ["audio:mp1", "container:mp3"]
-compare = ["decodes"]
+compare = ["audio:md5"]
 
 [[entry]]
 path = "fate:mp3-conformance/compl.bit"
@@ -224,12 +254,12 @@ compare = ["audio:snr:90"]
 [[entry]]
 path = "gen:h264_ac3.mkv"
 rows = ["audio:ac3", "container:mkv"]
-compare = ["audio:snr:90"]
+compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "gen:h264_eac3.mkv"
 rows = ["audio:eac3", "container:mkv"]
-compare = ["audio:snr:90"]
+compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "fate:eac3/csi_miami_5.1_256_spx_small.eac3"
@@ -244,7 +274,7 @@ compare = ["audio:snr:90"]
 [[entry]]
 path = "gen:h264_dts.mkv"
 rows = ["audio:dts", "container:mkv"]
-compare = ["audio:snr:90"]
+compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "fate:lossless-audio/truehd_5.1.raw"
@@ -264,12 +294,12 @@ compare = ["audio:md5"]
 [[entry]]
 path = "gen:h264_truehd.mkv"
 rows = ["audio:truehd", "container:mkv"]
-compare = ["audio:md5"]
+compare = ["video:md5", "audio:md5"]
 
 [[entry]]
 path = "fate:wmv8/wmv_drm.wmv"
 rows = ["audio:wma2", "container:asf"]
-compare = ["audio:snr:90"]
+compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "fate:wmapro/Beethovens_9th-1_small.wma"
@@ -279,7 +309,7 @@ compare = ["audio:snr:90"]
 [[entry]]
 path = "fate:wmavoice/streaming_CBR-11K.wma"
 rows = ["audio:wmavoice", "container:asf"]
-compare = ["audio:snr:80"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
 
 [[entry]]
 path = "fate:lossless-audio/luckynight-partial.wma"
@@ -314,12 +344,12 @@ compare = ["audio:snr:90"]
 [[entry]]
 path = "fate:musepack/inside-mp7.mpc"
 rows = ["audio:musepack"]
-compare = ["audio:snr:90"]
+compare = ["audio:md5", "diag:audio:snr:90"]
 
 [[entry]]
 path = "fate:musepack/inside-mp8.mpc"
 rows = ["audio:musepack"]
-compare = ["audio:snr:90"]
+compare = ["audio:md5", "diag:audio:snr:90"]
 
 [[entry]]
 path = "fate:atrac3/mc_sich_at3_066_small.wav"
@@ -339,7 +369,7 @@ compare = ["audio:md5"]
 [[entry]]
 path = "gen:audio_mod.mod"
 rows = ["audio:mod", "container:midi"]
-compare = ["decodes"]
+compare = ["audio:decodes"]
 
 [[entry]]
 path = "fate:lossless-audio/inside.tta"
@@ -359,7 +389,7 @@ compare = ["audio:snr:90"]
 [[entry]]
 path = "fate:real/ra3_in_rm_file.rm"
 rows = ["audio:ra144"]
-compare = ["audio:snr:90"]
+compare = ["audio:md5", "diag:audio:snr:90"]
 
 [[entry]]
 path = "fate:realaudio/ra4_288.ra"
@@ -369,7 +399,7 @@ compare = ["audio:snr:90"]
 [[entry]]
 path = "fate:sipr/sipr_16k.rm"
 rows = ["audio:sipr", "container:rm"]
-compare = ["audio:snr:90"]
+compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "fate:aa/bush.aa"
@@ -399,12 +429,12 @@ compare = ["audio:md5"]
 [[entry]]
 path = "fate:amrnb/10.2k.amr"
 rows = ["audio:amrnb", "container:raw_aac"]
-compare = ["audio:snr:80"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
 
 [[entry]]
 path = "fate:amrwb/deus-23k85.awb"
 rows = ["audio:amrwb"]
-compare = ["audio:snr:80"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
 
 [[entry]]
 path = "fate:lossless-audio/als_00_2ch48k16b.mp4"
@@ -414,7 +444,7 @@ compare = ["audio:md5"]
 [[entry]]
 path = "gen:audio.mid"
 rows = ["audio:midi", "container:midi"]
-compare = ["decodes"]
+compare = ["audio:decodes"]
 
 [[entry]]
 path = "fate:mpegps/pcm_aud.mpg"
@@ -424,27 +454,27 @@ compare = ["audio:md5"]
 [[entry]]
 path = "gen:audio_adpcm.wav"
 rows = ["audio:adpcm", "container:wav"]
-compare = ["audio:snr:70"]
+compare = ["audio:md5", "diag:audio:snr:70"]
 
 [[entry]]
 path = "fate:qt-surge-suite/surge-1-16-B-ima4.mov"
 rows = ["audio:adpcm"]
-compare = ["audio:snr:70"]
+compare = ["audio:md5", "diag:audio:snr:70"]
 
 [[entry]]
 path = "fate:qcp/0036580847.QCP"
 rows = ["audio:qcelp"]
-compare = ["audio:snr:80"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
 
 [[entry]]
 path = "fate:dv/dvcprohd_720p50.mov"
 rows = ["audio:dvaudio"]
-compare = ["decodes"]
+compare = ["audio:md5"]
 
 [[entry]]
 path = "fate:qt-surge-suite/surge-2-16-B-QDM2.mov"
 rows = ["audio:qdm2", "container:mov"]
-compare = ["audio:snr:60"]
+compare = ["audio:snr:90", "diag:audio:snr:60"]
 
 # QDMC: no FATE sample and no encoder exists anywhere (ffmpeg has the decoder
 # but nothing produces QDMC bitstreams). This entry documents the gap; the
@@ -452,17 +482,17 @@ compare = ["audio:snr:60"]
 [[entry]]
 path = "gen:audio_qdmc_placeholder.bin"
 rows = ["audio:qdmc"]
-compare = ["decodes"]
+compare = ["audio:snr:90"]
 
 [[entry]]
 path = "fate:qt-surge-suite/surge-1-8-MAC3.mov"
 rows = ["audio:mace3", "container:mov"]
-compare = ["audio:snr:60"]
+compare = ["audio:md5", "diag:audio:snr:60"]
 
 [[entry]]
 path = "fate:qt-surge-suite/surge-1-8-MAC6.mov"
 rows = ["audio:mace6", "container:mov"]
-compare = ["audio:snr:60"]
+compare = ["audio:md5", "diag:audio:snr:60"]
 
 [[entry]]
 path = "fate:ogg-opus/chained-meta.ogg"
@@ -474,92 +504,114 @@ path = "fate:caf/opus.caf"
 rows = ["audio:opus", "container:caf"]
 compare = ["audio:snr:90"]
 
+# Two MP2 tracks of different content (FFmpeg md5s differ): the default
+# selection plays stream 1 and is compared with FFmpeg's 0:1, the explicit
+# one plays stream 2 and is compared with FFmpeg's 0:2.
+[[entry]]
+path = "fate:h264/h264_intra_first-small.ts"
+rows = ["audio:mp2", "container:mpeg_ts"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:h264/h264_intra_first-small.ts"
+rows = ["audio:mp2", "container:mpeg_ts"]
+compare = ["video:md5", "audio:md5"]
+streams = { audio = 2 }
+
+# The second of two FLAC tracks (same PCM as the first, so this exercises the
+# explicit selection and its mapping to FFmpeg's 0:1, not their distinction).
+[[entry]]
+path = "fate:mkv/flac_channel_layouts.mka"
+rows = ["audio:flac", "container:mkv"]
+compare = ["audio:md5"]
+streams = { audio = 1 }
+
 # ---------------- Subtitles ----------------
 
 [[entry]]
 path = "fate:sub/vobsub.idx"
 rows = ["sub:dvd"]
-compare = ["decodes"]
+compare = ["sub:bitmap"]
 
 [[entry]]
 path = "fate:sub/SubRip_capability_tester.srt"
 rows = ["sub:subrip"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/MicroDVD_capability_tester.sub"
 rows = ["sub:microdvd"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/SubViewer_capability_tester.sub"
 rows = ["sub:subviewer"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/1ededcbd7b.ass"
 rows = ["sub:ass"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/SAMI_capability_tester.smi"
 rows = ["sub:sami"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/VPlayer_capability_tester.txt"
 rows = ["sub:vplayer"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/MPL2_capability_tester.txt"
 rows = ["sub:mpl2"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "fate:sub/Closedcaption_rollup.m2v"
 rows = ["sub:eia608"]
-compare = ["subcount"]
+compare = ["video:md5", "sub:text"]
 
 [[entry]]
 path = "fate:sub/witch.scc"
 rows = ["sub:cea708"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "gen:h264_aac_usf.mkv"
 rows = ["sub:usf"]
-compare = ["subcount"]
+compare = ["video:md5", "audio:snr:90", "sub:decodes"]
 
 [[entry]]
 path = "fate:sub/dvbsubtest_filter.ts"
 rows = ["sub:dvb", "container:mpeg_ts"]
-compare = ["subcount"]
+compare = ["video:md5", "audio:snr:90", "sub:bitmap"]
 
 [[entry]]
 path = "gen:h264_aac_srt.mkv"
 rows = ["sub:ogm"]
-compare = ["subcount"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
 
 [[entry]]
 path = "fate:sub/MovText_capability_tester.mp4"
 rows = ["sub:tx3g"]
-compare = ["subcount"]
+compare = ["sub:text"]
 
 [[entry]]
 path = "gen:vp9_opus_vtt.webm"
 rows = ["sub:webvtt"]
-compare = ["subcount"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
 
 [[entry]]
 path = "fate:sub/pgs_sub.sup"
 rows = ["sub:pgs"]
-compare = ["decodes"]
+compare = ["sub:bitmap"]
 
 [[entry]]
 path = "gen:h264_aac_pgs.mkv"
 rows = ["sub:pgs", "container:mkv"]
-compare = ["decodes"]
+compare = ["video:md5", "sub:bitmap"]
 
 # SVCD / CMML / Kate: no FATE samples and no ffmpeg encoders. SVCD OGT is
 # covered by the subs-bitmap worker's FATE-less row via psx-str; CMML and
@@ -568,17 +620,17 @@ compare = ["decodes"]
 [[entry]]
 path = "gen:sub_svcd_placeholder.bin"
 rows = ["sub:svcd"]
-compare = ["decodes"]
+compare = ["sub:decodes"]
 
 [[entry]]
 path = "gen:sub_cmml_placeholder.bin"
 rows = ["sub:cmml"]
-compare = ["decodes"]
+compare = ["sub:decodes"]
 
 [[entry]]
 path = "gen:sub_kate_placeholder.bin"
 rows = ["sub:kate"]
-compare = ["decodes"]
+compare = ["sub:decodes"]
 
 # ---------------- Containers ----------------
 
@@ -625,7 +677,7 @@ compare = ["audio:snr:90"]
 [[entry]]
 path = "fate:amrnb/10.2k.amr"
 rows = ["container:raw_aac"]
-compare = ["audio:snr:80"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
 
 [[entry]]
 path = "fate:dv/dvcprohd_720p50.mov"
@@ -650,12 +702,12 @@ compare = ["video:md5", "audio:md5"]
 [[entry]]
 path = "gen:h264_aac_nut.nut"
 rows = ["container:nut"]
-compare = ["video:md5", "audio:md5"]
+compare = ["video:md5", "audio:snr:90"]
 
 [[entry]]
 path = "gen:audio.mid"
 rows = ["container:midi"]
-compare = ["decodes"]
+compare = ["audio:decodes"]
 
 [[entry]]
 path = "fate:creative/BBC_4BIT.VOC"

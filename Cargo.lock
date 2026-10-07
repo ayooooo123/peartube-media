@@ -254,6 +254,7 @@ dependencies = [
  "oxideav-vp9",
  "oxideav-wavpack",
  "oxideav-wma",
+ "refcheck",
  "subs-text",
 ]
 
@@ -336,6 +337,8 @@ dependencies = [
  "libc",
  "md5",
  "oxideav-core",
+ "oxideav-subtitle",
+ "parking_lot",
  "player",
  "refcheck",
  "serde",
@@ -919,7 +922,7 @@ dependencies = [
 [[package]]
 name = "oxideav-avi"
 version = "0.0.10"
-source = "git+https://github.com/OxideAV/oxideav-avi?rev=2a5aa9fc78381d4d8db1d066849bc35ce6ad9442#2a5aa9fc78381d4d8db1d066849bc35ce6ad9442"
+source = "git+https://github.com/ayooooo123/oxideav-avi?rev=b919db191b3bc6f5da0fe250e660b37c231d1c26#b919db191b3bc6f5da0fe250e660b37c231d1c26"
 dependencies = [
  "oxideav-core",
 ]

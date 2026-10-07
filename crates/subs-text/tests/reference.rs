@@ -19,7 +19,13 @@ fn format_srt_time(us: i64) -> String {
 }
 
 fn ffmpeg_srt_cues(path: &Path) -> Vec<(String, String)> {
+    ffmpeg_srt_cues_with_options(path, &[])
+}
+
+fn ffmpeg_srt_cues_with_options(path: &Path, options: &[&str]) -> Vec<(String, String)> {
     let output = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error"])
+        .args(options)
         .args([
             "-i",
             path.to_str().unwrap(),
@@ -309,41 +315,32 @@ fn test_sami_reference() {
     }
 }
 
+fn assert_standalone_cues(sample: &str, options: &[&str]) {
+    let sample = fate(sample);
+    let reference = ffmpeg_srt_cues_with_options(&sample, options);
+    assert!(!reference.is_empty(), "FFmpeg must produce reference cues");
+    let decoded = refcheck::decode(&sample, &[subs_text::register], MediaType::Subtitle, 0);
+    let actual: Vec<_> = decoded.frames.iter().map(|frame| {
+        let Frame::Subtitle(cue) = frame else { panic!("expected subtitle frame") };
+        (
+            format!("{} --> {}", format_srt_time(cue.start_us), format_srt_time(cue.end_us)),
+            oxideav_subtitle::srt::render_segments(&cue.segments).trim().to_string(),
+        )
+    }).collect();
+    assert_eq!(actual, reference, "complete cue text, timing and count for {}", sample.display());
+}
+
 #[test]
 fn test_subviewer1_reference() {
-    let sample = fate("sub/SubViewer1_capability_tester.sub");
-    let decoded = refcheck::decode(
-        &sample,
-        &[subs_text::register],
-        MediaType::Subtitle,
-        0,
+    assert_standalone_cues(
+        "sub/SubViewer1_capability_tester.sub",
+        &["-sub_charenc", "windows-1250"],
     );
-    assert_eq!(decoded.frames.len(), 10, "expected 10 decoded cues");
-    let (first_pts, last_pts) = match (&decoded.frames[0], &decoded.frames[9]) {
-        (Frame::Subtitle(c1), Frame::Subtitle(c10)) => (c1.start_us, c10.start_us),
-        _ => panic!("expected subtitle frames"),
-    };
-    assert_eq!(first_pts, 225_000_000); // 00:03:45
-    assert_eq!(last_pts, 7_218_000_000); // 02:00:18
 }
 
 #[test]
 fn test_vplayer_reference() {
-    let sample = fate("sub/VPlayer_capability_tester.txt");
-    let decoded = refcheck::decode(
-        &sample,
-        &[subs_text::register],
-        MediaType::Subtitle,
-        0,
-    );
-    assert_eq!(decoded.frames.len(), 3, "expected 3 decoded cues");
-    let (c1, c2, c3) = match (&decoded.frames[0], &decoded.frames[1], &decoded.frames[2]) {
-        (Frame::Subtitle(c1), Frame::Subtitle(c2), Frame::Subtitle(c3)) => (c1, c2, c3),
-        _ => panic!("expected subtitle frames"),
-    };
-    assert_eq!(c1.start_us, 120_000); // 00:00:00,120
-    assert_eq!(c2.start_us, 23_510_000); // 00:00:23,510
-    assert_eq!(c3.start_us, 62_050_000); // 00:01:02,050
+    assert_standalone_cues("sub/VPlayer_capability_tester.txt", &[]);
 }
 
 #[test]

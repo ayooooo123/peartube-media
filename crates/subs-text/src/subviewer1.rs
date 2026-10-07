@@ -60,7 +60,7 @@ pub fn open_demuxer(
     let text = decode_subtitle_text(&raw);
     let packets = demux_subviewer1_text(&text)?;
 
-    let time_base = TimeBase::new(1, 1_000); // milliseconds
+    let time_base = TimeBase::new(1, 1); // SubViewer 1 timestamps are whole seconds.
     let mut params = CodecParameters::audio(CodecId::new(CODEC_ID));
     params.media_type = MediaType::Subtitle;
     params.sample_rate = None;
@@ -108,7 +108,7 @@ fn demux_subviewer1_text(text: &str) -> Result<VecDeque<Packet>> {
         }
 
         if let Some((hh, mm, ss)) = parse_timestamp_tag(line) {
-            let pts_start = (hh * 3600 + mm * 60 + ss + delay) * 1_000; // ms
+            let pts_start = hh * 3600 + mm * 60 + ss + delay;
             i += 1;
             if i < lines.len() {
                 let sub_line = lines[i].trim_end_matches(['\r', '\n']);
@@ -142,15 +142,13 @@ fn demux_subviewer1_text(text: &str) -> Result<VecDeque<Packet>> {
         }
     }
 
-    let time_base = TimeBase::new(1, 1_000);
+    let time_base = TimeBase::new(1, 1);
     let mut packets = VecDeque::with_capacity(raw_subs.len());
     for s in raw_subs {
         let mut pkt = Packet::new(0, time_base, s.data.into_bytes());
         pkt.pts = Some(s.pts);
         pkt.dts = Some(s.pts);
-        if s.duration >= 0 {
-            pkt.duration = Some(s.duration);
-        }
+        pkt.duration = Some(s.duration);
         pkt.flags.keyframe = true;
         packets.push_back(pkt);
     }
@@ -215,15 +213,7 @@ impl Decoder for SubViewer1Decoder {
             .map(|pts| packet.time_base.rescale(pts, TimeBase::new(1, 1_000_000)))
             .unwrap_or(0);
 
-        let end_us = if let Some(dur) = packet.duration {
-            if dur >= 0 {
-                start_us + packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000))
-            } else {
-                start_us + (u32::MAX as i64) * 1_000
-            }
-        } else {
-            start_us + (u32::MAX as i64) * 1_000
-        };
+        let end_us = crate::text_common::subtitle_end_us(packet, start_us);
 
         self.pending.push_back(Frame::Subtitle(SubtitleCue {
             start_us,
