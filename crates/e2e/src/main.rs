@@ -269,6 +269,18 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, nth: usize, floor_db: 
     };
     // One decode frame of slack; floor at one frame of the source rate.
     let slack = cap.sample_rate.max(1) as usize / 10 + 2048;
+    if reference.len().abs_diff(cap.pcm.len()) > slack {
+        // A wrong sample count fails this entry; it must not abort the run.
+        return Compare {
+            verdict: "FAIL",
+            metric: format!("samples={}", cap.pcm.len() / cap.channels.max(1) as usize),
+            error: Some(format!(
+                "length {} vs FFmpeg {} (slack {slack})",
+                cap.pcm.len(),
+                reference.len()
+            )),
+        };
+    }
     let snr = refcheck::snr_db(&reference, &cap.pcm, slack);
     let metric = format!(
         "samples={} snr={snr:.1} dB",
