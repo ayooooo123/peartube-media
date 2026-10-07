@@ -757,3 +757,26 @@ fn discovery_does_not_rescan_a_parameterless_head_per_packet() {
         .expect("open did not finish within 20 s");
     assert_eq!(streams, [("ac3".to_string(), None)]);
 }
+
+/// 100,000 one-byte MPEG audio PES without a timestamp, within the probe
+/// size: discovery delivers each to a stream whose head never holds an
+/// audio header (0xFF bytes). Whether a delivery completed one depends
+/// on the bytes it added, so opening takes time linear in the PES count:
+/// it ends within 12 s, where rescanning the head (up to 64 KiB) after
+/// every PES takes over half a minute.
+#[test]
+fn discovery_stays_linear_in_one_byte_audio_pes() {
+    let mut ps = PACK.to_vec();
+    for _ in 0..100_000 {
+        ps.extend(pes(0xC0, None, &[0xFF]));
+    }
+    ps.extend_from_slice(&[0, 0, 1, 0xB9]);
+    let (opened, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ctx = codecs::context();
+        let demuxer = ctx.containers.open_demuxer("mpeg", Box::new(std::io::Cursor::new(ps)), &ctx.codecs);
+        let _ = opened.send(demuxer.map(|d| d.streams().iter().map(|s| s.params.codec_id.as_str().to_string()).collect::<Vec<_>>()));
+    });
+    let streams = result.recv_timeout(std::time::Duration::from_secs(12)).expect("open ends within 12 s");
+    assert_eq!(streams.unwrap(), ["mp2"], "the audio stream");
+}

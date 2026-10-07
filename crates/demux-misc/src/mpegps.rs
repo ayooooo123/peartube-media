@@ -1555,6 +1555,8 @@ mod tests {
                 first_ts: None,
                 start_time: None,
                 framing: Framing::Pes,
+                index: Index::default(),
+                probing: Vec::new(),
             };
             let mut at = 0;
             while at < bytes.len() && !track.ready {
