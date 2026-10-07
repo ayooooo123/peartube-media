@@ -428,6 +428,47 @@ fn decoder_completes_frames_across_packets_until_eof_and_reset_forgets_them() {
     assert_eq!(after_reset, reference, "decoding after reset vs a fresh decoder");
 }
 
+/// A frame takes the PTS of the packet its first byte arrived in, however
+/// many packets its sync marker spans before the frame is recognised (a
+/// core marker on its sixth byte): its first six bytes come one per
+/// packet, the PTS on the first only, then the rest. As the first frame,
+/// and as a frame after a timestamp jump, where following on from the
+/// frame before would give another time.
+#[test]
+fn a_frame_keeps_the_pts_of_its_first_byte_across_one_byte_packets() {
+    let frames = demux_all("dts", Box::new(std::fs::File::open(fate("dts/dts_es.dts")).unwrap()));
+    let (first, second) = (&frames[0].data, &frames[1].data);
+    let tb = TimeBase::new(1, 90_000);
+    let dribble = |frame: &[u8], pts: i64| -> Vec<Packet> {
+        let mut packets: Vec<Packet> = frame[..6].iter().map(|&b| Packet::new(0, tb, vec![b])).collect();
+        packets[0] = packets[0].clone().with_pts(pts);
+        packets.push(Packet::new(0, tb, frame[6..].to_vec()));
+        packets
+    };
+    let mut ctx = RuntimeContext::new();
+    codec_dca::register(&mut ctx);
+    let params = CodecParameters::audio(CodecId::new("dts"));
+    for (what, packets, want) in [
+        ("first frame", dribble(first, 9000), vec![Some(9000)]),
+        (
+            "frame after a jump",
+            [vec![Packet::new(0, tb, first.clone()).with_pts(9000)], dribble(second, 30_000)].concat(),
+            vec![Some(9000), Some(30_000)],
+        ),
+    ] {
+        let mut decoder = ctx.codecs.first_decoder(&params).unwrap();
+        for p in &packets {
+            decoder.send_packet(p).unwrap_or_else(|e| panic!("{what}: {e}"));
+        }
+        decoder.flush().unwrap();
+        let mut times = Vec::new();
+        while let Ok(Frame::Audio(a)) = decoder.receive_frame() {
+            times.push(a.pts);
+        }
+        assert_eq!(times, want, "{what}: frame timestamps");
+    }
+}
+
 // ───────────────────── timing past a frame that fails ─────────────────────
 
 /// Flip the primary channel count that follows a core frame header: the

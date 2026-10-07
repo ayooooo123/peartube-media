@@ -120,8 +120,13 @@ pub struct DcaDecoderImpl {
     ready: VecDeque<Frame>,
 }
 
-/// AV_PARSER_PTS_NB: the packets whose timestamps FFmpeg's parser keeps.
-const PTS_NB: usize = 4;
+/// Packets whose timestamps are kept: every one that may hold the first
+/// byte of the frame the stream has not timed yet. FFmpeg's parser keeps
+/// 4 (AV_PARSER_PTS_NB) but fetches a frame's timestamp as soon as the
+/// frame before it ends; here a frame is timed once its start is known,
+/// on the last byte of its marker, so the packet holding its first byte
+/// is at most [`demuxer::MARKER_LEN`] packets back (each brings a byte).
+const PTS_NB: usize = demuxer::MARKER_LEN;
 
 /// The dca parser stage FFmpeg runs between its demuxers and the decoder,
 /// which a demuxer's packets reach here instead (an MPEG-TS PES may hold

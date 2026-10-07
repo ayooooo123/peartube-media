@@ -347,6 +347,10 @@ impl ParseState {
 /// frame ahead of it ended: a core marker is recognised on its sixth byte.
 const MARKER_TAIL: usize = 5;
 
+/// The longest sync marker (core, in any of its four encodings): a frame
+/// is known to start this many bytes after its first byte arrived.
+pub(crate) const MARKER_LEN: usize = MARKER_TAIL + 1;
+
 /// Input kept while no frame has started: a marker starts at most six
 /// bytes before the byte that completes it.
 const SCAN_TAIL: usize = 8;
