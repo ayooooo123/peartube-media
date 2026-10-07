@@ -1167,7 +1167,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg12video"
 version = "0.0.13"
-source = "git+https://github.com/OxideAV/oxideav-mpeg12video?rev=aac677c54865e6fce01f576876cf564b327c09bf#aac677c54865e6fce01f576876cf564b327c09bf"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=9c4c24c2d336ffde2e23f29d55812e75c40d780a#9c4c24c2d336ffde2e23f29d55812e75c40d780a"
 dependencies = [
  "oxideav-core",
 ]
