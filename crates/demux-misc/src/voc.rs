@@ -84,35 +84,19 @@ struct VocDemuxer {
     sample_format: Option<SampleFormat>,
 }
 
-/// FFmpeg's av_get_audio_frame_duration2 substitute for the codecs VOC
-/// carries: samples decoded from `size` bytes of compressed/PCM data.
-/// Returns None when it cannot be derived (then the pts stalls to -1,
-/// FFmpeg's AV_NOPTS_VALUE path).
-fn audio_duration(codec: &str, channels: u16, size: usize, sample_format: Option<SampleFormat>) -> Option<i64> {
-    let ch = channels.max(1) as usize;
-    match codec {
-        // SBPro 2/3/4 bits: FFmpeg packs 2/3/4-bit samples into u8 pairs.
-        "adpcm_sbpro_2" => (size * 4).checked_div(ch).map(|v| v as i64),
-        "adpcm_sbpro_3" => (size * 8).checked_div(3 * ch).map(|v| v as i64),
-        "adpcm_sbpro_4" => (size * 2).checked_div(ch).map(|v| v as i64),
-        "adpcm_ct" => {
-            // MS ADPCM: 7 bytes of headers per channel, then 4-byte
-            // blocks of 8 samples per channel.
-            if size < 7 * ch {
-                return None;
-            }
-            let blocks = (size - 7 * ch) / (4 * ch);
-            Some(blocks as i64 * 256 + 2)
-        }
-        "pcm_alaw" | "pcm_mulaw" | "pcm_u8" | "pcm_s8" => {
-            size.checked_div(ch).map(|v| v as i64)
-        }
-        "pcm_s16le" => size.checked_div(2 * ch).map(|v| v as i64),
-        _ => {
-            let bps = sample_format.map(|f| f.bytes_per_sample()).unwrap_or(1);
-            size.checked_div(bps * ch).map(|v| v as i64)
-        }
-    }
+/// av_get_audio_frame_duration2 (libavcodec/utils.c): only codecs with
+/// an exact coded sample width have a duration here. SBPro packets have
+/// predictor bytes and no duration rule; after the first packet their
+/// timestamps are unknown, not compressed-size-derived sample counts.
+fn audio_duration(codec: &str, channels: u16, size: usize) -> Option<i64> {
+    let bits = match codec {
+        "adpcm_ct" => 4,
+        "pcm_alaw" | "pcm_mulaw" | "pcm_u8" | "pcm_s8" => 8,
+        "pcm_s16le" => 16,
+        _ => return None,
+    };
+    let samples = (size * 8).checked_div(bits * usize::from(channels))?;
+    (samples > 0).then_some(samples as i64)
 }
 
 impl VocDemuxer {
@@ -268,8 +252,8 @@ impl VocDemuxer {
         let mut data = vec![0u8; size];
         self.input.read_exact(&mut data)?;
 
-        let duration = audio_duration(codec, self.channels, size, self.sample_format);
-        let pts = self.pts;
+        let duration = audio_duration(codec, self.channels, size);
+        let pts = (self.pts >= 0).then_some(self.pts);
         match duration {
             Some(d) if self.pts >= 0 => self.pts += d,
             _ => self.pts = -1,
@@ -279,8 +263,8 @@ impl VocDemuxer {
         let mut pkt = Packet {
             stream_index: 0,
             time_base: stream.time_base,
-            pts: Some(pts),
-            dts: Some(pts),
+            pts,
+            dts: pts,
             duration: None,
             flags: Default::default(),
             data,
