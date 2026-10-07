@@ -1303,7 +1303,7 @@ dependencies = [
 [[package]]
 name = "oxideav-subtitle"
 version = "0.1.2"
-source = "git+https://github.com/OxideAV/oxideav-subtitle?rev=03f3aa41d2ea8d8baaadaef8030061c66c2338c9#03f3aa41d2ea8d8baaadaef8030061c66c2338c9"
+source = "git+https://github.com/ayooooo123/oxideav-subtitle?rev=53df836f596bb4ce8391bb821b2100d3e7f94f1b#53df836f596bb4ce8391bb821b2100d3e7f94f1b"
 dependencies = [
  "oxideav-core",
  "oxideav-pixfmt",
@@ -1655,12 +1655,15 @@ dependencies = [
 name = "subs-text"
 version = "0.1.0"
 dependencies = [
+ "codecs",
  "oxideav-ass",
  "oxideav-core",
  "oxideav-mkv",
  "oxideav-mp4",
  "oxideav-ogg",
  "oxideav-subtitle",
+ "parking_lot",
+ "player",
  "refcheck",
 ]
 

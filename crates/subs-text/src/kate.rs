@@ -279,13 +279,13 @@ impl Decoder for KateDecoder {
                 let text_str = String::from_utf8_lossy(text_bytes).into_owned();
 
                 let mut start_us = self.ctx.granule_to_us(start);
-                let mut end_us = start_us + self.ctx.granule_to_us(duration);
+                let mut end_us = start_us.saturating_add(self.ctx.granule_to_us(duration));
 
                 if start == 0 && duration == 0 {
                     if let Some(pts) = packet.pts {
                         start_us = packet.time_base.rescale(pts, TimeBase::new(1, 1_000_000));
                         end_us = if let Some(dur) = packet.duration {
-                            start_us + packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000))
+                            start_us.saturating_add(packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000)))
                         } else {
                             start_us
                         };

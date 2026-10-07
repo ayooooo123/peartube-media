@@ -1,3 +1,7 @@
+//! Container-probe diagnostic, not a playback or packet-correctness test.
+//! Run with `cargo run -p demux-misc --example check_oxideav`.
+//! Reference tests and the E2E corpus provide acceptance checks.
+
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -58,8 +62,7 @@ fn check_sample(ctx: &oxideav_core::RuntimeContext, name: &str, rel_path: &str) 
     }
 }
 
-#[test]
-fn test_oxideav_capabilities() {
+fn main() {
     let ctx = codecs::context();
     println!("Registered containers: {:?}", ctx.containers.demuxer_names().collect::<Vec<_>>());
 
