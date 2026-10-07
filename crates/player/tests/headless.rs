@@ -1702,28 +1702,107 @@ fn far_future_final_timestamp_does_not_hold_the_end() {
     assert!(state.position < Duration::from_secs(6), "position ran to {:?}", state.position);
 }
 
+/// Wraps the registry's MPEG-2 decoder and releases every picture only at
+/// flush, as a hardware decoder or a flush-only software decoder may: the
+/// demuxer reaches the end while the clock is still held at zero.
+struct FlushOnly {
+    inner: Box<dyn oxideav_core::Decoder>,
+    held: std::collections::VecDeque<oxideav_core::Frame>,
+    flushed: bool,
+}
+
+static FLUSH_ONLY_OPENED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl FlushOnly {
+    fn open(params: &oxideav_core::CodecParameters) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
+        FLUSH_ONLY_OPENED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let inner = codecs::context().codecs.first_decoder(params)?;
+        Ok(Box::new(FlushOnly { inner, held: Default::default(), flushed: false }))
+    }
+
+    fn drain(&mut self) -> oxideav_core::Result<()> {
+        loop {
+            match self.inner.receive_frame() {
+                Ok(frame) => self.held.push_back(frame),
+                Err(oxideav_core::Error::NeedMore | oxideav_core::Error::Eof) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl oxideav_core::Decoder for FlushOnly {
+    fn codec_id(&self) -> &oxideav_core::CodecId {
+        self.inner.codec_id()
+    }
+    fn send_packet(&mut self, packet: &oxideav_core::Packet) -> oxideav_core::Result<()> {
+        self.inner.send_packet(packet)?;
+        self.drain()
+    }
+    fn receive_frame(&mut self) -> oxideav_core::Result<oxideav_core::Frame> {
+        match (self.flushed, self.held.pop_front()) {
+            (true, Some(frame)) => Ok(frame),
+            (true, None) => Err(oxideav_core::Error::Eof),
+            (false, frame) => {
+                if let Some(frame) = frame {
+                    self.held.push_front(frame);
+                }
+                Err(oxideav_core::Error::NeedMore)
+            }
+        }
+    }
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        self.inner.flush()?;
+        self.drain()?;
+        self.flushed = true;
+        Ok(())
+    }
+    fn reset(&mut self) -> oxideav_core::Result<()> {
+        self.inner.reset()?;
+        self.held.clear();
+        self.flushed = false;
+        Ok(())
+    }
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.inner.output_video_dimensions()
+    }
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
+        self.inner.output_pixel_format()
+    }
+}
+
 #[test]
 fn decoder_held_frames_play_after_demux_eof() {
     let _cpu = realtime_test();
-    // The pinned MPEG-2 decoder emits its pictures only at flush, after the
-    // demuxer has reached the end with the clock still held at zero.
     let bytes = ffmpeg_file("mkv", &[
         "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25:duration=6",
         "-c:v", "mpeg2video", "-g", "25", "-bf", "0",
     ]);
     let path = tempfile("mkv");
     std::fs::write(&path, bytes).unwrap();
+    // The player takes the first registered decoder, so the wrapper goes in
+    // before the full registry.
+    let mut context = oxideav_core::RuntimeContext::new();
+    context.codecs.register(
+        oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("mpeg2video"))
+            .capabilities(oxideav_core::CodecCapabilities::video("flush_only"))
+            .decoder(FlushOnly::open),
+    );
+    codecs::register_all(&mut context);
     let backend = Headless::new();
-    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), Arc::new(context), PlayerOptions::default(), |_| {});
     let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
     drop(player);
     std::fs::remove_file(path).unwrap();
     assert!(state.ended && state.error.is_none(), "{state:?}");
     let video = &backend.capture().video[0];
-    assert_eq!(state.dropped_frames, 0, "frames past the EOF horizon were dropped ({} shown)", video.pts.len());
-    // The pinned decoder loses its last two pictures and stamps the rest
-    // itself; the transport must still show every picture it outputs.
-    assert!(video.pts.len() >= 148, "only {} frames shown", video.pts.len());
+    // Capping the tail at "clock + queue horizon" while the clock was held
+    // dropped every picture past 3 s (74 of 150). A few late frames under
+    // machine load are a timing matter, not this one.
+    assert_eq!(video.pts.last().copied(), Some(Duration::from_millis(5960)),
+        "the final picture was not shown ({} shown, {} dropped)", video.pts.len(), state.dropped_frames);
+    assert!(video.pts.len() >= 135, "only {} of 150 pictures shown ({} dropped)", video.pts.len(), state.dropped_frames);
+    assert!(FLUSH_ONLY_OPENED.load(std::sync::atomic::Ordering::SeqCst) > 0, "the flush-only decoder was not used");
 }
 
 

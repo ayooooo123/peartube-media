@@ -100,24 +100,17 @@ pub fn compare(path: &Path, output: &Path) -> Result<Report,String> {
     println!("{} frames={}/{} exact={} pre_eof={} first_packet={:?} geometry_packet={:?} geometry_bytes={:?} initial={:?} at_open={:?} packets={} stamped_packets={} bytes={} pts_exact={pts_exact}/{} ffmpeg_untimed={ffmpeg_untimed} oracle={}",path.display(),ours.frames,reference.len(),matching,ours.before_eof,ours.first_output_packet,ours.geometry_packet,ours.geometry_bytes,ours.initial_dimensions,ours.opened_dimensions,ours.packets,ours.stamped_packets,ours.input_bytes,reference_pts.len(),output.display());
     if ours.hashes != reference { return Err(format!("complete MD5 mismatch: {matching}/{} matched, {} decoded", reference.len(),ours.frames)); }
     if ours.frames > 2 && ours.before_eof == 0 { return Err("no incremental output".into()); }
-    if ours.container == "mpegvideo" {
-        // The raw demuxer numbers packets in coded order (1/fps); display
-        // times must still rise by exactly one period after the first frame.
-        let times: Vec<i64> = ours.pts.iter().map(|t| t.ok_or("untimed frame")).collect::<Result<_,_>>()?;
-        if !times.windows(2).all(|w| w[0] < w[1]) || !times[1..].windows(2).all(|w| w[1] - w[0] == 1) {
-            return Err(format!("raw display times not at frame cadence: {:?}", &times[..times.len().min(12)]));
-        }
-    } else {
-        // Exact wherever FFmpeg has a time. FFmpeg leaves a flushed picture
-        // without its own PTS untimed; ours must still continue the timeline.
-        let wrong = (0..ours.pts.len().max(reference_pts.len())).find(|&i| match reference_pts.get(i) {
-            Some(Some(t)) => ours.pts.get(i) != Some(&Some(*t)),
-            Some(None) => !ours.pts.get(i).copied().flatten().is_some_and(|t| i == 0 || ours.pts[i-1].is_some_and(|p| t > p)),
-            None => true,
-        });
-        if let Some(i) = wrong {
-            return Err(format!("PTS mismatch at frame {i}: ours {:?}, FFmpeg {:?} ({pts_exact}/{} exact)", ours.pts.get(i), reference_pts.get(i), reference_pts.len()));
-        }
+    // Exact wherever FFmpeg has a time, raw elementary streams included (the
+    // raw demuxer times packets as FFmpeg does). FFmpeg leaves a flushed or
+    // untimed leading picture without its own PTS; ours must still continue
+    // the timeline.
+    let wrong = (0..ours.pts.len().max(reference_pts.len())).find(|&i| match reference_pts.get(i) {
+        Some(Some(t)) => ours.pts.get(i) != Some(&Some(*t)),
+        Some(None) => !ours.pts.get(i).copied().flatten().is_some_and(|t| i == 0 || ours.pts[i-1].is_some_and(|p| t > p)),
+        None => true,
+    });
+    if let Some(i) = wrong {
+        return Err(format!("PTS mismatch at frame {i}: ours {:?}, FFmpeg {:?} ({pts_exact}/{} exact)", ours.pts.get(i), reference_pts.get(i), reference_pts.len()));
     }
     Ok(ours)
 }
