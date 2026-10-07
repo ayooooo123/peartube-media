@@ -1,5 +1,8 @@
-// Ported from FFmpeg libavformat/mlpdec.c (the raw MLP/TrueHD demuxer) and
-// libavformat/rawdec.c (ff_raw_read_partial_packet framing), commit 2da55bf.
+// Ported from FFmpeg libavformat/mlpdec.c (the raw MLP/TrueHD demuxer),
+// libavformat/rawdec.c (ff_raw_read_partial_packet framing), the key-frame
+// rule of libavcodec/mlp_parser.c and the generic-index seek of
+// libavformat/seek.c (seek_frame_generic, ff_add_index_entry,
+// ff_reduce_index, ff_index_search_timestamp), commit 2da55bf.
 // Licensed under LGPL-2.1-or-later.
 
 //! Raw MLP / TrueHD demuxers. FFmpeg's raw demuxers emit one packet per
@@ -26,6 +29,9 @@ use crate::tables::{MLP_CHANNELS, MLP_QUANTS, THD_CHANCOUNT};
 /// major sync.
 const HEAD_BYTES: usize = 256 * 1024;
 
+/// avformat's max_index_size (1 MiB) over sizeof(AVIndexEntry) (24 bytes).
+const MAX_INDEX_ENTRIES: usize = (1 << 20) / 24;
+
 pub struct RawMlpDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
@@ -36,8 +42,20 @@ pub struct RawMlpDemuxer {
     next_pts: u64,
     /// Samples per access unit: 40 << (ratebits & 7).
     au_size: u32,
-    /// File offset where the AU chain starts (for seek walks).
+    /// File offset where the AU chain starts.
     start_offset: u64,
+    /// AVFMT_GENERIC_INDEX: the key access units returned so far, their
+    /// offset and pts by pts (ff_add_index_entry replaces one of the same
+    /// pts; ff_reduce_index keeps every other entry of a full index).
+    index: Vec<(u64, u64)>,
+}
+
+/// mlp_parser.c sets key_frame for an access unit with a major sync
+/// (0xF8726FBA or 0xF8726FBB after the 4-byte unit header) and clears it
+/// for the others. FFmpeg also drops a major sync whose header does not
+/// read (ff_mlp_read_major_sync); this demuxer flags it key.
+fn major_sync(au: &[u8]) -> bool {
+    au.get(4..8).is_some_and(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) & 0xFFFF_FFFE == 0xF872_6FBA)
 }
 
 impl RawMlpDemuxer {
@@ -176,6 +194,7 @@ impl RawMlpDemuxer {
             next_pts: 0,
             au_size,
             start_offset: base_offset,
+            index: Vec::new(),
         }))
     }
 }
@@ -272,44 +291,60 @@ impl Demuxer for RawMlpDemuxer {
         }
 
         let pts = self.next_pts;
+        let offset = self.next_offset;
         self.next_pts += u64::from(self.au_size);
         self.next_offset += len as u64;
 
+        let key = major_sync(&data);
+        if key {
+            // av_read_frame indexes every key packet it returns.
+            if self.index.len() >= MAX_INDEX_ENTRIES {
+                self.index = self.index.iter().step_by(2).copied().collect();
+            }
+            match self.index.binary_search_by_key(&pts, |e| e.1) {
+                Ok(at) => self.index[at].0 = offset,
+                Err(at) => self.index.insert(at, (offset, pts)),
+            }
+        }
         let tb = self.streams[0].time_base;
         Ok(Packet::new(0, tb, data)
             .with_pts(pts as i64)
             .with_dts(pts as i64)
-            .with_keyframe(true))
+            .with_keyframe(key))
     }
 
-
+    /// mlpdec.c is AVFMT_GENERIC_INDEX: seek.c seek_frame_generic with
+    /// AVSEEK_FLAG_BACKWARD lands on the last access unit with a major sync
+    /// at or before the target, among those returned so far; past the last
+    /// of them units are read on, bounded by the input, until a key unit
+    /// starts after the target or more than 1000 others did.
     fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
-        // AU boundaries are only known by walking; jump to the sample
-        // position at the AU grid (the raw stream has no seek index).
-        if self.au_size == 0 {
-            return Err(Error::unsupported("empty stream"));
+        let search = |index: &[(u64, u64)]| index.partition_point(|e| e.1 as i64 <= pts).checked_sub(1);
+        let mut found = search(&self.index);
+        if found.is_none() && self.index.first().is_some_and(|e| pts < e.1 as i64) {
+            return Err(Error::invalid("seek before the first major sync"));
         }
-        let au_index = (pts.max(0) as u64 / u64::from(self.au_size)) * u64::from(self.au_size);
-        self.next_pts = au_index;
-        // Offset unknown without walking from the start; walk now, bounded
-        // by the AU grid.
-        let mut offset = self.start_offset;
-        let mut walk_pts = 0u64;
-        while walk_pts < au_index {
-            self.input.seek(SeekFrom::Start(offset))?;
-            let mut hdr = [0u8; 2];
-            if read_up_to(&mut self.input, &mut hdr)? < 2 {
-                return Err(Error::unsupported("seek past end of stream"));
+        if found.is_none() || found == Some(self.index.len() - 1) {
+            (self.next_offset, self.next_pts) = self.index.last().copied().unwrap_or((self.start_offset, 0));
+            let mut nonkey = 0;
+            while let Ok(packet) = self.next_packet() {
+                if packet.dts.is_some_and(|dts| dts > pts) {
+                    if packet.flags.keyframe {
+                        break;
+                    }
+                    nonkey += 1;
+                    if nonkey > 1001 {
+                        break;
+                    }
+                }
             }
-            let len = (u16::from_be_bytes(hdr) & 0xfff) as usize * 2;
-            if len < 4 {
-                return Err(Error::unsupported("seek into a broken length chain"));
-            }
-            offset += len as u64;
-            walk_pts += u64::from(self.au_size);
+            found = search(&self.index);
         }
-        self.next_offset = offset;
-        Ok(au_index as i64)
+        let Some(i) = found else {
+            return Err(Error::invalid("no major sync to seek to"));
+        };
+        (self.next_offset, self.next_pts) = self.index[i];
+        Ok(self.next_pts as i64)
     }
 }
 
