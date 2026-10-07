@@ -23,6 +23,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         subs_text::register_codecs,
         // Every PGS, DVB, DVD, CVD and OGT id, ahead of oxideav-sub-image.
         subs_bitmap::register_codecs,
+        // EIA-608 and CEA-708 caption triplets (the engine feeds them).
+        subs_cc::register_codecs,
         codec_rv::register_codecs,
         codec_wmv::register_codecs,
         codec_wma::lib_registration::register_codecs,
