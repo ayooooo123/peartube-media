@@ -206,7 +206,7 @@ fn long_major_sync_seek(codec: &str) {
             at += length;
             au += 1;
         }
-        assert_eq!(&majors[..2], &[0, 128], "fixture must need >64 silent AUs after a seek");
+        assert_eq!(&majors[..2], &[0, 128], "major syncs must be 128 access units apart");
         // The long major-sync interval deliberately defeats raw probing.
         let oracle = Command::new(pinned_ffmpeg())
             .args(["-nostdin", "-v", "error", "-f", codec, "-i", input.0.to_str().unwrap(),
@@ -214,10 +214,16 @@ fn long_major_sync_seek(codec: &str) {
         assert!(oracle.status.success(), "{}", String::from_utf8_lossy(&oracle.stderr));
         let ff: Vec<f32> = oracle.stdout.chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        // The seek lands on the major sync at or before the target, as
+        // FFmpeg's does (only major-sync units are random-access points), so
+        // playback resumes at the target instead of waiting 128 units for
+        // the next one; audio before the target is dropped by whole frames.
         let (played, channels) = play(&input.0, Some(Duration::from_micros(834)));
-        let expected = &ff[majors[1] * 40 * channels..];
-        eprintln!("{codec}: post-seek {} samples/channel, expected {}", played.len() / channels, expected.len() / channels);
-        assert_eq!(played, expected, "post-major-sync PCM must play, bit-exact");
+        let unit = 40 * channels;
+        eprintln!("{codec}: post-seek {} samples/channel of {}", played.len() / channels, ff.len() / channels);
+        assert!(played.len() % unit == 0 && played.len() + 2 * unit >= ff.len(),
+            "playback must resume within one unit of the target: {} of {} samples", played.len(), ff.len());
+        assert_eq!(played[..], ff[ff.len() - played.len()..], "post-seek PCM must equal FFmpeg's, bit-exact");
 }
 
 #[test]
