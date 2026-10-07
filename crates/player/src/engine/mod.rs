@@ -97,6 +97,12 @@ const QUEUE_MAX_SECS: f64 = 2.0;
 const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
+/// Audio timestamps this close to where the previous write ended are
+/// continuous (container rounding).
+const PTS_SLACK: Duration = Duration::from_millis(5);
+/// The longest audio gap filled with silence. Longer jumps are
+/// discontinuities (or hostile timestamps), not silence to play out.
+const MAX_SILENCE: Duration = Duration::from_secs(2);
 
 /// Side data travels with its packet, including across equal-PTS laces.
 pub(crate) struct QueuedPacket {
@@ -1445,9 +1451,10 @@ fn run_audio_thread(
                             if pcm.is_empty() {
                                 break;
                             }
-                            let ticks = af.pts.unwrap_or(0).max(0);
-                            let secs = stream.time_base.seconds_of(ticks).max(0.0);
-                            let pts = Duration::from_secs_f64(secs);
+                            let pts = match af.pts {
+                                Some(ticks) => Duration::from_secs_f64(stream.time_base.seconds_of(ticks.max(0)).max(0.0)),
+                                None => written.end.unwrap_or_default(),
+                            };
                             if !write_pcm(
                                 sink, &shared, &pcm, channels as usize, rate, pts, seen_seek,
                                 realtime, &mut written, &retired,
@@ -1501,6 +1508,9 @@ fn run_audio_thread(
             }
         }
 
+        // A decoder that does not stamp its frames gets the packet's time
+        // for the first one; the rest continue where the previous ended.
+        let mut packet_pts = packet.pts;
         loop {
             if quit() {
                 return;
@@ -1543,8 +1553,20 @@ fn run_audio_thread(
             let sink_failed = !sink_open;
 
             let mut pcm = convert_audio_to_f32(&af, format, channels);
-            let ticks = af.pts.or(packet.pts).unwrap_or(0).max(0);
-            let mut pts_secs = stream.time_base.seconds_of(ticks).max(0.0);
+            let ticks = af.pts.or(packet_pts.take());
+            let mut pts_secs = match (ticks, written.end) {
+                (Some(ticks), _) => stream.time_base.seconds_of(ticks),
+                (None, Some(end)) => end.as_secs_f64(),
+                (None, None) => 0.0,
+            };
+            // Samples stamped before zero precede the presentation (codec
+            // priming); clamping them to zero would overlap the first real
+            // samples on the output's timeline.
+            if pts_secs < 0.0 {
+                let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
+                pcm.drain(..(before * channels).min(pcm.len()));
+                pts_secs = 0.0;
+            }
 
             // Drop pre-target output after a seek: audio before the target
             // never reaches the sink. The frame that holds the target loses
@@ -1651,8 +1673,37 @@ fn write_pcm(
 ) -> bool {
     let channels = channels.max(1);
     let rate = rate.max(1);
-    let frames = pcm.len() / channels;
     let chunk = (rate as usize / 50).max(1);
+    // The output's clock counts frames from its first write, so its
+    // timeline must be contiguous: fill a gap with silence, drop what an
+    // overlap repeats. Jitter within `PTS_SLACK` is left alone; a gap past
+    // `MAX_SILENCE` (a timestamp discontinuity, or hostile input) is not
+    // filled.
+    let mut pcm = pcm;
+    let mut pts = pts;
+    if let Some(end) = written.end {
+        if pts > end + PTS_SLACK && pts - end <= MAX_SILENCE {
+            let silence = vec![0.0f32; chunk * channels];
+            let mut missing = ((pts - end).as_secs_f64() * f64::from(rate)).round() as usize;
+            while missing > 0 {
+                let frames = missing.min(chunk);
+                let at = written.end.unwrap_or(end);
+                if !write_pcm(sink, shared, &silence[..frames * channels], channels, rate, at,
+                    seen_seek, realtime, written, retired) {
+                    return false;
+                }
+                missing -= frames;
+            }
+        } else if pts + PTS_SLACK < end {
+            let repeated = ((end - pts).as_secs_f64() * f64::from(rate)).round() as usize;
+            if repeated * channels >= pcm.len() {
+                return true;
+            }
+            pcm = &pcm[repeated * channels..];
+            pts = end;
+        }
+    }
+    let frames = pcm.len() / channels;
     let mut done = 0;
     while done < frames {
         let at = pts + Duration::from_secs_f64(done as f64 / f64::from(rate));

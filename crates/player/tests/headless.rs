@@ -1677,3 +1677,43 @@ fn flash_beeps_remain_synchronized_after_stall_pause_and_seek() {
     assert_flash_beeps(&backend.capture(), &bytes, &[(0..7).collect(), (3..8).collect()], "headless-stall-seek");
 }
 
+#[test]
+fn audio_clock_presents_each_write_at_its_pts_across_a_gap() {
+    let _cpu = realtime_test();
+    // 500 ms with no audio after the first second: frames from 1 s on are
+    // stamped 1.5 s and later.
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=2",
+        "-af", "asetpts='if(gte(T,1),PTS+0.5/TB,PTS)'", "-c:a", "pcm_s16le",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(10), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let capture = backend.capture();
+    let audio = &capture.audio[0];
+    let channels = usize::from(audio.channels);
+    // Which continuous device run played interleaved sample `index`, and
+    // when. An underrun (a late engine) splits runs and is not a clock
+    // error, so timestamps are compared only within one run.
+    let heard = |index: usize| audio.played.iter().position(|&(start, end, _)| start <= index && index < end)
+        .map(|run| {
+            let (start, _, at) = audio.played[run];
+            (run, at as f64 / 1e9 + ((index - start) / channels) as f64 / audio.device_rate)
+        });
+    let mut crossed_gap = false;
+    for pair in audio.writes.windows(2) {
+        let ((pts_a, offset_a), (pts_b, offset_b)) = (pair[0], pair[1]);
+        let (Some((run_a, at_a)), Some((run_b, at_b))) = (heard(offset_a), heard(offset_b)) else { continue };
+        if run_a != run_b { continue }
+        let skew = (at_b - at_a) - (pts_b.as_secs_f64() - pts_a.as_secs_f64());
+        assert!(skew.abs() < 0.001, "write at {pts_b:?} after {pts_a:?} heard {:.1} ms off its timestamp", skew * 1e3);
+        crossed_gap |= pts_a < Duration::from_millis(1500) && pts_b >= Duration::from_millis(1500);
+    }
+    assert!(crossed_gap, "the gap was not played within one continuous run");
+}
+
