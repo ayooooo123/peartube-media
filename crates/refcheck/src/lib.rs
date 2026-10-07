@@ -115,7 +115,9 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
             Ok(packet) if packet.stream_index == stream.index => {
                 let metadata = demuxer.packet_metadata();
                 decoder.send_packet(&packet).unwrap_or_else(|e| panic!("send_packet: {e}"));
-                out.trimmer.packet(&packet, metadata.audio_trim);
+                if kind == MediaType::Audio {
+                    out.trimmer.packet(&packet, metadata.audio_trim).unwrap_or_else(|e| panic!("audio trim: {e}"));
+                }
                 out.drain(&mut decoder, &stream);
             }
             Ok(_) => {}
@@ -161,7 +163,7 @@ impl Output {
                         rate: layout.sample_rate,
                         time_base: stream.time_base,
                     };
-                    self.trimmer.frame(piece, pts, &mut self.kept);
+                    self.trimmer.frame(piece, pts, &mut self.kept).unwrap_or_else(|e| panic!("audio trim: {e}"));
                     for piece in self.kept.drain(..) {
                         self.frames.push(Frame::Audio(piece.frame));
                         self.frame_formats.push(piece.reported);
@@ -207,6 +209,11 @@ impl Pcm for Piece {
 
     fn rate(&self) -> u32 {
         self.rate
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.frame.data.iter().map(Vec::capacity).sum::<usize>()
+            + self.frame.data.capacity() * std::mem::size_of::<Vec<u8>>()
     }
 
     fn drop_front(&mut self, n: usize) {

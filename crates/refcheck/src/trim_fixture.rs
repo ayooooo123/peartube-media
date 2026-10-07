@@ -11,6 +11,8 @@
 //! file with the [`EXTENSION`] extension and open it with [`register`]ed
 //! registries.
 
+#![forbid(unsafe_code)]
+
 use oxideav_core::{
     AudioFormat, AudioFrame, AudioTrim, CodecId, CodecInfo, CodecParameters, CodecResolver, Decoder, Demuxer, Error,
     Frame, Packet, PacketMetadata, ReadSeek, Result, RuntimeContext, SampleFormat, StreamInfo, TimeBase,

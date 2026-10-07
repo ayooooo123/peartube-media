@@ -1468,7 +1468,11 @@ fn run_audio_thread(
                         break;
                     }
                     let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
-                    trimmer.frame(chunk, af.pts, &mut kept);
+                    if let Err(e) = trimmer.frame(chunk, af.pts, &mut kept) {
+                        shared.state.lock().error.get_or_insert_with(|| e.to_string());
+                        notify_changed(&shared);
+                        return;
+                    }
                     if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
                         break;
                     }
@@ -1499,7 +1503,11 @@ fn run_audio_thread(
         match send_res {
             Ok(Ok(())) => {
                 consecutive_errors = 0;
-                trimmer.packet(&packet, metadata.audio_trim);
+                if let Err(e) = trimmer.packet(&packet, metadata.audio_trim) {
+                    shared.state.lock().error.get_or_insert_with(|| e.to_string());
+                    notify_changed(&shared);
+                    return;
+                }
             }
             Ok(Err(_)) | Err(_) => {
                 consecutive_errors += 1;
@@ -1550,7 +1558,11 @@ fn run_audio_thread(
             };
             let Frame::Audio(af) = frame else { continue };
             let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
-            trimmer.frame(chunk, af.pts, &mut kept);
+            if let Err(e) = trimmer.frame(chunk, af.pts, &mut kept) {
+                shared.state.lock().error.get_or_insert_with(|| e.to_string());
+                notify_changed(&shared);
+                return;
+            }
             if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
                 // Stopped, retired or a seek: the rest of this packet is stale.
                 break;
@@ -1575,6 +1587,10 @@ impl Pcm for Chunk {
 
     fn rate(&self) -> u32 {
         self.rate
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.pcm.capacity() * std::mem::size_of::<f32>()
     }
 
     fn drop_front(&mut self, n: usize) {
