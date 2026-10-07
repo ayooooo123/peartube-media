@@ -101,13 +101,19 @@ fn absent(au: &[u8]) -> Vec<u8> {
 
 /// An immediate-playout AU: `au` with AudioPreRoll(config, units).
 fn ipf(au: &[u8], config: &[u8], units: &[&[u8]]) -> Vec<u8> {
+    ipf_overrun(au, config, units, 0)
+}
+
+/// `ipf`, with each pre-roll auLen claiming `overrun` bytes more than the
+/// unit has. The AudioPreRoll payload length stays exact.
+fn ipf_overrun(au: &[u8], config: &[u8], units: &[&[u8]], overrun: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     push_escaped(&mut payload, config.len() as u32, 4, 4, 8);
     config.iter().for_each(|&byte| push(&mut payload, byte.into(), 8));
     push(&mut payload, 0, 2); // applyCrossfade, reserved
     push_escaped(&mut payload, units.len() as u32, 2, 4, 0);
     for unit in units {
-        push_escaped(&mut payload, unit.len() as u32, 16, 16, 0);
+        push_escaped(&mut payload, unit.len() as u32 + overrun, 16, 16, 0);
         unit.iter().for_each(|&byte| push(&mut payload, byte.into(), 8));
     }
     let payload = bytes(&payload);
@@ -132,6 +138,40 @@ fn decode_all(params: &oxideav_core::CodecParameters, units: &[Vec<u8>]) -> Vec<
 fn max_error(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+}
+
+/// Fd_1_c1_0x03 with a leading AudioPreRoll element, after three AUs.
+fn warm_mono() -> Box<dyn oxideav_core::Decoder> {
+    let (mut params, mono) = usac_packets("aac/usac/Fd_1_c1_0x03.mp4");
+    params.extradata = with_preroll_element(&params.extradata).0;
+    let mut decoder = aac_decoder(&params);
+    for au in &mono[..3] {
+        assert_eq!(decode_one(&mut decoder, &packet(absent(&au.data))).unwrap().len(), 1024);
+    }
+    decoder
+}
+
+/// Send `rejected`, which must fail without output, then `valid`. Returns
+/// the largest difference from `reference` and the first differing AU.
+fn recovery_error(
+    decoder: &mut Box<dyn oxideav_core::Decoder>,
+    rejected: &[u8],
+    valid: &[Vec<u8>],
+    reference: &[Vec<f32>],
+) -> (f32, Option<usize>) {
+    let error = decoder.send_packet(&packet(rejected.to_vec())).unwrap_err();
+    assert!(matches!(decoder.receive_frame(), Err(oxideav_core::Error::NeedMore)), "rejected AU emitted PCM");
+    eprintln!("rejected: {error}");
+    assert_eq!(valid.len(), reference.len());
+    let mut worst = (0f32, None);
+    for (i, (au, expected)) in valid.iter().zip(reference).enumerate() {
+        let difference = max_error(&decode_one(decoder, &packet(au.clone())).unwrap(), expected);
+        worst.0 = worst.0.max(difference);
+        if difference != 0.0 && worst.1.is_none() {
+            worst.1 = Some(i);
+        }
+    }
+    worst
 }
 
 /// Existing FATE tool coverage. Columns: frames, pre-roll payloads, pre-roll
@@ -275,4 +315,50 @@ fn usac_preroll_priming() {
     let error = decoder.send_packet(&packet(ipf(&original[k], &bytes(&bad), &[&rewritten[k - 1]]))).unwrap_err();
     assert!(error.to_string().contains("1024-line"), "{error}");
     assert!(matches!(decoder.receive_frame(), Err(oxideav_core::Error::NeedMore)));
+}
+
+/// A warm mono decoder rejects a valid stereo reconfiguration whose pre-roll
+/// auLen overruns the AudioPreRoll payload. The valid AU 48 transition must
+/// then reproduce continuous decoding from AU 48 on.
+#[test]
+fn usac_preroll_reconfiguration_recovers_after_rejection() {
+    let (params, packets) = usac_packets("aac/usac/Ext_2_c1_Ln_0x03.mp4");
+    let (asc, config) = with_preroll_element(&params.extradata);
+    let mut stereo = params.clone();
+    stereo.extradata = asc;
+    let rewritten: Vec<Vec<u8>> = packets.iter().map(|p| absent(&p.data)).collect();
+    let continuous = decode_all(&stereo, &rewritten);
+    let k = 48;
+    let rejected = ipf_overrun(&packets[k].data, &config, &[&rewritten[k - 1]], 1);
+    let mut valid = vec![ipf(&packets[k].data, &config, &[&rewritten[k - 1]])];
+    valid.extend_from_slice(&rewritten[k + 1..]);
+    let (error, first) = recovery_error(&mut warm_mono(), &rejected, &valid, &continuous[k..]);
+    eprintln!("AU {k} transition after rejection: maximum error {error:e}, first differing AU {:?}", first.map(|i| k + i));
+    assert_eq!(error, 0.0, "AU {k} transition after rejection, first differing AU {:?}", first.map(|i| k + i));
+}
+
+/// Canonical xhe AU 0 without its last four bytes keeps its whole
+/// AudioPreRoll, so a fresh decoder primes and a warm mono decoder is
+/// reconfigured to stereo and primed before the CPE runs out of data. Both
+/// must then decode the intact stream exactly as a fresh decoder does.
+#[test]
+fn usac_preroll_recovers_after_rejection_inside_the_primed_au() {
+    let (params, xhe) = usac_packets("aac/usac/xhe_target_level.m4a");
+    let units: Vec<Vec<u8>> = xhe.iter().map(|p| p.data.clone()).collect();
+    let reference = decode_all(&params, &units);
+    let au0 = bits(&units[0]);
+    let mut p = 0;
+    assert_eq!(take(&au0, &mut p, 3), 0b110, "independent, pre-roll present, explicit length");
+    let length = take(&au0, &mut p, 8) as usize;
+    assert!(length < 255 && p + length * 8 < au0.len() - 32);
+    let rejected = &units[0][..units[0].len() - 4];
+    let mut failures = Vec::new();
+    for (start, mut decoder) in [("fresh", aac_decoder(&params)), ("warm mono", warm_mono())] {
+        let (error, first) = recovery_error(&mut decoder, rejected, &units, &reference);
+        eprintln!("{start} decoder: maximum error {error:e}, first differing AU {first:?}");
+        if error != 0.0 {
+            failures.push(format!("{start}: maximum error {error:e} from AU {first:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
 }
