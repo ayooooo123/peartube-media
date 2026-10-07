@@ -1,10 +1,12 @@
-// Ported from FFmpeg libavformat/dtsdec.c (raw DTS demuxer + probe) and
-// libavformat/dtshddec.c (DTS-HD DTSHDHDR wrapper) (commit 2da55bf).
+// Ported from FFmpeg libavformat/dtsdec.c (raw DTS demuxer + probe),
+// libavformat/dtshddec.c (DTS-HD DTSHDHDR wrapper) and the generic-index
+// seek of libavformat/seek.c (seek_frame_generic, ff_add_index_entry,
+// ff_reduce_index, ff_index_search_timestamp) (commit 2da55bf).
 // Licensed under LGPL-2.1-or-later.
 
 //! The raw `dts` demuxer (FFmpeg's `ff_raw_read_partial_packet` framing
 //! plus full frame-length parsing from `dca_parser.c`) and the `dtshd`
-//! chunked wrapper demuxer.
+//! chunked wrapper demuxer, both seekable like FFmpeg's generic index.
 
 use crate::bitreader::BitReader;
 use crate::data::{FF_DCA_FREQ_RANGES, FF_DCA_SAMPLE_RATES, FF_DCA_SAMPLING_FREQS};
@@ -12,6 +14,7 @@ use crate::dca::{self, CoreFrameHeader, DCA_CORE_FRAME_HEADER_SIZE};
 use crate::decoder::MAX_PACKET_SIZE;
 use crate::exss::{ExssParser, exss_parse};
 use crate::lbr::{DCA_LBR_HEADER_DECODER_INIT, DCA_LBR_HEADER_SYNC_ONLY};
+use demux_seek_core::{read_on, Allowance, Index};
 use oxideav_core::{
     CodecParameters, ContainerRegistry, Demuxer, Error, MediaType, Packet, ProbeData, ProbeScore,
     ReadSeek, Result, SampleFormat, StreamInfo, TimeBase,
@@ -389,6 +392,11 @@ pub(crate) struct FrameSplitter {
 }
 
 impl FrameSplitter {
+    /// A splitter for input that starts at stream offset `base`.
+    pub(crate) fn starting_at(base: u64) -> Self {
+        Self { base, ..Self::default() }
+    }
+
     /// Bytes [`push`](Self::push) takes now; at least one after
     /// [`next_frame`](Self::next_frame) returned `Ok(None)`.
     pub(crate) fn room(&self) -> usize {
@@ -482,6 +490,74 @@ impl FrameSplitter {
     }
 }
 
+// ───────────────────────── generic index (seek.c) ─────────────────────────
+
+/// Where reading was, given back when a seek fails.
+struct Reading {
+    at: u64,
+    /// DTS-HD's read position in the STRMDATA extent.
+    pos: u64,
+    split: FrameSplitter,
+    clock: FrameClock,
+    eof: bool,
+}
+
+/// What seek.c seek_frame_generic needs of a raw DTS demuxer. Both are
+/// AVFMT_GENERIC_INDEX (dtsdec.c, dtshddec.c): av_read_frame indexes each
+/// key packet it returns, every DTS frame, at its frame_offset
+/// (AVSTREAM_PARSE_FULL_RAW) and dts.
+trait FrameSeek: Demuxer {
+    fn index(&self) -> &Index;
+    /// Read on from `pos` with a new parser (ff_read_frame_flush), frames
+    /// timed from `ts` (avpriv_update_cur_dts), from 0 without one.
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()>;
+    fn data_offset(&self) -> u64;
+    fn allowance(&mut self) -> &mut Allowance;
+    /// Reading as it stands, moved out for a seek to give back.
+    fn take_reading(&mut self) -> Result<Reading>;
+    fn give_back(&mut self, reading: Reading) -> Result<()>;
+
+    /// seek_frame_generic with AVSEEK_FLAG_BACKWARD: the last frame at or
+    /// before `ts` among those returned so far; past the last of them
+    /// frames are read on, within the seek's allowance, until one starts
+    /// after the target. A seek that fails leaves reading where it was.
+    fn seek_generic(&mut self, ts: i64) -> Result<i64> {
+        let found = self.index().search(ts, true);
+        if found.is_none() && self.index().entries().first().is_some_and(|e| ts < e.timestamp) {
+            return Err(Error::invalid("dts: seek before the first frame"));
+        }
+        let reading = self.take_reading()?;
+        self.allowance().start();
+        let landed = self.land(ts, found);
+        let landed = self.allowance().finish(landed);
+        if landed.is_err() {
+            self.give_back(reading)?;
+        }
+        landed
+    }
+
+    fn land(&mut self, ts: i64, mut found: Option<usize>) -> Result<i64> {
+        if found.is_none() || found == Some(self.index().entries().len() - 1) {
+            match self.index().entries().last().copied() {
+                Some(e) => self.restart(e.pos as u64, Some(e.timestamp))?,
+                None => {
+                    let at = self.data_offset();
+                    self.restart(at, None)?
+                }
+            }
+            // Every frame is a key frame.
+            read_on(ts, || self.next_packet().map(|p| (true, p.dts)))?;
+            found = self.index().search(ts, true);
+        }
+        let Some(i) = found else {
+            return Err(Error::invalid("dts: no frame to seek to"));
+        };
+        let e = self.index().entries()[i];
+        self.restart(e.pos as u64, Some(e.timestamp))?;
+        Ok(e.timestamp)
+    }
+}
+
 // ───────────────────────── raw `dts` demuxer ─────────────────────────
 
 /// Raw DTS demuxer: FFmpeg's `ff_raw_read_partial_packet` (1024-byte
@@ -492,9 +568,11 @@ pub struct RawDtsDemuxer {
     streams: Vec<StreamInfo>,
     /// Frames cut from the input read so far.
     split: FrameSplitter,
-    /// Timestamps of the frames cut so far.
     clock: FrameClock,
     eof: bool,
+    index: Index,
+    /// What the seek under way may still read.
+    allowance: Allowance,
 }
 
 impl RawDtsDemuxer {
@@ -545,12 +623,15 @@ impl RawDtsDemuxer {
 
         let mut split = FrameSplitter::default();
         split.push(&head);
+        let allowance = Allowance::default();
         Ok(Box::new(RawDtsDemuxer {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             split,
             clock: FrameClock::default(),
             eof: false,
+            index: Index::default(),
+            allowance,
         }))
     }
 
@@ -568,6 +649,7 @@ impl RawDtsDemuxer {
             }
             filled += n;
         }
+        self.allowance.spend(1, 0)?;
         self.split.push(&buf[..filled]);
         Ok(())
     }
@@ -612,7 +694,7 @@ impl Demuxer for RawDtsDemuxer {
             match self.split.next_frame() {
                 Err(frame) => return Err(self.clock.drop_frame(&self.streams[0], &frame)),
                 Ok(Some((_, frame))) if frame.len() < MIN_FRAME => continue,
-                Ok(Some((_, frame))) => return Ok(self.clock.packet(&self.streams[0], frame)),
+                Ok(Some((at, frame))) => return Ok(timed(&mut self.clock, &mut self.index, &self.streams[0], at, frame)),
                 Ok(None) => {}
             }
             if self.eof {
@@ -620,7 +702,9 @@ impl Demuxer for RawDtsDemuxer {
                 // tail frame it holds comes out when it looks like one.
                 return match self.split.finish() {
                     Err(frame) => Err(self.clock.drop_frame(&self.streams[0], &frame)),
-                    Ok(Some((_, frame))) if frame.len() > MIN_FRAME => Ok(self.clock.packet(&self.streams[0], frame)),
+                    Ok(Some((at, frame))) if frame.len() > MIN_FRAME => {
+                        Ok(timed(&mut self.clock, &mut self.index, &self.streams[0], at, frame))
+                    }
                     Ok(_) => Err(Error::Eof),
                 };
             }
@@ -628,13 +712,62 @@ impl Demuxer for RawDtsDemuxer {
         }
     }
 
-    fn seek_to(&mut self, _stream_index: u32, _pts: i64) -> Result<i64> {
-        Err(Error::unsupported("raw DTS demuxer does not support seeking"))
+    /// dtsdec.c is AVFMT_GENERIC_INDEX: seek.c seek_frame_generic.
+    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+        self.seek_generic(pts)
     }
 
     fn duration_micros(&self) -> Option<i64> {
         None
     }
+}
+
+impl FrameSeek for RawDtsDemuxer {
+    fn index(&self) -> &Index {
+        &self.index
+    }
+
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos))?;
+        self.split = FrameSplitter::starting_at(pos);
+        self.clock = FrameClock { next_pts: ts.unwrap_or(0), ..FrameClock::default() };
+        self.eof = false;
+        Ok(())
+    }
+
+    fn data_offset(&self) -> u64 {
+        0
+    }
+
+    fn allowance(&mut self) -> &mut Allowance {
+        &mut self.allowance
+    }
+
+    fn take_reading(&mut self) -> Result<Reading> {
+        Ok(Reading {
+            at: self.input.stream_position()?,
+            pos: 0,
+            split: std::mem::take(&mut self.split),
+            clock: std::mem::take(&mut self.clock),
+            eof: self.eof,
+        })
+    }
+
+    fn give_back(&mut self, r: Reading) -> Result<()> {
+        self.input.seek(SeekFrom::Start(r.at))?;
+        (self.split, self.clock, self.eof) = (r.split, r.clock, r.eof);
+        Ok(())
+    }
+}
+
+/// A frame's packet, timed by `clock`, and its index entry (every DTS
+/// frame is a key frame).
+fn timed(clock: &mut FrameClock, index: &mut Index, stream: &StreamInfo, at: u64, frame: Vec<u8>) -> Packet {
+    let packet = clock.packet(stream, frame);
+    if let Some(dts) = packet.dts {
+        index.add(at as i64, dts, 0, 0, true);
+    }
+    packet
 }
 
 const MIN_FRAME: usize = 16;
@@ -756,8 +889,10 @@ const STRMDATA: u64 = 0x5354_524D_4441_5441;
 pub struct DtshdDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    /// Frames cut from the STRMDATA read so far.
+    /// Frames cut from the STRMDATA read so far, at file offsets.
     split: FrameSplitter,
+    /// The STRMDATA extent.
+    data_start: u64,
     data_end: u64,
     /// Sample rate from AUPR_HDR.
     sample_rate: u32,
@@ -766,6 +901,9 @@ pub struct DtshdDemuxer {
     pos: u64,
     eof: bool,
     clock: FrameClock,
+    index: Index,
+    /// What the seek under way may still read.
+    allowance: Allowance,
 }
 
 impl DtshdDemuxer {
@@ -872,16 +1010,20 @@ impl DtshdDemuxer {
             params,
         };
 
+        let allowance = Allowance::default();
         Ok(Box::new(DtshdDemuxer {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
-            split: FrameSplitter::default(),
+            split: FrameSplitter::starting_at(data_start),
+            data_start,
             data_end,
             sample_rate,
             duration_samples,
             pos: data_start,
             eof: false,
             clock: FrameClock::default(),
+            index: Index::default(),
+            allowance,
         }))
     }
 }
@@ -909,7 +1051,7 @@ impl Demuxer for DtshdDemuxer {
             match self.split.next_frame() {
                 Err(frame) => return Err(self.clock.drop_frame(&self.streams[0], &frame)),
                 Ok(Some((_, frame))) if frame.len() < MIN_FRAME => continue,
-                Ok(Some((_, frame))) => return Ok(self.clock.packet(&self.streams[0], frame)),
+                Ok(Some((at, frame))) => return Ok(timed(&mut self.clock, &mut self.index, &self.streams[0], at, frame)),
                 Ok(None) => {}
             }
             if self.eof {
@@ -917,7 +1059,9 @@ impl Demuxer for DtshdDemuxer {
                 // after any initial padding.
                 return match self.split.finish() {
                     Err(frame) => Err(self.clock.drop_frame(&self.streams[0], &frame)),
-                    Ok(Some((_, frame))) if !frame.is_empty() => Ok(self.clock.packet(&self.streams[0], frame)),
+                    Ok(Some((at, frame))) if !frame.is_empty() => {
+                        Ok(timed(&mut self.clock, &mut self.index, &self.streams[0], at, frame))
+                    }
                     Ok(_) => Err(Error::Eof),
                 };
             }
@@ -928,17 +1072,17 @@ impl Demuxer for DtshdDemuxer {
                 continue;
             }
             let mut buf = [0u8; RAW_PACKET_SIZE];
+            self.allowance.spend(1, 0)?;
             self.input.read_exact(&mut buf[..chunk])?;
             self.split.push(&buf[..chunk]);
             self.pos += chunk as u64;
         }
     }
 
+    /// dtshddec.c is AVFMT_GENERIC_INDEX: seek.c seek_frame_generic within
+    /// the STRMDATA extent.
     fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
-        // Byte-accurate seeking is not possible without a NAVI table;
-        // FFmpeg's generic index builds one by reading. Reject.
-        let _ = pts;
-        Err(Error::unsupported("dtshd demuxer does not support seeking"))
+        self.seek_generic(pts)
     }
 
     fn duration_micros(&self) -> Option<i64> {
@@ -946,6 +1090,45 @@ impl Demuxer for DtshdDemuxer {
             return None;
         }
         i64::try_from(u128::from(self.duration_samples) * 1_000_000 / u128::from(self.sample_rate)).ok()
+    }
+}
+
+impl FrameSeek for DtshdDemuxer {
+    fn index(&self) -> &Index {
+        &self.index
+    }
+
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos))?;
+        self.pos = pos;
+        self.split = FrameSplitter::starting_at(pos);
+        self.clock = FrameClock { next_pts: ts.unwrap_or(0), ..FrameClock::default() };
+        self.eof = false;
+        Ok(())
+    }
+
+    fn data_offset(&self) -> u64 {
+        self.data_start
+    }
+
+    fn allowance(&mut self) -> &mut Allowance {
+        &mut self.allowance
+    }
+
+    fn take_reading(&mut self) -> Result<Reading> {
+        Ok(Reading {
+            at: self.input.stream_position()?,
+            pos: self.pos,
+            split: std::mem::take(&mut self.split),
+            clock: std::mem::take(&mut self.clock),
+            eof: self.eof,
+        })
+    }
+
+    fn give_back(&mut self, r: Reading) -> Result<()> {
+        self.input.seek(SeekFrom::Start(r.at))?;
+        (self.pos, self.split, self.clock, self.eof) = (r.pos, r.split, r.clock, r.eof);
+        Ok(())
     }
 }
 

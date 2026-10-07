@@ -732,10 +732,12 @@ fn caf() {
     }
 }
 
-/// cbs.mak, av1.mak, vpx.mak: frame headers carry size and pts.
+/// cbs.mak, av1.mak, vpx.mak: frame headers carry size and pts; key
+/// flags are those of FFmpeg's VP8 / VP9 / AV1 parsers, which seeking
+/// depends on.
 #[test]
 fn ivf() {
-    check_inventory("ivf", &["ivf"], CONTAINER);
+    check_inventory("ivf", &["ivf"], Mode { keys: true, ..CONTAINER });
 }
 
 /// NUT: FATE muxes its NUT inputs (lavf.mak); mux one here with FFmpeg

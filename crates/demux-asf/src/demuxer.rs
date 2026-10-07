@@ -1,4 +1,6 @@
-//! Ported from FFmpeg commit 2da55bf (libavformat/asfdec_f.c, asf.c, asf.h, asf_tags.c).
+//! Ported from FFmpeg commit 2da55bf (libavformat/asfdec_f.c, asf.c, asf.h,
+//! asf_tags.c, argo_asf.c; seeking: asf_read_seek, asf_build_simple_index,
+//! asf_read_pts and argo_asf_seek over libavformat/seek.c).
 //! Licensed under LGPL-2.1-or-later.
 
 use std::collections::VecDeque;
@@ -11,6 +13,7 @@ use oxideav_core::{
 };
 
 use crate::guid::*;
+use demux_seek_core::{gen_search, is_exhausted, rescale, Allowance, Index, Reduce};
 
 /// Maximum supported number of streams in an ASF file.
 const MAX_STREAMS: usize = 128;
@@ -56,6 +59,9 @@ struct StreamState {
     pending_pts: i64,
     pts: i64,
     keyframe: bool,
+    /// Offset of the data packet holding the object's first fragment
+    /// (FFmpeg pkt.pos = asf->packet_pos at allocation).
+    pos: u64,
     skip_to_key: bool,
     ds_span: u8,
     ds_packet_size: u16,
@@ -64,28 +70,91 @@ struct StreamState {
     payload_extensions: Vec<PayloadExtension>,
 }
 
-#[derive(Clone, Debug)]
-struct IndexEntry {
-    pts: i64,
-    pos: u64,
-}
-
 pub struct AsfDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     asf_id_to_stream_idx: [Option<usize>; MAX_STREAMS],
     asf_streams: Vec<StreamState>,
     hdr: AsfMainHeader,
+    /// Start of the data object's payload, after its 24-byte object
+    /// header (FFmpeg asf->data_object_offset).
+    data_object_offset: u64,
+    /// First data packet (FFmpeg si->data_offset).
     data_offset: u64,
     data_object_size: u64,
     metadata: Vec<(String, String)>,
     chapters: Vec<Chapter>,
     attached_pictures: Vec<AttachedPicture>,
     pending_packets: VecDeque<Packet>,
-    index: Vec<IndexEntry>,
-    index_read: bool,
+    /// The attached-picture packets, queued again after every seek
+    /// (avformat_queue_attached_pictures in av_seek_frame).
+    attached_packets: Vec<Packet>,
+    /// Per stream: the index entries asf_build_simple_index and
+    /// asf_read_pts add (FFStream.index_entries), within
+    /// MAX_INDEX_ENTRIES.
+    seek_index: Vec<Index>,
+    /// asf->index_read: 0 unread, 1 a usable Simple Index Object was
+    /// read, -1 reading it failed.
+    index_read: i8,
+    /// The usable Simple Index Object, read again for exact landings.
+    simple_index: Option<SimpleIndex>,
+    /// What the seek under way may still read.
+    allowance: Allowance,
+    /// Offset of the data packet being parsed (asf->packet_pos).
+    packet_pos: u64,
+    /// `pos` of the last packet next_packet returned.
+    last_pos: u64,
 
     // Packet parsing state (matches FFmpeg ASFContext)
+    packet_size_left: i64,
+    packet_padsize: u32,
+    packet_flags: u8,
+    packet_property: u8,
+    packet_timestamp: u32,
+    packet_segsizetype: u8,
+    packet_segments: i32,
+    packet_time_start: u32,
+    packet_time_delta: u32,
+    packet_multi_size: u32,
+    uses_std_ecc: i8,
+    current_asf_stream_id: usize,
+    /// asf->packet_key_frame: the key bit of the last frame header, set
+    /// when an audio object is allocated; it persists across the
+    /// payloads of a multiple-payload segment.
+    current_key_frame: bool,
+    current_frag_offset: u32,
+    current_replic_size: u32,
+    /// Set when the input is an Argo ASF file (magic "ASF\0"): the packet
+    /// path switches to FFmpeg's argo_asf read_packet logic.
+    argo: Option<ArgoState>,
+}
+
+/// Argo ASF demux state (FFmpeg ArgoASFDemuxContext).
+struct ArgoState {
+    blocks_read: u32,
+    num_blocks: u32,
+    num_samples: u32,
+    block_align: u32,
+}
+
+/// A Simple Index Object as asf_build_simple_index read it for
+/// `stream`: entry i (pktnum u32, pktct u16) at `entries + 6 i` indexes
+/// data packet pktnum at max(itime i / 10000 - preroll, 0) ms.
+#[derive(Clone, Copy)]
+struct SimpleIndex {
+    stream: usize,
+    entries: u64,
+    count: u32,
+    itime: i64,
+}
+
+/// Where reading was, given back when a seek fails.
+struct Reading {
+    at: u64,
+    asf_streams: Vec<StreamState>,
+    pending_packets: VecDeque<Packet>,
+    packet_pos: u64,
+    last_pos: u64,
     packet_size_left: i64,
     packet_padsize: u32,
     packet_flags: u8,
@@ -101,17 +170,6 @@ pub struct AsfDemuxer {
     current_key_frame: bool,
     current_frag_offset: u32,
     current_replic_size: u32,
-    /// Set when the input is an Argo ASF file (magic "ASF\0"): the packet
-    /// path switches to FFmpeg's argo_asf read_packet logic.
-    argo: Option<ArgoState>,
-}
-
-/// Argo ASF demux state (FFmpeg ArgoASFDemuxContext).
-struct ArgoState {
-    blocks_read: u32,
-    num_blocks: u32,
-    num_samples: u32,
-    block_align: u32,
 }
 
 impl AsfDemuxer {
@@ -137,20 +195,27 @@ impl AsfDemuxer {
         let _reserved1 = read_u8(&mut *input)?;
         let _reserved2 = read_u8(&mut *input)?;
 
+        let allowance = Allowance::default();
         let mut demuxer = Self {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: Vec::new(),
             asf_id_to_stream_idx: [None; MAX_STREAMS],
             asf_streams: (0..MAX_STREAMS).map(|_| StreamState::default()).collect(),
             hdr: AsfMainHeader::default(),
+            data_object_offset: 0,
             data_offset: 0,
             data_object_size: u64::MAX,
             metadata: Vec::new(),
             chapters: Vec::new(),
             attached_pictures: Vec::new(),
             pending_packets: VecDeque::new(),
-            index: Vec::new(),
-            index_read: false,
+            attached_packets: Vec::new(),
+            seek_index: Vec::new(),
+            index_read: 0,
+            simple_index: None,
+            allowance,
+            packet_pos: 0,
+            last_pos: 0,
             packet_size_left: 0,
             packet_padsize: 0,
             packet_flags: 0,
@@ -170,6 +235,9 @@ impl AsfDemuxer {
         };
 
         demuxer.read_header(codecs)?;
+        demuxer.packet_pos = demuxer.data_offset;
+        demuxer.attached_packets = demuxer.pending_packets.iter().cloned().collect();
+        demuxer.seek_index = demuxer.streams.iter().map(|_| Index::new(Reduce::Lossy)).collect();
         Ok(Box::new(demuxer))
     }
 
@@ -188,7 +256,7 @@ impl AsfDemuxer {
 
             let gsize = read_u64_le(&mut *self.input)?;
             if g == ASF_DATA_HEADER {
-                let data_obj_offset = self.input.stream_position()?;
+                self.data_object_offset = self.input.stream_position()?;
                 if (self.hdr.flags & 0x01) == 0 && gsize >= 100 {
                     self.data_object_size = gsize.saturating_sub(24);
                 } else {
@@ -200,7 +268,6 @@ impl AsfDemuxer {
                 let _res1 = read_u8(&mut *self.input)?;
                 let _res2 = read_u8(&mut *self.input)?;
                 self.data_offset = self.input.stream_position()?;
-                let _ = data_obj_offset;
                 break;
             }
 
@@ -333,20 +400,27 @@ impl AsfDemuxer {
             params,
         };
 
+        let allowance = Allowance::default();
         let demuxer = Self {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             asf_id_to_stream_idx: [None; MAX_STREAMS],
             asf_streams: (0..MAX_STREAMS).map(|_| StreamState::default()).collect(),
             hdr: AsfMainHeader::default(),
+            data_object_offset: (chunk_offset + 20) as u64,
             data_offset: (chunk_offset + 20) as u64,
             data_object_size: u64::MAX,
             metadata: Vec::new(),
             chapters: Vec::new(),
             attached_pictures: Vec::new(),
             pending_packets: VecDeque::new(),
-            index: Vec::new(),
-            index_read: true,
+            attached_packets: Vec::new(),
+            seek_index: Vec::new(),
+            index_read: 0,
+            simple_index: None,
+            allowance,
+            packet_pos: 0,
+            last_pos: 0,
             packet_size_left: 0,
             packet_padsize: 0,
             packet_flags: 0,
@@ -1089,79 +1163,290 @@ impl AsfDemuxer {
         Ok(())
     }
 
-    fn build_simple_index(&mut self) -> Result<()> {
-        if self.index_read {
-            return Ok(());
-        }
-        self.index_read = true;
-        if self.data_object_size == u64::MAX {
-            return Ok(());
-        }
-        let cur = self.input.stream_position()?;
-        let index_search_pos = self.data_offset + self.data_object_size;
-        if self.input.seek(SeekFrom::Start(index_search_pos)).is_err() {
-            let _ = self.input.seek(SeekFrom::Start(cur));
-            return Ok(());
-        }
+    /// asf_build_simple_index: index `stream` by the Simple Index Object
+    /// among the top-level objects after the data object. Sets index_read
+    /// to 1 for an index of more than one entry; an error leaves the
+    /// entries read so far (they still bound a bisection).
+    fn build_simple_index(&mut self, stream: usize) -> Result<()> {
+        let current_pos = self.input.stream_position()?;
+        let built = self.read_simple_index(stream);
+        self.input.seek(SeekFrom::Start(current_pos))?;
+        built
+    }
 
-        loop {
-            let mut g = [0u8; 16];
-            if self.input.read_exact(&mut g).is_err() {
-                break;
-            }
-            let gsize = match read_u64_le(&mut *self.input) {
-                Ok(s) => s,
-                Err(_) => break,
-            };
+    fn read_simple_index(&mut self, stream: usize) -> Result<()> {
+        // data_object_offset + data_object_size in FFmpeg's int64_t
+        // arithmetic: an unknown size, (uint64_t)-1, lands one byte back.
+        let end = self.data_object_offset.wrapping_add(self.data_object_size);
+        self.input.seek(SeekFrom::Start(end))?;
+        let mut g = [0u8; 16];
+        self.input.read_exact(&mut g)?;
+        // The data object can be followed by other top-level objects:
+        // skip them until the simple index object is reached.
+        while g != ASF_SIMPLE_INDEX_HEADER {
+            let Ok(gsize) = read_u64_le(&mut *self.input) else { return Ok(()) };
             if gsize < 24 {
-                break;
+                return Ok(());
             }
-            if g == ASF_SIMPLE_INDEX_HEADER {
-                let mut _file_id = [0u8; 16];
-                if self.input.read_exact(&mut _file_id).is_err() {
-                    break;
+            let Ok(skip) = i64::try_from(gsize - 24) else { return Ok(()) };
+            self.input.seek(SeekFrom::Current(skip))?;
+            self.input.read_exact(&mut g)?;
+        }
+        let _gsize = read_u64_le(&mut *self.input)?;
+        let mut _file_id = [0u8; 16];
+        self.input.read_exact(&mut _file_id)?;
+        let itime = read_u64_le(&mut *self.input)? as i64;
+        let _pct = read_u32_le(&mut *self.input)?;
+        let ict = read_u32_le(&mut *self.input)? as i32;
+        let entries = self.input.stream_position()?;
+        let packet_size = i64::from(self.hdr.max_pktsize);
+        let data_offset = self.data_offset as i64;
+        let preroll = i64::from(self.hdr.preroll);
+        let mut last_pos = -1;
+        // Entries are 6 bytes (pktnum, pktct); read them in blocks.
+        let mut buf = vec![0u8; 6 * 4096];
+        let mut i: i32 = 0;
+        while i < ict {
+            let want = ((ict - i) as usize).min(4096) * 6;
+            let got = read_up_to(&mut *self.input, &mut buf[..want])?;
+            for entry in buf[..got].chunks_exact(6) {
+                let pktnum = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                let pos = data_offset.wrapping_add(packet_size.wrapping_mul(i64::from(pktnum)));
+                let index_pts = rescale(itime, i64::from(i), 10000).saturating_sub(preroll).max(0);
+                if pos != last_pos {
+                    self.seek_index[stream].add(pos, index_pts, packet_size, 0, true);
+                    last_pos = pos;
                 }
-                let itime = match read_u64_le(&mut *self.input) {
-                    Ok(t) => t,
-                    Err(_) => break,
-                };
-                let _pct = match read_u32_le(&mut *self.input) {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-                let ict = match read_u32_le(&mut *self.input) {
-                    Ok(c) => c as usize,
-                    Err(_) => break,
-                };
-
-                let pkt_size = self.hdr.max_pktsize as u64;
-                let mut last_pos = u64::MAX;
-                for i in 0..ict.min(65536) {
-                    let pktnum = match read_u32_le(&mut *self.input) {
-                        Ok(n) => n as u64,
-                        Err(_) => break,
-                    };
-                    let _pktct = match read_u16_le(&mut *self.input) {
-                        Ok(c) => c,
-                        Err(_) => break,
-                    };
-                    let pos = self.data_offset + pkt_size * pktnum;
-                    let index_pts = ((i as u64).saturating_mul(itime) / 10000)
-                        .saturating_sub(self.hdr.preroll as u64) as i64;
-                    if pos != last_pos {
-                        self.index.push(IndexEntry { pts: index_pts, pos });
-                        last_pos = pos;
-                    }
-                }
-                break;
+                i += 1;
             }
-            if self.input.seek(SeekFrom::Current(gsize as i64 - 24)).is_err() {
-                break;
+            if got < want {
+                // avio_feof inside the entries: AVERROR_INVALIDDATA
+                return Err(Error::invalid("asf: truncated simple index"));
             }
         }
-
-        let _ = self.input.seek(SeekFrom::Start(cur));
+        self.index_read = i8::from(ict > 1);
+        if ict > 1 {
+            self.simple_index = Some(SimpleIndex { stream, entries, count: ict as u32, itime });
+        }
         Ok(())
+    }
+
+    /// av_index_search_timestamp backward over the whole Simple Index
+    /// Object, read again from the file where this index has thinned it.
+    /// Entry times never fall, an entry is indexed where its packet
+    /// differs from the one before, and one of the same time replaces an
+    /// earlier: FFmpeg lands on the first entry of the run of equal
+    /// packets that holds the last entry at or before `pts`. `(pos, pts)`,
+    /// None where FFmpeg indexed no entry there.
+    fn simple_index_landing(&mut self, si: SimpleIndex, pts: i64) -> Result<Option<(i64, i64)>> {
+        let preroll = i64::from(self.hdr.preroll);
+        let index_pts = |i: u32| rescale(si.itime, i64::from(i), 10000).saturating_sub(preroll).max(0);
+        if index_pts(0) > pts {
+            return Ok(None);
+        }
+        let (mut lo, mut hi) = (0u32, si.count - 1);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if index_pts(mid) <= pts {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        // Back to the first entry of the run of lo's packet.
+        let mut buf = vec![0u8; 6 * 4096];
+        let pktnum = |b: &[u8], k: usize| i32::from_le_bytes([b[6 * k], b[6 * k + 1], b[6 * k + 2], b[6 * k + 3]]);
+        let mut run: Option<i32> = None;
+        let mut first = lo;
+        let mut end = lo;
+        'scan: loop {
+            let start = end.saturating_sub(4095);
+            let n = (end - start + 1) as usize;
+            self.input.seek(SeekFrom::Start(si.entries + 6 * u64::from(start)))?;
+            self.input.read_exact(&mut buf[..6 * n])?;
+            for k in (0..n).rev() {
+                let p = pktnum(&buf, k);
+                match run {
+                    None => run = Some(p),
+                    Some(r) if r != p => break 'scan,
+                    Some(_) => {}
+                }
+                first = start + k as u32;
+            }
+            if start == 0 {
+                break;
+            }
+            end = start - 1;
+        }
+        let packet_size = i64::from(self.hdr.max_pktsize);
+        let pos = (self.data_offset as i64).wrapping_add(packet_size.wrapping_mul(i64::from(run.unwrap_or(0))));
+        // The first entry is indexed unless its position is last_pos's -1.
+        if first == 0 && pos == -1 {
+            return Ok(None);
+        }
+        Ok(Some((pos, index_pts(first))))
+    }
+
+    /// Rewind the packet parser to the data packet at `pos`: FFmpeg's
+    /// avio_seek, ff_read_frame_flush and asf_reset_header.
+    fn restart(&mut self, pos: u64) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos))?;
+        self.pending_packets.clear();
+        self.reset_packet_state();
+        Ok(())
+    }
+
+    /// skip_to_key: video streams drop fragments until a key frame starts.
+    fn skip_to_key(&mut self) {
+        for (asf_id, idx) in self.asf_id_to_stream_idx.iter().enumerate() {
+            if idx.is_some_and(|idx| self.streams[idx].params.media_type == MediaType::Video) {
+                self.asf_streams[asf_id].skip_to_key = true;
+            }
+        }
+    }
+
+    /// asf_read_pts: from the data packet at or after `*ppos`, the dts of
+    /// the first key packet of `stream`, `*ppos` moved to the data packet
+    /// that packet starts in; `None` (AV_NOPTS_VALUE) when the read ends
+    /// first. Every key packet read is indexed for its stream.
+    fn read_pts(&mut self, stream: usize, ppos: &mut i64) -> Result<Option<i64>> {
+        let mut start_pos = vec![*ppos; self.streams.len()];
+        let packet_size = i64::from(self.hdr.max_pktsize);
+        let data_offset = self.data_offset as i64;
+        let mut pos = *ppos;
+        if packet_size > 0 {
+            pos = (pos.saturating_add(packet_size - 1) - data_offset) / packet_size * packet_size + data_offset;
+        }
+        *ppos = pos;
+        let Ok(start) = u64::try_from(pos) else { return Ok(None) };
+        if self.restart(start).is_err() {
+            return Ok(None);
+        }
+        loop {
+            // "asf_read_pts failed"; an exhausted allowance ends the seek.
+            let packet = match self.next_packet() {
+                Ok(packet) => packet,
+                Err(e) if is_exhausted(&e) => return Err(e),
+                Err(_) => return Ok(None),
+            };
+            if !packet.flags.keyframe {
+                continue;
+            }
+            let s = packet.stream_index as usize;
+            let key_pos = self.last_pos as i64;
+            if let (Some(dts), Some(index), Some(&from)) = (packet.dts, self.seek_index.get_mut(s), start_pos.get(s)) {
+                index.add(key_pos, dts, packet.data.len() as i64, key_pos - from + 1, true);
+            }
+            if let Some(from) = start_pos.get_mut(s) {
+                *from = key_pos + 1;
+            }
+            if s == stream {
+                *ppos = key_pos;
+                return Ok(packet.dts);
+            }
+        }
+    }
+
+    /// asf_read_seek after its checks: the Simple Index Object where it is
+    /// usable, else ff_seek_frame_binary over asf_read_pts. `(pos, ts)` of
+    /// the landing, `None` where FFmpeg returns -1. A Simple Index Object
+    /// the allowance does not cover ends the seek, not just the index.
+    fn search(&mut self, stream: usize, pts: i64) -> Result<Option<(u64, i64)>> {
+        if self.index_read == 0 {
+            if let Err(e) = self.build_simple_index(stream) {
+                if is_exhausted(&e) {
+                    return Err(e);
+                }
+                self.index_read = -1;
+            }
+        }
+        // avformat_seek_file seeks backward to a target after 0.
+        let backward = pts > 0;
+        if self.index_read > 0 && !self.seek_index[stream].entries().is_empty() {
+            let index = &self.seek_index[stream];
+            let kept = index.search(pts, backward).map(|i| index.entries()[i]);
+            let exact = match self.simple_index {
+                Some(si) if si.stream == stream && backward => self.simple_index_landing(si, pts)?,
+                _ => None,
+            };
+            // asf_read_pts entries come later, and win a tie.
+            let found = match (kept, exact) {
+                (Some(e), Some((pos, ts))) if e.timestamp < ts => Some((pos, ts)),
+                (Some(e), _) => Some((e.pos, e.timestamp)),
+                (None, exact) => exact,
+            };
+            if let Some((pos, ts)) = found {
+                return Ok(u64::try_from(pos).ok().map(|pos| (pos, ts)));
+            }
+        }
+        // no index or seeking by index failed
+        let bounds = self.seek_index[stream].bounds(pts);
+        let file_size = self.input.seek(SeekFrom::End(0))? as i64;
+        let data_offset = self.data_offset as i64;
+        let found = gen_search(pts, bounds, data_offset, file_size, &mut |pos, _| self.read_pts(stream, pos))?;
+        Ok(found.and_then(|(pos, ts)| u64::try_from(pos).ok().map(|pos| (pos, ts))))
+    }
+
+    /// Reading as it stands, for a seek to give back if it fails. A
+    /// stream's partly assembled object moves out; the search resets it
+    /// anyway (asf_reset_header).
+    fn take_reading(&mut self) -> Result<Reading> {
+        let asf_streams = self
+            .asf_streams
+            .iter_mut()
+            .map(|s| StreamState { assembled_packet: std::mem::take(&mut s.assembled_packet), ..s.clone() })
+            .collect();
+        Ok(Reading {
+            at: self.input.stream_position()?,
+            asf_streams,
+            pending_packets: std::mem::take(&mut self.pending_packets),
+            packet_pos: self.packet_pos,
+            last_pos: self.last_pos,
+            packet_size_left: self.packet_size_left,
+            packet_padsize: self.packet_padsize,
+            packet_flags: self.packet_flags,
+            packet_property: self.packet_property,
+            packet_timestamp: self.packet_timestamp,
+            packet_segsizetype: self.packet_segsizetype,
+            packet_segments: self.packet_segments,
+            packet_time_start: self.packet_time_start,
+            packet_time_delta: self.packet_time_delta,
+            packet_multi_size: self.packet_multi_size,
+            uses_std_ecc: self.uses_std_ecc,
+            current_asf_stream_id: self.current_asf_stream_id,
+            current_key_frame: self.current_key_frame,
+            current_frag_offset: self.current_frag_offset,
+            current_replic_size: self.current_replic_size,
+        })
+    }
+
+    fn give_back(&mut self, r: Reading) -> Result<()> {
+        self.input.seek(SeekFrom::Start(r.at))?;
+        (self.asf_streams, self.pending_packets) = (r.asf_streams, r.pending_packets);
+        (self.packet_pos, self.last_pos, self.packet_size_left, self.packet_padsize) =
+            (r.packet_pos, r.last_pos, r.packet_size_left, r.packet_padsize);
+        (self.packet_flags, self.packet_property, self.packet_timestamp, self.packet_segsizetype) =
+            (r.packet_flags, r.packet_property, r.packet_timestamp, r.packet_segsizetype);
+        (self.packet_segments, self.packet_time_start, self.packet_time_delta, self.packet_multi_size) =
+            (r.packet_segments, r.packet_time_start, r.packet_time_delta, r.packet_multi_size);
+        (self.uses_std_ecc, self.current_asf_stream_id, self.current_key_frame) =
+            (r.uses_std_ecc, r.current_asf_stream_id, r.current_key_frame);
+        (self.current_frag_offset, self.current_replic_size) = (r.current_frag_offset, r.current_replic_size);
+        Ok(())
+    }
+
+    /// argo_asf_seek: the block holding `pts`, in uint32_t arithmetic.
+    fn argo_seek(&mut self, pts: i64) -> Result<i64> {
+        let argo = self.argo.as_ref().expect("argo state");
+        let block = (pts / i64::from(argo.num_samples.max(1))) as u32;
+        if block >= argo.num_blocks {
+            return Err(Error::invalid("argo asf: seek past the last block"));
+        }
+        let offset = self.data_offset + u64::from(block) * u64::from(argo.block_align);
+        self.input.seek(SeekFrom::Start(offset))?;
+        let argo = self.argo.as_mut().expect("argo state");
+        argo.blocks_read = block;
+        Ok(i64::from(block) * i64::from(argo.num_samples))
     }
 
     fn reset_packet_state(&mut self) {
@@ -1396,38 +1681,48 @@ impl Demuxer for AsfDemuxer {
         &self.chapters
     }
 
-    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
-        if pts <= 0 {
-            self.reset_packet_state();
-            self.input.seek(SeekFrom::Start(self.data_offset))?;
-            for st in &mut self.asf_streams {
-                st.skip_to_key = true;
+    /// asf_read_seek (asfdec_f.c), or argo_asf_seek for Argo ASF: lands at
+    /// or before `pts`, in `stream_index`'s time base. The attached
+    /// pictures then come first again, as after av_seek_frame. The search
+    /// reads within the seek's allowance; one that fails leaves reading
+    /// where it was.
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        if self.argo.is_some() {
+            return self.argo_seek(pts);
+        }
+        let stream = stream_index as usize;
+        if stream >= self.streams.len() {
+            return Err(Error::invalid("asf: no such stream to seek"));
+        }
+        if self.hdr.max_pktsize == 0 || self.hdr.max_pktsize > i32::MAX as u32 {
+            // s->packet_size, an int, <= 0
+            return Err(Error::unsupported("asf: no packet size to seek by"));
+        }
+        let landed = if pts == 0 {
+            // explicitly handle the case of seeking to 0
+            self.restart(self.data_offset)?;
+            0
+        } else {
+            let reading = self.take_reading()?;
+            self.allowance.start();
+            let found = self.search(stream, pts);
+            let landed = match self.allowance.finish(found) {
+                Ok(Some((pos, ts))) => self.restart(pos).map(|()| Some(ts)),
+                other => other.map(|_| None),
+            };
+            match landed {
+                Ok(Some(ts)) => {
+                    self.skip_to_key();
+                    ts
+                }
+                failed => {
+                    self.give_back(reading)?;
+                    return Err(failed.err().unwrap_or_else(|| Error::invalid("asf: no key frame to seek to")));
+                }
             }
-            return Ok(0);
-        }
-
-        self.build_simple_index()?;
-        if self.index.is_empty() {
-            return Err(Error::unsupported("no simple index in ASF file"));
-        }
-
-        let mut idx = 0;
-        for (i, entry) in self.index.iter().enumerate() {
-            if entry.pts <= pts {
-                idx = i;
-            } else {
-                break;
-            }
-        }
-
-        let target_pos = self.index[idx].pos;
-        let actual_pts = self.index[idx].pts;
-        self.input.seek(SeekFrom::Start(target_pos))?;
-        self.reset_packet_state();
-        for st in &mut self.asf_streams {
-            st.skip_to_key = true;
-        }
-        Ok(actual_pts)
+        };
+        self.pending_packets = self.attached_packets.iter().cloned().collect();
+        Ok(landed)
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
@@ -1463,11 +1758,15 @@ impl Demuxer for AsfDemuxer {
                     self.input.seek(SeekFrom::Current(skip as i64))?;
                 }
                 let cur = self.input.stream_position()?;
+                self.packet_pos = cur;
+                // Do not exceed the size of the data object (FFmpeg's
+                // unsigned compare: a position before it is past it too).
                 if self.data_object_size != u64::MAX
-                    && cur.saturating_sub(self.data_offset) >= self.data_object_size
+                    && (cur < self.data_object_offset || cur - self.data_object_offset >= self.data_object_size)
                 {
                     return Err(Error::Eof);
                 }
+                self.allowance.spend(1, 0)?;
                 self.get_packet()?;
                 self.packet_time_start = 0;
                 continue;
@@ -1476,7 +1775,6 @@ impl Demuxer for AsfDemuxer {
             // FFmpeg: asf->stream_index persists; multipacket continuations
             // reuse the stream chosen by their segment's frame header.
             let mut asf_stream_id = self.current_asf_stream_id;
-            let mut packet_key_frame = false;
             let mut frag_offset = 0u32;
             let mut frag_size = 0u32;
             // FFmpeg: asf->packet_replic_size is context — it persists across
@@ -1494,7 +1792,7 @@ impl Demuxer for AsfDemuxer {
                 let mut rsize = 1u32;
                 let num = read_u8(&mut *self.input)?;
                 self.packet_segments -= 1;
-                packet_key_frame = (num & 0x80) != 0;
+                self.current_key_frame = (num & 0x80) != 0;
                 asf_stream_id = (num & 0x7F) as usize;
                 self.current_asf_stream_id = asf_stream_id;
 
@@ -1548,7 +1846,7 @@ impl Demuxer for AsfDemuxer {
                 if std::env::var_os("PEARTUBE_ASF_DEBUG").is_some() {
                     eprintln!(
                         "hdr sid={} key={} fo={} rs={} size_left={}",
-                        asf_stream_id, packet_key_frame, frag_offset,
+                        asf_stream_id, self.current_key_frame, frag_offset,
                         replic_size, self.packet_size_left
                     );
                 }
@@ -1666,6 +1964,22 @@ impl Demuxer for AsfDemuxer {
                     self.asf_streams[asf_stream_id].pending_pts = packet_frag_timestamp;
                 }
                 frag_size = frag_size_read.unwrap_or(0);
+
+                // asf_parse_packet: a stream waiting for a key frame after
+                // a seek drops the fragments of other frames; the first
+                // fragment of a key frame (packet_frag_offset 0, as for a
+                // multiple-payload segment) ends the wait.
+                if asf_stream_id < MAX_STREAMS && self.asf_id_to_stream_idx[asf_stream_id].is_some() {
+                    if !self.current_key_frame && self.asf_streams[asf_stream_id].skip_to_key {
+                        self.packet_time_start = 0;
+                        self.input.seek(SeekFrom::Current(i64::from(frag_size)))?;
+                        self.packet_size_left -= i64::from(frag_size);
+                        continue;
+                    }
+                    if replic_size == 1 || frag_offset == 0 {
+                        self.asf_streams[asf_stream_id].skip_to_key = false;
+                    }
+                }
             }
 
             if replic_size == 1 || self.packet_time_start != 0 {
@@ -1701,7 +2015,6 @@ impl Demuxer for AsfDemuxer {
                     st.packet_obj_size = sub_size;
                     st.pending_pts = pts + self.hdr.preroll as i64;
                     st.pts = pts;
-                    st.keyframe = true; // compressed payloads are audio (always key)
                 }
             }
 
@@ -1748,7 +2061,12 @@ impl Demuxer for AsfDemuxer {
                 asf_st.assembled_packet = vec![0u8; obj_size];
                 asf_st.assembled_len = 0;
                 asf_st.pts = asf_st.pending_pts.saturating_sub(self.hdr.preroll as i64);
-                asf_st.keyframe = is_audio || packet_key_frame;
+                asf_st.pos = self.packet_pos;
+                // An audio object sets asf->packet_key_frame itself.
+                if is_audio {
+                    self.current_key_frame = true;
+                }
+                asf_st.keyframe = self.current_key_frame;
             }
 
             // FFmpeg: "packet_size_left -= frag_size; if (< 0) continue;"
@@ -1823,13 +2141,7 @@ impl Demuxer for AsfDemuxer {
                     }
                 }
 
-                if asf_st.skip_to_key {
-                    if asf_st.keyframe {
-                        asf_st.skip_to_key = false;
-                    } else {
-                        continue;
-                    }
-                }
+                self.last_pos = asf_st.pos;
 
                 let time_base = TimeBase::new(1, 1000);
                 let mut pkt = Packet::new(stream_idx as u32, time_base, data);
@@ -1984,4 +2296,18 @@ fn read_i64_le(r: &mut dyn Read) -> Result<i64> {
     let mut b = [0u8; 8];
     r.read_exact(&mut b)?;
     Ok(i64::from_le_bytes(b))
+}
+
+/// Read until `buf` is full or the input ends; the bytes read.
+fn read_up_to(r: &mut dyn Read, buf: &mut [u8]) -> Result<usize> {
+    let mut got = 0;
+    while got < buf.len() {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Ok(got)
 }

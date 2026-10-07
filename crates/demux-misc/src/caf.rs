@@ -442,6 +442,35 @@ impl Demuxer for CafDemuxer {
     fn next_packet(&mut self) -> Result<Packet> {
         self.read_packet()
     }
+
+    /// cafdec.c read_seek with AVSEEK_FLAG_BACKWARD. Constant-size packets
+    /// go by arithmetic, so PCM resumes at the target sample itself;
+    /// a packet table by av_index_search_timestamp over its entries (the
+    /// last packet starting at or before the target). Without either,
+    /// FFmpeg's fallback (seek_frame_generic) has no index and fails too.
+    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+        let timestamp = pts.max(0);
+        let priming = i64::from(self.priming);
+        let (pos, packet_cnt, frame_cnt) = if self.frames_per_packet > 0 && self.bytes_per_packet > 0 {
+            let mut pos = self.bytes_per_packet.saturating_mul(timestamp / self.frames_per_packet);
+            if self.data_size > 0 {
+                pos = pos.min(self.data_size);
+            }
+            let packet_cnt = pos / self.bytes_per_packet;
+            (pos, packet_cnt, self.frames_per_packet.saturating_mul(packet_cnt) - priming)
+        } else {
+            let at = self.table.partition_point(|&(_, frame)| frame <= timestamp);
+            let Some(&(pos, frame)) = at.checked_sub(1).and_then(|i| self.table.get(i)) else {
+                return Err(Error::unsupported("caf: no packet table entry to seek to"));
+            };
+            (pos, (at - 1) as i64, frame)
+        };
+        let start = self.data_start.checked_add(pos as u64).ok_or_else(|| Error::invalid("caf: seek offset overflow"))?;
+        self.input.seek(SeekFrom::Start(start))?;
+        self.packet_cnt = packet_cnt;
+        self.frame_cnt = frame_cnt;
+        Ok(frame_cnt)
+    }
 }
 
 pub fn register(reg: &mut ContainerRegistry) {

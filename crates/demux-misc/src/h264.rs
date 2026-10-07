@@ -8,7 +8,7 @@ use oxideav_core::{
     PROBE_SCORE_EXTENSION,
 };
 
-use crate::rawvideo::{RawVideoDemuxer, H264};
+use crate::rawvideo::{RawVideoDemuxer, H264, RAW_VIDEO_CLOCK};
 
 pub fn probe_h264(probe: &ProbeData) -> ProbeScore {
     let p = probe.buf;
@@ -88,7 +88,7 @@ pub fn open_h264(
         duration: None,
         start_time: Some(0),
     };
-    Ok(Box::new(RawVideoDemuxer::new("h264", input, stream, H264::default())))
+    Ok(Box::new(RawVideoDemuxer::new("h264", input, stream, H264::new((1, RAW_VIDEO_CLOCK)))))
 }
 
 pub fn register(reg: &mut ContainerRegistry) {

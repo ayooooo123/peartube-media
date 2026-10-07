@@ -1,5 +1,7 @@
-// Ported from FFmpeg libavformat/mlpdec.c (the raw MLP/TrueHD demuxer) and
-// libavformat/rawdec.c (ff_raw_read_partial_packet framing), commit 2da55bf.
+// Ported from FFmpeg libavformat/mlpdec.c (the raw MLP/TrueHD demuxer),
+// libavformat/rawdec.c (ff_raw_read_partial_packet framing), the
+// sync and key-frame rules of libavcodec/mlp_parser.c, and seek.c's
+// seek_frame_generic over demux-seek-core, commit 2da55bf.
 // Licensed under LGPL-2.1-or-later.
 
 //! Raw MLP / TrueHD demuxers. FFmpeg's raw demuxers emit one packet per
@@ -7,12 +9,14 @@
 //! access units for the decoder. OxideAV has no separate parser stage, so
 //! this demuxer does what FFmpeg's `mlp_parse` does: scan for a major sync,
 //! then cut complete access units using the 12-bit length field (× 2) in
-//! each AU header, verifying the parity nibble exactly like
-//! `read_access_unit`'s parity check. Timestamps are sample indices at the
-//! source rate, as FFmpeg's `mlp_read_header` sets up.
+//! each AU header, keeping a unit whose major sync reads or, without one,
+//! whose parity nibble holds, and losing sync on the others. Timestamps
+//! are sample indices at the source rate, as FFmpeg's `mlp_read_header`
+//! sets up.
 
 use std::io::{Read, Seek, SeekFrom};
 
+use demux_seek_core::{read_on, Allowance, Index};
 use oxideav_core::{
     CodecId, CodecParameters, ContainerRegistry, Demuxer, Error, MediaType, Packet, ProbeData,
     ProbeScore, ReadSeek, Result, SampleFormat, StreamInfo, TimeBase,
@@ -20,11 +24,16 @@ use oxideav_core::{
 
 use crate::bitreader::BitReader;
 use crate::common::{mlp_samplerate, truehd_channels, SYNC_MLP, SYNC_TRUEHD};
+use crate::parse;
 use crate::tables::{MLP_CHANNELS, MLP_QUANTS, THD_CHANCOUNT};
 
 /// How much head open() reads: enough for the resync scan and the first
 /// major sync.
 const HEAD_BYTES: usize = 256 * 1024;
+
+/// The stream bytes a parity check may read past a unit's end: the unit
+/// header and 15 substream headers of 4 bytes.
+const PARITY_LOOKAHEAD: usize = 4 + 4 * 15;
 
 pub struct RawMlpDemuxer {
     input: Box<dyn ReadSeek>,
@@ -36,8 +45,57 @@ pub struct RawMlpDemuxer {
     next_pts: u64,
     /// Samples per access unit: 40 << (ratebits & 7).
     au_size: u32,
-    /// File offset where the AU chain starts (for seek walks).
+    /// File offset where the AU chain starts.
     start_offset: u64,
+    /// mlp_parser.c's num_substreams: that of the last major sync read
+    /// (0 in a new parser), which the parity check covers.
+    num_substreams: u32,
+    /// AVFMT_GENERIC_INDEX: the key access units returned so far.
+    index: Index,
+    /// What the seek under way may still read.
+    allowance: Allowance,
+}
+
+/// What mlp_parse makes of an access unit (mlp_parser.c:142-168).
+enum Unit {
+    /// A major sync ff_mlp_read_major_sync reads: a key frame, and the
+    /// stream's substream count from then on.
+    Key(u32),
+    /// No major sync, the parity of its headers holding.
+    Plain,
+    /// A major sync that does not read, or a parity check that fails:
+    /// the parser loses sync and scans for the next major sync.
+    LostSync,
+}
+
+/// mlp_parse on `unit`, `after` the stream bytes that follow it (FFmpeg's
+/// parity loop reads past a short unit's end into them).
+fn classify(unit: &[u8], after: &[u8], num_substreams: u32) -> Unit {
+    let sync_present = unit.len() >= 8 && u32::from_be_bytes([unit[4], unit[5], unit[6], unit[7]]) & 0xFFFF_FFFE == 0xF872_6FBA;
+    if sync_present {
+        let buf = &unit[4..];
+        let mut gb = BitReader::new(buf);
+        return match parse::read_major_sync(buf, &mut gb) {
+            Ok(mh) => Unit::Key(mh.num_substreams),
+            Err(_) => Unit::LostSync,
+        };
+    }
+    // The first nibble of a unit is a parity check of the 4-byte unit
+    // header and the 2- or 4-byte substream headers.
+    let byte = |p: usize| unit.get(p).or_else(|| after.get(p - unit.len())).copied().unwrap_or(0);
+    let (mut parity, mut p) = (0u8, 0usize);
+    for i in -1..num_substreams as i32 {
+        parity ^= byte(p) ^ byte(p + 1);
+        p += 2;
+        if i < 0 || byte(p - 2) & 0x80 != 0 {
+            parity ^= byte(p) ^ byte(p + 1);
+            p += 2;
+        }
+    }
+    if ((parity >> 4) ^ parity) & 0xF != 0xF {
+        return Unit::LostSync;
+    }
+    Unit::Plain
 }
 
 impl RawMlpDemuxer {
@@ -168,14 +226,18 @@ impl RawMlpDemuxer {
             params,
         };
 
+        let allowance = Allowance::default();
         Ok(Box::new(RawMlpDemuxer {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             format_name,
             next_offset: base_offset,
             next_pts: 0,
             au_size,
             start_offset: base_offset,
+            num_substreams: 0,
+            index: Index::default(),
+            allowance,
         }))
     }
 }
@@ -192,31 +254,49 @@ fn ratebits_of(buf: &[u8], sync_at: usize, is_mlp: bool) -> u32 {
 }
 
 impl RawMlpDemuxer {
-    /// Scan forward from just past the cursor for the next major sync and
-    /// resume there (mlp_parser's lost_sync path).
-    fn resync(&mut self) -> Result<Packet> {
-        const WINDOW: usize = 64 * 1024;
+    /// The offset of the access unit whose major sync comes first at or
+    /// after `from + 4` (mlp_parser's lost_sync scan). The read window
+    /// starts small and doubles to 64 KiB, so a run of false headers costs
+    /// a few hundred bytes each and a long gap a few large reads.
+    fn find_sync(&mut self, mut from: u64) -> Result<u64> {
+        const MIN_WINDOW: usize = 256;
+        const MAX_WINDOW: usize = 64 * 1024;
         let sync_byte = if self.format_name == "mlp" {
             SYNC_MLP
         } else {
             SYNC_TRUEHD
         };
-        let mut from = self.next_offset + 1;
+        let mut window = MIN_WINDOW;
         loop {
             self.input.seek(SeekFrom::Start(from))?;
-            let mut buf = vec![0u8; WINDOW];
+            let mut buf = vec![0u8; window];
             let n = read_up_to(&mut self.input, &mut buf)?;
             if n < 8 {
                 return Err(Error::Eof);
             }
-            for off in 0..=n - 8 {
-                if buf[off + 4..off + 8] == [0xf8, 0x72, 0x6f, sync_byte] {
-                    self.next_offset = from + off as u64;
-                    return self.next_packet();
-                }
+            if let Some(off) = buf[..n].windows(8).position(|w| w[4..8] == [0xf8, 0x72, 0x6f, sync_byte]) {
+                return Ok(from + off as u64);
             }
             from += (n - 7) as u64;
+            window = (window * 2).min(MAX_WINDOW);
         }
+    }
+
+    /// seek_frame_generic from the index search's result `found`; reading
+    /// restarts with a new parser (ff_read_frame_flush).
+    fn land(&mut self, pts: i64, mut found: Option<usize>) -> Result<i64> {
+        if found.is_none() || found == Some(self.index.entries().len() - 1) {
+            let (offset, ts) = self.index.entries().last().map_or((self.start_offset, 0), |e| (e.pos as u64, e.timestamp as u64));
+            (self.next_offset, self.next_pts, self.num_substreams) = (offset, ts, 0);
+            read_on(pts, || self.next_packet().map(|p| (p.flags.keyframe, p.dts)))?;
+            found = self.index.search(pts, true);
+        }
+        let Some(i) = found else {
+            return Err(Error::invalid("no major sync to seek to"));
+        };
+        let e = self.index.entries()[i];
+        (self.next_offset, self.next_pts, self.num_substreams) = (e.pos as u64, e.timestamp as u64, 0);
+        Ok(e.timestamp)
     }
 }
 
@@ -247,69 +327,77 @@ impl Demuxer for RawMlpDemuxer {
     fn next_packet(&mut self) -> Result<Packet> {
         // Read the 2-byte AU header at the cursor (ff_raw_read_partial_packet
         // is unstructured; the AU framing comes from the parser, which reads
-        // the length field wherever the cursor sits).
-        let mut hdr = [0u8; 2];
-        self.input.seek(SeekFrom::Start(self.next_offset))?;
-        let got = read_up_to(&mut self.input, &mut hdr)?;
-        if got < 2 {
-            return Err(Error::Eof);
-        }
-        let len = (u16::from_be_bytes(hdr) & 0xfff) as usize * 2;
-        if len < 4 {
-            // Broken length chain mid-stream: FFmpeg's parser resyncs by
-            // scanning for the next sync word. Do the same from the cursor.
-            return self.resync();
-        }
-
-        let mut data = vec![0u8; len];
-        self.input.seek(SeekFrom::Start(self.next_offset))?;
-        if self.input.read_exact(&mut data).is_err() {
-            // Truncated final AU (luckynight ends mid-frame): FFmpeg's raw
-            // demuxer emits the short read, but the decoder needs a whole
-            // AU header at minimum; a partial frame errors inside it. Drop
-            // the tail like the parse loop does.
-            return Err(Error::Eof);
-        }
-
-        let pts = self.next_pts;
-        self.next_pts += u64::from(self.au_size);
-        self.next_offset += len as u64;
-
-        let tb = self.streams[0].time_base;
-        Ok(Packet::new(0, tb, data)
-            .with_pts(pts as i64)
-            .with_dts(pts as i64)
-            .with_keyframe(true))
-    }
-
-
-    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
-        // AU boundaries are only known by walking; jump to the sample
-        // position at the AU grid (the raw stream has no seek index).
-        if self.au_size == 0 {
-            return Err(Error::unsupported("empty stream"));
-        }
-        let au_index = (pts.max(0) as u64 / u64::from(self.au_size)) * u64::from(self.au_size);
-        self.next_pts = au_index;
-        // Offset unknown without walking from the start; walk now, bounded
-        // by the AU grid.
-        let mut offset = self.start_offset;
-        let mut walk_pts = 0u64;
-        while walk_pts < au_index {
-            self.input.seek(SeekFrom::Start(offset))?;
+        // the length field wherever the cursor sits). A unit the parser
+        // rejects loses sync: FFmpeg's parser scans on for the next major
+        // sync word, and so does this loop, each turn strictly past the
+        // last. A lost unit has no packet and takes no time.
+        loop {
             let mut hdr = [0u8; 2];
-            if read_up_to(&mut self.input, &mut hdr)? < 2 {
-                return Err(Error::unsupported("seek past end of stream"));
+            self.input.seek(SeekFrom::Start(self.next_offset))?;
+            let got = read_up_to(&mut self.input, &mut hdr)?;
+            if got < 2 {
+                return Err(Error::Eof);
             }
             let len = (u16::from_be_bytes(hdr) & 0xfff) as usize * 2;
             if len < 4 {
-                return Err(Error::unsupported("seek into a broken length chain"));
+                self.next_offset = self.find_sync(self.next_offset + 1)?;
+                continue;
             }
-            offset += len as u64;
-            walk_pts += u64::from(self.au_size);
+            self.allowance.spend(1, 0)?;
+            let mut data = vec![0u8; len + PARITY_LOOKAHEAD];
+            self.input.seek(SeekFrom::Start(self.next_offset))?;
+            let got = read_up_to(&mut self.input, &mut data)?;
+            if got < len {
+                // Truncated final AU (luckynight ends mid-frame): FFmpeg's raw
+                // demuxer emits the short read, but the decoder needs a whole
+                // AU header at minimum; a partial frame errors inside it. Drop
+                // the tail like the parse loop does.
+                return Err(Error::Eof);
+            }
+            let offset = self.next_offset;
+            let key = match classify(&data[..len], &data[len..got], self.num_substreams) {
+                Unit::LostSync => {
+                    self.next_offset = self.find_sync(offset + 1)?;
+                    continue;
+                }
+                Unit::Key(substreams) => {
+                    self.num_substreams = substreams;
+                    true
+                }
+                Unit::Plain => false,
+            };
+            data.truncate(len);
+            let pts = self.next_pts;
+            self.next_pts += u64::from(self.au_size);
+            self.next_offset += len as u64;
+            if key {
+                // av_read_frame indexes every key packet it returns.
+                self.index.add(offset as i64, pts as i64, 0, 0, true);
+            }
+            let tb = self.streams[0].time_base;
+            return Ok(Packet::new(0, tb, data).with_pts(pts as i64).with_dts(pts as i64).with_keyframe(key));
         }
-        self.next_offset = offset;
-        Ok(au_index as i64)
+    }
+
+    /// mlpdec.c is AVFMT_GENERIC_INDEX: seek.c seek_frame_generic with
+    /// AVSEEK_FLAG_BACKWARD lands on the last access unit with a major sync
+    /// at or before the target, among those returned so far; past the last
+    /// of them units are read on, within the seek's allowance, until a key
+    /// unit starts after the target or more than 1000 others did. A seek
+    /// that fails leaves reading where it was.
+    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+        let found = self.index.search(pts, true);
+        if found.is_none() && self.index.entries().first().is_some_and(|e| pts < e.timestamp) {
+            return Err(Error::invalid("seek before the first major sync"));
+        }
+        let reading = (self.next_offset, self.next_pts, self.num_substreams);
+        self.allowance.start();
+        let landed = self.land(pts, found);
+        let landed = self.allowance.finish(landed);
+        if landed.is_err() {
+            (self.next_offset, self.next_pts, self.num_substreams) = reading;
+        }
+        landed
     }
 }
 

@@ -1,12 +1,15 @@
-// Ported from FFmpeg libavformat/pva.c (commit 2da55bf)
+// Ported from FFmpeg libavformat/pva.c (commit 2da55bf), with the
+// timestamp seek of libavformat/seek.c (ff_seek_frame_binary).
 // License: LGPL-2.1-or-later
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
     Packet, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo, TimeBase,
     PROBE_SCORE_EXTENSION,
 };
+
+use demux_seek_core::{gen_search, Allowance, Bounds, Index};
 
 const PVA_MAGIC: u16 = 0x4156; // "AV"
 const PVA_MAX_PAYLOAD_LENGTH: usize = 0x17F8;
@@ -53,6 +56,11 @@ pub struct PvaDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     continue_pes: usize,
+    /// Per stream: where each PVA packet with a pts starts, by pts
+    /// (read_part_of_packet indexes them; pva_read_header adds 0 at 0).
+    index: [Index; 2],
+    /// What the seek under way may still read.
+    allowance: Allowance,
 }
 
 pub fn open_pva(
@@ -81,11 +89,121 @@ pub fn open_pva(
         },
     ];
 
+    let mut index = [Index::default(), Index::default()];
+    for stream in &mut index {
+        stream.add(0, 0, 0, 0, true);
+    }
+    let allowance = Allowance::default();
     Ok(Box::new(PvaDemuxer {
-        input,
+        input: Box::new(allowance.meter(input)),
         streams,
         continue_pes: 0,
+        index,
+        allowance,
     }))
+}
+
+/// `N` bytes as avio reads them: zeros past the end, which it reports.
+fn read_padded<const N: usize>(input: &mut dyn ReadSeek) -> Result<([u8; N], bool)> {
+    let mut buf = [0u8; N];
+    let mut got = 0;
+    while got < N {
+        match input.read(&mut buf[got..]) {
+            Ok(0) => return Ok((buf, true)),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok((buf, false))
+}
+
+impl PvaDemuxer {
+    /// read_part_of_packet as pva_read_timestamp calls it (read_packet 0,
+    /// a new PES expected): the packet's pts, payload length and stream
+    /// id, `None` where FFmpeg returns an error.
+    fn read_part(&mut self) -> Result<Option<(Option<i64>, i64, u8)>> {
+        self.allowance.spend(1, 0)?;
+        let startpos = self.input.stream_position()? as i64;
+        let (hdr, _) = read_padded::<8>(&mut *self.input)?;
+        let syncword = u16::from_be_bytes([hdr[0], hdr[1]]);
+        let streamid = hdr[2];
+        let flags = hdr[5];
+        let mut length = i64::from(u16::from_be_bytes([hdr[6], hdr[7]]));
+        if syncword != PVA_MAGIC
+            || (streamid != PVA_VIDEO_PAYLOAD && streamid != PVA_AUDIO_PAYLOAD)
+            || length > PVA_MAX_PAYLOAD_LENGTH as i64
+        {
+            return Ok(None);
+        }
+        let mut pva_pts = None;
+        if streamid == PVA_VIDEO_PAYLOAD && flags & 0x10 != 0 {
+            let (pts, _) = read_padded::<4>(&mut *self.input)?;
+            pva_pts = Some(i64::from(u32::from_be_bytes(pts)));
+            length -= 4;
+        } else if streamid == PVA_AUDIO_PAYLOAD {
+            let (pes, eof) = read_padded::<9>(&mut *self.input)?;
+            if eof {
+                return Ok(None);
+            }
+            let pes_signal = (u32::from(pes[0]) << 16) | (u32::from(pes[1]) << 8) | u32::from(pes[2]);
+            let pes_flags = u16::from_be_bytes([pes[6], pes[7]]);
+            let header_len = usize::from(pes[8]);
+            if pes_signal != 1 || header_len == 0 {
+                return Ok(None);
+            }
+            let mut header = vec![0u8; header_len];
+            if self.input.read_exact(&mut header).is_err() {
+                return Ok(None);
+            }
+            length -= 9 + header_len as i64;
+            if pes_flags & 0x80 != 0 && header[0] & 0xF0 == 0x20 {
+                if header_len < 5 {
+                    return Ok(None);
+                }
+                pva_pts = Some(parse_pes_pts(&header));
+            }
+        }
+        if let Some(pts) = pva_pts {
+            self.index[usize::from(streamid - 1)].add(startpos, pts, 0, 0, true);
+        }
+        Ok(Some((pva_pts, length, streamid)))
+    }
+
+    /// pva_read_timestamp: from `*pos` on, at most 8 maximal payloads
+    /// ahead, the pts of the first packet of `stream` that has one,
+    /// stepping a byte on where no packet parses. Like FFmpeg it returns
+    /// the last pts it read when it runs out of range, whatever stream
+    /// that pts was of.
+    fn read_timestamp(&mut self, pos: &mut i64, pos_limit: i64, stream: usize) -> Result<Option<i64>> {
+        let limit = pos.saturating_add(PVA_MAX_PAYLOAD_LENGTH as i64 * 8).min(pos.saturating_add(pos_limit));
+        let mut res = None;
+        while *pos < limit {
+            res = None;
+            self.input.seek(SeekFrom::Start(*pos as u64))?;
+            let Some((pts, length, streamid)) = self.read_part()? else {
+                *pos += 1;
+                continue;
+            };
+            res = pts;
+            if usize::from(streamid - 1) != stream || pts.is_none() {
+                // The payload is passed by an absolute seek, which the
+                // metered input does not charge.
+                self.allowance.spend(0, length.max(0) as u64)?;
+                *pos = self.input.stream_position()? as i64 + length;
+                continue;
+            }
+            break;
+        }
+        self.continue_pes = 0;
+        Ok(res)
+    }
+
+    /// ff_seek_frame_binary over pva_read_timestamp.
+    fn search(&mut self, stream: usize, timestamp: i64, bounds: Bounds) -> Result<Option<(i64, i64)>> {
+        let file_size = self.input.seek(SeekFrom::End(0))? as i64;
+        gen_search(timestamp, bounds, 0, file_size, &mut |pos, limit| self.read_timestamp(pos, limit, stream))
+    }
 }
 
 impl Demuxer for PvaDemuxer {
@@ -98,6 +216,7 @@ impl Demuxer for PvaDemuxer {
     }
 
     fn next_packet(&mut self) -> Result<Packet> {
+        let startpos = self.input.stream_position()? as i64;
         let mut hdr = [0u8; 8];
         match self.input.read(&mut hdr) {
             Ok(0) => return Err(Error::Eof),
@@ -154,6 +273,9 @@ impl Demuxer for PvaDemuxer {
             }
             self.continue_pes = self.continue_pes.saturating_sub(length);
         }
+        if let Some(pts) = pva_pts {
+            self.index[stream_index as usize].add(startpos, pts, 0, 0, true);
+        }
 
         let mut payload = vec![0u8; length];
         // A cut file ends mid-packet; FFmpeg's av_get_packet returns
@@ -183,6 +305,39 @@ impl Demuxer for PvaDemuxer {
         };
         pkt.flags.keyframe = true;
         Ok(pkt)
+    }
+
+    /// pva.c has no read_seek: FFmpeg bisects with pva_read_timestamp
+    /// (seek.c ff_seek_frame_binary, ff_gen_search with
+    /// AVSEEK_FLAG_BACKWARD) within the bounds of the stream's index. Video
+    /// pts come in display order, so the landing follows every step of
+    /// the search. The search reads within the seek's allowance; a failed
+    /// seek, its reposition to the landing included, leaves reading where
+    /// it was, the audio PES in progress (continue_pes) included.
+    fn seek_to(&mut self, stream_index: u32, timestamp: i64) -> Result<i64> {
+        let stream = stream_index as usize;
+        let Some(index) = self.index.get(stream) else {
+            return Err(Error::invalid("pva: no such stream to seek"));
+        };
+        let bounds = index.bounds(timestamp);
+        let (resume, continue_pes) = (self.input.stream_position()?, self.continue_pes);
+        self.allowance.start();
+        let found = self.search(stream, timestamp, bounds);
+        let landed = match self.allowance.finish(found) {
+            Ok(Some((pos, ts))) => self.input.seek(SeekFrom::Start(pos as u64)).map(|_| Some(ts)).map_err(Error::from),
+            other => other.map(|_| None),
+        };
+        match landed {
+            Ok(Some(ts)) => {
+                self.continue_pes = 0;
+                Ok(ts)
+            }
+            failed => {
+                self.input.seek(SeekFrom::Start(resume))?;
+                self.continue_pes = continue_pes;
+                Err(failed.err().unwrap_or_else(|| Error::invalid("pva: no timestamp to seek by")))
+            }
+        }
     }
 }
 

@@ -139,6 +139,7 @@ name = "codec-dca"
 version = "0.1.0"
 dependencies = [
  "codecs",
+ "demux-seek-core",
  "oxideav-core",
  "refcheck",
 ]
@@ -147,6 +148,7 @@ dependencies = [
 name = "codec-mlp"
 version = "0.1.0"
 dependencies = [
+ "demux-seek-core",
  "md5",
  "oxideav-core",
  "oxideav-mkv",
@@ -187,6 +189,7 @@ name = "codec-wmv"
 version = "0.1.0"
 dependencies = [
  "demux-asf",
+ "demux-seek-core",
  "oxideav-avi",
  "oxideav-core",
  "oxideav-mov",
@@ -303,6 +306,7 @@ dependencies = [
 name = "demux-asf"
 version = "0.1.0"
 dependencies = [
+ "demux-seek-core",
  "oxideav-core",
  "refcheck",
 ]
@@ -312,7 +316,9 @@ name = "demux-misc"
 version = "0.1.0"
 dependencies = [
  "codecs",
+ "demux-seek-core",
  "oxideav-core",
+ "player",
  "refcheck",
 ]
 
@@ -320,8 +326,16 @@ dependencies = [
 name = "demux-rm"
 version = "0.1.0"
 dependencies = [
+ "demux-seek-core",
  "oxideav-core",
  "refcheck",
+]
+
+[[package]]
+name = "demux-seek-core"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
 ]
 
 [[package]]

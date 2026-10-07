@@ -6,6 +6,7 @@ license = "LGPL-2.1-or-later"
 
 [dependencies]
 oxideav-core.workspace = true
+demux-seek-core.workspace = true
 
 [dev-dependencies]
 md5 = "0.7"
