@@ -508,6 +508,48 @@ fn eac3() {
     check_inventory("eac3", &["eac3", "ec3"], CONTAINER);
 }
 
+/// A directory for one test's generated inputs, in the scratch directory
+/// Cargo gives integration tests; the test removes it after use.
+fn scratch_dir(test: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("demux-misc-{test}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// `codec` from FFmpeg's encoder into `dir/name`, raw, from lavfi
+/// `source`.
+fn encode(dir: &Path, name: &str, codec: &str, source: &str, args: &[&str]) -> PathBuf {
+    let path = dir.join(name);
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", source, "-c:v", codec])
+        .args(args)
+        .args(["-f", codec])
+        .arg(&path)
+        .output()
+        .expect("ffmpeg must be on PATH");
+    assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    path
+}
+
+/// Each sequence header of a raw MPEG-1/2 stream: its offset, its
+/// frame_rate_code, and its sequence extension's low_delay,
+/// frame_rate_extension_n and frame_rate_extension_d.
+fn sequence_headers(bytes: &[u8]) -> Vec<(usize, u8, Option<(u8, u8, u8)>)> {
+    let starts: Vec<usize> = (0..bytes.len().saturating_sub(10)).filter(|&i| bytes[i..i + 3] == [0, 0, 1]).collect();
+    let extension = |e: usize| (bytes[e + 3] == 0xB5 && bytes[e + 4] >> 4 == 1).then(|| (bytes[e + 9] >> 7, (bytes[e + 9] >> 5) & 3, bytes[e + 9] & 0x1F));
+    starts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &at)| bytes[at + 3] == 0xB3)
+        .map(|(k, &at)| (at, bytes[at + 7] & 0x0F, starts.get(k + 1).and_then(|&e| extension(e))))
+        .collect()
+}
+
+/// The offset of each picture header of a raw MPEG-1/2 stream.
+fn picture_headers(bytes: &[u8]) -> Vec<usize> {
+    (0..bytes.len().saturating_sub(4)).filter(|&i| bytes[i..i + 4] == [0, 0, 1, 0]).collect()
+}
+
 /// Raw MPEG-1/2 video: the frames FFmpeg's mpegvideo parser cuts, timed
 /// as FFmpeg 2da55bf's demuxer layer times them. Without B-frame delay a
 /// frame's pts is its dts; with it, I- and P-frames have no pts and B-frames
@@ -527,8 +569,7 @@ fn mpegvideo() {
     println!("mpegvideo: {} required FATE inputs: {}", inputs.len(), inputs.join(", "));
     let mut failures: Vec<String> =
         inputs.iter().filter_map(|rel| compare(&suite_path(rel), rel, "mpegvideo", RAW_MPEG).err()).collect();
-    let dir = std::env::temp_dir().join(format!("demux-misc-mpegvideo-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("mpegvideo");
     let generated = [
         ("mpeg1-bframes.m1v", "mpeg1video", "176x144", &["-bf", "2"][..]),
         ("mpeg1-ippp.m1v", "mpeg1video", "176x144", &["-bf", "0"][..]),
@@ -537,17 +578,7 @@ fn mpegvideo() {
         ("mpeg2-low-delay.m2v", "mpeg2video", "176x144", &["-bf", "0", "-flags", "+low_delay"][..]),
     ];
     for (name, codec, size, args) in generated {
-        let path = dir.join(name);
-        let out = std::process::Command::new("ffmpeg")
-            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
-            .arg(format!("testsrc=duration=0.6:size={size}:rate=25"))
-            .args(["-c:v", codec])
-            .args(args)
-            .args(["-f", codec])
-            .arg(&path)
-            .output()
-            .expect("ffmpeg must be on PATH");
-        assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        let path = encode(&dir, name, codec, &format!("testsrc=duration=0.6:size={size}:rate=25"), args);
         failures.extend(compare(&path, &format!("generated {name}"), "mpegvideo", RAW_MPEG).err());
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -558,6 +589,110 @@ fn mpegvideo() {
         inputs.len() + generated.len(),
         failures.join("\n")
     );
+}
+
+/// A sequence change inside the first 1024-byte read. FFmpeg's decoder
+/// sees the first picture only once that read is parsed, and the frame
+/// rate and B-frame delay it takes from that picture's sequence hold
+/// from the next read on, over those of the later sequence the read
+/// already parsed. Two MPEG-2 sequences: three pictures of the first,
+/// then the second's I-picture, completed in the first read, and its
+/// P-pictures, with no sequence header of their own, in that read and
+/// two more. 25 fps with B-frame delay then 50 fps low-delay, and the
+/// other way round.
+#[test]
+fn mpegvideo_sequence_change_in_the_first_read() {
+    let dir = scratch_dir("mpegvideo-sequence-change");
+    // frame rate, its frame_rate_code, low_delay
+    let delayed = ("25", 3u8, 0u8);
+    let low_delay = ("50", 6u8, 1u8);
+    let mut failures = Vec::new();
+    for (first, second) in [(delayed, low_delay), (low_delay, delayed)] {
+        let name = format!("mpeg2-{}fps-low-delay-{}-then-{}fps-low-delay-{}.m2v", first.0, first.2, second.0, second.2);
+        let mut bytes = Vec::new();
+        for (part, (rate, _, low_delay), frames) in [("a", first, "3"), ("b", second, "80")] {
+            let mut args = vec!["-frames:v", frames, "-g", "1000", "-bf", "0", "-q:v", "31"];
+            if low_delay == 1 {
+                args.extend(["-flags", "+low_delay"]);
+            }
+            let source = format!("testsrc=duration=4:size=16x16:rate={rate}");
+            bytes.extend(std::fs::read(encode(&dir, &format!("{part}-{name}"), "mpeg2video", &source, &args)).unwrap());
+        }
+        let sequences = sequence_headers(&bytes);
+        let declared: Vec<_> = sequences.iter().map(|&(_, rate, ext)| (rate, ext)).collect();
+        assert_eq!(declared, [(first.1, Some((first.2, 0, 0))), (second.1, Some((second.2, 0, 0)))], "{name}: two sequences");
+        let pictures: Vec<usize> = picture_headers(&bytes).into_iter().filter(|&p| p > sequences[1].0).collect();
+        assert!(pictures[1] + 4 <= 1024, "{name}: the first read ends the second sequence's first picture");
+        assert!(bytes.len() > 2 * 1024, "{name}: the second sequence's P-pictures run on through two more reads");
+        let path = dir.join(&name);
+        std::fs::write(&path, &bytes).unwrap();
+        failures.extend(compare(&path, &format!("generated {name}"), "mpegvideo", RAW_MPEG).err());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{} of 2 sequence changes differ from FFmpeg:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// What FFmpeg's decoder sets after the first read is what it reads from
+/// the first picture's sequence. A frame_rate_code it rejects (15,
+/// reserved) reads as 24000/1001, where FFmpeg's parser has no rate and
+/// the 25 fps fallback until then. A picture before any sequence header
+/// does not count: a stream cut after its first sequence header, low
+/// delay, its next one a read later; the pictures before it are not
+/// delayed.
+#[test]
+fn mpegvideo_decoder_reads_the_first_pictures_sequence() {
+    let dir = scratch_dir("mpegvideo-decoder");
+    let low_delay = ["-bf", "0", "-q:v", "31", "-flags", "+low_delay"];
+    let mut failures = Vec::new();
+
+    let name = "mpeg2-reserved-frame-rate-code.m2v";
+    let source = "testsrc=duration=4:size=16x16:rate=25";
+    let mut bytes = std::fs::read(encode(&dir, "reserved.m2v", "mpeg2video", source, &[&["-frames:v", "80", "-g", "1000"][..], &low_delay].concat())).unwrap();
+    for (at, _, _) in sequence_headers(&bytes) {
+        bytes[at + 7] |= 0x0F;
+    }
+    assert!(bytes.len() > 2 * 1024, "{name}: pictures in two more reads");
+    std::fs::write(dir.join(name), &bytes).unwrap();
+    failures.extend(compare(&dir.join(name), &format!("generated {name}"), "mpegvideo", RAW_MPEG).err());
+
+    let name = "mpeg2-cut-after-the-first-sequence-header.m2v";
+    let source = "testsrc=duration=4:size=16x16:rate=50";
+    let whole = std::fs::read(encode(&dir, "gop60.m2v", "mpeg2video", source, &[&["-frames:v", "160", "-g", "60"][..], &low_delay].concat())).unwrap();
+    let bytes = &whole[picture_headers(&whole)[1]..];
+    let first_sequence = sequence_headers(bytes)[0].0;
+    let headerless = picture_headers(bytes).into_iter().filter(|&p| p > 1024 && p < first_sequence).count();
+    assert!(headerless >= 2, "{name}: pictures with no sequence header before them in the second read");
+    std::fs::write(dir.join(name), bytes).unwrap();
+    failures.extend(compare(&dir.join(name), &format!("generated {name}"), "mpegvideo", RAW_MPEG).err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{} of 2 inputs differ from FFmpeg:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// 36000/1001 fps (frame_rate_code 1, 24000/1001, extended by 3/2): a
+/// frame lasts 33366⅔ ticks of 1/1200000, and av_add_stable moves the
+/// dts on by 33367, 33367 and 33366 ticks in turn. Which frame gets the
+/// short step depends on the timestamp the rounding starts from: FFmpeg's
+/// relative origin (RELATIVE_TS_BASE), not 0. Low-delay, so every frame's
+/// pts and dts come from that rounding; 22 frames, every phase several
+/// times.
+#[test]
+fn mpegvideo_frames_of_a_fractional_tick_count() {
+    let dir = scratch_dir("mpegvideo-fractional-ticks");
+    let name = "mpeg2-36000-1001-low-delay.m2v";
+    // -force_fps: the frame rate as given, not the nearest standard one.
+    let args = ["-force_fps", "-bf", "0", "-flags", "+low_delay", "-q:v", "31"];
+    let path = encode(&dir, name, "mpeg2video", "testsrc=duration=0.6:size=16x16:rate=36000/1001", &args);
+    let sequences = sequence_headers(&std::fs::read(&path).unwrap());
+    assert!(
+        !sequences.is_empty() && sequences.iter().all(|&(_, rate, ext)| (rate, ext) == (1, Some((1, 2, 1)))),
+        "{name}: frame_rate_code 1, extension n 2 d 1, low_delay: {sequences:?}"
+    );
+    let result = compare(&path, &format!("generated {name}"), "mpegvideo", RAW_MPEG);
+    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(e) = result {
+        panic!("{e}");
+    }
 }
 
 /// h264.mak (the conformance suite) and every other raw H.264 input:

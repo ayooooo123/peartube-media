@@ -210,6 +210,11 @@ const PICTURE_TYPE_B: u8 = 3;
 /// ff_raw_video_read_header's time base: 1/1200000.
 pub(crate) const RAW_VIDEO_CLOCK: i64 = 1_200_000;
 
+/// RELATIVE_TS_BASE (avformat_internal.h): the dts FFmpeg starts a stream
+/// without timestamps from. av_read_frame returns a timestamp relative to
+/// it (is_relative: above RELATIVE_TS_BASE - 2^48) less it.
+const RELATIVE_TS_BASE: i64 = i64::MAX - (1 << 48);
+
 /// How FFmpeg times raw MPEG-1/2 video, which carries no timestamps: what
 /// mpegvideo_extract_headers leaves in the parser and codec contexts, and
 /// compute_pkt_fields (demux.c) on each parsed unit, in 1/1200000.
@@ -217,12 +222,24 @@ pub(crate) const RAW_VIDEO_CLOCK: i64 = 1_200_000;
 /// With B-frame delay (has_b_frames), an I- or P-frame's pts is unknown
 /// and its dts is the current one, which then moves on by the duration of
 /// the I- or P-frame before it; a B-frame's pts and dts are the current
-/// dts, which moves on by its own duration. Without delay every frame is
-/// timed like a B-frame. A duration counts fields: 1/(2 x frame rate),
-/// times 1 + repeat_pict.
+/// dts, which moves on by its own duration (av_add_stable). Without delay
+/// every frame is timed like a B-frame. A duration counts fields:
+/// 1/(2 x frame rate), times 1 + repeat_pict. The dts runs from
+/// RELATIVE_TS_BASE, the origin av_add_stable rounds a fractional tick
+/// count from in FFmpeg, and comes out less it.
+///
+/// FFmpeg's decoder, which avformat_find_stream_info runs on the first
+/// picture after a sequence header once the read that ended it is
+/// parsed, sets the delay, frame rate and codec from that picture's
+/// sequence (mpeg_decode_postinit): they hold from the next read on, over
+/// those of any later sequence header that read held.
 struct MpegClock {
+    /// The last sequence header's frame_rate_code, once there is one.
+    frame_rate_code: Option<usize>,
     /// pc->frame_rate: the last sequence header's frame rate.
     frame_rate: (i64, i64),
+    /// s1->frame_rate_ext: the last sequence extension's factors.
+    frame_rate_ext: (i64, i64),
     /// avctx->framerate: with its sequence extension's factors.
     framerate: (i64, i64),
     progressive_sequence: bool,
@@ -236,20 +253,39 @@ struct MpegClock {
     /// The last sequence extension's low_delay, which FFmpeg's decoder
     /// turns into has_b_frames.
     low_delay: bool,
-    /// A unit with a picture has been stamped, and FFmpeg's decoder, run
-    /// on the first one by avformat_find_stream_info before the next read,
-    /// has set has_b_frames from it.
-    picture_stamped: bool,
-    decoder_ran: bool,
+    discovery: Discovery,
     /// sti->cur_dts and sti->last_IP_duration
     cur_dts: i64,
     last_ip_duration: i64,
 }
 
+/// FFmpeg's decoder during avformat_find_stream_info.
+#[derive(Clone, Copy)]
+enum Discovery {
+    /// No picture after a sequence header parsed yet.
+    NoPicture,
+    /// The first one is parsed, in the read not over yet: what the decoder
+    /// sets from its sequence once it is.
+    Pending(DecoderTiming),
+    /// The decoder has set it.
+    Done,
+}
+
+/// What mpeg_decode_postinit sets: avctx->has_b_frames, framerate, and
+/// codec_id (MPEG-2 or not).
+#[derive(Clone, Copy)]
+struct DecoderTiming {
+    has_b_frames: bool,
+    framerate: (i64, i64),
+    mpeg2: bool,
+}
+
 impl Default for MpegClock {
     fn default() -> Self {
         Self {
+            frame_rate_code: None,
             frame_rate: (0, 0),
+            frame_rate_ext: (1, 1),
             // avcodec_alloc_context3
             framerate: (0, 1),
             progressive_sequence: false,
@@ -257,9 +293,8 @@ impl Default for MpegClock {
             repeat_pict: 0,
             has_b_frames: false,
             low_delay: false,
-            picture_stamped: false,
-            decoder_ran: false,
-            cur_dts: 0,
+            discovery: Discovery::NoPicture,
+            cur_dts: RELATIVE_TS_BASE,
             last_ip_duration: 0,
         }
     }
@@ -285,7 +320,7 @@ impl MpegClock {
     }
 
     /// compute_pkt_fields for a unit of picture type `pict_type`: its pts,
-    /// dts and duration.
+    /// dts and duration, as av_read_frame returns them.
     fn stamp(&mut self, pict_type: u8) -> (Option<i64>, Option<i64>, Option<i64>) {
         if pict_type == PICTURE_TYPE_B {
             self.has_b_frames = true;
@@ -307,15 +342,32 @@ impl MpegClock {
             }
             self.cur_dts = dts.saturating_add(self.last_ip_duration);
             self.last_ip_duration = duration;
-            (None, Some(dts), known)
+            (None, Some(returned(dts)), known)
         } else if duration > 0 {
             let pts = self.cur_dts;
             self.cur_dts = add_stable(pts, num, den);
-            (Some(pts), Some(pts), known)
+            (Some(returned(pts)), Some(returned(pts)), known)
         } else {
             (None, None, None)
         }
     }
+
+    /// What mpeg_decode_postinit sets from the sequence parsed last, of
+    /// frame_rate_code `code`: the delay low_delay leaves, and the code's
+    /// frame rate (24000/1001 for a code the decoder rejects), times the
+    /// extension's factors for MPEG-2.
+    fn decoder_timing(&self, code: usize) -> DecoderTiming {
+        let code = if code == 0 || code > 13 { 1 } else { code };
+        let (num, den) = FRAME_RATES[code];
+        let framerate = if self.mpeg2 { (num * self.frame_rate_ext.0, den * self.frame_rate_ext.1) } else { (num, den) };
+        DecoderTiming { has_b_frames: !self.low_delay, framerate, mpeg2: self.mpeg2 }
+    }
+}
+
+/// A timestamp as av_read_frame returns it: less RELATIVE_TS_BASE when
+/// relative to it.
+fn returned(ts: i64) -> i64 {
+    if ts > RELATIVE_TS_BASE - (1 << 48) { ts - RELATIVE_TS_BASE } else { ts }
 }
 
 /// av_rescale_q(a, b, c), rounding to nearest with ties away from zero.
@@ -330,7 +382,8 @@ fn rescale(a: i64, b: (i64, i64), c: (i64, i64)) -> i64 {
 }
 
 /// av_add_stable(1/1200000, ts, num/den, 1): `ts` moved on by num/den
-/// seconds without accumulating rounding errors.
+/// seconds without accumulating rounding errors. Where a fractional tick
+/// count rounds depends on `ts` itself, not only on how far it moved.
 fn add_stable(ts: i64, num: i64, den: i64) -> i64 {
     let clock = (1, RAW_VIDEO_CLOCK);
     let (m, d) = (i128::from(num) * i128::from(RAW_VIDEO_CLOCK), i128::from(den));
@@ -430,7 +483,9 @@ impl MpegVideo {
                 }
                 SEQ_START_CODE => {
                     if b.len() >= 7 {
-                        clock.frame_rate = FRAME_RATES[usize::from(b[3] & 0x0F)];
+                        let code = usize::from(b[3] & 0x0F);
+                        clock.frame_rate_code = Some(code);
+                        clock.frame_rate = FRAME_RATES[code];
                         clock.framerate = clock.frame_rate;
                         clock.mpeg2 = false;
                     }
@@ -442,7 +497,8 @@ impl MpegVideo {
                         clock.progressive_sequence = b[1] & (1 << 3) != 0;
                         clock.low_delay = b[5] >> 7 != 0;
                         clock.has_b_frames = !clock.low_delay;
-                        clock.framerate = (clock.frame_rate.0 * (ext_n + 1), clock.frame_rate.1 * (ext_d + 1));
+                        clock.frame_rate_ext = (ext_n + 1, ext_d + 1);
+                        clock.framerate = (clock.frame_rate.0 * clock.frame_rate_ext.0, clock.frame_rate.1 * clock.frame_rate_ext.1);
                         clock.mpeg2 = true;
                     }
                     // picture coding extension
@@ -482,20 +538,28 @@ impl Units for MpegVideo {
     /// timed as FFmpeg's demuxer layer times the unit.
     fn unit(&mut self, unit: &[u8], _index: i64) -> Stamp {
         let picture = self.extract_headers(unit);
-        let (pts, dts, duration) = self.clock.stamp(self.pict_type);
-        self.clock.picture_stamped |= picture;
+        let clock = &mut self.clock;
+        if let (true, Discovery::NoPicture, Some(code)) = (picture, clock.discovery, clock.frame_rate_code) {
+            clock.discovery = Discovery::Pending(clock.decoder_timing(code));
+        }
+        let (pts, dts, duration) = clock.stamp(self.pict_type);
         Stamp { key: self.pict_type == 1, pts, dts, duration }
     }
 
-    /// avformat_find_stream_info decodes the first picture once the read
-    /// that ended it has been parsed, and FFmpeg's MPEG-1/2 decoder sets
-    /// has_b_frames to !low_delay: an MPEG-1 stream is delayed from the
-    /// next read on, B-frames seen or not.
+    /// avformat_find_stream_info decodes the first picture after a
+    /// sequence header once the read that ended it has been parsed, and
+    /// FFmpeg's MPEG-1/2 decoder sets has_b_frames to !low_delay (an
+    /// MPEG-1 stream is delayed, B-frames seen or not), the frame rate and
+    /// the codec, all from that picture's sequence: they hold from the
+    /// next read on. The units of that read after it keep the timing the
+    /// parser gave them.
     fn read_done(&mut self) {
         let clock = &mut self.clock;
-        if clock.picture_stamped && !clock.decoder_ran {
-            clock.decoder_ran = true;
-            clock.has_b_frames = !clock.low_delay;
+        if let Discovery::Pending(set) = clock.discovery {
+            clock.has_b_frames = set.has_b_frames;
+            clock.framerate = set.framerate;
+            clock.mpeg2 = set.mpeg2;
+            clock.discovery = Discovery::Done;
         }
     }
 }
