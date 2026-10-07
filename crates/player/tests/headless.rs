@@ -1932,6 +1932,8 @@ fn untimed_pictures_continue_the_timeline_in_realtime() {
     assert!(video.pts.windows(2).all(|w| w[0] < w[1]), "pictures out of order: {:?}", video.pts);
     assert!(video.pts.last().copied().unwrap_or_default() >= Duration::from_millis(1880), "timeline ended at {:?}", video.pts.last());
 }
+
+#[test]
 fn video_without_container_size_plays_at_the_decoded_size() {
     // A raw H.264 stream declares no picture size; only the decoder knows
     // it. Every picture must still reach the sink at that size, matching
