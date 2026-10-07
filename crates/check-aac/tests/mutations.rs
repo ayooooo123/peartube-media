@@ -156,21 +156,25 @@ fn exercise_mutations(samples: &[&str], seed: u64) {
 fn usac_persistent_sequence_mutations() {
     use oxideav_core::{Error, Packet};
     const WINDOW: usize = 10;
-    let corpora: Vec<_> = [
+    let mut samples = vec![
         "aac/Fd_2_c1_Ms_0x04.mp4",
         "aac/usac/Fd_1_c1_0x03.mp4",
         "aac/usac/Fd_2_c1_Tns_0x04.mp4",
         "aac/usac/Ext_2_c1_Ln_0x03.mp4",
         "aac/usac/xhe_target_level.m4a",
-    ]
-    .iter()
-    .map(|rel| {
+    ].into_iter().map(str::to_owned).collect::<Vec<_>>();
+    let iso = std::env::var_os("ISO_USAC").map(std::path::PathBuf::from).unwrap_or_else(||
+        std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join("projects/oracles/iso-usac"));
+    for name in ["Fd_2_c1_WinCp_0x0c", "Fd_2_c1_WinTns_0x0c", "Fd_2_c1_Nf_0x0c"] {
+        samples.push(iso.join(format!("members/compressedMp4/{name}.mp4")).to_str().unwrap().to_owned());
+    }
+    let corpora: Vec<_> = samples.iter().map(|rel| {
         let (params, packets) = usac_packets(rel);
         let starts: Vec<usize> = (0..packets.len().saturating_sub(WINDOW))
             .filter(|&i| packets[i].data[0] & 0x80 != 0)
             .collect();
         let channels = aac_decoder(&params).output_audio_format().unwrap().channels as usize;
-        (*rel, params, packets, starts, channels)
+        (rel.as_str(), params, packets, starts, channels)
     })
     .collect();
     let mut clean_cache = std::collections::HashMap::new();

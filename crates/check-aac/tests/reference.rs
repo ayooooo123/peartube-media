@@ -74,12 +74,6 @@ const PASSING_END_TRIMMED: &[(&str, f64, usize)] = &[
     ("aac/er_eld2000np_48_ep0.mp4", 137.490163, 64),
 ];
 
-/// Samples the fork decodes end-to-end whose SNR against FFmpeg's
-/// float decode is still below the 90 dB floor. Each entry pins the
-/// measured SNR: a change in either direction (a regression or the
-/// gap being closed) fails the assert, so the table tracks progress.
-const KNOWN_GAPS: &[(&str, f64)] = &[];
-
 
 #[test]
 fn reference_passing_samples() {
@@ -122,35 +116,16 @@ fn reference_config_change_samples() {
     assert_eq!(ours.len(), 1265664, "latm_stereo_to_51: frame count");
 }
 
-#[test]
-fn reference_known_gap_samples() {
-    for (rel, pin) in KNOWN_GAPS {
-        let (ours, path, _ch) = decoded_f32(rel);
-        let ff = refcheck::ffmpeg_audio_f32(&path, 0);
-        assert!(
-            ff.len().abs_diff(ours.len()) <= 4096,
-            "{rel}: length ours={} ff={}",
-            ours.len(),
-            ff.len()
-        );
-        let snr = refcheck::snr_db(&ff, &ours, 4096);
-        assert!(
-            (snr - *pin).abs() < 10.0,
-            "{rel}: SNR {snr:.2} dB moved away from the pinned {pin} dB — \
-             update the table (a rise past 90 dB graduates the sample to \
-             PASSING; a drop is a regression)"
-        );
-    }
-}
 
 /// Keep the raw FD PCM and container presentation trim separate. These
 /// assertions verify the exact untrimmed length and compare every presented
 /// sample, including the first block; no codec startup region is omitted.
-/// xhe_target_level is compared unmodified: while the fork's AudioPreRoll
-/// priming diverges from FFmpeg (which never primes), this test is red.
+/// xhe_target_level uses the independent native oracle in native_reference.rs;
+/// these eight entries retain their original stronger FFmpeg floors.
 #[test]
 fn reference_usac_samples() {
     for &(rel, initial_skip, final_padding, floor) in check_aac::USAC_SAMPLES {
+        let Some(floor) = floor else { continue };
         let (ours, path, channels) = decoded_f32(rel);
         let ff = refcheck::ffmpeg_audio_f32(&path, 0);
         let start = initial_skip * channels as usize;
@@ -190,7 +165,6 @@ fn reference_usac_loudness_targets() {
         ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -16, "aac/usac/Ext_2_c1_Ln_0x03__Lou-16.s16", 139.252920),
         ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -24, "aac/usac/Ext_2_c1_Ln_0x03__Lou-24.s16", 139.604440),
         ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -31, "aac/usac/Ext_2_c1_Ln_0x03__Lou-31.s16", 139.325931),
-        ("aac/usac/xhe_target_level.m4a", -24, "aac/usac/xhe_target_level.s16", 138.133034),
     ] {
         let (ours, path, channels) = check_aac::decoded_usac_target(rel, target);
         let reference = std::process::Command::new("ffmpeg")
@@ -208,11 +182,6 @@ fn reference_usac_loudness_targets() {
         let snr = refcheck::snr_db(&ff, presented, 0);
         eprintln!("{rel}: target {target}, SNR {snr:.6} dB");
         assert!(snr >= floor, "{rel}: target {target} SNR {snr:.6} dB below floor {floor} dB");
-        // xHE's S16 FATE reference retains 128/ch padding, but not the
-        // whole final AU that is outside the edit-list presentation.
-        let fate_pcm = if rel.ends_with("xhe_target_level.m4a") {
-            &ours[..ours.len() - 1024 * channels as usize]
-        } else { presented };
-        assert_fate_pcm(&refcheck::fate(golden), fate_pcm);
+        assert_fate_pcm(&refcheck::fate(golden), presented);
     }
 }

@@ -134,14 +134,11 @@ fn max_error(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
 }
 
-/// Which USAC tools each conformance file exercises, pinned so the README's
-/// coverage statements stay true. Columns: frames, AudioPreRoll payloads,
-/// pre-roll AUs decoded, payloads skipped, config changes, short-window
-/// channels, noise-filled channels, TNS channels, unapplied TNS channels,
-/// M/S pairs, complex-prediction pairs, `complex_coef = 1` pairs and
-/// `use_prev_frame = 1` pairs. No file exercises `complex_coef = 1`,
-/// `use_prev_frame = 1` or TNS with `common_window = 0` and `tns_on_lr = 0`:
-/// those FFmpeg-mirrored paths have no oracle here.
+/// Existing FATE tool coverage. Columns: frames, pre-roll payloads, pre-roll
+/// AUs decoded, payloads skipped, config changes, short-window channels,
+/// noise-filled channels, TNS channels, independent-window TNS not on L/R,
+/// M/S pairs, prediction pairs, complex coefficients and previous-frame MDST.
+/// The independent ISO corpus covers the tools absent from these nine files.
 #[test]
 fn usac_tool_coverage() {
     let expected: [[u64; 13]; 9] = [
@@ -161,7 +158,7 @@ fn usac_tool_coverage() {
         eprintln!("{rel}: {c:?}");
         let actual = [
             c.frames, c.preroll_payloads, c.preroll_decoded, c.preroll_skipped, c.config_changes,
-            c.short_window_channels, c.noise_filled_channels, c.tns_channels, c.tns_unapplied,
+            c.short_window_channels, c.noise_filled_channels, c.tns_channels, c.tns_independent_not_on_lr,
             c.ms_frames, c.prediction_frames, c.complex_coef_frames, c.previous_frame_frames,
         ];
         assert_eq!(actual, expected, "{rel}");
@@ -171,10 +168,8 @@ fn usac_tool_coverage() {
 
 /// Priming mechanics on the only real AudioPreRoll stream: production output
 /// must equal continuous decoding of the encoder's pre-roll AU followed by the
-/// stream. This checks our decoder against itself; it is not an oracle for
-/// standards-correct output. The SNR against FFmpeg (which never primes) is
-/// printed for the record; the unmodified comparison in `reference.rs` is the
-/// acceptance check.
+/// stream. This checks decoder state against itself, not fidelity; the
+/// unmodified canonical comparison in native_reference.rs is the oracle.
 #[test]
 fn usac_xhe_primed_production_output() {
     let rel = "aac/usac/xhe_target_level.m4a";
@@ -195,12 +190,6 @@ fn usac_xhe_primed_production_output() {
     for (i, frame) in primed.iter().enumerate() {
         assert_eq!(&decode_one(&mut continuous, &packets[i]).unwrap(), frame, "AU {i}");
     }
-    let ours: Vec<f32> = primed.concat();
-    let ff = refcheck::ffmpeg_audio_f32(&refcheck::fate(rel), 0);
-    let presented = &ours[..ff.len()];
-    let snr = refcheck::snr_db(&ff, presented, 0);
-    let first = refcheck::snr_db(&ff[..2048], &presented[..2048], 0);
-    eprintln!("{rel}: primed production vs FFmpeg (unprimed): SNR {snr:.6} dB, AU0 {first:.6} dB");
 }
 
 #[test]

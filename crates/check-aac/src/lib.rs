@@ -56,23 +56,26 @@ pub const MUTATION_SAMPLES: &[&str] = &[
     "aac/CT_DecoderCheck/sbr_i-ps_i.aac",
 ];
 
-/// USAC FD corpus: `(path, initial_skip, final_padding, snr_floor_db)`.
+/// USAC FD corpus: `(path, initial_skip, final_padding, ffmpeg_snr_floor_db)`.
 /// Skip and padding are the MP4 edit-list trim in samples per channel. The
 /// raw decoder cannot apply them until container-provided sample-trim
-/// metadata reaches the decode pipeline. Floors are the first measured SNR
-/// (fork `e03fbe6`) minus 0.5 dB.
-pub const USAC_SAMPLES: &[(&str, usize, usize, f64)] = &[
-    ("aac/Fd_2_c1_Ms_0x01.mp4", 2323, 763, 138.962070),
-    ("aac/Fd_2_c1_Ms_0x04.mp4", 2220, 859, 138.573987),
-    ("aac/usac/Fd_1_c1_0x03.mp4", 2220, 340, 138.753700),
-    ("aac/usac/Fd_1_c1_0x04.mp4", 2220, 516, 138.715224),
-    ("aac/usac/Fd_2_c1_0x03.mp4", 2220, 340, 138.742638),
-    ("aac/usac/Fd_2_c1_0x05.mp4", 2220, 852, 138.611948),
-    ("aac/usac/Fd_2_c1_Tns_0x04.mp4", 2220, 859, 137.773368),
-    ("aac/usac/Ext_2_c1_Ln_0x03.mp4", 1600, 704, 139.604440),
+/// metadata reaches the decode pipeline. FFmpeg floors are the first
+/// measured SNR (fork `e03fbe6`) minus 0.5 dB. `None`: FFmpeg is not the
+/// oracle. FFmpeg 2da55bf never primes from AudioPreRoll, so its
+/// `xhe_target_level` output is wrong; `tests/native_reference.rs` compares
+/// that stream with libxaac's decoder instead.
+pub const USAC_SAMPLES: &[(&str, usize, usize, Option<f64>)] = &[
+    ("aac/Fd_2_c1_Ms_0x01.mp4", 2323, 763, Some(138.962070)),
+    ("aac/Fd_2_c1_Ms_0x04.mp4", 2220, 859, Some(138.573987)),
+    ("aac/usac/Fd_1_c1_0x03.mp4", 2220, 340, Some(138.753700)),
+    ("aac/usac/Fd_1_c1_0x04.mp4", 2220, 516, Some(138.715224)),
+    ("aac/usac/Fd_2_c1_0x03.mp4", 2220, 340, Some(138.742638)),
+    ("aac/usac/Fd_2_c1_0x05.mp4", 2220, 852, Some(138.611948)),
+    ("aac/usac/Fd_2_c1_Tns_0x04.mp4", 2220, 859, Some(137.773368)),
+    ("aac/usac/Ext_2_c1_Ln_0x03.mp4", 1600, 704, Some(139.604440)),
     // FFmpeg omits the final whole AU outside the edit, then trims 128
     // samples from the preceding AU. OxideAV returns both raw AUs.
-    ("aac/usac/xhe_target_level.m4a", 0, 1024 + 128, 138.516260),
+    ("aac/usac/xhe_target_level.m4a", 0, 1024 + 128, None),
 ];
 
 /// The first audio stream's parameters and all of its packets, demuxed by
@@ -130,4 +133,69 @@ pub fn decoded_usac_target(rel: &str, target: i32) -> (Vec<f32>, std::path::Path
     }
     let channels = decoder.output_audio_format().unwrap().channels;
     (pcm, refcheck::fate(rel), channels)
+}
+
+/// A test reference file under `tests/data/`.
+pub fn data_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
+}
+
+/// PCM read from a reference WAV's physical `data` bytes. A header that
+/// declares more frames than the file holds is reported in
+/// `declared_frames`, never padded.
+pub struct ReferencePcm {
+    /// Interleaved samples scaled to [-1, 1).
+    pub samples: Vec<f32>,
+    pub channels: usize,
+    pub sample_rate: u32,
+    pub bits: u16,
+    pub declared_frames: usize,
+    pub frames: usize,
+}
+
+/// Read a little-endian integer PCM WAV (16 or 24 bits).
+pub fn read_wav(path: &std::path::Path) -> ReferencePcm {
+    let data = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WAVE", "{}: not a WAV", path.display());
+    let u16_at = |p: usize| u16::from_le_bytes([data[p], data[p + 1]]);
+    let u32_at = |p: usize| u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
+    let mut pos = 12;
+    let mut format = None;
+    while pos + 8 <= data.len() {
+        let size = u32_at(pos + 4) as usize;
+        let body = pos + 8;
+        match &data[pos..pos + 4] {
+            b"fmt " => format = Some((u16_at(body), u16_at(body + 2) as usize, u32_at(body + 4), u16_at(body + 14))),
+            b"data" => {
+                let (tag, channels, sample_rate, bits) = format.expect("fmt before data");
+                assert_eq!(tag, 1, "{}: integer PCM", path.display());
+                let width = bits as usize / 8;
+                let physical = &data[body..data.len().min(body + size)];
+                let frames = physical.len() / (width * channels);
+                let scale = 1.0 / (1u32 << (bits - 1)) as f32;
+                let samples = physical[..frames * width * channels].chunks_exact(width).map(|b| {
+                    let value = match width {
+                        2 => i16::from_le_bytes([b[0], b[1]]) as i32,
+                        3 => i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8,
+                        _ => panic!("{}: {bits}-bit PCM", path.display()),
+                    };
+                    value as f32 * scale
+                }).collect();
+                return ReferencePcm { samples, channels, sample_rate, bits, declared_frames: size / (width * channels), frames };
+            }
+            _ => {}
+        }
+        pos = body + size + (size & 1);
+    }
+    panic!("{}: no data chunk", path.display());
+}
+
+/// SNR of every channel of interleaved `test` against `reference`, over
+/// their first `frames` frames.
+pub fn channel_snr_db(reference: &[f32], test: &[f32], channels: usize, frames: usize) -> Vec<f64> {
+    assert!(reference.len() >= frames * channels && test.len() >= frames * channels, "{frames} frames x {channels} channels");
+    (0..channels).map(|c| {
+        let pick = |pcm: &[f32]| -> Vec<f32> { pcm[..frames * channels].iter().skip(c).step_by(channels).copied().collect() };
+        refcheck::snr_db(&pick(reference), &pick(test), 0)
+    }).collect()
 }

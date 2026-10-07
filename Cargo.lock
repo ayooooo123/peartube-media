@@ -864,7 +864,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "oxideav-aac"
 version = "0.1.7"
-source = "git+https://github.com/ayooooo123/oxideav-aac?rev=02ed7a8e05c0cbf4b68741c5aa84461d9921c437#02ed7a8e05c0cbf4b68741c5aa84461d9921c437"
+source = "git+https://github.com/ayooooo123/oxideav-aac?rev=e7ad75c2c21e7588b90493f12fc85679b7f5e27e#e7ad75c2c21e7588b90493f12fc85679b7f5e27e"
 dependencies = [
  "oxideav-core",
 ]
