@@ -49,13 +49,19 @@ recovers complete packets from damaged Cluster tails, reconstructs ProRes/WavPac
 payloads, and derives lace timing, TrackTimestampScale and H.264/HEVC decode
 timestamps. Untrusted input is bounded: 256 tracks, 4 MiB per CodecPrivate and
 16 MiB in total, and 32 MiB retained per Block (payload capacity, laces,
-header stripping, copies, side data and packet slots). The 1024-packet cap
-counts virtual-track copies: compliant Blocks wait until held packets drain;
-an individual Block needing more than 1024 packets is InvalidData and queues
-nothing. Startup analysis also stops at a 512 KiB retained-byte threshold,
-plus the bounded current Block. Source errors propagate, including ordinary
-InvalidInput reads and source-generated UnexpectedEof; physical truncation
-remains recoverable.
+header stripping, copies, side data and packet slots). BlockGroup children
+must fit their parents, and their stored bytes and records are charged to that
+budget before they are read or held, including before a Block waits. A
+Top-Level master is read for a CRC-32 only when its first child is one, then in
+fixed chunks; a third SeekHead is skipped unread. The 1024-packet cap counts
+virtual-track copies and the frames a lace actually holds (a one-frame EBML
+lace is InvalidData): compliant Blocks wait until held packets drain, and one
+that then fails recovers from its own offset; an individual Block needing more
+than 1024 packets is InvalidData and queues nothing. Startup analysis also
+stops at a 512 KiB retained-byte threshold, plus the bounded current Block.
+Source errors propagate, including ordinary InvalidInput reads,
+source-generated UnexpectedEof and failures met in trailing Tags, Cluster
+CRC-32s or seek landings; physical truncation remains recoverable.
 
 Packets keep FFmpeg's parser keyframe flags. The shared
 `Demuxer::packet_metadata()` snapshot separately carries the container's
