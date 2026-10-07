@@ -20,7 +20,7 @@ use parking_lot::Condvar;
 
 use crate::backend::{Clock, SubtitleImage, SubtitleSink};
 use crate::clock::current_monotonic_ns;
-use crate::engine::Lane;
+use crate::engine::{Lane, QUEUE_MAX_SECS};
 
 /// Longest the pipeline waits without looking at the clock again. The lane
 /// wakes it on everything that matters (a packet, a seek, the clock starting
@@ -28,9 +28,14 @@ use crate::engine::Lane;
 /// wake.
 const MAX_WAIT: Duration = Duration::from_millis(100);
 
-/// Largest bitmap canvas shown: the engine's video limits.
-const MAX_CANVAS_SIDE: usize = 16384;
-const MAX_CANVAS_PIXELS: usize = 8192 * 8192;
+/// Largest bitmap canvas shown: the bitmap decoders' canvas cap.
+const MAX_CANVAS_SIDE: usize = 4096;
+const MAX_CANVAS_PIXELS: usize = 4096 * 4096;
+
+/// Decoded cues waiting for their start, at most: behind video or audio
+/// only cues stamped beyond the demuxer's read-ahead pile up there.
+const MAX_PENDING_CUES: usize = 64;
+const MAX_PENDING_BYTES: usize = 64 << 20;
 
 /// Renders one text/ASS cue onto a video-sized RGBA canvas.
 pub fn render_text_cue(
@@ -131,6 +136,16 @@ struct Cue {
     /// replaces it (a bitmap state without a display duration).
     end: Option<Duration>,
     content: Content,
+}
+
+impl Cue {
+    /// Bytes of the bitmap it holds.
+    fn bytes(&self) -> usize {
+        match &self.content {
+            Content::Text(image) => image.rgba.len(),
+            Content::Bitmap(state) => state.image.as_ref().map_or(0, |image| image.rgba.len()),
+        }
+    }
 }
 
 enum Content {
@@ -237,6 +252,17 @@ fn advance(on: &mut OnScreen, pending: &mut VecDeque<Cue>, now: Duration) -> boo
     }
 }
 
+/// Drops the cues due last while more wait than `MAX_PENDING_*` allow,
+/// keeping the next one.
+fn bound(pending: &mut VecDeque<Cue>) {
+    let mut bytes: usize = pending.iter().map(Cue::bytes).sum();
+    while pending.len() > 1 && (pending.len() > MAX_PENDING_CUES || bytes > MAX_PENDING_BYTES) {
+        if let Some(dropped) = pending.pop_back() {
+            bytes -= dropped.bytes();
+        }
+    }
+}
+
 /// The sink, and whether anything is up on it.
 struct Screen {
     sink: Box<dyn SubtitleSink>,
@@ -296,6 +322,9 @@ pub(crate) struct SubtitlePipeline {
     pub(crate) demux_cv: Arc<Condvar>,
     /// The playback's seek generation; a change starts the pipeline over.
     pub(crate) seek_generation: Box<dyn Fn() -> u64 + Send>,
+    /// Video or audio pipelines bound the demuxer's read-ahead (they drain
+    /// their own lanes); otherwise only this lane does.
+    pub(crate) paced: Box<dyn Fn() -> bool + Send>,
     pub(crate) stopped: Arc<AtomicBool>,
     pub(crate) retired: Arc<AtomicBool>,
 }
@@ -374,7 +403,12 @@ impl SubtitlePipeline {
                 decoded_cue(frame, packet, self.time_base, w, h)
             }));
             if let Ok(Some(cue)) = cue {
-                pending.push_back(cue);
+                // Cues come up by start time, as VLC picks subpictures by
+                // date: one stamped out of order (a hostile stamp, a PTS
+                // jump) neither holds back the cues after it nor comes up
+                // early. Equal starts keep their decode order.
+                let at = pending.partition_point(|queued| queued.start <= cue.start);
+                pending.insert(at, cue);
             }
         }
     }
@@ -402,10 +436,11 @@ impl SubtitlePipeline {
 /// clock: every text cue is shown and cleared at once and every bitmap state
 /// shown as it decodes (cleared first when the previous one ended before
 /// it), so captures see the exact cue sequence. A seek clears the screen
-/// and starts over from the demuxer's new position. Ends at the lane's end
-/// once nothing more is due (a bitmap state without an end stays up), when
-/// the player stops or when a selection switch sets `retired` (both clear
-/// the screen).
+/// and starts over from the demuxer's new position. Alone, it ends at the
+/// lane's end once nothing more is due (a bitmap state without an end stays
+/// up). Behind video or audio it stays until they have played, then clears
+/// the screen (the engine also retires it then). It also ends when the
+/// player stops or a selection switch sets `retired`, clearing the screen.
 pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn SubtitleSink>) {
     let mut screen = Screen {
         sink,
@@ -417,6 +452,8 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
     let mut pending: VecDeque<Cue> = VecDeque::new();
     let mut seen_seek = (pipe.seek_generation)();
     let mut eof = false;
+    // Video or audio have drained their lanes during this pipeline.
+    let mut was_paced = false;
 
     while !pipe.quit() {
         let generation = (pipe.seek_generation)();
@@ -461,18 +498,40 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
             continue;
         }
 
-        if let Some(now) = pipe.clock.now() {
+        let now = pipe.clock.now();
+        if let Some(now) = now {
             if advance(&mut on, &mut pending, now) {
                 screen.show(&on);
             }
         }
         let next = on.next_end().into_iter().chain(pending.front().map(|cue| cue.start)).min();
-        let take = pending.is_empty() && !eof;
+        let paced = (pipe.paced)();
+        was_paced |= paced;
+        // Taking the next packet only once every decoded cue is up makes
+        // this lane bound the demuxer's read-ahead when it is alone. Behind
+        // video or audio, which bound it themselves, a cue due beyond that
+        // read-ahead (a hostile stamp, a PTS jump) must not stop the lane:
+        // the demuxer would wait on it and starve them.
+        let horizon = now.unwrap_or_default() + Duration::from_secs_f64(QUEUE_MAX_SECS);
+        let take = !eof && pending.front().is_none_or(|cue| cue.start > horizon && paced);
         if !take && next.is_none() {
-            return;
+            // Nothing more is due. Alone, the last state stays up as the
+            // playback ends. Behind video or audio it stays while they
+            // play (a seek may still restart this pipeline) and comes down
+            // when they have played: the engine retires the pipeline then.
+            if !paced {
+                if was_paced {
+                    on.clear();
+                    screen.clear();
+                }
+                return;
+            }
         }
         match pipe.wait(next, take, seen_seek) {
-            Woke::Packet(packet) => pipe.decode(&packet, &mut pending),
+            Woke::Packet(packet) => {
+                pipe.decode(&packet, &mut pending);
+                bound(&mut pending);
+            }
             Woke::Eof => eof = true,
             Woke::Other => {}
         }

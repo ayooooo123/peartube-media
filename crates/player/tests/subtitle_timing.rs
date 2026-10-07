@@ -74,10 +74,8 @@ fn pgs_player_display_state_sequence_matches_ffmpeg() {
 
     let observation = Arc::new(Mutex::new(Observation::default()));
     let backend = Arc::new(TimedHeadless { headless: Headless::new(), observation: observation.clone() });
-    let mut ctx = codecs::context();
-    subs_bitmap::register(&mut ctx);
     let player = Player::open(
-        movie.to_str().unwrap(), backend.clone(), Arc::new(ctx),
+        movie.to_str().unwrap(), backend.clone(), Arc::new(codecs::context()),
         PlayerOptions { subtitle: Some(1), realtime: true, ..PlayerOptions::default() }, |_| {},
     );
     let begun = Instant::now();

@@ -174,9 +174,7 @@ fn expected_events(reference: &oracle::Reference) -> Vec<(Duration, Option<usize
 const HALF_US: Duration = Duration::from_nanos(500);
 
 fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Reference) {
-    let mut ctx = codecs::context();
-    subs_bitmap::register(&mut ctx);
-    let ctx = Arc::new(ctx);
+    let ctx = Arc::new(codecs::context());
     let mut demux = if format == "vobsub" {
         subs_bitmap::open_vobsub(
             Box::new(std::fs::File::open(path).unwrap()),
@@ -218,6 +216,8 @@ fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Refere
         lane: lane.clone(),
         demux_cv,
         seek_generation: Box::new(|| 0),
+        // Subtitles alone: the lane is the only bound on the read-ahead.
+        paced: Box::new(|| false),
         stopped: stopped.clone(),
         retired: Arc::new(AtomicBool::new(false)),
     };

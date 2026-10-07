@@ -57,6 +57,12 @@ fn segment(out: &mut Vec<u8>, ms: u32, kind: u8, payload: &[u8]) {
 /// replacement without a spurious clear, and explicit clears after short
 /// (< 500 ms) displays. FFmpeg decodes this exact stream as the oracle.
 pub fn pgs_with_clears(path: &Path) {
+    pgs_states(path, &[(200, true), (2500, true), (2800, false), (3000, true), (3400, false)]);
+}
+
+/// FATE pgs_sub.sup's first display set at each `(ms, true)` and an empty
+/// presentation set (a clear) at each `(ms, false)`.
+pub fn pgs_states(path: &Path, states: &[(u32, bool)]) {
     let source = std::fs::read(refcheck::fate("sub/pgs_sub.sup")).unwrap();
     let mut first = Vec::new();
     let mut cursor = 0;
@@ -74,7 +80,7 @@ pub fn pgs_with_clears(path: &Path) {
     clear[7] = 0; // normal presentation, not a new epoch
     clear[10] = 0; // zero composition objects: clear
     let mut data = Vec::new();
-    for (ms, visible) in [(200, true), (2500, true), (2800, false), (3000, true), (3400, false)] {
+    for &(ms, visible) in states {
         if visible {
             for (kind, payload) in &first {
                 segment(&mut data, ms, *kind, payload);

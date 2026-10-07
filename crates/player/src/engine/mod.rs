@@ -96,7 +96,7 @@ pub enum TrackKind {
 
 /// Queue bounds: packets are held back by both media duration and bytes.
 /// (duration, video bytes, audio bytes, subtitle bytes)
-const QUEUE_MAX_SECS: f64 = 2.0;
+pub(crate) const QUEUE_MAX_SECS: f64 = 2.0;
 const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
@@ -873,11 +873,21 @@ fn run_player_pipeline(
     shared.pipelines_started();
     run_demux_loop(&mut run);
 
-    for thread in [run.video_thread.take(), run.audio_thread.take(), run.sub_thread.take()]
-        .into_iter()
-        .flatten()
-    {
+    // Subtitles never hold the end of a playback with video or audio: a
+    // state still up when those have played (its end can be minutes or
+    // hours out) comes down with them. Alone, subtitles play to their last
+    // end; without realtime nothing waits on the clock and the pipeline
+    // ends once its lane has drained.
+    let paced = run.video_thread.is_some() || run.audio_thread.is_some();
+    for thread in [run.video_thread.take(), run.audio_thread.take()].into_iter().flatten() {
         thread.join();
+    }
+    if let Some(subtitles) = run.sub_thread.take() {
+        if paced && realtime {
+            subtitles.retire(&shared, &sub_lane);
+        } else {
+            subtitles.join();
+        }
     }
     // Everything has played: the idle audio output stops with the clock.
     if let Some(sink) = shared.audio_sink.lock().as_mut() {
@@ -1015,49 +1025,20 @@ fn spawn_subtitles(
     PipelineThread::spawn("peartube-subtitles", move |retired| {
         let _consumer = consumer;
         let mut params = stream.params.clone();
-        // DVD/CVD/OGT positions are video pixels unless the stream declares
-        // its own canvas. PGS/DVB instead define their canvas in-band.
+        let (video_size, lanes) = (shared.state.lock().video_size, shared.lanes.lock().clone());
+        // DVD, CVD and OGT place regions in video pixels. For a stream that
+        // declares no canvas, FFmpeg's is the video's (fftools/ffmpeg_demux.c
+        // sub2video); the DVD decoder's own `size:` line still takes
+        // precedence, as dvdsubdec's does. The video size is known only from
+        // the container at open: nothing publishes a decoded one, so without
+        // it the decoders keep their 720x576, and nothing waits for a size.
         let video_pixels = matches!(params.codec_id.as_str(), "dvd_subtitle" | "dvdsub" | "vobsub" | "cvd_subtitle" | "ogt");
-        // VobSub's size is parsed/validated by the DVD decoder, where it
-        // takes precedence over CodecParameters. Do not wait on video for it.
-        let indexed_size = matches!(params.codec_id.as_str(), "dvd_subtitle" | "dvdsub" | "vobsub")
-            && params.extradata.split(|&b| b == b'\n' || b == b'\r').any(|line| line.starts_with(b"size:"));
-        if video_pixels && !indexed_size
-            && (params.width.unwrap_or(0) == 0 || params.height.unwrap_or(0) == 0)
-        {
-            let video_lane = shared.lanes.lock().first().cloned();
-            loop {
-                if shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst)
-                    || shared.failed.load(Ordering::SeqCst)
-                {
-                    return;
-                }
-                let (size, video) = {
-                    let state = shared.state.lock();
-                    (state.video_size, state.video)
-                };
-                if let Some((width, height)) = size.filter(|&(w, h)| w > 0 && h > 0) {
-                    if params.width.unwrap_or(0) == 0 { params.width = Some(width); }
-                    if params.height.unwrap_or(0) == 0 { params.height = Some(height); }
-                    break;
-                }
-                if video.is_none() {
-                    // Subtitle-only playback retains the decoder's fallback.
-                    break;
-                }
-                if video_lane.as_ref().is_none_or(|lane| !lane.consumed.load(Ordering::SeqCst)) {
-                    // Video ended without ever reporting a size. There is no
-                    // authoritative canvas: never label 720x576 as its size.
-                    return;
-                }
-                // Keep the first packet intact until size publication. Stop,
-                // selection retirement and seeks wake this lane; the bounded
-                // wait also observes video EOF/failure without a notification.
-                let mut queue = lane.queue.lock();
-                lane.cv.wait_for(&mut queue, Duration::from_millis(100));
-            }
+        let declared = params.width.unwrap_or(0) > 0 && params.height.unwrap_or(0) > 0;
+        if let Some((width, height)) = video_size.filter(|_| video_pixels && !declared) {
+            params.width = Some(params.width.unwrap_or(0).max(width));
+            params.height = Some(params.height.unwrap_or(0).max(height));
         }
-        let (w, h) = shared.state.lock().video_size.unwrap_or((320, 240));
+        let (w, h) = video_size.unwrap_or((320, 240));
         let decoder = match shared.ctx.codecs.first_decoder(&params) {
             Ok(d) => d,
             Err(_) => return,
@@ -1075,6 +1056,9 @@ fn spawn_subtitles(
             lane,
             demux_cv,
             seek_generation: Box::new(move || seeks.seek_gen.load(Ordering::SeqCst)),
+            // A video or audio pipeline drains its lane: the demuxer's
+            // read-ahead is bounded by theirs.
+            paced: Box::new(move || lanes.iter().take(2).any(|lane| lane.consumed.load(Ordering::SeqCst))),
             stopped: shared.stopped.clone(),
             retired,
         };
@@ -1209,8 +1193,12 @@ fn run_demux_loop(run: &mut Run<'_>) {
             // lane without a consumer is always empty (see `Consumer`).
             // Leaving ends `run_player_pipeline`, which joins the pipelines
             // and sets Ended. A seek or a selection switch clears lanes and
-            // reopens `eof` at the top of this loop.
-            let drained = [run.video_thread.as_ref(), run.audio_thread.as_ref(), run.sub_thread.as_ref()]
+            // reopens `eof` at the top of this loop. In realtime, subtitles
+            // behind video or audio do not hold the end: their last state
+            // comes down when those have played (`run_player_pipeline`).
+            let paced = run.options.realtime && (run.video_thread.is_some() || run.audio_thread.is_some());
+            let subtitles = run.sub_thread.as_ref().filter(|_| !paced);
+            let drained = [run.video_thread.as_ref(), run.audio_thread.as_ref(), subtitles]
                 .into_iter().flatten().all(|thread| thread.handle.is_finished());
             if drained {
                 return;
@@ -1321,9 +1309,10 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
 
 /// `select_audio` / `select_subtitle` took effect: retire the replaced
 /// pipeline, start the new one, and refresh the headless registry entry. A
-/// new audio track resumes where playback is: the demuxer re-reads from the
-/// clock's position (a refresh seek) instead of starting the track wherever
-/// it has read ahead to.
+/// new audio or subtitle track resumes where playback is: the demuxer
+/// re-reads from the clock's position (a refresh seek) instead of starting
+/// the track wherever it has read ahead to, so a subtitle up at that
+/// position shows at once.
 fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let shared = run.shared;
 
@@ -1382,11 +1371,13 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     }
 
     let realtime = run.options.realtime;
+    let mut refreshed = false;
     if audio_changed {
         let stream = find_stream(run.streams, run.current_audio)
             .filter(|s| s.params.media_type == MediaType::Audio);
         if let Some(stream) = stream {
             shared.request_seek(shared.master.now().unwrap_or_default());
+            refreshed = true;
             run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
         }
     }
@@ -1394,6 +1385,9 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
         let stream = find_stream(run.streams, run.current_subtitle)
             .filter(|s| s.params.media_type == MediaType::Subtitle);
         if let Some(stream) = stream {
+            if !refreshed {
+                shared.request_seek(shared.master.now().unwrap_or_default());
+            }
             run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime));
         }
     }
