@@ -4,6 +4,7 @@ use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use audio_trim::{Pcm, Trimmer};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use oxideav_core::{
@@ -1360,7 +1361,10 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
 /// out only up to `PREROLL` past it. From its first samples of each seek the
 /// output's clock leads the playback. At EOF the pipeline ends once its last
 /// samples are heard; it ends early when the player stops or a selection
-/// switch sets `retired`.
+/// switch sets `retired`. The encoder delay and end padding the container
+/// declares (`PacketMetadata::audio_trim`) never reach the sink: they come
+/// off the decoder's output through `audio_trim`, as `refcheck` removes
+/// them, so the reference tests check what plays.
 fn run_audio_thread(
     stream: StreamInfo,
     sink: &mut dyn AudioSink,
@@ -1384,17 +1388,25 @@ fn run_audio_thread(
         }
     };
 
-    let mut current_rate = stream.params.sample_rate.unwrap_or(48000);
-    let mut current_channels = stream.params.channels.unwrap_or(2);
+    let mut out = AudioOut {
+        rate: stream.params.sample_rate.unwrap_or(48000),
+        channels: stream.params.channels.unwrap_or(2),
+        open: false,
+        written: Written::default(),
+        seen_seek_target: 0,
+        primed: None,
+    };
     // The output may come from the previous track: none of that plays on.
     sink.flush();
-    let mut sink_open = sink.open(current_rate, current_channels).is_ok();
-    let mut written = Written::default();
+    out.open = sink.open(out.rate, out.channels).is_ok();
     let mut starved = false;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
-    let mut seen_seek_target: u64 = 0;
-    let mut primed: Option<u64> = None;
+    let mut trimmer: Trimmer<Chunk> = Trimmer::new();
+    let mut kept: Vec<Chunk> = Vec::new();
+    // Where the decoder's output so far ends: where a frame without a pts
+    // of its own starts.
+    let mut decoded_end: Option<f64> = None;
     let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
     while !quit() {
@@ -1405,16 +1417,18 @@ fn run_audio_thread(
                 break;
             }
         }
-        sync_audio_sink(sink, &shared, &mut written.running);
+        sync_audio_sink(sink, &shared, &mut out.written.running);
 
-        // Seek generation: start the decoder and the sink over, drop
-        // pre-target output after the demuxer's seek lands.
+        // Seek generation: start the decoder, the trims and the sink over,
+        // drop pre-target output after the demuxer's seek lands.
         let gen_now = shared.seek_gen.load(Ordering::SeqCst);
         if gen_now != seen_seek {
             seen_seek = gen_now;
             sink.flush();
-            written.running = None;
-            written.end = None;
+            out.written.running = None;
+            out.written.end = None;
+            trimmer.reset();
+            decoded_end = None;
             decoder = match make_decoder(&shared.ctx, &stream.params) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1430,49 +1444,45 @@ fn run_audio_thread(
         }
 
         // Pull a packet; the EOF marker ends this pipeline.
-        let applied = written.running;
+        let applied = out.written.running;
         let woken = || quit() || Some(shared.running()) != applied;
         let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
-        let QueuedPacket { packet, .. } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+        let QueuedPacket { packet, metadata } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
-                // Drain the decoder's tail into the sink.
+                // Drain the decoder's tail into the sink. What the trimmer
+                // still holds after that is the stream's end padding.
                 let _ = decoder.flush();
+                let mut packet_pts = None;
                 while !quit() {
                     let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
-                    match recv {
-                        Ok(Ok(Frame::Audio(af))) => {
-                            let (format, rate, channels) =
-                                audio_layout(decoder.as_ref(), &stream.params, &af);
-                            let pcm = convert_audio_to_f32(&af, format, channels as usize);
-                            if pcm.is_empty() {
-                                break;
-                            }
-                            let pts = match af.pts {
-                                Some(ticks) => Duration::from_secs_f64(stream.time_base.seconds_of(ticks.max(0)).max(0.0)),
-                                None => written.end.unwrap_or_default(),
-                            };
-                            if !write_pcm(
-                                sink, &shared, &pcm, channels as usize, rate, pts, seen_seek,
-                                realtime, &mut written, &retired,
-                            ) {
-                                break;
-                            }
-                        }
-                        Ok(Ok(_)) => {}
+                    let af = match recv {
+                        Ok(Ok(Frame::Audio(af))) => af,
+                        Ok(Ok(_)) => continue,
                         _ => break,
+                    };
+                    // An empty frame ends the tail: a decoder may return
+                    // them forever.
+                    if af.samples == 0 {
+                        break;
+                    }
+                    let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
+                    trimmer.frame(chunk, &mut kept);
+                    if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
+                        break;
                     }
                 }
+                trimmer.finish();
                 // The output plays what it holds before the pipeline ends:
                 // the audio leads the clock up to its last sample, and the
                 // playback ends after that sample is heard.
-                if let (true, Some(end), Some(leads)) = (realtime, written.end, written.leads) {
+                if let (true, Some(end), Some(leads)) = (realtime, out.written.end, out.written.leads) {
                     if leads == seen_seek {
                         shared.wait_heard(end, seen_seek, &retired, |running| {
-                            if written.running != Some(running) {
+                            if out.written.running != Some(running) {
                                 if running { sink.play(); } else { sink.pause(); }
-                                written.running = Some(running);
+                                out.written.running = Some(running);
                             }
                         });
                     }
@@ -1489,6 +1499,7 @@ fn run_audio_thread(
         match send_res {
             Ok(Ok(())) => {
                 consecutive_errors = 0;
+                trimmer.packet(metadata.audio_trim);
             }
             Ok(Err(_)) | Err(_) => {
                 consecutive_errors += 1;
@@ -1538,76 +1549,167 @@ fn run_audio_thread(
                 }
             };
             let Frame::Audio(af) = frame else { continue };
-
-            let (format, sample_rate, channels) = audio_layout(decoder.as_ref(), &stream.params, &af);
-            let channels = channels as usize;
-
-            if !sink_open || sample_rate != current_rate || (channels as u16) != current_channels {
-                current_rate = sample_rate;
-                current_channels = channels as u16;
-                written.reopen(&shared);
-                sink_open = sink.open(current_rate, current_channels).is_ok();
-            }
-            let sink_failed = !sink_open;
-
-            let mut pcm = convert_audio_to_f32(&af, format, channels);
-            let ticks = af.pts.or(packet_pts.take());
-            let mut pts_secs = match (ticks, written.end) {
-                (Some(ticks), _) => stream.time_base.seconds_of(ticks),
-                (None, Some(end)) => end.as_secs_f64(),
-                (None, None) => 0.0,
-            };
-            // Samples stamped before zero precede the presentation (codec
-            // priming); clamping them to zero would overlap the first real
-            // samples on the output's timeline.
-            if pts_secs < 0.0 {
-                let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
-                pcm.drain(..(before * channels).min(pcm.len()));
-                pts_secs = 0.0;
-            }
-
-            // Drop pre-target output after a seek: audio before the target
-            // never reaches the sink. The frame that holds the target loses
-            // its samples before it, so the clock restarts at the target with
-            // the target's own sample.
-            if let Some(seek) = *shared.active_seek.lock() {
-                if seek.generation > seen_seek_target && pts_secs < seek.target {
-                    let frames = pcm.len() / channels.max(1);
-                    let before = ((seek.target - pts_secs) * f64::from(sample_rate)).round() as usize;
-                    if before < frames {
-                        pcm.drain(..before * channels);
-                        pts_secs = seek.target;
-                    } else {
-                        pcm.clear();
-                    }
-                }
-                if !pcm.is_empty() {
-                    seen_seek_target = seen_seek;
-                }
-            }
-            if pcm.is_empty() {
-                continue;
-            }
-
-            // A failed output cannot prime; let the remaining streams run.
-            // A working output primes only after it has actually taken PCM.
-            if sink_failed {
-                if primed != Some(seen_seek) {
-                    primed = Some(seen_seek);
-                    shared.pipe_primed(Pipe::Audio, seen_seek);
-                }
-                continue;
-            }
-            let pts = Duration::from_secs_f64(pts_secs);
-            if !write_pcm(
-                sink, &shared, &pcm, channels, sample_rate, pts, seen_seek, realtime,
-                &mut written, &retired,
-            ) {
+            let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
+            trimmer.frame(chunk, &mut kept);
+            if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
                 // Stopped, retired or a seek: the rest of this packet is stale.
                 break;
             }
         }
     }
+}
+
+/// Decoded audio on its way to the sink: interleaved f32 in its own layout
+/// and the time its first sample plays.
+struct Chunk {
+    pcm: Vec<f32>,
+    channels: usize,
+    rate: u32,
+    pts: f64,
+}
+
+impl Pcm for Chunk {
+    fn samples(&self) -> usize {
+        self.pcm.len() / self.channels.max(1)
+    }
+
+    fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn drop_front(&mut self, n: usize) {
+        self.pcm.drain(..n.saturating_mul(self.channels).min(self.pcm.len()));
+        self.pts += n as f64 / f64::from(self.rate.max(1));
+    }
+
+    fn split_off(&mut self, n: usize) -> Self {
+        let rest = self.pcm.split_off(n.saturating_mul(self.channels).min(self.pcm.len()));
+        let pts = self.pts + n as f64 / f64::from(self.rate.max(1));
+        Chunk { pcm: rest, channels: self.channels, rate: self.rate, pts }
+    }
+}
+
+/// A decoded frame as a `Chunk`, stamped where it starts: its own pts, else
+/// the packet's for the first frame after a send, else where the decoder's
+/// previous frame ended.
+fn decoded_chunk(
+    decoder: &dyn Decoder,
+    stream: &StreamInfo,
+    af: &oxideav_core::AudioFrame,
+    packet_pts: &mut Option<i64>,
+    decoded_end: &mut Option<f64>,
+) -> Chunk {
+    let (format, rate, channels) = audio_layout(decoder, &stream.params, af);
+    let channels = channels as usize;
+    let pcm = convert_audio_to_f32(af, format, channels);
+    let pts = match (af.pts.or(packet_pts.take()), *decoded_end) {
+        (Some(ticks), _) => stream.time_base.seconds_of(ticks),
+        (None, Some(end)) => end,
+        (None, None) => 0.0,
+    };
+    let frames = pcm.len() / channels.max(1);
+    *decoded_end = Some(pts + frames as f64 / f64::from(rate.max(1)));
+    Chunk { pcm, channels, rate, pts }
+}
+
+/// What an audio pipeline's output is set up for and has taken.
+struct AudioOut {
+    /// The layout the sink was last opened with, and whether that worked.
+    rate: u32,
+    channels: u16,
+    open: bool,
+    written: Written,
+    /// The newest seek generation whose target the output has reached.
+    seen_seek_target: u64,
+    /// The seek generation a failed output last let the playback go for.
+    primed: Option<u64>,
+}
+
+/// Hands what the trimmer released to the sink, in order. False when the
+/// player stopped, the pipeline was retired, or a seek superseded the
+/// audio; the rest is dropped then.
+fn present_kept(
+    sink: &mut dyn AudioSink,
+    shared: &SharedState,
+    out: &mut AudioOut,
+    kept: &mut Vec<Chunk>,
+    seen_seek: u64,
+    realtime: bool,
+    retired: &AtomicBool,
+) -> bool {
+    for chunk in kept.drain(..) {
+        if !present_audio(sink, shared, out, chunk, seen_seek, realtime, retired) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One chunk of decoded audio to the sink, which is (re)opened for its
+/// layout. Samples stamped before zero precede the presentation (codec
+/// priming no container trim covered), and after a seek those before its
+/// target never play.
+fn present_audio(
+    sink: &mut dyn AudioSink,
+    shared: &SharedState,
+    out: &mut AudioOut,
+    chunk: Chunk,
+    seen_seek: u64,
+    realtime: bool,
+    retired: &AtomicBool,
+) -> bool {
+    let Chunk { mut pcm, channels, rate: sample_rate, pts } = chunk;
+    if !out.open || sample_rate != out.rate || channels as u16 != out.channels {
+        out.rate = sample_rate;
+        out.channels = channels as u16;
+        out.written.reopen(shared);
+        out.open = sink.open(out.rate, out.channels).is_ok();
+    }
+    let sink_failed = !out.open;
+
+    // Clamping samples stamped before zero to zero would overlap the first
+    // real samples on the output's timeline.
+    let mut pts_secs = pts;
+    if pts_secs < 0.0 {
+        let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
+        pcm.drain(..(before.saturating_mul(channels)).min(pcm.len()));
+        pts_secs = 0.0;
+    }
+
+    // Drop pre-target output after a seek: audio before the target never
+    // reaches the sink. The chunk that holds the target loses its samples
+    // before it, so the clock restarts at the target with the target's own
+    // sample.
+    if let Some(seek) = *shared.active_seek.lock() {
+        if seek.generation > out.seen_seek_target && pts_secs < seek.target {
+            let frames = pcm.len() / channels.max(1);
+            let before = ((seek.target - pts_secs) * f64::from(sample_rate)).round() as usize;
+            if before < frames {
+                pcm.drain(..before * channels);
+                pts_secs = seek.target;
+            } else {
+                pcm.clear();
+            }
+        }
+        if !pcm.is_empty() {
+            out.seen_seek_target = seen_seek;
+        }
+    }
+    if pcm.is_empty() {
+        return true;
+    }
+
+    // A failed output cannot prime; let the remaining streams run. A
+    // working output primes only after it has actually taken PCM.
+    if sink_failed {
+        if out.primed != Some(seen_seek) {
+            out.primed = Some(seen_seek);
+            shared.pipe_primed(Pipe::Audio, seen_seek);
+        }
+        return true;
+    }
+    let pts = Duration::from_secs_f64(pts_secs);
+    write_pcm(sink, shared, &pcm, channels, sample_rate, pts, seen_seek, realtime, &mut out.written, retired)
 }
 
 /// What an audio pipeline knows about its output across writes.

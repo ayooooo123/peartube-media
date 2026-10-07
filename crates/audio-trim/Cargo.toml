@@ -1,0 +1,10 @@
+[package]
+name = "audio-trim"
+description = "Removes container-declared encoder delay and end padding from decoded audio, once, after decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true

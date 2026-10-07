@@ -14,6 +14,7 @@ autoexamples = false
 probe = []
 
 [dependencies]
+audio-trim = { path = "../audio-trim" }
 oxideav-core.workspace = true
 oxideav-http.workspace = true
 oxideav-ass = { workspace = true, features = ["render"] }
