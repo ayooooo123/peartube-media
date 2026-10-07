@@ -4,7 +4,7 @@
 //
 // Sample list from FFmpeg's FATE makefiles (tests/fate/*.mak): every test whose
 // sample is an ASF/WMV/WMA container (asf/, wmv8/, wmapro/, wmavoice/,
-// cover_art/, lossless-audio/, mss1/, mss2/, g2m/, argo-asf/).
+// cover_art/, lossless-audio/, mss1/, mss2/, mts2/, g2m/, tdsc/, argo-asf/).
 
 use refcheck::fate;
 
@@ -411,6 +411,18 @@ fn g2m4() {
         streams: &[("video", "g2m")],
         packet_counts: &[(0, 28)],
         first_pts: &[(0, 0)],
+    });
+}
+
+/// FFmpeg screen.mak: `FATE_SCREEN-$(call FRAMECRC, ASF, TDSC) += fate-tdsc`
+/// on tdsc/tdsc.asf — TDSC video plus an MP3 track.
+#[test]
+fn tdsc() {
+    check(&Case {
+        sample: "tdsc/tdsc.asf",
+        streams: &[("video", "tdsc"), ("audio", "mp3")],
+        packet_counts: &[(0, 42), (1, 99)],
+        first_pts: &[(0, 0), (1, 20)],
     });
 }
 

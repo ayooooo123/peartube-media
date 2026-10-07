@@ -9,11 +9,13 @@
 //! Streams exist at open and demuxing never changes them; they match
 //! ffprobe's in order, type, codec and the parameters FFmpeg reports.
 //! FFmpeg's demuxer returns PES payloads that its parsers then re-frame.
-//! This demuxer re-frames DVD subpictures only, with FFmpeg's dvdsub
-//! parser, so those streams compare with ffprobe's parsed packet table
-//! and every other stream with the unparsed one (`-fflags
-//! +noparse+nofillin`): every packet's payload MD5, size, pts and dts,
-//! and the interleaving of the unparsed streams.
+//! This demuxer re-frames what its decoders need whole, with FFmpeg's
+//! parsers: DVD subpictures (dvdsub), MPEG audio (mpegaudio) and AC-3 /
+//! E-AC-3 (ac3). Those streams compare with ffprobe's parsed packet
+//! table, timestamps FFmpeg fills in included; every other stream
+//! compares with the unparsed one (`-fflags +noparse+nofillin`). Every
+//! packet's payload MD5, size, pts and dts, and the interleaving of the
+//! unparsed streams.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -139,9 +141,9 @@ fn demux(path: &Path) -> (Vec<StreamInfo>, Vec<StreamInfo>, Vec<Pkt>) {
     (at_open, demuxer.streams().to_vec(), packets)
 }
 
-/// The streams whose packets are reassembled units.
+/// The streams whose packets are parsed units.
 fn reframed(stream: &StreamInfo) -> bool {
-    stream.params.codec_id.as_str() == "dvd_subtitle"
+    matches!(stream.params.codec_id.as_str(), "dvd_subtitle" | "mp1" | "mp2" | "mp3" | "ac3" | "eac3")
 }
 
 fn check(rel: &str) {
@@ -302,13 +304,21 @@ const PACK: [u8; 14] = [0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 0, 0, 3, 0xF8];
 /// A private stream 1 PES with a PTS, carrying `payload` (substream id
 /// first).
 fn private_pes(pts: u32, payload: &[u8]) -> Vec<u8> {
-    let len = 3 + 5 + payload.len();
-    let mut pes = vec![0, 0, 1, 0xBD, (len >> 8) as u8, len as u8, 0x81, 0x80, 5];
-    // '0010' PTS[32..30] '1' PTS[29..15] '1' PTS[14..0] '1'
-    let pts = u64::from(pts);
-    pes.push(0x21 | (((pts >> 30) & 7) << 1) as u8);
-    pes.extend_from_slice(&((((pts >> 15) & 0x7FFF) << 1 | 1) as u16).to_be_bytes());
-    pes.extend_from_slice(&(((pts & 0x7FFF) << 1 | 1) as u16).to_be_bytes());
+    pes(0xBD, Some(pts), payload)
+}
+
+/// An MPEG-2 PES of `stream_id`, with a PTS when given.
+fn pes(stream_id: u8, pts: Option<u32>, payload: &[u8]) -> Vec<u8> {
+    let header = if pts.is_some() { 5 } else { 0 };
+    let len = 3 + header + payload.len();
+    let mut pes = vec![0, 0, 1, stream_id, (len >> 8) as u8, len as u8, 0x81, if pts.is_some() { 0x80 } else { 0 }, header as u8];
+    if let Some(pts) = pts {
+        // '0010' PTS[32..30] '1' PTS[29..15] '1' PTS[14..0] '1'
+        let pts = u64::from(pts);
+        pes.push(0x21 | (((pts >> 30) & 7) << 1) as u8);
+        pes.extend_from_slice(&((((pts >> 15) & 0x7FFF) << 1 | 1) as u16).to_be_bytes());
+        pes.extend_from_slice(&(((pts & 0x7FFF) << 1 | 1) as u16).to_be_bytes());
+    }
     pes.extend_from_slice(payload);
     pes
 }
@@ -362,4 +372,153 @@ fn private_stream_1_substreams_keep_their_ids_for_cvd_and_ogt() {
             (3, Some(36000), ac3[4..].to_vec()),
         ]
     );
+}
+
+// ─── discovery budget ───
+
+/// FFmpeg's default probesize: the input stream discovery may read.
+const PROBE_SIZE: usize = 5_000_000;
+
+/// An MPEG-1 Layer II frame, 48 kHz 192 kbit/s stereo without CRC (576
+/// bytes, 1152 samples = 2160 ticks), its body all `fill`.
+fn mp2_frame(fill: u8) -> Vec<u8> {
+    let mut frame = vec![fill; 576];
+    frame[..4].copy_from_slice(&[0xFF, 0xFD, 0xA4, 0x00]);
+    frame
+}
+
+/// `len` bytes or more of input the demuxer passes over without a
+/// packet, in one of the forms it skips.
+fn skipped(form: &str, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 64 * 1024);
+    while out.len() < len {
+        match form {
+            // no start code anywhere
+            "junk" => out.resize(len, 0xA5),
+            "padding" => {
+                out.extend_from_slice(&[0, 0, 1, 0xBE, 0xEA, 0x60]);
+                out.resize(out.len() + 0xEA60, 0xFF);
+            }
+            // private stream 1 substream 0xFF: no codec, never a stream
+            "unsupported substream" => {
+                let mut payload = vec![0x11; 60_000];
+                payload[0] = 0xFF;
+                out.extend(pes(0xBD, None, &payload));
+            }
+            // not Sofdec, not DVD navigation
+            "private stream 2" => {
+                out.extend_from_slice(&[0, 0, 1, 0xBF, 0xEA, 0x60]);
+                out.resize(out.len() + 0xEA60, 0x22);
+            }
+            "pack headers" => out.extend_from_slice(&PACK),
+            _ => unreachable!(),
+        }
+    }
+    out
+}
+
+/// A reader that records how far into the input it has read.
+struct Watched {
+    inner: std::io::Cursor<Vec<u8>>,
+    furthest: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl std::io::Read for Watched {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::io::Read::read(&mut self.inner, buf)?;
+        self.furthest.fetch_max(self.inner.position(), std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Watched {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.inner, pos)
+    }
+}
+
+/// MP2 stream 0xC0, then input the demuxer skips, then the rest of 0xC0
+/// and a stream first met past the skipped input (0xC1), before the rest
+/// when `new_stream_first`. 0xC0's fourth frame starts before the skipped
+/// input and ends after it. Opening reads at most the probe size whatever
+/// the form of the skipped input, and does not take the budget for the end
+/// of the input: 0xC0 is the only stream, and all six of its frames come
+/// out whole, timed from their PES.
+fn discovery_stops_at_the_probe_size(form: &str, skipped_len: impl Fn(usize) -> usize, new_stream_first: bool) {
+    let frames: Vec<Vec<u8>> = (0..6).map(|k| mp2_frame(0x50 + k)).collect();
+    let other = [PACK.to_vec(), pes(0xC1, Some(9000), &mp2_frame(0x60))].concat();
+    let mut ps = PACK.to_vec();
+    ps.extend(pes(0xC0, Some(9000), &[frames[0].clone(), frames[1].clone()].concat()));
+    ps.extend_from_slice(&PACK);
+    ps.extend(pes(0xC0, Some(9000 + 2 * 2160), &[&frames[2][..], &frames[3][..300]].concat()));
+    let region = skipped(form, skipped_len(ps.len()));
+    ps.extend_from_slice(&region);
+    if new_stream_first {
+        ps.extend_from_slice(&other);
+    }
+    ps.extend(pes(0xC0, None, &[&frames[3][300..], &frames[4][..]].concat()));
+    if !new_stream_first {
+        ps.extend_from_slice(&other);
+    }
+    ps.extend(pes(0xC0, Some(9000 + 5 * 2160), &frames[5]));
+    ps.extend_from_slice(&[0, 0, 1, 0xB9]);
+
+    let furthest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let input = Watched { inner: std::io::Cursor::new(ps), furthest: furthest.clone() };
+    let ctx = codecs::context();
+    let mut demuxer = ctx.containers.open_demuxer("mpeg", Box::new(input), &ctx.codecs).unwrap();
+    let read_at_open = furthest.load(std::sync::atomic::Ordering::Relaxed);
+    let streams: Vec<(u32, String)> =
+        demuxer.streams().iter().map(|s| (s.index, s.params.codec_id.as_str().to_string())).collect();
+    assert_eq!(streams, [(0, "mp2".to_string())], "{form}: streams at open");
+    assert!(
+        read_at_open <= (PROBE_SIZE + 256 * 1024) as u64,
+        "{form}: open read {read_at_open} bytes of input, probe size {PROBE_SIZE}"
+    );
+    let mut got = Vec::new();
+    loop {
+        match demuxer.next_packet() {
+            Ok(p) => got.push((p.stream_index, p.pts, p.data)),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("{form}: demux: {e}"),
+        }
+    }
+    let want: Vec<(u32, Option<i64>, Vec<u8>)> =
+        frames.iter().enumerate().map(|(k, f)| (0, Some(9000 + 2160 * k as i64), f.clone())).collect();
+    assert_eq!(got.len(), want.len(), "{form}: packets {:?}", got.iter().map(|g| (g.0, g.1, g.2.len())).collect::<Vec<_>>());
+    for (n, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(g == w, "{form}: packet {n}: stream {} pts {:?} {} bytes, want pts {:?}", g.0, g.1, g.2.len(), w.1);
+    }
+}
+
+#[test]
+fn discovery_stops_at_the_probe_size_in_junk() {
+    discovery_stops_at_the_probe_size("junk", |_| 6_000_000, true);
+}
+
+#[test]
+fn discovery_stops_at_the_probe_size_in_padding() {
+    discovery_stops_at_the_probe_size("padding", |_| 6_000_000, true);
+}
+
+#[test]
+fn discovery_stops_at_the_probe_size_in_unsupported_substreams() {
+    discovery_stops_at_the_probe_size("unsupported substream", |_| 6_000_000, true);
+}
+
+#[test]
+fn discovery_stops_at_the_probe_size_in_private_stream_2() {
+    discovery_stops_at_the_probe_size("private stream 2", |_| 6_000_000, true);
+}
+
+#[test]
+fn discovery_stops_at_the_probe_size_in_pack_headers() {
+    discovery_stops_at_the_probe_size("pack headers", |_| 6_000_000, true);
+}
+
+/// The start code of 0xC0's continuation straddles the probe size: the
+/// scan that hit the budget leaves it to playback whole.
+#[test]
+fn discovery_keeps_a_start_code_across_the_probe_size() {
+    discovery_stops_at_the_probe_size("junk", |head| PROBE_SIZE - 2 - head, false);
 }

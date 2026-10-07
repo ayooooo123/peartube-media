@@ -244,8 +244,12 @@ impl VideoSink for HeldVideo {
         self.sink.open_compressed(params)
     }
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> { self.sink.open_frames(params) }
-    fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError> { self.sink.push_packet(packet, pts) }
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+        self.sink.push_packet(packet, pts, random_access)
+    }
     fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> { self.sink.push_frame(frame, pts) }
+    fn frame_lead(&self) -> Duration { self.sink.frame_lead() }
+    fn finish(&mut self) -> Result<(), SinkError> { self.sink.finish() }
     fn flush(&mut self) { self.sink.flush(); }
     fn set_playing(&mut self, playing: bool) { self.sink.set_playing(playing); }
 }

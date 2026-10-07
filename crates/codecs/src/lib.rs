@@ -1,7 +1,7 @@
 //! Every container and decoder the player uses, in one registry.
 //!
-//! OxideAV crates register first; this workspace's `codec-*` crates
-//! register after them and claim higher priority where both decode a format.
+//! Decoder factories are first-registered-wins; install our replacements first.
+//! Container factories are keyed by name; install our replacements last.
 
 use oxideav_core::RuntimeContext;
 
@@ -14,6 +14,21 @@ pub fn context() -> RuntimeContext {
 
 /// Installs every container and decoder into `ctx`.
 pub fn register_all(ctx: &mut RuntimeContext) {
+    // The player uses first_decoder, not the priority-walking pipeline.
+    // Install container-aware subtitle factories before standalone ones.
+    subs_text::register(ctx);
+    for register in [
+        codec_mlp::register_codecs,
+        codec_dca::register_codecs,
+        subs_text::register_codecs,
+        codec_rv::register_codecs,
+        codec_wmv::register_codecs,
+        codec_wma::lib_registration::register_codecs,
+    ] {
+        register(&mut ctx.codecs);
+    }
+    codec_ra::register(ctx);
+
     for register in [
         // Containers
         oxideav_avi::__oxideav_entry,
@@ -77,8 +92,15 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     // tone instruments.
     oxideav_midi::register_codecs(&mut ctx.codecs);
 
-    // This workspace's crates, after OxideAV so their priorities win.
-    for register in [demux_asf::register, codec_mlp::register, demux_misc::register, demux_rm::register, codec_dca::register, subs_text::register, codec_ra::register, codec_rv::register, codec_wmv::register, codec_wma::register] {
+    for register in [
+        codec_mlp::register_containers,
+        codec_dca::register_containers,
+        codec_wmv::demuxers::register_containers,
+        subs_text::register_containers,
+    ] {
+        register(&mut ctx.containers);
+    }
+    for register in [demux_asf::register, demux_misc::register, demux_rm::register] {
         register(ctx);
     }
 }

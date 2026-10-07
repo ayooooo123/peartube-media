@@ -194,7 +194,9 @@ fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Refere
     let consumer = Consumer::new(&lane, &demux_cv);
     loop {
         match demux.next_packet() {
-            Ok(packet) if packet.stream_index == stream.index => lane.push(packet),
+            Ok(packet) if packet.stream_index == stream.index => {
+                lane.push(QueuedPacket { packet, metadata: PacketMetadata::default() })
+            }
             Ok(_) => {}
             Err(Error::Eof) => break,
             Err(error) => panic!("{format} demux: {error}"),

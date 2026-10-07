@@ -9,6 +9,5 @@ description = "Pure-Rust DTS / DCA audio decoder and demuxer (Core, XCH, XXCH, X
 oxideav-core = "*"
 
 [dev-dependencies]
+codecs = { path = "../codecs" }
 refcheck = { workspace = true }
-oxideav-basic = { workspace = true }
-oxideav-mpegts = { workspace = true }

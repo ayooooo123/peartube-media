@@ -103,7 +103,7 @@ fn video_probe(mode: Mode) -> i32 {
     // `set_video_window(None)` able to detach the codec. The typed Arc is
     // recovered from the registration so the probe can call sink methods
     // directly while the backend still tracks it.
-    let clock = Arc::new(NullClock);
+    let clock = probe_clock();
     let _box_sink = backend.video(clock);
     let sink_video: Arc<parking_lot::Mutex<player::android::AndroidVideoSink>> = backend
         .shared()
@@ -272,7 +272,7 @@ fn run_stream(
     backend: &Arc<AndroidBackend>,
     sink_video: &Arc<parking_lot::Mutex<player::android::AndroidVideoSink>>,
     params: &oxideav_core::CodecParameters,
-    packets: &[Packet],
+    packets: &[(Packet, bool)],
     time_base: TimeBase,
     swap_at: usize,
     swap_state: &Arc<parking_lot::Mutex<Swap>>,
@@ -301,7 +301,7 @@ fn run_stream(
     let mut sw_decoder: Option<Box<dyn oxideav_core::Decoder>> = None;
     let mut pushed = 0usize;
     let mut fallbacks = 0usize;
-    for pkt in packets.iter() {
+    for (pkt, random_access) in packets.iter() {
         if pushed == swap_at {
             println!(
                 "[video] swap: set_video_window(None) at packet {pushed}/{}",
@@ -325,7 +325,7 @@ fn run_stream(
             decode_and_push_frame(sink_video, &mut sw_decoder, params, pkt, pts)
         } else {
             let mut sink = sink_video.lock();
-            sink.push_packet(pkt, pts)
+            push_packet(&mut *sink, pkt, pts, *random_access)
         };
         match r {
             Ok(()) => {}
@@ -344,7 +344,7 @@ fn run_stream(
                     println!("[video] swap: new window set at packet {pushed}");
                     let mut sink = sink_video.lock();
                     reopen_mode(&mut sink, mode, params)?;
-                    sink.push_packet(pkt, pts)?;
+                    push_packet(&mut *sink, pkt, pts, *random_access)?;
                 } else {
                     return Err(SinkError::Unavailable);
                 }
@@ -371,7 +371,7 @@ fn run_stream(
                 println!("[video] moved to fresh window (reader C)");
                 let mut sink = sink_video.lock();
                 reopen_mode(&mut sink, mode, params)?;
-                sink.push_packet(pkt, pts)?;
+                push_packet(&mut *sink, pkt, pts, *random_access)?;
             }
             Err(e) => return Err(e),
         }
@@ -428,7 +428,7 @@ fn make_reader(mode: Mode) -> (ndk::media::image_reader::ImageReader, Arc<Atomic
 /// Demuxes the video track of an MP4 with oxideav-mp4.
 fn load_h264(
     path: &str,
-) -> Result<(Vec<Packet>, oxideav_core::CodecParameters, TimeBase), String> {
+) -> Result<(Vec<(Packet, bool)>, oxideav_core::CodecParameters, TimeBase), String> {
     let mut ctx = RuntimeContext::new();
     oxideav_mp4::__oxideav_entry(&mut ctx);
     let file = File::open(path).map_err(|e| e.to_string())?;
@@ -445,7 +445,10 @@ fn load_h264(
     let mut packets = Vec::new();
     loop {
         match demuxer.next_packet() {
-            Ok(p) if p.stream_index == video.index => packets.push(p),
+            Ok(p) if p.stream_index == video.index => {
+                let random_access = p.flags.keyframe || demuxer.packet_metadata().container_keyframe;
+                packets.push((p, random_access));
+            }
             Ok(_) => {}
             Err(oxideav_core::Error::Eof) => break,
             Err(e) => return Err(format!("demux: {e}")),
@@ -533,15 +536,19 @@ fn audio_probe() -> i32 {
     }
 }
 
-/// Placeholder clock for the video probe; real sync comes from the audio
-/// clock in the engine. Frames are presented immediately.
-struct NullClock;
-impl Clock for NullClock {
-    fn now(&self) -> Option<Duration> {
-        None
-    }
-    fn monotonic_ns_at(&self, _at: Duration) -> Option<i64> {
-        None
+/// The video-only probe uses the same free clock as audio-less playback.
+fn probe_clock() -> Arc<dyn Clock> {
+    let clock = player::clock::FreeRunningClock::new();
+    clock.play();
+    Arc::new(clock)
+}
+
+fn push_packet(sink: &mut dyn VideoSink, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+    loop {
+        match sink.push_packet(packet, pts, random_access) {
+            Err(SinkError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
+            result => return result,
+        }
     }
 }
 
@@ -584,7 +591,7 @@ fn sw_first_probe() -> i32 {
     let window = reader.window().unwrap();
     let backend = AndroidBackend::new();
     backend.set_video_window(Some(window));
-    let _box_sink = backend.video(Arc::new(NullClock));
+    let _box_sink = backend.video(probe_clock());
     let sink_video: Arc<parking_lot::Mutex<player::android::AndroidVideoSink>> = backend
         .shared()
         .active_video
@@ -605,11 +612,11 @@ fn sw_first_probe() -> i32 {
         }
     }
     let mut pushed = 0usize;
-    for pkt in &packets {
+    for (pkt, random_access) in &packets {
         let pts = packet_media_time(pkt, time_base);
         let r = {
             let mut sink = sink_video.lock();
-            sink.push_packet(pkt, pts)
+            push_packet(&mut *sink, pkt, pts, *random_access)
         };
         match r {
             Ok(()) => pushed += 1,
@@ -668,7 +675,7 @@ fn nosurface_probe() -> i32 {
     codec.start().map_err(|e| println!("[nosurf] start err: {e:?}")).unwrap();
 
     let mut out_count = 0usize;
-    for pkt in packets.iter().take(60) {
+    for (pkt, _) in packets.iter().take(60) {
         // input
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let idx = loop {

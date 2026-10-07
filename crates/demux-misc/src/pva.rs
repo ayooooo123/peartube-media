@@ -175,8 +175,9 @@ impl Demuxer for PvaDemuxer {
             stream_index,
             time_base: TimeBase::new(1, 90000),
             pts: pva_pts,
-            dts: pva_pts,
-            duration: Some(1),
+            // pva_read_packet supplies PTS only, not decoder-order time.
+            dts: None,
+            duration: None,
             flags: Default::default(),
             data: payload,
         };

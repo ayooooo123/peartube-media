@@ -1,5 +1,5 @@
 use super::backend::BackendShared;
-use super::clock::monotonic_now_ns;
+use crate::clock::current_monotonic_ns;
 use crate::backend::{Clock, SinkError, VideoSink};
 use ndk::hardware_buffer_format::HardwareBufferFormat;
 use ndk::media::media_codec::{
@@ -10,7 +10,7 @@ use ndk::native_window::NativeWindow;
 use oxideav_core::{CodecParameters, Packet, PixelFormat, VideoFrame};
 use crate::annexb::convert_packet_to_annex_b;
 use oxideav_pixfmt::FrameInfo;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -35,6 +35,7 @@ pub struct AndroidVideoSink {
     stop_output_signal: Mutex<Vec<Arc<AtomicBool>>>,
     midstream_error: Arc<Mutex<Option<String>>>,
     is_playing: Arc<AtomicBool>,
+    output_wake: Arc<(Mutex<()>, Condvar)>,
     /// Length-prefix size taken from avcC/hvcC.
     nal_length_size: usize,
     /// How the demuxer frames this stream's packets: `true` = Annex B start
@@ -50,8 +51,6 @@ pub struct AndroidVideoSink {
     /// holds packets until the next keyframe instead of erroring, so the
     /// rebuilt codec starts from a clean point.
     awaiting_keyframe: bool,
-    /// The type-derived decoder stalled and we retried on the software one.
-    tried_software_decoder: bool,
     /// The type-derived decoder for this stream proved unusable (stalled);
     /// later re-opens (new window, resume) go straight to the software one.
     prefer_software: bool,
@@ -68,13 +67,13 @@ impl AndroidVideoSink {
             stop_output_signal: Mutex::new(Vec::new()),
             midstream_error: Arc::new(Mutex::new(None)),
             is_playing: Arc::new(AtomicBool::new(true)),
+            output_wake: Arc::new((Mutex::new(()), Condvar::new())),
             nal_length_size: 4,
             packets_are_annex_b: false,
             software_frame_info: None,
             last_compressed_params: None,
             is_compressed: false,
             awaiting_keyframe: false,
-            tried_software_decoder: false,
             prefer_software: false,
         }
     }
@@ -87,6 +86,7 @@ impl AndroidVideoSink {
         for flag in self.stop_output_signal.lock().iter() {
             flag.store(true, Ordering::SeqCst);
         }
+        self.output_wake.1.notify_all();
         if let Some(codec) = self.codec.take() {
             let _ = codec.0.stop();
             // Dropping codec releases AMediaCodec (aborts a wedged
@@ -320,6 +320,7 @@ impl AndroidVideoSink {
         self.stop_output_signal.lock().push(thread_stop.clone());
         let thread_err = self.midstream_error.clone();
         let thread_playing = self.is_playing.clone();
+        let thread_wake = self.output_wake.clone();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         self.output_done = Some(done_rx);
 
@@ -327,7 +328,7 @@ impl AndroidVideoSink {
             let _done = DoneSignal(done_tx);
             while !thread_stop.load(Ordering::Relaxed) {
                 if !thread_playing.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(10));
+                    thread_wake.1.wait_for(&mut thread_wake.0.lock(), Duration::from_millis(10));
                     continue;
                 }
 
@@ -338,20 +339,35 @@ impl AndroidVideoSink {
                     Ok(DequeuedOutputBufferInfoResult::Buffer(out_buf)) => {
                         let pts_us = out_buf.info().presentation_time_us();
                         let pts = Duration::from_micros(pts_us.max(0) as u64);
-                        let target_mono_ns = thread_clock.monotonic_ns_at(pts);
-                        let now_mono_ns = monotonic_now_ns();
-
-                        if let Some(target_ns) = target_mono_ns {
-                            if target_ns < now_mono_ns - 30_000_000 {
-                                // Drop late buffer
+                        // Keep ownership until near presentation, re-reading
+                        // the audio mapping after every wake. Scheduling far
+                        // ahead would make a later hold/seek uncancellable.
+                        loop {
+                            if thread_stop.load(Ordering::SeqCst) {
                                 let _ = thread_codec.0.release_output_buffer(out_buf, false);
-                            } else {
-                                let _ = thread_codec
-                                    .0
-                                    .release_output_buffer_at_time(out_buf, target_ns);
+                                break;
                             }
-                        } else {
-                            let _ = thread_codec.0.release_output_buffer(out_buf, true);
+                            let now = current_monotonic_ns();
+                            if thread_playing.load(Ordering::SeqCst) {
+                                if let Some(target) = thread_clock.monotonic_ns_at(pts) {
+                                    if target < now - 30_000_000 {
+                                        let _ = thread_codec.0.release_output_buffer(out_buf, false);
+                                        break;
+                                    }
+                                    if target <= now + 5_000_000 {
+                                        #[cfg(debug_assertions)]
+                                        if super::clock::tracing() {
+                                            eprintln!("ENGINE_SYNC video pts_ns={} release_ns={} observed_ns={now}", pts.as_nanos(), target);
+                                        }
+                                        let _ = thread_codec.0.release_output_buffer_at_time(out_buf, target);
+                                        break;
+                                    }
+                                    thread_wake.1.wait_for(&mut thread_wake.0.lock(),
+                                        Duration::from_nanos((target - now - 5_000_000) as u64).min(Duration::from_millis(10)));
+                                    continue;
+                                }
+                            }
+                            thread_wake.1.wait_for(&mut thread_wake.0.lock(), Duration::from_millis(5));
                         }
                     }
                     Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {}
@@ -507,14 +523,10 @@ fn parse_hvcc_to_annex_b(data: &[u8]) -> Option<(Vec<u8>, usize)> {
 
 impl VideoSink for AndroidVideoSink {
     fn open_compressed(&mut self, params: &CodecParameters) -> bool {
-        let force = self.prefer_software;
-        if !force {
-            self.tried_software_decoder = false;
-        }
-        self.open_compressed_inner(params, force)
+        self.open_compressed_inner(params, self.prefer_software)
     }
 
-    fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError> {
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
         if self.backend.is_suspended.load(Ordering::SeqCst) {
             return Err(SinkError::Unavailable);
         }
@@ -524,7 +536,7 @@ impl VideoSink for AndroidVideoSink {
         // After a codec teardown (window loss, suspend, fallback), wait for
         // the next keyframe so the rebuilt codec starts from a clean point.
         if self.awaiting_keyframe {
-            if packet.flags.keyframe {
+            if random_access {
                 self.awaiting_keyframe = false;
             } else {
                 return Ok(());
@@ -542,6 +554,14 @@ impl VideoSink for AndroidVideoSink {
             None => return Err(SinkError::Fallback("decoder not active".into())),
         };
 
+
+        // A full input queue must not hide pause/seek/drop for seconds.
+        // The engine retries the same packet after checking its generation.
+        let mut buf = match codec.0.dequeue_input_buffer(Duration::from_millis(20)) {
+            Ok(DequeuedInputBufferResult::Buffer(buf)) => buf,
+            Ok(DequeuedInputBufferResult::TryAgainLater) => return Err(SinkError::WouldBlock),
+            Err(e) => return Err(SinkError::Fallback(format!("dequeue_input_buffer: {e:?}"))),
+        };
         // Framing comes from the extradata decision made at open time, not
         // from sniffing: a 4-byte AVCC NAL length of 256–511 starts with
         // `00 00 01` and would be misread as Annex B.
@@ -553,57 +573,6 @@ impl VideoSink for AndroidVideoSink {
             convert_packet_to_annex_b(&packet.data, self.nal_length_size)
         } else {
             packet.data.clone()
-        };
-
-        // Dequeue an input buffer. A healthy decoder runs out of input
-        // buffers while it holds frames for B-frame reordering
-        // (output.delay up to 8): no output is released yet, so the output
-        // thread cannot return input buffers either. That state is normal —
-        // wait for the output thread to make progress rather than failing;
-        // only give up (and allow the software-decoder retry) when NO output
-        // was ever dequeued and the wait exceeds the stall budget.
-        let start_dequeue = Instant::now();
-        let stall_budget = Duration::from_secs(300);
-        let mut buf = loop {
-            let err_opt = self.midstream_error.lock().take();
-            if let Some(err) = err_opt {
-                self.teardown_codec();
-                self.awaiting_keyframe = self.is_compressed;
-                return Err(SinkError::Fallback(err));
-            }
-
-            match codec.0.dequeue_input_buffer(Duration::from_millis(20)) {
-                Ok(DequeuedInputBufferResult::Buffer(buf)) => {
-                    break buf;
-                }
-                Ok(DequeuedInputBufferResult::TryAgainLater) => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => {
-                    self.teardown_codec();
-                    self.awaiting_keyframe = self.is_compressed;
-                    return Err(SinkError::Fallback(format!(
-                        "dequeue_input_buffer error: {e:?}"
-                    )));
-                }
-            }
-
-            if start_dequeue.elapsed() < stall_budget {
-                continue;
-            }
-            // Stalled past the budget: give up on this decoder.
-            self.teardown_codec();
-            self.awaiting_keyframe = self.is_compressed;
-            if !self.tried_software_decoder {
-                self.tried_software_decoder = true;
-                self.prefer_software = true;
-                if let Some(params) = self.last_compressed_params.clone() {
-                    if self.open_compressed_inner(&params, true) {
-                        return self.push_packet(packet, pts);
-                    }
-                }
-            }
-            return Err(SinkError::Fallback("input buffer dequeue timed out".into()));
         };
 
         let raw_dest = buf.buffer_mut();
@@ -655,6 +624,12 @@ impl VideoSink for AndroidVideoSink {
     }
 
     fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> {
+        #[cfg(debug_assertions)]
+        let mark = || if super::clock::tracing() { current_monotonic_ns() } else { 0 };
+        #[cfg(debug_assertions)]
+        let entered_ns = mark();
+        #[cfg(debug_assertions)]
+        let target_ns = if super::clock::tracing() { self.clock.monotonic_ns_at(pts).unwrap_or(-1) } else { -1 };
         // Releasing the codec before CPU-locking the window
         self.teardown_codec();
 
@@ -682,22 +657,21 @@ impl VideoSink for AndroidVideoSink {
             &oxideav_pixfmt::ConvertOptions::default(),
         )
         .map_err(|e| SinkError::Fatal(format!("pixel conversion failed: {e:?}")))?;
+        #[cfg(debug_assertions)]
+        let converted_ns = mark();
 
         window
             .set_buffers_geometry(w as i32, h as i32, Some(HardwareBufferFormat::R8G8B8A8_UNORM))
             .map_err(|e| SinkError::Fatal(format!("setBuffersGeometry failed: {e:?}")))?;
+        #[cfg(debug_assertions)]
+        let configured_ns = mark();
 
-        // Wait until pts
-        if let Some(target_mono_ns) = self.clock.monotonic_ns_at(pts) {
-            let now_mono_ns = monotonic_now_ns();
-            if target_mono_ns > now_mono_ns {
-                std::thread::sleep(Duration::from_nanos((target_mono_ns - now_mono_ns) as u64));
-            }
-        }
 
         let mut guard = window
             .lock(None)
             .map_err(|e| SinkError::Fatal(format!("ANativeWindow_lock failed: {e:?}")))?;
+        #[cfg(debug_assertions)]
+        let locked_ns = mark();
 
         let src_stride = rgba_frame.planes[0].stride;
         let src_bytes = &rgba_frame.planes[0].data;
@@ -714,17 +688,43 @@ impl VideoSink for AndroidVideoSink {
             }
         }
 
-        // Dropping guard unlocks and posts
+        // The engine already waited against the live master clock (zero
+        // frame lead). Posting does not sleep against a stale deadline.
+        drop(guard);
+        #[cfg(debug_assertions)]
+        if super::clock::tracing() {
+            eprintln!("ENGINE_SYNC video pts_ns={} release_ns={} path=software entered_ns={entered_ns} target_ns={target_ns} converted_ns={converted_ns} configured_ns={configured_ns} locked_ns={locked_ns}", pts.as_nanos(), current_monotonic_ns());
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = pts;
         Ok(())
     }
 
+    fn frame_lead(&self) -> Duration { Duration::ZERO }
+
+    fn finish(&mut self) -> Result<(), SinkError> {
+        let Some(codec) = &self.codec else { return Ok(()); };
+        match codec.0.dequeue_input_buffer(Duration::from_millis(20)) {
+            Ok(DequeuedInputBufferResult::Buffer(buf)) => codec.0.queue_input_buffer(buf, 0, 0, 0, 4)
+                .map_err(|e| SinkError::Fallback(format!("MediaCodec EOS: {e:?}"))),
+            Ok(DequeuedInputBufferResult::TryAgainLater) => Err(SinkError::WouldBlock),
+            Err(e) => Err(SinkError::Fallback(format!("MediaCodec EOS dequeue: {e:?}"))),
+        }
+    }
+
     fn flush(&mut self) {
-        if let Some(codec) = self.codec.as_ref() {
-            let _ = codec.0.flush();
+        // No dequeued output buffer may outlive a seek. Stop/join its
+        // generation before resetting the decoder, then restart at a keyframe.
+        if self.is_compressed {
+            self.teardown_codec();
+            if let Some(params) = self.last_compressed_params.clone() {
+                self.open_compressed(&params);
+            }
         }
     }
 
     fn set_playing(&mut self, playing: bool) {
         self.is_playing.store(playing, Ordering::SeqCst);
+        self.output_wake.1.notify_all();
     }
 }

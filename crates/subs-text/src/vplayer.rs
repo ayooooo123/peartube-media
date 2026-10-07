@@ -126,9 +126,7 @@ fn demux_vplayer_text(text: &str) -> Result<VecDeque<Packet>> {
         let mut pkt = Packet::new(0, time_base, s.data.into_bytes());
         pkt.pts = Some(s.pts);
         pkt.dts = Some(s.pts);
-        if s.duration >= 0 {
-            pkt.duration = Some(s.duration);
-        }
+        pkt.duration = Some(s.duration);
         pkt.flags.keyframe = true;
         packets.push_back(pkt);
     }
@@ -230,15 +228,7 @@ impl Decoder for VPlayerDecoder {
             .map(|pts| packet.time_base.rescale(pts, TimeBase::new(1, 1_000_000)))
             .unwrap_or(0);
 
-        let end_us = if let Some(dur) = packet.duration {
-            if dur >= 0 {
-                start_us + packet.time_base.rescale(dur, TimeBase::new(1, 1_000_000))
-            } else {
-                start_us + (u32::MAX as i64) * 1_000
-            }
-        } else {
-            start_us + (u32::MAX as i64) * 1_000
-        };
+        let end_us = crate::text_common::subtitle_end_us(packet, start_us);
 
         self.pending.push_back(Frame::Subtitle(SubtitleCue {
             start_us,

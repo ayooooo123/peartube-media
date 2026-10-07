@@ -6,6 +6,7 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_media::{CMClock, CMClockOrTimebase, CMTime, CMTimeFlags, CMTimebase};
 
 use crate::backend::Clock;
+use crate::clock::current_monotonic_ns;
 
 /// The Valid flag, re-declared for clarity (objc2-core-media has it as a
 /// bitflags variant).
@@ -63,6 +64,10 @@ impl Clock for AppleClock {
     }
 
     fn monotonic_ns_at(&self, at: Duration) -> Option<i64> {
+        // A timebase that stands still says nothing about when `at` comes.
+        if unsafe { self.timebase.rate() } == 0.0 {
+            return None;
+        }
         let cm_time = CMTime {
             value: at.as_nanos().min(i64::MAX as u128) as i64,
             timescale: 1_000_000_000,
@@ -71,16 +76,20 @@ impl Clock for AppleClock {
         };
         // CMSyncConvertTime takes CMClockOrTimebase (= CFType) references;
         // both wrappers store exactly that representation.
-        let from: &CMClockOrTimebase = unsafe { cast_clock_or_timebase(&self.timebase) };
-        let to: &CMClockOrTimebase = unsafe { cast_clock_or_timebase(&self.host_clock) };
-        let host_time = unsafe { objc2_core_media::CMSyncConvertTime(cm_time, from, to) };
-        if host_time.flags.contains(CM_TIME_VALID) && host_time.timescale > 0 {
-            let secs = host_time.value as f64 / host_time.timescale as f64;
-            if secs.is_finite() {
-                return Some((secs * 1e9) as i64);
-            }
-        }
-        None
+        let from: &CMClockOrTimebase = unsafe { cast_clock_or_timebase(&**self.timebase) };
+        let to: &CMClockOrTimebase = unsafe { cast_clock_or_timebase(&**self.host_clock) };
+        let host_at = unsafe { objc2_core_media::CMSyncConvertTime(cm_time, from, to) };
+        let host_now = unsafe { self.host_clock.time() };
+        // Host time (mach_absolute_time) stops while the machine sleeps,
+        // CLOCK_MONOTONIC does not: carry the distance over instead of the
+        // epoch.
+        let seconds = |t: CMTime| {
+            (t.flags.contains(CM_TIME_VALID) && t.timescale > 0)
+                .then(|| t.value as f64 / f64::from(t.timescale))
+                .filter(|s| s.is_finite())
+        };
+        let ahead = seconds(host_at)? - seconds(host_now)?;
+        Some(current_monotonic_ns() + (ahead * 1e9) as i64)
     }
 }
 

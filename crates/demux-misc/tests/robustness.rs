@@ -35,14 +35,17 @@ impl Rng {
     }
 }
 
-/// The formats and one FATE sample each.
+/// Every format, including the previously missing multichannel and CAVS inputs.
 const CASES: &[(&str, &str)] = &[
     ("ac3/monsters_inc_2.0_192_small.ac3", "ac3"),
+    ("ac3/monsters_inc_5.1_448_small.ac3", "ac3"),
     ("eac3/csi_miami_5.1_256_spx_small.eac3", "eac3"),
+    ("eac3/the_great_wall_7.1.eac3", "eac3"),
     ("mpeg2/sony-ct3.bs", "mpegvideo"),
     ("sub/Closedcaption_rollup.m2v", "mpegvideo"),
     ("h264/lossless.h264", "h264"),
     ("hevc-conformance/WPP_A_ericsson_MAIN_2.bit", "hevc"),
+    ("cavs/cavs.mpg", "mpeg"),
     ("mpegps/pcm_aud.mpg", "mpeg"),
     ("mpeg2/dvd_single_frame.vob", "mpeg"),
     ("sub/vobsub.sub", "mpeg"),

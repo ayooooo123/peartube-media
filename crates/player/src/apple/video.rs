@@ -4,9 +4,12 @@
 //! stream's avcC/hvcC extradata plus the packet payloads. Software-decoded
 //! frames are converted with `oxideav-pixfmt` to NV12 (8-bit 4:2:0) or
 //! 10-bit 4:2:0 as appropriate, wrapped in IOSurface-backed `CVPixelBuffer`s
-//! from a pool, and enqueued on the same layer. All layer work happens on
-//! the main queue; engine threads only touch CoreMedia objects and
-//! `dispatch2` async blocks.
+//! from a pool, and enqueued on the same layer. Either way the layer shows
+//! each sample at its timestamp on the playback's clock: it is a renderer of
+//! the audio's `AVSampleBufferRenderSynchronizer` when there is audio, and
+//! otherwise runs on a timebase of its own, anchored to the engine's clock
+//! whenever that starts or jumps. All layer work happens on the main queue;
+//! engine threads only touch CoreMedia objects and `dispatch2` async blocks.
 
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,12 +20,12 @@ use dispatch2::{run_on_main, DispatchQueue};
 use objc2::rc::Retained;
 use objc2_av_foundation::{
     AVLayerVideoGravityResizeAspect, AVQueuedSampleBufferRenderingStatus,
-    AVSampleBufferDisplayLayer, AVSampleBufferVideoRenderer,
+    AVSampleBufferDisplayLayer, AVSampleBufferRenderSynchronizer, AVSampleBufferVideoRenderer,
 };
 use objc2_core_foundation::{CFNumber, CFRetained};
 use objc2_core_media::{
-    CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
-    CMVideoCodecType, CMVideoFormatDescription, CMVideoFormatDescriptionCreate,
+    CMClock, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
+    CMTimebase, CMVideoCodecType, CMVideoFormatDescription, CMVideoFormatDescriptionCreate,
     CMVideoFormatDescriptionCreateFromH264ParameterSets,
     CMVideoFormatDescriptionCreateFromHEVCParameterSets,
 };
@@ -45,7 +48,7 @@ use crate::apple::util::{
     annex_b_to_length_prefixed, create_block_buffer_from_bytes, find_atom, parse_avcc,
     parse_hvcc, SendSync,
 };
-use crate::backend::{SinkError, VideoSink};
+use crate::backend::{Clock, SinkError, VideoSink};
 
 /// Codec id → VideoToolbox format-description creation, and the annex-B
 /// rewrite that packets may need.
@@ -58,6 +61,8 @@ enum CompressedKind {
 struct Compressed {
     /// NAL length size from avcC/hvcC (1, 2 or 4).
     length_size: usize,
+    /// Stream framing from extradata, not ambiguous packet length bytes.
+    annex_b: bool,
     format: CFRetained<CMVideoFormatDescription>,
     /// First keyframe seen; nothing is enqueued before it, so decoding
     /// starts at a random-access point.
@@ -78,11 +83,133 @@ pub struct AppleVideoSink {
     /// Set to `true` once `failed` has been observed; further software
     /// frames then flow normally.
     fallback_reported: std::cell::Cell<bool>,
-    /// Software frames display as decoded instead of at `pts` (video-only
-    /// playback without an audio clock anchor).
-    display_immediately: bool,
+    /// What times the layer's presentation.
+    timing: Timing,
     observers: Vec<SendSync<Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>>,
-    _screenshot_probe: (),
+}
+
+/// What times the layer's presentation: it shows each sample when this
+/// reaches the sample's timestamp.
+enum Timing {
+    /// The layer is a renderer of the playback's synchronizer, beside the
+    /// audio renderer: its timebase is the audio clock.
+    Synchronized {
+        synchronizer: SendSync<Retained<AVSampleBufferRenderSynchronizer>>,
+        clock: Arc<dyn Clock>,
+    },
+    /// No audio output: the layer's own timebase (on the host clock),
+    /// anchored to the engine's clock whenever presentation starts, stops or
+    /// jumps.
+    Own {
+        timebase: SendSync<CFRetained<CMTimebase>>,
+        clock: Arc<dyn Clock>,
+    },
+    /// Timebase creation failed: report output failure, never silently
+    /// display compressed video without synchronization.
+    Unavailable,
+}
+
+impl Timing {
+    /// Starts or stops the layer's presentation with the engine's clock. A
+    /// synchronized layer runs its synchronizer too: once the audio has
+    /// ended the video still pauses and plays.
+    fn set_playing(&self, playing: bool) {
+        let rate = if playing { 1.0 } else { 0.0 };
+        match self {
+            Timing::Synchronized { synchronizer, .. } if !playing => unsafe {
+                synchronizer.setRate(0.0);
+            },
+            Timing::Synchronized { .. } | Timing::Own { .. } => self.anchor(rate),
+            Timing::Unavailable => {}
+        }
+    }
+
+    /// Re-anchor after a seek even if audio never writes another sample.
+    fn jumped(&self, playing: bool) {
+        self.anchor(if playing { 1.0 } else { 0.0 });
+    }
+
+    /// Follow the engine's position when it is using its free-running clock.
+    /// When audio leads, both clocks already read the same native timebase.
+    fn anchor(&self, rate: f64) {
+        match self {
+            Timing::Synchronized { synchronizer, clock } => unsafe {
+                let timebase = synchronizer.timebase();
+                let seconds = |time: CMTime| {
+                    (time.flags.contains(CMTimeFlags::Valid) && time.timescale > 0)
+                        .then(|| time.value as f64 / f64::from(time.timescale))
+                };
+                // Bracket the clock read: thread preemption between reads
+                // must not look like skew when audio owns this timebase.
+                let before = seconds(timebase.time());
+                let now = clock.now();
+                let after = seconds(timebase.time());
+                if let Some(now) = now {
+                    let aligned = before.zip(after).is_some_and(|(before, after)| {
+                        let at = now.as_secs_f64();
+                        at >= before - 0.001 && at <= after + 0.001
+                    });
+                    if !aligned {
+                        let sync: &AVSampleBufferRenderSynchronizer = synchronizer;
+                        let time = cm_time_from_duration(now, 1_000_000_000);
+                        let _: () = objc2::msg_send![sync, setRate: rate as f32, time: time];
+                        return;
+                    }
+                }
+                synchronizer.setRate(rate as f32);
+            },
+            Timing::Own { timebase, clock } => {
+                let Some(now) = clock.now() else { return };
+                // CoreMedia's synchronization API is thread-safe.
+                unsafe {
+                    let host_now = CMClock::host_time_clock().time();
+                    let _ = timebase.set_rate_and_anchor_time(rate, cm_time_from_duration(now, 1_000_000_000), host_now);
+                }
+            }
+            Timing::Unavailable => {}
+        }
+    }
+}
+
+/// Makes the layer (its `AVSampleBufferVideoRenderer` where there is one)
+/// a renderer of `synchronizer`, so it shows samples on that timebase.
+/// False when AVFoundation refuses.
+fn join_synchronizer(
+    layer: &Retained<AVSampleBufferDisplayLayer>,
+    synchronizer: &Retained<AVSampleBufferRenderSynchronizer>,
+) -> bool {
+    let (layer, synchronizer) = (SendSync(layer.clone()), SendSync(synchronizer.clone()));
+    run_on_main(move |_mtm| {
+        objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            with_renderer(&layer, |renderer| unsafe { synchronizer.addRenderer(renderer) })
+        }))
+        .is_ok()
+    })
+}
+
+/// A stopped timebase on the host clock, made the layer's control timebase.
+fn own_timebase(layer: &Retained<AVSampleBufferDisplayLayer>) -> Option<CFRetained<CMTimebase>> {
+    let mut raw: *mut CMTimebase = ptr::null_mut();
+    // SAFETY: CF allocation with a valid out pointer; Create rule (+1).
+    #[allow(deprecated)] // create_with_master_clock: the only bound constructor
+    let status = unsafe {
+        CMTimebase::create_with_master_clock(None, &CMClock::host_time_clock(), NonNull::from(&mut raw))
+    };
+    if status != 0 || raw.is_null() {
+        return None;
+    }
+    let timebase = unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw)) };
+    unsafe {
+        let _ = timebase.set_rate(0.0);
+    }
+    let (layer, shared) = (SendSync(layer.clone()), SendSync(timebase.clone()));
+    let set = run_on_main(move |_mtm| {
+        objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+            layer.setControlTimebase(Some(&shared));
+        }))
+        .is_ok()
+    });
+    set.then_some(timebase)
 }
 
 struct VideoState {
@@ -99,6 +226,10 @@ struct SoftwarePath {
     dst_ostype: u32,
     pool: SendSync<CFRetained<CVPixelBufferPool>>,
 }
+
+/// How long before its timestamp a software frame should reach the layer:
+/// time to cross to the main queue and be queued before it is due.
+const FRAME_LEAD: Duration = Duration::from_millis(100);
 
 
 
@@ -183,18 +314,27 @@ impl AppleVideoSink {
         SinkHandle(SendSync(self.layer.0.clone()))
     }
 
-    pub fn new(layer: Retained<AVSampleBufferDisplayLayer>, display_immediately: bool) -> Self {
+    /// A sink on `layer`. With `synchronizer` (the playback's, made for its
+    /// audio) the layer becomes one of its renderers and shows samples on
+    /// the audio clock; without one it gets a timebase of its own that
+    /// follows `clock`.
+    pub fn new(
+        layer: Retained<AVSampleBufferDisplayLayer>,
+        synchronizer: Option<Retained<AVSampleBufferRenderSynchronizer>>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         let main = unsafe { dispatch2::DispatchRetained::retain(std::ptr::NonNull::from(DispatchQueue::main())) };
         let failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let failed_for_obs = failed.clone();
         let frames_enqueued = Arc::new(AtomicU64::new(0));
 
-        unsafe {
-            layer.setVideoGravity(
+        let gravity_layer = SendSync(layer.clone());
+        run_on_main(move |_| unsafe {
+            gravity_layer.setVideoGravity(
                 AVLayerVideoGravityResizeAspect
                     .expect("AVLayerVideoGravityResizeAspect is a documented constant"),
             );
-        }
+        });
 
         // FailedToDecode → record the error; the next push returns
         // SinkError::Fallback (packet pushes run on engine threads).
@@ -212,11 +352,32 @@ impl AppleVideoSink {
                                 objc2_av_foundation::AVSampleBufferDisplayLayerFailedToDecodeNotificationErrorKey,
                             )
                         })
-                        .map(|e| format!("{e:?}"))
+                        .map(|error| {
+                            let description: Retained<objc2_foundation::NSString> =
+                                objc2::msg_send![&*error, description];
+                            description.to_string()
+                        })
                         .unwrap_or_else(|| "unknown decode failure".into());
                     *failed_for_obs.lock().expect("failed lock") = Some(err);
                 }),
             )
+        };
+
+        let timing = match synchronizer {
+            Some(synchronizer) => {
+                if join_synchronizer(&layer, &synchronizer) {
+                    Timing::Synchronized { synchronizer: SendSync(synchronizer), clock }
+                } else {
+                    Timing::Unavailable
+                }
+            }
+            None => match own_timebase(&layer) {
+                Some(timebase) => Timing::Own {
+                    timebase: SendSync(timebase),
+                    clock,
+                },
+                None => Timing::Unavailable,
+            },
         };
 
         Self {
@@ -230,9 +391,8 @@ impl AppleVideoSink {
             failed,
             frames_enqueued,
             fallback_reported: std::cell::Cell::new(false),
-            display_immediately,
+            timing,
             observers: vec![SendSync(observer)],
-            _screenshot_probe: (),
         }
     }
 
@@ -280,7 +440,7 @@ impl AppleVideoSink {
                     }
                 };
                 Some(
-                    msg.map(|e| format!("{e:?}"))
+                    msg.map(|e| format!("{} {}: {}", e.domain(), e.code(), e.localizedDescription()))
                         .unwrap_or_else(|| "layer status failed".into()),
                 )
             })
@@ -404,6 +564,7 @@ fn split_length_prefixed(data: &[u8], length_size: usize) -> Vec<&[u8]> {
 
 impl VideoSink for AppleVideoSink {
     fn open_compressed(&mut self, params: &CodecParameters) -> bool {
+        if matches!(self.timing, Timing::Unavailable) { return false; }
         let kind = match params.codec_id.as_str() {
             "h264" => CompressedKind::H264,
             "hevc" | "h265" => CompressedKind::Hevc,
@@ -419,14 +580,14 @@ impl VideoSink for AppleVideoSink {
         let mut state = self.state.lock().expect("video state");
         state.compressed = Some(Compressed {
             length_size,
+            annex_b,
             format,
             primed: false,
         });
-        let _ = annex_b;
         true
     }
 
-    fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError> {
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
         if let Some(err) = self.failed.lock().expect("failed lock").take() {
             self.fallback_reported.set(true);
             return Err(SinkError::Fallback(err));
@@ -437,29 +598,26 @@ impl VideoSink for AppleVideoSink {
             return Err(SinkError::Fallback(err));
         }
 
-        let (format, data, primed) = {
+        let (format, data) = {
             let mut state = self.state.lock().expect("video state");
             let comp = state
                 .compressed
                 .as_mut()
                 .ok_or_else(|| SinkError::Fatal("push_packet without open_compressed".into()))?;
-            let is_key = packet.flags.keyframe;
             if !comp.primed {
-                if !is_key {
+                if !random_access {
                     // Wait for a random-access point before first enqueue.
                     return Ok(());
                 }
                 comp.primed = true;
             }
-            let primed = comp.primed;
-            let data = if packet_is_annex_b(&packet.data) {
-                annex_b_to_length_prefixed(&packet.data, comp.length_size)
+            let data = if comp.annex_b {
+                std::borrow::Cow::Owned(annex_b_to_length_prefixed(&packet.data, comp.length_size))
             } else {
-                packet.data.clone()
+                std::borrow::Cow::Borrowed(packet.data.as_slice())
             };
-            (comp.format.clone(), data, primed)
+            (comp.format.clone(), data)
         };
-        let _ = primed;
         if data.is_empty() {
             return Ok(());
         }
@@ -531,12 +689,13 @@ impl VideoSink for AppleVideoSink {
 
     fn flush(&mut self) {
         self.frames_enqueued.store(0, Ordering::Relaxed);
-        {
+        let playing = {
             let mut state = self.state.lock().expect("video state");
             if let Some(comp) = state.compressed.as_mut() {
                 comp.primed = false;
             }
-        }
+            state.playing
+        };
         *self.failed.lock().expect("failed lock") = None;
         self.fallback_reported.set(false);
         self.enqueue_on_main(|layer| {
@@ -546,18 +705,32 @@ impl VideoSink for AppleVideoSink {
                 });
             }));
         });
+        self.timing.jumped(playing);
     }
 
-    #[allow(dead_code)] // trait item; the engine calls it, tests/examples may not
     fn set_playing(&mut self, playing: bool) {
         self.state.lock().expect("video state").playing = playing;
-        // Presentation timing follows the synchronizer rate; the layer has
-        // no independent rate.
+        self.timing.set_playing(playing);
+    }
+
+    fn frame_lead(&self) -> Duration {
+        match self.timing {
+            Timing::Unavailable => Duration::ZERO,
+            Timing::Synchronized { .. } | Timing::Own { .. } => FRAME_LEAD,
+        }
+    }
+
+    /// The layer's decoder presents queued samples by timestamp without an
+    /// end-of-stream marker: the native smoke displays the final reordered
+    /// frame of a B-frame stream at EOS.
+    fn finish(&mut self) -> Result<(), SinkError> {
+        Ok(())
     }
 }
 
 impl AppleVideoSink {
     fn open_frames_inner(&mut self, params: &CodecParameters) -> Result<(), SinkError> {
+        if matches!(self.timing, Timing::Unavailable) { return Err(SinkError::Unavailable); }
         let width = params.width.ok_or_else(|| {
             SinkError::Fatal("software video stream without width".into())
         })?;
@@ -678,7 +851,6 @@ impl AppleVideoSink {
         // exec_async; the video thread blocks on the result channel. Obj-C
         // exceptions convert to SinkError instead of aborting.
         let sink = self.clone_sink_handle();
-        let display_immediately = self.display_immediately;
         let enqueued = run_on_main(move |_mtm| {
             let res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
                 let pixel: CFRetained<CVPixelBuffer> = pool_pixel_buffer(&pool)?;
@@ -705,41 +877,6 @@ impl AppleVideoSink {
                 }
                 // SAFETY: Create-rule function returned +1.
                 let sample = CFRetained::from_raw(NonNull::new_unchecked(raw));
-                if display_immediately {
-                    // Video-only playback: no audio clock anchors the
-                    // synchronizer timebase, so timestamp-based display
-                    // never fires. Mark the frame display-immediately.
-                    unsafe extern "C-unwind" {
-                            fn CFArrayGetCount(
-                                array: &objc2_core_foundation::CFArray,
-                            ) -> isize;
-                            fn CFArrayGetValueAtIndex(
-                                array: &objc2_core_foundation::CFArray,
-                                index: isize,
-                            ) -> *const std::ffi::c_void;
-                        }
-                        let attachments = CMSampleBuffer::sample_attachments_array(
-                            &sample, true,
-                        )
-                        .expect("attachments array");
-                        if CFArrayGetCount(&attachments) > 0 {
-                            // SAFETY: the per-sample attachments dictionary
-                            // of a fresh sample buffer is mutable.
-                            let dict = &*(CFArrayGetValueAtIndex(
-                                &attachments, 0,
-                            )
-                            as *const objc2_core_foundation::CFMutableDictionary);
-                            objc2_core_foundation::CFMutableDictionary::set_value(
-                                Some(dict),
-                                (objc2_core_media::kCMSampleAttachmentKey_DisplayImmediately
-                                    as *const objc2_core_foundation::CFString)
-                                    .cast(),
-                                (objc2_core_foundation::kCFBooleanTrue.unwrap()
-                                    as *const objc2_core_foundation::CFBoolean)
-                                    .cast(),
-                            );
-                        }
-                    }
                 with_renderer(sink.layer(), |r| {
                     let _: () = objc2::msg_send![r, enqueueSampleBuffer: &*sample];
                 });
@@ -763,13 +900,6 @@ impl AppleVideoSink {
             Err(_) => Err(SinkError::Fatal("push_frame failed".into())),
         }
     }
-
-    #[allow(dead_code)] // trait item; the engine calls it, tests/examples may not
-    fn set_playing(&mut self, playing: bool) {
-        self.state.lock().expect("video state").playing = playing;
-        // Presentation timing follows the synchronizer rate; the layer has
-        // no independent rate.
-    }
 }
 
 impl Drop for AppleVideoSink {
@@ -780,16 +910,36 @@ impl Drop for AppleVideoSink {
                     .removeObserver(obs.0.as_ref());
             }
         }
+        // Free the layer for the next playback: out of this playback's
+        // synchronizer, or off its own timebase. Asynchronous, so a sink
+        // dropped while the main thread waits for the playback to wind down
+        // cannot deadlock; the next sink's setup queues behind it.
+        let layer = SendSync(self.layer.0.clone());
+        match &self.timing {
+            Timing::Synchronized { synchronizer, .. } => {
+                let synchronizer = synchronizer.clone();
+                self.main.exec_async(move || {
+                    let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                        with_renderer(&layer, |renderer| unsafe {
+                            synchronizer.removeRenderer_atTime_completionHandler(
+                                renderer,
+                                objc2_core_media::kCMTimeInvalid,
+                                None,
+                            );
+                        })
+                    }));
+                });
+            }
+            Timing::Own { .. } => {
+                self.main.exec_async(move || {
+                    let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+                        layer.setControlTimebase(None);
+                    }));
+                });
+            }
+            Timing::Unavailable => {}
+        }
     }
-}
-
-impl VideoState {
-    fn _probe(&self) {}
-}
-
-/// True when the packet payload is Annex-B (start-code delimited).
-fn packet_is_annex_b(data: &[u8]) -> bool {
-    data.starts_with(&[0, 0, 0, 1]) || data.starts_with(&[0, 0, 1])
 }
 
 /// Builds a `{key: value}` dictionary of CFString → CFType. Keys are the
