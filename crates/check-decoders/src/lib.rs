@@ -84,7 +84,13 @@ pub fn decode_packets(
         .codecs
         .first_decoder(params)
         .unwrap_or_else(|e| panic!("no decoder for {:?}: {e}", params.codec_id));
-    let mut out = Decoded { params: params.clone(), audio_format: None, frame_formats: Vec::new(), frames: Vec::new() };
+    let mut out = Decoded {
+        params: params.clone(),
+        audio_format: None,
+        frame_formats: Vec::new(),
+        frames: Vec::new(),
+        trim_fallbacks: Default::default(),
+    };
     let mut errors = Vec::new();
     let drain = |decoder: &mut Box<dyn Decoder>, out: &mut Decoded, errors: &mut Vec<(usize, String)>, index: usize| loop {
         match decoder.receive_frame() {
