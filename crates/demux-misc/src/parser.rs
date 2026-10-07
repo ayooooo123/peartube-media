@@ -31,6 +31,13 @@ pub(crate) trait Split {
     fn audio(&self) -> (i64, u32) {
         (0, 0)
     }
+
+    /// av_get_audio_frame_duration for the codec context the parser has
+    /// set up: what compute_frame_duration gives a unit in samples when
+    /// the parser gave it no duration (0 for none).
+    fn fallback(&self) -> i64 {
+        0
+    }
 }
 
 /// A parsed unit and the timestamps of the demuxed packet it inherits.
@@ -42,6 +49,8 @@ pub(crate) struct Unit {
     /// the unit came out (0 when it does not tell).
     pub samples: i64,
     pub sample_rate: u32,
+    /// The codec's duration in samples when the parser has none.
+    pub fallback: i64,
     /// Where the unit starts in the input (the parser's frame_offset,
     /// which raw demuxers make the packet position and index).
     pub pos: i64,
@@ -152,7 +161,8 @@ impl<S: Split> Parser<S> {
             ts.next_frame_offset = ts.cur_offset + index as i64;
             ts.fetch_timestamp = true;
             let (samples, sample_rate) = self.split.audio();
-            out.push(Unit { data, pts: ts.out_pts, dts: ts.out_dts, samples, sample_rate, pos: ts.frame_offset });
+            let fallback = self.split.fallback();
+            out.push(Unit { data, pts: ts.out_pts, dts: ts.out_dts, samples, sample_rate, fallback, pos: ts.frame_offset });
         }
         let index = index.max(0) as usize;
         ts.cur_offset += index as i64;
@@ -401,6 +411,12 @@ impl MpegAudio {
     pub fn new(codec: &'static str) -> Self {
         Self { pc: Combine::default(), header: 0, header_count: 0, frame_size: 0, codec, sample_rate: 0, channels: 0, duration: 0 }
     }
+
+    /// The parser av_parser_init makes after a seek: the codec context it
+    /// sets (codec, sample rate, channels) outlives the parser.
+    pub fn reset(&self) -> Self {
+        Self { sample_rate: self.sample_rate, channels: self.channels, ..Self::new(self.codec) }
+    }
 }
 
 impl Split for MpegAudio {
@@ -461,6 +477,17 @@ impl Split for MpegAudio {
 
     fn audio(&self) -> (i64, u32) {
         (self.duration, self.sample_rate)
+    }
+
+    /// get_audio_frame_duration: MP1 and MP2 frames have fixed sizes, MP3
+    /// frames one by sample rate.
+    fn fallback(&self) -> i64 {
+        match self.codec {
+            "mp1" => 384,
+            "mp2" => 1152,
+            "mp3" if self.sample_rate > 0 => if self.sample_rate <= 24000 { 576 } else { 1152 },
+            _ => 0,
+        }
     }
 }
 
@@ -535,6 +562,12 @@ impl Ac3 {
             channels: 0,
             duration: 0,
         }
+    }
+
+    /// The parser av_parser_init makes after a seek: the codec context it
+    /// sets (codec, sample rate, channels) outlives the parser.
+    pub fn reset(&self) -> Self {
+        Self { sample_rate: self.sample_rate, channels: self.channels, ..Self::new(self.codec) }
     }
 
     /// The unit's last syncframe sets the codec context, when its CRC
@@ -626,6 +659,12 @@ impl Split for Ac3 {
     fn audio(&self) -> (i64, u32) {
         (self.duration, self.sample_rate)
     }
+
+    /// get_audio_frame_duration: AC-3 frames have a fixed size; E-AC-3 has
+    /// none to fall back on.
+    fn fallback(&self) -> i64 {
+        if self.codec == "ac3" { 1536 } else { 0 }
+    }
 }
 
 /// RELATIVE_TS_BASE (avformat_internal.h): a stream's timestamps before
@@ -648,6 +687,38 @@ fn rescale_down(a: i64, b: i64, c: i64) -> i64 {
         return 0;
     }
     i64::try_from(i128::from(a) * i128::from(b) / i128::from(c)).unwrap_or(i64::MAX)
+}
+
+/// av_rescale_q for positive time bases (num, den): to nearest, ties away
+/// from zero.
+fn rescale_q(a: i64, b: (i64, i64), c: (i64, i64)) -> i64 {
+    let num = i128::from(a) * i128::from(b.0) * i128::from(c.1);
+    let den = i128::from(b.1) * i128::from(c.0);
+    if den <= 0 {
+        return a;
+    }
+    let q = (num.abs() + den / 2) / den;
+    i64::try_from(if num < 0 { -q } else { q }).unwrap_or(i64::MAX)
+}
+
+/// av_add_stable(ts_tb, ts, inc_tb, 1): `ts` moved on by `inc_tb` without
+/// accumulating rounding errors; where a fractional tick count rounds
+/// depends on `ts` itself.
+fn add_stable(ts: i64, ts_tb: (i64, i64), inc_tb: (i64, i64)) -> i64 {
+    let m = i128::from(inc_tb.0) * i128::from(ts_tb.1);
+    let d = i128::from(inc_tb.1) * i128::from(ts_tb.0);
+    if d <= 0 {
+        return ts;
+    }
+    if m % d == 0 {
+        return ts.saturating_add(i64::try_from(m / d).unwrap_or(i64::MAX));
+    }
+    if m < d {
+        return ts;
+    }
+    let old = rescale_q(ts, ts_tb, inc_tb);
+    let old_ts = rescale_q(old, inc_tb, ts_tb);
+    rescale_q(old.saturating_add(1), inc_tb, ts_tb).saturating_add(ts.saturating_sub(old_ts))
 }
 
 /// compute_pkt_fields (demux.c) for a parsed audio stream (no decoder
@@ -683,11 +754,12 @@ impl AudioClock {
     pub fn stamp(&mut self, unit: Unit, index: u32, time_base: oxideav_core::TimeBase, queue: &mut VecDeque<Packet>) -> Packet {
         let mut pts = unit.pts;
         let mut dts = unit.dts;
-        let duration = if unit.sample_rate > 0 {
-            rescale_down(unit.samples, self.den, self.num * i64::from(unit.sample_rate))
-        } else {
-            0
-        };
+        // parse_packet's duration from the parser; without one,
+        // compute_frame_duration's from the codec context, which moves the
+        // clock by the exact fraction (av_add_stable).
+        let (samples, exact) = if unit.samples > 0 { (unit.samples, false) } else { (unit.fallback, true) };
+        let rate = i64::from(unit.sample_rate);
+        let duration = if rate > 0 && samples > 0 { rescale_down(samples, self.den, self.num * rate) } else { 0 };
         if let (Some(p), Some(d)) = (pts, dts) {
             let wrap = 1i64 << self.wrap_bits;
             if self.wrap_bits < 63 && d > i64::MIN + wrap && d - (wrap >> 1) > p {
@@ -711,8 +783,12 @@ impl AudioClock {
             let p = pts.unwrap_or(self.cur_dts);
             pts = Some(p);
             dts = Some(p);
-            // av_add_stable of a whole number of ticks
-            self.cur_dts = p.saturating_add(duration);
+            self.cur_dts = if exact && duration > 0 {
+                add_stable(p, (self.num, self.den), (samples, rate))
+            } else {
+                // av_add_stable of a whole number of ticks
+                p.saturating_add(duration)
+            };
         }
         if let Some(d) = dts {
             self.cur_dts = self.cur_dts.max(d);

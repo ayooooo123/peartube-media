@@ -130,49 +130,51 @@ pub(crate) fn rescale(a: i64, b: i64, c: i64) -> i64 {
 /// (AV_NOPTS_VALUE) when there is none. The second argument is pos_limit.
 pub(crate) type ReadTimestamp<'a> = dyn FnMut(&mut i64, i64) -> Result<Option<i64>> + 'a;
 
-/// ff_seek_frame_binary up to its avio_seek: the index bounds the search,
-/// ff_gen_search finds the position. `(pos, ts)` to resume at, `None`
-/// where FFmpeg's seek fails.
-pub(crate) fn seek_frame_binary(
-    index: &Index,
-    target: i64,
-    data_offset: i64,
-    file_size: i64,
-    read_timestamp: &mut ReadTimestamp<'_>,
-) -> Result<Option<(i64, i64)>> {
-    let (mut pos_min, mut pos_max, mut pos_limit) = (0, 0, -1);
-    let (mut ts_min, mut ts_max) = (None, None);
-    let entries = index.entries();
-    if !entries.is_empty() {
-        let e = entries[index.search(target, true).unwrap_or(0)];
-        if e.timestamp <= target || e.pos == e.min_distance {
-            pos_min = e.pos;
-            ts_min = Some(e.timestamp);
+/// The search range ff_gen_search starts from: positions, and the
+/// timestamps at its ends where known.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bounds {
+    pub pos_min: i64,
+    pub pos_max: i64,
+    pub pos_limit: i64,
+    pub ts_min: Option<i64>,
+    pub ts_max: Option<i64>,
+}
+
+impl Index {
+    /// ff_seek_frame_binary before it bisects (AVSEEK_FLAG_BACKWARD): the
+    /// entries around `target` bound the search.
+    pub fn bounds(&self, target: i64) -> Bounds {
+        let mut bounds = Bounds { pos_min: 0, pos_max: 0, pos_limit: -1, ts_min: None, ts_max: None };
+        let entries = self.entries();
+        if !entries.is_empty() {
+            let e = entries[self.search(target, true).unwrap_or(0)];
+            if e.timestamp <= target || e.pos == e.min_distance {
+                bounds.pos_min = e.pos;
+                bounds.ts_min = Some(e.timestamp);
+            }
+            if let Some(i) = self.search(target, false) {
+                let e = entries[i];
+                bounds.pos_max = e.pos;
+                bounds.ts_max = Some(e.timestamp);
+                bounds.pos_limit = e.pos - e.min_distance;
+            }
         }
-        if let Some(i) = index.search(target, false) {
-            let e = entries[i];
-            pos_max = e.pos;
-            ts_max = Some(e.timestamp);
-            pos_limit = pos_max - e.min_distance;
-        }
+        bounds
     }
-    gen_search(target, pos_min, pos_max, pos_limit, ts_min, ts_max, data_offset, file_size, read_timestamp)
 }
 
 /// ff_gen_search with AVSEEK_FLAG_BACKWARD: `(pos, ts)` of the last
 /// packet found at or before `target`, `None` where FFmpeg returns -1.
-#[allow(clippy::too_many_arguments)]
+/// ff_seek_frame_binary is this over [`Index::bounds`].
 pub(crate) fn gen_search(
     target: i64,
-    mut pos_min: i64,
-    mut pos_max: i64,
-    mut pos_limit: i64,
-    ts_min: Option<i64>,
-    ts_max: Option<i64>,
+    bounds: Bounds,
     data_offset: i64,
     file_size: i64,
     read_timestamp: &mut ReadTimestamp<'_>,
 ) -> Result<Option<(i64, i64)>> {
+    let Bounds { mut pos_min, mut pos_max, mut pos_limit, ts_min, ts_max } = bounds;
     let mut ts_min = match ts_min {
         Some(ts) => ts,
         None => {
@@ -324,7 +326,7 @@ mod tests {
             Ok(Some(at / 10 * 3))
         };
         for target in [0, 1, 3, 100, 149, 296, 297, 500] {
-            let got = seek_frame_binary(&Index::default(), target, 0, 1000, &mut read).unwrap();
+            let got = gen_search(target, Index::default().bounds(target), 0, 1000, &mut read).unwrap();
             let want = (target.min(297) / 3 * 10, target.min(297) / 3 * 3);
             assert_eq!(got, Some(want), "target {target}");
         }

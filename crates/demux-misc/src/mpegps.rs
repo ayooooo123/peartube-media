@@ -1,7 +1,9 @@
 // Ported from FFmpeg libavformat/mpeg.c (commit 2da55bf), with the stream
 // discovery and parser stage of libavformat/demux.c (find_stream_info,
-// probe_codec, parse_packet, compute_pkt_fields) and the CVD/OGT
-// subpicture substreams of VLC modules/demux/mpeg/ps.h (commit 2e358f3).
+// probe_codec, parse_packet, compute_pkt_fields), the timestamp seek of
+// libavformat/seek.c (ff_seek_frame_binary, ff_read_frame_flush,
+// avpriv_update_cur_dts) and the CVD/OGT subpicture substreams of VLC
+// modules/demux/mpeg/ps.h (commit 2e358f3).
 // License: LGPL-2.1-or-later
 //
 // MPEG-1/2 program stream demuxer (.mpg/.mpeg/.vob). The container
@@ -39,6 +41,7 @@ use oxideav_core::{
 };
 
 use crate::parser::{mpa_decode_header, returned, Ac3, AudioClock, DvdSub, MpegAudio, Parser, Unit};
+use crate::seek::{gen_search, Index};
 
 const PACK_START_CODE: u32 = 0x1BA;
 const SYSTEM_HEADER_START_CODE: u32 = 0x1BB;
@@ -47,6 +50,8 @@ const PRIVATE_STREAM_1: u32 = 0x1BD;
 const PADDING_STREAM: u32 = 0x1BE;
 const PRIVATE_STREAM_2: u32 = 0x1BF;
 
+/// mpeg.c MAX_SYNC_SIZE: how far one search for a start code reads.
+const MAX_SYNC_SIZE: i64 = 100_000;
 /// FFmpeg's default probesize: input bytes read at open to find streams.
 const PROBE_SIZE: u64 = 5_000_000;
 /// avformat_find_stream_info's analyze durations in 90 kHz ticks: 5 s
@@ -184,6 +189,9 @@ struct Track {
     first_ts: Option<i64>,
     start_time: Option<i64>,
     framing: Framing,
+    /// The dts of the stream's PES headers read (mpegps_read_pes_header
+    /// indexes each), which bound a seek's search.
+    index: Index,
 }
 
 /// One PES header: its stream id after private-stream-1 / extension
@@ -201,8 +209,9 @@ enum Next<T> {
     Found(T),
     /// The end of the input.
     End,
-    /// Discovery's input budget ran out first; reading resumes where it
-    /// stopped.
+    /// Discovery's input budget ran out first, or a search for a start
+    /// code read MAX_SYNC_SIZE bytes without one (FFERROR_REDO); reading
+    /// resumes where it stopped.
     Budget,
 }
 
@@ -224,6 +233,9 @@ pub struct MpegPsDemuxer {
     probed: u64,
     queue: VecDeque<Packet>,
     eof: bool,
+    /// Where the packs start (FFmpeg's data_offset, past an IMKH or
+    /// Sofdec signature).
+    data_offset: i64,
 }
 
 impl MpegPsDemuxer {
@@ -378,8 +390,11 @@ impl MpegPsDemuxer {
 
     /// mpegps_read_pes_header. While discovering, the scan for a start
     /// code stops at the input budget, leaving any bytes that may begin
-    /// one for playback to read again.
-    fn read_pes_header(&mut self) -> Result<Next<PesHeader>> {
+    /// one for playback to read again. `bounded` stops it after
+    /// MAX_SYNC_SIZE bytes, where FFmpeg's scan returns FFERROR_REDO
+    /// (which a timestamp search takes for no timestamp). Every PES with
+    /// a dts goes into the index of the streams of its id.
+    fn read_pes_header(&mut self, bounded: bool) -> Result<Next<PesHeader>> {
         let mut last_sync = self.position()?;
         let mut error_redo = false;
         loop {
@@ -391,6 +406,7 @@ impl MpegPsDemuxer {
                 Some(limit) => limit - self.position()?,
                 None => i64::MAX,
             };
+            let room = if bounded { room.min(MAX_SYNC_SIZE) } else { room };
             // find_next_start_code
             let mut state: u32 = 0xFF;
             let mut scanned = 0i64;
@@ -552,8 +568,58 @@ impl MpegPsDemuxer {
                 error_redo = true;
                 continue;
             }
+            if let Some(dts) = dts {
+                for track in self.tracks.iter_mut().filter(|t| t.id == startcode) {
+                    track.index.add(pos, dts, 0, 0, true);
+                }
+            }
             return Ok(Next::Found(PesHeader { startcode, len, pts, dts, pos }));
         }
+    }
+
+    /// mpegps_read_dts: from `*pos` on, the dts of the first PES of stream
+    /// `id` that has one, `*pos` moved to its start code; none when the
+    /// input ends or a start code is more than MAX_SYNC_SIZE away first.
+    fn read_dts(&mut self, pos: &mut i64, id: u32) -> Result<Option<i64>> {
+        let Ok(at) = u64::try_from(*pos) else { return Ok(None) };
+        self.input.seek(SeekFrom::Start(at))?;
+        loop {
+            let header = match self.read_pes_header(true)? {
+                Next::Found(header) => header,
+                Next::End | Next::Budget => return Ok(None),
+            };
+            if header.startcode == id && header.dts.is_some() {
+                *pos = header.pos;
+                return Ok(header.dts);
+            }
+            self.skip(header.len)?;
+        }
+    }
+
+    /// After a seek: reading resumes at `pos` (ff_read_frame_flush), each
+    /// parser new, each audio clock at `ts` (avpriv_update_cur_dts; every
+    /// stream has the same time base).
+    fn restart(&mut self, pos: i64, ts: i64) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos as u64))?;
+        self.queue.clear();
+        self.eof = false;
+        for track in &mut self.tracks {
+            // What the parsers set on the codec context (codec, sample
+            // rate) outlives them.
+            match &mut track.framing {
+                Framing::Pes | Framing::SubstreamId(_) => {}
+                Framing::Spu(parser) => *parser = Parser::new(DvdSub::default()),
+                Framing::Mpa(parser, clock) => {
+                    *parser = Parser::new(parser.split.reset());
+                    clock.seeked(ts);
+                }
+                Framing::Ac3(parser, clock) => {
+                    *parser = Parser::new(parser.split.reset());
+                    clock.seeked(ts);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -564,7 +630,7 @@ impl MpegPsDemuxer {
     /// input, or, while discovering, the input budget running out.
     fn read_packet(&mut self) -> Result<Next<(usize, Option<i64>)>> {
         loop {
-            let PesHeader { startcode, mut len, pts, dts, pos } = match self.read_pes_header()? {
+            let PesHeader { startcode, mut len, pts, dts, pos } = match self.read_pes_header(false)? {
                 Next::Found(header) => header,
                 Next::End => return Ok(Next::End),
                 Next::Budget => return Ok(Next::Budget),
@@ -744,6 +810,7 @@ impl MpegPsDemuxer {
             first_ts: None,
             start_time: None,
             framing,
+            index: Index::default(),
         });
         Ok(Some(self.tracks.len() - 1))
     }
@@ -1136,8 +1203,10 @@ pub fn open_mpegps(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Res
         probed: 0,
         queue: VecDeque::new(),
         eof: false,
+        data_offset: 0,
     };
     demuxer.read_header()?;
+    demuxer.data_offset = demuxer.position()?;
     demuxer.discover()?;
     Ok(Box::new(demuxer))
 }
@@ -1163,6 +1232,39 @@ impl Demuxer for MpegPsDemuxer {
             }
             if let Next::End = self.read_packet()? {
                 self.end_of_input();
+            }
+        }
+    }
+
+    /// mpeg.c has no read_seek: FFmpeg bisects with its read_timestamp,
+    /// mpegps_read_dts (seek.c ff_seek_frame_binary, ff_gen_search with
+    /// AVSEEK_FLAG_BACKWARD), within the bounds the stream's index of PES
+    /// dts gives. It lands on the last PES of the stream at or before the
+    /// target, mid-GOP as FFmpeg's does. Every step reads at most up to
+    /// the next timestamped PES of the stream, with at most MAX_SYNC_SIZE
+    /// bytes between start codes. A search that fails leaves reading
+    /// where it was.
+    fn seek_to(&mut self, stream_index: u32, timestamp: i64) -> Result<i64> {
+        let Some(track) = self.tracks.get(stream_index as usize) else {
+            return Err(Error::invalid("mpeg: no such stream to seek"));
+        };
+        let (id, bounds) = (track.id, track.index.bounds(timestamp));
+        let resume = self.position()?;
+        let file_size = self.input.seek(SeekFrom::End(0))? as i64;
+        let data_offset = self.data_offset;
+        let found = gen_search(timestamp, bounds, data_offset, file_size, &mut |pos, _limit| self.read_dts(pos, id));
+        match found {
+            Ok(Some((pos, ts))) => {
+                self.restart(pos, ts)?;
+                Ok(ts)
+            }
+            Ok(None) => {
+                self.input.seek(SeekFrom::Start(resume as u64))?;
+                Err(Error::invalid("mpeg: no timestamp to seek by"))
+            }
+            Err(e) => {
+                self.input.seek(SeekFrom::Start(resume as u64))?;
+                Err(e)
             }
         }
     }

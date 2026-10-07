@@ -297,7 +297,6 @@ pub struct Ac3Demuxer {
     format_name: &'static str,
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    codec: &'static str,
     parser: Parser<Ac3>,
     clock: AudioClock,
     queue: VecDeque<Packet>,
@@ -350,7 +349,6 @@ fn open_ac3_inner(
         format_name,
         input,
         streams: vec![stream],
-        codec,
         parser: Parser::new(Ac3::new(codec)),
         clock: AudioClock::new(1, 90_000, 33),
         queue: VecDeque::new(),
@@ -407,7 +405,8 @@ impl Ac3Demuxer {
     /// clock at `ts` (avpriv_update_cur_dts) or, without one, as at open.
     fn restart(&mut self, pos: i64, ts: Option<i64>) -> Result<()> {
         self.input.seek(SeekFrom::Start(pos as u64))?;
-        self.parser = Parser::new(Ac3::new(self.codec));
+        // What the parser set on the codec context outlives it.
+        self.parser = Parser::new(self.parser.split.reset());
         self.clock = AudioClock::new(1, 90_000, 33);
         if let Some(ts) = ts {
             self.clock.seeked(ts);
