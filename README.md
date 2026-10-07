@@ -71,10 +71,11 @@ Cues or SeekHead tree, and in the EBML header, must fit its parent, and the EBML
 header's strings and extension records keep at most 16 MiB together (FFmpeg's
 limit for one EBML string). Only a Segment or Cluster may use the unknown size;
 any other Top-Level element doing so, or running past its Segment, is damage
-(the walk rescans for what follows; between Clusters, playback resumes at the
-next Cluster), and so is an AttachedFile or FileData of unknown size. A master
-over its budget, in line or found through the SeekHead, is noted as damage too,
-and a Tags or SeekHead found through the SeekHead keeps its complete records. A
+(the walk rescans for what follows; between Clusters, playback and seeks resume
+at the next Cluster), and so is an AttachedFile or FileData of unknown size,
+which leaves the UIDs of the attachments kept before it. A master over its
+budget, in line or found through the SeekHead, is noted as damage too, and a
+Tags or SeekHead found through the SeekHead keeps its complete records. A
 Cluster may start with a Void.
 SegmentUUID, PrevUUID and NextUUID must be 16 octets. Text fields in Info,
 Chapters and Attachments hold at most 64 KiB, and each of these masters keeps
@@ -85,9 +86,10 @@ reaching past its AttachedFile or the Segment is refused unread, and a source
 failure while it reads is returned as itself. Everything the open keeps from
 Tracks or Tags, including tag resolution, the per-stream views and room to
 parse or decompress a codec configuration, stays within the master's 32 MiB
-limit at its peak and after the open; a decoded CodecPrivate frees the stored
-one's room, and a Tags master replaced between Clusters frees its entries' room
-in one pass. The Cues index keeps at most 32 MiB:
+limit at its peak and after the open; a CodecPrivate decodes in the room kept
+for parsing it and its stored form's charge passes to the decoded one, and a
+Tags master replaced between Clusters frees its entries' room in one pass. The
+Cues index keeps at most 32 MiB:
 past that, or past damage, it keeps the CuePoints before it, and a seek past
 the last point kept for its track, or with no Cues, scans the Clusters from
 the first one (a known read cost on large remote files). Cluster
