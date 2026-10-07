@@ -31,9 +31,10 @@
 //! colour, font name and size, alignment and `\r` — with libass's state
 //! semantics: a style switch holds until it is switched back, the first
 //! alignment override wins, and `\r` returns to the event's own style (a
-//! `\rName` naming no style does too). FFmpeg's SubRip encoder resets to
-//! `Default` instead; libass, the renderer players and FFmpeg's own `ass`
-//! filter use, is followed here.
+//! `\rName` naming no style does too). FFmpeg's SubRip encoder instead
+//! resets a bare `\r` to `Default` and drops all styling for a name the
+//! script lacks; libass, the renderer players and FFmpeg's own `ass` filter
+//! use, is followed here.
 //!
 //! A cue's character set is decided per cue: text that is valid UTF-8 is
 //! shown as UTF-8, as in FFmpeg; text that is not, which FFmpeg rejects

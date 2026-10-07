@@ -260,8 +260,9 @@ fn libass_colours(path: &Path, t: f64, palette: &[(u8, u8, u8)]) -> Vec<(u8, u8,
 
 /// A style reset (`\r`) returns to the event's own style, and so does a
 /// reset naming a style the script lacks: what libass, the reference ASS
-/// renderer, draws. FFmpeg's SubRip conversion maps both to `Default`
-/// instead, so it cannot be the oracle here; libass's own render is.
+/// renderer, draws. FFmpeg's SubRip conversion resets a bare `\r` to
+/// `Default` and drops all styling for a missing name, so it cannot be the
+/// oracle here; libass's own render is.
 #[test]
 fn ass_style_resets_render_as_libass_renders_them() {
     let path = data("reset.ass");
