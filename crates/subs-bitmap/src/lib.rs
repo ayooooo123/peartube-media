@@ -14,15 +14,17 @@
 //! | HDMV PGS | `hdmv_pgs_subtitle`, `pgs` | FFmpeg `libavcodec/pgssubdec.c` |
 //! | DVB subtitles | `dvb_subtitle`, `dvbsub` | FFmpeg `libavcodec/dvbsubdec.c` |
 //! | DVD/VobSub | `dvd_subtitle`, `dvdsub`, `vobsub` | FFmpeg `libavcodec/dvdsubdec.c`, `dvdsub.c` |
+//! | CVD | `cvd_subtitle` | VLC `modules/codec/cvdsub.c` |
+//! | Philips OGT/SVCD | `ogt` | VLC `modules/codec/svcdsub.c` |
 //!
 //! | Container | Name | Ported from |
 //! |---|---|---|
 //! | Raw PGS (`.sup`) | `sup` | FFmpeg `libavformat/supdec.c` |
 //! | Paired VobSub (`.idx` + `.sub`) | `open_vobsub` API | FFmpeg `libavformat/mpeg.c`, `subtitles.c` |
 //!
-//! FFmpeg sources are from commit 2da55bf; each file's header was checked to
-//! be the GNU Lesser General Public License 2.1 or later, hence this crate's
-//! licence.
+//! FFmpeg sources are from commit 2da55bf; VLC sources are from
+//! 2e358f3098c2f2b7621d1dc568de8b61ad786322. Every ported source header
+//! was checked for LGPL-2.1-or-later licensing.
 //!
 //! Reference tests compare complete PGS canvases and their timing with
 //! FFmpeg through SUP, Matroska and M2TS, DVB through MPEG-TS and Matroska
@@ -32,6 +34,13 @@
 //! in real decoder epochs, including truncations and header/RLE bit flips,
 //! plus 2000 VobSub index mutations. Every PGS and DVD reset is followed by
 //! a complete FFmpeg comparison.
+//!
+//! CVD/OGT tests compare complete canvases and intervals with an
+//! independently compiled original VLC C decoder/renderer, not FFmpeg
+//! (which has neither decoder): hand-authored structural packets, and
+//! files authored by dvdauthor's spumux read through the MPEG-PS demuxer.
+//! Neither is an archived disc stream; real-disc interoperability is
+//! unproven.
 
 #![forbid(unsafe_code)]
 
@@ -44,6 +53,7 @@ mod dvd;
 mod pgs;
 mod subtitle;
 mod sup;
+mod vcd;
 mod vobsub;
 
 pub use vobsub::open_vobsub;
@@ -60,6 +70,10 @@ pub const DVB_CODEC_ID: &str = "dvb_subtitle";
 pub const DVB_DECODER_NAME: &str = "dvbsub";
 /// DVD subpictures in Matroska S_VOBSUB, MPEG-PS and paired VobSub files.
 pub const DVD_CODEC_ID: &str = "dvd_subtitle";
+/// CVD private-stream subtitle packets (sub-ID 0x00..0x03 retained).
+pub const CVD_CODEC_ID: &str = "cvd_subtitle";
+/// Philips OGT/SVCD private-stream packets (five-byte 0x70 prefix retained).
+pub const OGT_CODEC_ID: &str = "ogt";
 
 /// Tag-resolution priority, below OxideAV's default 100. Decoder factories
 /// must additionally register before upstream factories: first_decoder
@@ -105,6 +119,18 @@ pub fn register(ctx: &mut RuntimeContext) {
                 .tag(CodecTag::matroska("S_VOBSUB")),
         );
     }
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new(CVD_CODEC_ID))
+            .capabilities(caps("cvdsub_vlc_port"))
+            .with_resolution_priority(RESOLUTION_PRIORITY)
+            .decoder(vcd::make_cvd),
+    );
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new(OGT_CODEC_ID))
+            .capabilities(caps("ogt_vlc_port"))
+            .with_resolution_priority(RESOLUTION_PRIORITY)
+            .decoder(vcd::make_ogt),
+    );
     sup::register(&mut ctx.containers);
 }
 

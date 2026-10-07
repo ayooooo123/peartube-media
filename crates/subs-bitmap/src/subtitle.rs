@@ -100,6 +100,11 @@ impl CanvasFrames {
         Self { width: pick(width, 720), height: pick(height, 576), frames: VecDeque::new() }
     }
 
+    /// The current canvas size.
+    pub(crate) fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
     /// Queues the canvas frame of `sub`, decoded from `packet` by a decoder
     /// whose `AVCodecContext` size is `decoder_width x decoder_height`.
     pub(crate) fn push(&mut self, sub: Subtitle<'_>, packet: &Packet, decoder_width: i32, decoder_height: i32) -> Result<()> {

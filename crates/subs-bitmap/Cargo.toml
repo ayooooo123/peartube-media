@@ -3,7 +3,7 @@ name = "subs-bitmap"
 description = "Bitmap subtitle decoders and demuxers for peartube-media"
 version.workspace = true
 edition.workspace = true
-# Ports FFmpeg subtitle decoders and SUP/VobSub demuxers (see src/lib.rs).
+# Ports FFmpeg/VLC bitmap decoders and SUP/VobSub demuxers (see src/lib.rs).
 # (LGPL-2.1-or-later).
 license = "LGPL-2.1-or-later"
 publish.workspace = true
