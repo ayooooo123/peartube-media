@@ -1155,7 +1155,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mp3"
 version = "0.1.3"
-source = "git+https://github.com/OxideAV/oxideav-mp3?rev=eef86cb33fe7f334c2b9ec64ec8342ddbd595d08#eef86cb33fe7f334c2b9ec64ec8342ddbd595d08"
+source = "git+https://github.com/ayooooo123/oxideav-mp3?rev=561b73649c1a85dd24e2498fb73dd125469262d0#561b73649c1a85dd24e2498fb73dd125469262d0"
 dependencies = [
  "oxideav-core",
 ]

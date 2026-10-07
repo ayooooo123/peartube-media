@@ -3,7 +3,8 @@
 //! exactly FFmpeg's samples, and exactly the ones `refcheck::decode` keeps.
 //! FATE samples (tests/fate/gapless.mak, demux.mak): Ogg Opus with end
 //! padding past the final granule, AAC in MP4 with iTunSMPB and edit-list
-//! priming and padding (HE-AAC v2 too).
+//! priming and padding (HE-AAC v2 too), MP3 with LAME delay and padding
+//! (and an iTunes MP3 FFmpeg trims nothing from).
 
 use std::sync::Arc;
 
@@ -33,6 +34,9 @@ const SAMPLES: &[&str] = &[
     "audiomatch/tones_afconvert_44100_stereo_aac_he2.m4a",
     "audiomatch/tones_fdkaac_44100_stereo_aac_lc.m4a",
     "gapless/102400samples_qt-lc-aac.m4a",
+    "gapless/gapless.mp3",
+    "gapless/gapless-itunes.mp3",
+    "audiomatch/square3.mp3",
 ];
 
 #[test]
