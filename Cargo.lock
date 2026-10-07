@@ -295,6 +295,7 @@ dependencies = [
 name = "demux-asf"
 version = "0.1.0"
 dependencies = [
+ "demux-seek-core",
  "oxideav-core",
  "refcheck",
 ]
