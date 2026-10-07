@@ -36,28 +36,43 @@
 //! - a nonzero `skip_samples` replaces whatever start skip is still pending
 //!   (libavcodec's rule) and comes off the decoded samples from the span's
 //!   start on, across as many frames as it covers: a USAC stream's 2220
-//!   samples of priming span three 1024-sample frames;
+//!   samples of priming span three 1024-sample frames. The first sample
+//!   after it begins the presentation ([`Pcm::begins_presentation`]), even
+//!   where the container's timestamps put it before zero;
 //! - `discard_padding` comes off the end of the span: output that may still
 //!   be padding is held back until the next span starts or the stream ends
-//!   ([`Trimmer::finish`]). Padding larger than the span removes the span,
-//!   not earlier packets' output;
+//!   ([`Trimmer::finish`]). Padding larger than the samples left after
+//!   priming is ignored, as in FFmpeg `decode.c`;
 //! - both counts are samples per channel at `sample_rate`, rescaled to the
 //!   rate the decoder actually outputs (an SBR decoder doubles it). A trim
 //!   without a rate is ignored.
 //!
+//! A decoder's own start delay is a default skip that a container's skip
+//! replaces, as libavcodec seeds `skip_samples` with `AVCodecContext::delay`
+//! when a decoder opens. OxideAV's Opus decoder removes its OpusHead
+//! pre-skip from its own output instead, so a container's skip (an MP4 edit
+//! list, Matroska CodecDelay) would come off on top of it:
+//! [`take_decoder_delay`] moves that delay out of the decoder's parameters
+//! and into [`Trimmer::with_decoder_delay`].
+//!
 //! [`Trimmer::reset`] forgets all of it: after a seek the decoder starts over
-//! and the demuxer says what the new position needs.
+//! and the demuxer says what the new position needs. A decoder's delay does
+//! not come back; libavcodec does not apply it again on a flush either.
 //!
 //! Untrusted counts never drive an allocation or loop. At most
 //! [`MAX_QUEUED`] packets may await output, and retained padding (including
-//! PCM allocation capacities) is bounded by [`MAX_HELD_BYTES`]. Exceeding
-//! either bound returns `InvalidData`, rather than losing packet identity.
+//! PCM allocation capacities) is bounded by [`MAX_HELD_BYTES`]. Neither
+//! limit stops the audio; both are counted in [`Fallbacks`]. A full queue
+//! drops its oldest packet and that packet's trims. Until a frame's
+//! timestamp names a queued packet again, or a reset, frames then play
+//! untrimmed rather than take a newer packet's trims by duration or order.
+//! Retained padding past the limit plays untrimmed.
 
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
 
-use oxideav_core::{AudioFormat, AudioFrame, AudioTrim, CodecParameters, Error, Packet, Result, SampleFormat};
+use oxideav_core::{AudioFormat, AudioFrame, AudioTrim, CodecParameters, Packet, SampleFormat};
 
 /// Maximum number of packets awaiting decoder output.
 pub const MAX_QUEUED: usize = 64;
@@ -125,6 +140,10 @@ pub trait Pcm: Sized {
     /// Keeps the first `n` samples, `0 < n < samples()`, and returns the
     /// rest, which starts `n` samples later.
     fn split_off(&mut self, n: usize) -> Self;
+    /// This piece's first sample is the first after a start skip: the
+    /// presentation the container (or decoder) declared begins here,
+    /// whatever its timestamp says.
+    fn begins_presentation(&mut self) {}
 }
 
 /// A sample count, as declared or fixed at the output rate.
@@ -210,17 +229,64 @@ struct Span<P> {
     held_bytes: usize,
 }
 
+/// Trim work that could not be applied: the audio plays on untrimmed. A
+/// caller reports it as a mismatch, not as a decoder failure. Counts
+/// saturate and survive a seek.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fallbacks {
+    /// Packets dropped from a full queue, and with them their trims.
+    pub lost_packets: u64,
+    /// Spans whose retained padding passed [`MAX_HELD_BYTES`] and played.
+    pub released_padding_spans: u64,
+}
+
+impl Fallbacks {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+
+    pub fn add(&mut self, other: Self) {
+        self.lost_packets = self.lost_packets.saturating_add(other.lost_packets);
+        self.released_padding_spans = self.released_padding_spans.saturating_add(other.released_padding_spans);
+    }
+}
+
+/// Moves a decoder's own start delay out of `params`, the parameters the
+/// decoder is made from, into the trim a [`Trimmer`] starts with
+/// ([`Trimmer::with_decoder_delay`]). Only Opus has one: the OpusHead
+/// pre-skip (RFC 7845 §5.1), in 48 kHz samples, which FFmpeg's decoder
+/// declares as `AVCodecContext::delay` and OxideAV's removes itself.
+pub fn take_decoder_delay(params: &mut CodecParameters) -> Option<AudioTrim> {
+    if params.codec_id.as_str() != "opus" {
+        return None;
+    }
+    let head = params.extradata.get_mut(..12).filter(|head| head.starts_with(b"OpusHead"))?;
+    let pre_skip = u16::from_le_bytes([head[10], head[11]]);
+    head[10..12].fill(0);
+    (pre_skip > 0).then_some(AudioTrim { skip_samples: u32::from(pre_skip), discard_padding: 0, sample_rate: 48_000 })
+}
+
 /// Applies [`AudioTrim`]s to a decoder's output. See the crate docs.
 pub struct Trimmer<P> {
     /// Leading samples still to skip.
     skip: Count,
+    /// A start skip ended exactly where the last output ended: the next
+    /// output begins the presentation.
+    skip_ended: bool,
     queue: VecDeque<Queued>,
     current: Option<Span<P>>,
+    /// Duration order cannot identify output after a queued packet is lost.
+    /// A matching frame timestamp or a seek restores that association.
+    association_lost: bool,
+    fallbacks: Fallbacks,
 }
 
 impl<P: Pcm> Default for Trimmer<P> {
     fn default() -> Self {
-        Trimmer { skip: Count::None, queue: VecDeque::new(), current: None }
+        Trimmer {
+            skip: Count::None, skip_ended: false, queue: VecDeque::new(), current: None,
+            association_lost: false, fallbacks: Fallbacks::default(),
+        }
     }
 }
 
@@ -229,11 +295,30 @@ impl<P: Pcm> Trimmer<P> {
         Self::default()
     }
 
+    /// A trimmer whose first output loses `delay`, the decoder's own start
+    /// delay ([`take_decoder_delay`]), unless a container's nonzero skip
+    /// replaces it first.
+    pub fn with_decoder_delay(delay: Option<AudioTrim>) -> Self {
+        let mut trimmer = Self::default();
+        if let Some(t) = delay.filter(|t| t.sample_rate > 0) {
+            trimmer.skip = Count::declared(t.skip_samples, t.sample_rate);
+        }
+        trimmer
+    }
+
+    /// Counters since the caller last collected them. This does not alter
+    /// pending audio or packet association.
+    pub fn take_fallbacks(&mut self) -> Fallbacks {
+        std::mem::take(&mut self.fallbacks)
+    }
+
     /// `packet` went to the decoder; `trim` is its `audio_trim`. Its output
     /// may come later (see the crate docs).
-    pub fn packet(&mut self, packet: &Packet, trim: Option<AudioTrim>) -> Result<()> {
+    pub fn packet(&mut self, packet: &Packet, trim: Option<AudioTrim>) {
         if self.queue.len() == MAX_QUEUED {
-            return Err(Error::invalid("audio trim: too many packets awaiting output"));
+            self.queue.pop_front();
+            self.association_lost = true;
+            self.fallbacks.lost_packets = self.fallbacks.lost_packets.saturating_add(1);
         }
         let tb = packet.time_base;
         self.queue.push_back(Queued {
@@ -241,22 +326,22 @@ impl<P: Pcm> Trimmer<P> {
             pts: packet.pts,
             duration: packet.duration.filter(|&d| d > 0).map(|ticks| Duration { ticks, num: tb.num(), den: tb.den() }),
         });
-        Ok(())
     }
 
     /// One decoded frame, in output order, with the pts the decoder stamped
     /// it with. Appends what plays to `out`: the frame without its skipped
     /// start, and output held back as possible padding once it is known not
     /// to be.
-    pub fn frame(&mut self, mut pcm: P, mut pts: Option<i64>, out: &mut Vec<P>) -> Result<()> {
+    pub fn frame(&mut self, mut pcm: P, mut pts: Option<i64>, out: &mut Vec<P>) {
         if pcm.samples() == 0 {
             out.push(pcm);
-            return Ok(());
+            return;
         }
         loop {
             let rate = pcm.rate();
             if let Some(index) = self.starting(pts, rate) {
-                self.end_span();
+                self.end_span(out);
+                self.association_lost = false;
                 // Earlier packets produced no output, but their skip can
                 // still cover the first samples that do arrive.
                 for q in self.queue.drain(..index) {
@@ -275,6 +360,18 @@ impl<P: Pcm> Trimmer<P> {
                     pts: q.pts, padding, duration: q.duration, produced: 0,
                     held: VecDeque::new(), held_samples: 0, held_bytes: 0,
                 });
+            } else if self.association_lost
+                && self.current.as_ref().is_none_or(|span| pts.is_none() || pts != span.pts)
+            {
+                // A late frame may belong to an evicted packet. Do not
+                // attach a newer packet's trims to it by duration/order.
+                if let Some(span) = self.current.take() {
+                    out.extend(span.held);
+                }
+                self.skip = Count::None;
+                self.skip_ended = false;
+                out.push(pcm);
+                return;
             }
             // A decoder can coalesce multiple packets into one frame. Cut
             // at known span boundaries, but leave the final span open: its
@@ -285,37 +382,42 @@ impl<P: Pcm> Trimmer<P> {
                 (left > 0 && left < pcm.samples() as u64).then_some(left as usize)
             });
             let rest = boundary.map(|n| pcm.split_off(n));
-            self.apply(pcm, out)?;
-            let Some(next) = rest else { return Ok(()) };
+            self.apply(pcm, out);
+            let Some(next) = rest else { return };
             pcm = next;
             pts = None;
         }
     }
 
-    fn apply(&mut self, mut pcm: P, out: &mut Vec<P>) -> Result<()> {
+    fn apply(&mut self, mut pcm: P, out: &mut Vec<P>) {
         let n = pcm.samples() as u64;
         let rate = pcm.rate();
         let Some(span) = self.current.as_mut() else {
             out.push(pcm);
-            return Ok(());
+            return;
         };
         span.produced = span.produced.saturating_add(n);
         if self.skip != Count::None {
             let skip = self.skip.at(rate);
             if skip >= n {
                 self.skip = if skip > n { Count::Output(skip - n) } else { Count::None };
-                return Ok(());
+                self.skip_ended = skip == n;
+                return;
             }
             pcm.drop_front(skip as usize);
             self.skip = Count::None;
+            self.skip_ended = true;
+        }
+        if std::mem::take(&mut self.skip_ended) {
+            pcm.begins_presentation();
         }
         if span.padding == Count::None {
             out.push(pcm);
-            return Ok(());
+            return;
         }
         let padding = span.padding.at(rate);
         let charge = |p: &P| p.retained_bytes().saturating_add(std::mem::size_of::<P>());
-        span.held_samples += pcm.samples() as u64;
+        span.held_samples = span.held_samples.saturating_add(pcm.samples() as u64);
         span.held_bytes = span.held_bytes.saturating_add(charge(&pcm));
         span.held.push_back(pcm);
         while span.held_samples > padding {
@@ -334,10 +436,12 @@ impl<P: Pcm> Trimmer<P> {
             }
         }
         if span.held_bytes > MAX_HELD_BYTES {
-            self.reset();
-            return Err(Error::invalid("audio trim: retained padding exceeds 32 MiB"));
+            out.extend(span.held.drain(..));
+            span.held_samples = 0;
+            span.held_bytes = 0;
+            span.padding = Count::None;
+            self.fallbacks.released_padding_spans = self.fallbacks.released_padding_spans.saturating_add(1);
         }
-        Ok(())
     }
 
     /// The queued packet whose span a frame stamped `pts` at `rate` starts,
@@ -355,6 +459,9 @@ impl<P: Pcm> Trimmer<P> {
         if let Some(index) = pts.and_then(|p| self.queue.iter().position(|q| q.pts == Some(p))) {
             return Some(index);
         }
+        if self.association_lost {
+            return None;
+        }
         let complete = self.current.as_ref().is_none_or(|span| match span.duration {
             Some(d) => span.produced >= d.at(rate),
             None => true,
@@ -368,22 +475,36 @@ impl<P: Pcm> Trimmer<P> {
         }
     }
 
-    /// The current span is over: what it held back is its padding.
-    fn end_span(&mut self) {
-        self.current = None;
+    /// A span is complete: what it holds back is its padding. Padding larger
+    /// than the samples left after its priming is ignored instead, as
+    /// libavcodec ignores padding longer than a frame (`decode.c`).
+    fn end_span(&mut self, out: &mut Vec<P>) {
+        if let Some(span) = self.current.take() {
+            if let Count::Output(padding) = span.padding {
+                if padding > span.held_samples {
+                    out.extend(span.held);
+                }
+            }
+        }
     }
 
     /// The decoder is drained: what the last span holds back is the
-    /// stream's end padding, and queued packets produced nothing.
-    pub fn finish(&mut self) {
-        self.end_span();
+    /// stream's end padding (unless longer than the span, see `end_span`),
+    /// and queued packets produced nothing.
+    pub fn finish(&mut self, out: &mut Vec<P>) {
+        self.end_span(out);
         self.queue.clear();
+        self.skip_ended = false;
+        self.association_lost = false;
     }
 
-    /// The decoder starts over (a seek): nothing pending carries over.
+    /// The decoder starts over (a seek). Stale held PCM never plays.
     pub fn reset(&mut self) {
         self.skip = Count::None;
-        self.finish();
+        self.skip_ended = false;
+        self.current = None;
+        self.queue.clear();
+        self.association_lost = false;
     }
 }
 
@@ -433,8 +554,8 @@ mod tests {
     fn run(t: &mut Trimmer<Run>, packets: &[(Option<AudioTrim>, std::ops::Range<u64>)]) -> Vec<Run> {
         let mut out = Vec::new();
         for (meta, frame) in packets {
-            t.packet(&packet(frame.start as i64), *meta).unwrap();
-            t.frame(Run(frame.clone()), None, &mut out).unwrap();
+            t.packet(&packet(frame.start as i64), *meta);
+            t.frame(Run(frame.clone()), None, &mut out);
         }
         out
     }
@@ -443,8 +564,8 @@ mod tests {
     fn mid_stream_padding_goes_when_the_next_packets_output_starts() {
         // Matroska DiscardPadding on a Block before the last one.
         let mut t = Trimmer::new();
-        let out = run(&mut t, &[(None, 0..1024), (trim(0, 100), 1024..2048), (None, 2048..3072)]);
-        t.finish();
+        let mut out = run(&mut t, &[(None, 0..1024), (trim(0, 100), 1024..2048), (None, 2048..3072)]);
+        t.finish(&mut out);
         assert_eq!(out, [Run(0..1024), Run(1024..1948), Run(2048..3072)]);
     }
 
@@ -463,9 +584,9 @@ mod tests {
     fn empty_frames_pass_through_without_touching_the_skip() {
         let mut t = Trimmer::new();
         let mut out = Vec::new();
-        t.packet(&packet(0), trim(100, 0)).unwrap();
-        t.frame(Run(0..0), None, &mut out).unwrap();
-        t.frame(Run(0..1024), None, &mut out).unwrap();
+        t.packet(&packet(0), trim(100, 0));
+        t.frame(Run(0..0), None, &mut out);
+        t.frame(Run(0..1024), None, &mut out);
         assert_eq!(out, [Run(0..0), Run(100..1024)]);
     }
 
@@ -473,12 +594,12 @@ mod tests {
     fn equal_pts_laces_keep_padding_on_their_own_split_output() {
         let mut t = Trimmer::new();
         let mut out = Vec::new();
-        t.packet(&packet(0), trim(0, 700)).unwrap();
-        t.packet(&packet(0), None).unwrap();
-        t.frame(Run(0..512), Some(0), &mut out).unwrap();
-        t.frame(Run(512..1024), Some(0), &mut out).unwrap();
-        t.frame(Run(1024..2048), Some(0), &mut out).unwrap();
-        t.finish();
+        t.packet(&packet(0), trim(0, 700));
+        t.packet(&packet(0), None);
+        t.frame(Run(0..512), Some(0), &mut out);
+        t.frame(Run(512..1024), Some(0), &mut out);
+        t.frame(Run(1024..2048), Some(0), &mut out);
+        t.finish(&mut out);
         assert_eq!(out, [Run(0..324), Run(1024..2048)]);
     }
 
@@ -486,10 +607,10 @@ mod tests {
     fn a_frame_crossing_packet_spans_preserves_each_packets_padding() {
         let mut t = Trimmer::new();
         let mut out = Vec::new();
-        t.packet(&packet(0), trim(0, 100)).unwrap();
-        t.packet(&packet(1024), trim(0, 200)).unwrap();
-        t.frame(Run(0..2048), Some(0), &mut out).unwrap();
-        t.finish();
+        t.packet(&packet(0), trim(0, 100));
+        t.packet(&packet(1024), trim(0, 200));
+        t.frame(Run(0..2048), Some(0), &mut out);
+        t.finish(&mut out);
         assert_eq!(out, [Run(0..924), Run(1024..1848)]);
     }
 
@@ -500,38 +621,147 @@ mod tests {
         let mut p = packet(0);
         p.time_base = oxideav_core::TimeBase::new(i64::MAX, 1);
         p.duration = Some(i64::MAX);
-        t.packet(&p, trim(0, 100)).unwrap();
-        t.frame(Run(0..512), None, &mut out).unwrap();
-        t.packet(&packet(1024), None).unwrap();
-        t.frame(Run(512..1024), None, &mut out).unwrap();
-        t.finish();
+        t.packet(&p, trim(0, 100));
+        t.frame(Run(0..512), None, &mut out);
+        t.packet(&packet(1024), None);
+        t.frame(Run(512..1024), None, &mut out);
+        t.finish(&mut out);
         assert_eq!(out.into_iter().flat_map(|run| run.0).collect::<Vec<_>>(), (0..924).collect::<Vec<_>>());
     }
 
     #[test]
-    fn too_many_delayed_packets_are_rejected_without_losing_the_first_trim() {
+    fn full_association_queue_keeps_lost_output_untrimmed() {
         let mut t = Trimmer::new();
         let mut out = Vec::new();
-        t.packet(&packet(0), trim(100, 0)).unwrap();
-        for i in 1..MAX_QUEUED {
-            t.packet(&packet(i as i64 * 1024), None).unwrap();
+        t.packet(&packet(0), trim(100, 0));
+        for i in 1..=MAX_QUEUED {
+            t.packet(&packet(i as i64 * 1024), None);
         }
-        assert!(matches!(t.packet(&packet(65536), None), Err(Error::InvalidData(_))));
-        t.frame(Run(0..1024), Some(0), &mut out).unwrap();
-        assert_eq!(out, [Run(100..1024)]);
+        assert_eq!(t.queue.len(), MAX_QUEUED);
+        t.frame(Run(0..1024), Some(0), &mut out);
+        assert_eq!(out, [Run(0..1024)]);
+        assert_eq!(t.take_fallbacks(), Fallbacks { lost_packets: 1, released_padding_spans: 0 });
     }
 
     #[test]
-    fn hostile_padding_is_rejected_at_the_memory_bound_and_can_reset() {
+    fn a_queued_packets_timestamp_restores_association_after_a_loss() {
         let mut t = Trimmer::new();
         let mut out = Vec::new();
-        t.packet(&packet(0), trim(0, u32::MAX)).unwrap();
+        for i in 0..=MAX_QUEUED {
+            let meta = match i { 1 => trim(300, 0), 2 => trim(0, 100), _ => None };
+            t.packet(&packet(i as i64 * 1024), meta);
+        }
+        // Packet 0 is lost. An unstamped frame cannot be placed: it plays
+        // whole, without taking packet 1's skip by order.
+        t.frame(Run(0..1024), None, &mut out);
+        // Stamped frames name their packets again, with their own trims.
+        for n in 1..4u64 {
+            t.frame(Run(n * 1024..(n + 1) * 1024), Some(n as i64 * 1024), &mut out);
+        }
+        assert_eq!(out, [Run(0..1024), Run(1324..2048), Run(2048..2972), Run(3072..4096)]);
+    }
+
+    #[test]
+    fn memory_limit_releases_padding_and_keeps_later_audio() {
+        let mut t = Trimmer::new();
+        let mut out = Vec::new();
+        t.packet(&packet(0), trim(0, u32::MAX));
         let samples = MAX_HELD_BYTES as u64 / 4;
-        assert!(matches!(t.frame(Run(0..samples), None, &mut out), Err(Error::InvalidData(_))));
-        assert!(out.is_empty(), "no padding reaches the sink");
+        t.frame(Run(0..samples), Some(0), &mut out);
+        assert_eq!(out, [Run(0..samples)]);
+        assert_eq!(t.current.as_ref().unwrap().held_bytes, 0);
+        t.packet(&packet(samples as i64), None);
+        t.frame(Run(samples..samples + 1024), Some(samples as i64), &mut out);
+        assert_eq!(out, [Run(0..samples), Run(samples..samples + 1024)]);
+        assert_eq!(t.take_fallbacks(), Fallbacks { lost_packets: 0, released_padding_spans: 1 });
+    }
+
+    #[test]
+    fn a_decoder_delay_is_the_first_skip_unless_a_container_skip_replaces_it() {
+        let delay = Some(AudioTrim { skip_samples: 312, discard_padding: 0, sample_rate: 48000 });
+        let mut t = Trimmer::with_decoder_delay(delay);
+        assert_eq!(run(&mut t, &[(None, 0..1024), (None, 1024..2048)]), [Run(312..1024), Run(1024..2048)]);
+        // An MP4 edit list's or Matroska CodecDelay's skip replaces it.
+        let mut t = Trimmer::with_decoder_delay(delay);
+        assert_eq!(run(&mut t, &[(trim(500, 0), 0..1024)]), [Run(500..1024)]);
+        // A seek does not bring it back.
         t.reset();
-        t.packet(&packet(0), None).unwrap();
-        t.frame(Run(0..1024), None, &mut out).unwrap();
-        assert_eq!(out, [Run(0..1024)]);
+        assert_eq!(run(&mut t, &[(None, 9216..10240)]), [Run(9216..10240)]);
+    }
+
+    /// A run that records whether it begins the presentation.
+    #[derive(Debug, PartialEq)]
+    struct Marked(std::ops::Range<u64>, bool);
+
+    impl Pcm for Marked {
+        fn samples(&self) -> usize {
+            (self.0.end - self.0.start) as usize
+        }
+        fn rate(&self) -> u32 {
+            48000
+        }
+        fn retained_bytes(&self) -> usize {
+            0
+        }
+        fn drop_front(&mut self, n: usize) {
+            self.0.start += n as u64;
+        }
+        fn split_off(&mut self, n: usize) -> Self {
+            let at = self.0.start + n as u64;
+            let rest = Marked(at..self.0.end, false);
+            self.0.end = at;
+            rest
+        }
+        fn begins_presentation(&mut self) {
+            self.1 = true;
+        }
+    }
+
+    #[test]
+    fn the_first_sample_after_a_start_skip_begins_the_presentation() {
+        // Within a frame, at a frame boundary, and without a skip.
+        for (skip, first) in [(1500, Some(1500)), (1024, Some(1024)), (0, None)] {
+            let mut t = Trimmer::new();
+            let mut out = Vec::new();
+            for n in 0..3u64 {
+                t.packet(&packet(n as i64 * 1024), if n == 0 { trim(skip, 0) } else { None });
+                t.frame(Marked(n * 1024..(n + 1) * 1024, false), None, &mut out);
+            }
+            let begins: Vec<u64> = out.iter().filter(|m| m.1).map(|m| m.0.start).collect();
+            assert_eq!(begins, first.into_iter().collect::<Vec<_>>(), "skip {skip}");
+        }
+    }
+
+    #[test]
+    fn only_an_opus_pre_skip_moves_out_of_the_decoder_parameters() {
+        let head = |pre_skip: u16| {
+            [&b"OpusHead\x01\x02"[..], &pre_skip.to_le_bytes(), &48000u32.to_le_bytes(), &[0, 0, 0]].concat()
+        };
+        let mut opus = CodecParameters::audio(oxideav_core::CodecId::new("opus"));
+        opus.extradata = head(312);
+        assert_eq!(take_decoder_delay(&mut opus), Some(AudioTrim { skip_samples: 312, discard_padding: 0, sample_rate: 48000 }));
+        assert_eq!(opus.extradata, head(0));
+        assert_eq!(take_decoder_delay(&mut opus), None, "nothing left to move");
+        let mut aac = CodecParameters::audio(oxideav_core::CodecId::new("aac"));
+        aac.extradata = head(312);
+        assert_eq!(take_decoder_delay(&mut aac), None);
+        assert_eq!(aac.extradata, head(312));
+        let mut short = CodecParameters::audio(oxideav_core::CodecId::new("opus"));
+        short.extradata = head(312)[..11].to_vec();
+        assert_eq!(take_decoder_delay(&mut short), None);
+    }
+
+    #[test]
+    fn padding_larger_than_the_samples_after_priming_is_ignored() {
+        for padding in [223, 224, 225] {
+            let mut t = Trimmer::new();
+            let mut out = Vec::new();
+            t.packet(&packet(0), trim(800, padding));
+            t.frame(Run(0..1024), Some(0), &mut out);
+            t.finish(&mut out);
+            let end = if padding > 224 { 1024 } else { 1024 - u64::from(padding) };
+            let expected: Vec<_> = (800..end).collect();
+            assert_eq!(out.into_iter().flat_map(|run| run.0).collect::<Vec<_>>(), expected, "padding={padding}");
+        }
     }
 }

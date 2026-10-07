@@ -49,6 +49,9 @@ pub struct Decoded {
     /// until parametric stereo starts), so each frame is read in its own.
     pub frame_formats: Vec<Option<AudioFormat>>,
     pub frames: Vec<Frame>,
+    /// Trims that could not be applied. Nonzero counts report a mismatch
+    /// even when untrimmed fallback output happens to match a reference.
+    pub trim_fallbacks: audio_trim::Fallbacks,
 }
 
 /// The container the player's probe rule picks for `path` (engine-api.md):
@@ -85,8 +88,9 @@ pub fn probe_container(ctx: &RuntimeContext, path: &Path) -> Result<String, Stri
 /// Opens `path` with the containers and codecs that `registrars` install,
 /// picks the `nth` stream of `kind`, and decodes all of it. Audio loses the
 /// encoder delay and end padding its container declares
-/// (`PacketMetadata::audio_trim`), as the player's does and as FFmpeg's
-/// decode does, so the frames compare with FFmpeg's output.
+/// (`PacketMetadata::audio_trim`) and the decoder's own start delay, as the
+/// player's does and as FFmpeg's decode does, so the frames compare with
+/// FFmpeg's output.
 pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize) -> Decoded {
     let mut ctx = RuntimeContext::new();
     for register in registrars {
@@ -105,18 +109,21 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
         .nth(nth)
         .unwrap_or_else(|| panic!("{}: no {kind:?} stream #{nth}", path.display()))
         .clone();
+    let mut decoder_params = stream.params.clone();
+    let decoder_delay = audio_trim::take_decoder_delay(&mut decoder_params);
     let mut decoder = ctx
         .codecs
-        .first_decoder(&stream.params)
+        .first_decoder(&decoder_params)
         .unwrap_or_else(|e| panic!("no decoder for {:?}: {e}", stream.params.codec_id));
-    let mut out = Output { frames: Vec::new(), frame_formats: Vec::new(), trimmer: Trimmer::new(), kept: Vec::new() };
+    let trimmer = Trimmer::with_decoder_delay(decoder_delay);
+    let mut out = Output { frames: Vec::new(), frame_formats: Vec::new(), trimmer, kept: Vec::new() };
     loop {
         match demuxer.next_packet() {
             Ok(packet) if packet.stream_index == stream.index => {
                 let metadata = demuxer.packet_metadata();
                 decoder.send_packet(&packet).unwrap_or_else(|e| panic!("send_packet: {e}"));
                 if kind == MediaType::Audio {
-                    out.trimmer.packet(&packet, metadata.audio_trim).unwrap_or_else(|e| panic!("audio trim: {e}"));
+                    out.trimmer.packet(&packet, metadata.audio_trim);
                 }
                 out.drain(&mut decoder, &stream);
             }
@@ -127,9 +134,14 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
     }
     decoder.flush().unwrap_or_else(|e| panic!("flush: {e}"));
     out.drain(&mut decoder, &stream);
-    out.trimmer.finish();
+    out.trimmer.finish(&mut out.kept);
+    out.save_kept();
+    let trim_fallbacks = out.trimmer.take_fallbacks();
+    if !trim_fallbacks.is_empty() {
+        eprintln!("{}: audio trim mismatch: {trim_fallbacks:?}", path.display());
+    }
     let Output { frames, frame_formats, .. } = out;
-    Decoded { params: stream.params, audio_format: decoder.output_audio_format(), frame_formats, frames }
+    Decoded { params: stream.params, audio_format: decoder.output_audio_format(), frame_formats, frames, trim_fallbacks }
 }
 
 /// What `decode` keeps: frames (with the decoder's layout report for each)
@@ -163,17 +175,21 @@ impl Output {
                         rate: layout.sample_rate,
                         time_base: stream.time_base,
                     };
-                    self.trimmer.frame(piece, pts, &mut self.kept).unwrap_or_else(|e| panic!("audio trim: {e}"));
-                    for piece in self.kept.drain(..) {
-                        self.frames.push(Frame::Audio(piece.frame));
-                        self.frame_formats.push(piece.reported);
-                    }
+                    self.trimmer.frame(piece, pts, &mut self.kept);
+                    self.save_kept();
                 }
                 frame => {
                     self.frames.push(frame);
                     self.frame_formats.push(reported);
                 }
             }
+        }
+    }
+
+    fn save_kept(&mut self) {
+        for piece in self.kept.drain(..) {
+            self.frames.push(Frame::Audio(piece.frame));
+            self.frame_formats.push(piece.reported);
         }
     }
 }
@@ -364,7 +380,22 @@ pub fn md5_hex(bytes: &[u8]) -> String {
 /// FFmpeg's decode of stream `0:a:nth` as interleaved f32 at the source rate
 /// and channel count.
 pub fn ffmpeg_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
-    let out = ffmpeg(&[
+    audio_f32(Path::new("ffmpeg"), path, nth)
+}
+
+/// [`ffmpeg_audio_f32`] from the FFmpeg the ports follow, commit 2da55bf:
+/// `$FFMPEG_SRC/ffmpeg`, default ~/projects/ffmpeg-src. The `ffmpeg` on
+/// PATH (9.0.2) predates some of its behavior, such as reading an iTunes
+/// MP3's gapless counts.
+pub fn ffmpeg_src_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
+    let src = std::env::var_os("FFMPEG_SRC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
+    audio_f32(&src.join("ffmpeg"), path, nth)
+}
+
+fn audio_f32(binary: &Path, path: &Path, nth: usize) -> Vec<f32> {
+    let out = run_ffmpeg(binary, &[
         "-i", path.to_str().unwrap(), "-map", &format!("0:a:{nth}"), "-f", "f32le", "-c:a", "pcm_f32le", "-",
     ]);
     out.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
@@ -468,12 +499,16 @@ pub fn snr_db(reference: &[f32], test: &[f32], slack: usize) -> f64 {
 }
 
 fn ffmpeg(args: &[&str]) -> Vec<u8> {
-    let out = Command::new("ffmpeg")
+    run_ffmpeg(Path::new("ffmpeg"), args)
+}
+
+fn run_ffmpeg(binary: &Path, args: &[&str]) -> Vec<u8> {
+    let out = Command::new(binary)
         .args(["-v", "error", "-nostdin"])
         .args(args)
         .output()
-        .expect("ffmpeg must be on PATH");
-    assert!(out.status.success(), "ffmpeg {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        .unwrap_or_else(|e| panic!("{}: {e}", binary.display()));
+    assert!(out.status.success(), "{} {args:?}: {}", binary.display(), String::from_utf8_lossy(&out.stderr));
     out.stdout
 }
 
@@ -548,6 +583,7 @@ mod tests {
         // LATM stereo-to-5.1 or HE-AAC mono-until-PS streams do.
         let decoded = Decoded {
             params,
+            trim_fallbacks: audio_trim::Fallbacks::default(),
             audio_format: Some(format(SampleFormat::F32P, 2)),
             frame_formats: vec![Some(format(SampleFormat::S16, 1)), Some(format(SampleFormat::F32P, 2))],
             frames: vec![
@@ -572,6 +608,7 @@ mod tests {
         params.channels = Some(2);
         let decoded = Decoded {
             params,
+            trim_fallbacks: audio_trim::Fallbacks::default(),
             audio_format: None,
             frame_formats: vec![None],
             frames: vec![audio(2, vec![s16_plane(&[1, 2])])],
@@ -739,7 +776,7 @@ mod tests {
         // The first packet decodes to nothing; the frames carry their
         // packet's pts, so packet 2's padding stays on packet 2's samples.
         let mut spec = Spec::new(1, 48000, 1024, 4);
-        spec.mode = Mode::DropFirst;
+        spec.silent_packets = 1;
         spec.stamp = true;
         spec.packets[2].discard = 100;
         assert_eq!(decode_fixture(&spec), vec![(1024, 3 * 1024 - 100), (3 * 1024, 4 * 1024)]);
@@ -749,7 +786,7 @@ mod tests {
     fn without_durations_or_pts_output_follows_the_order_packets_were_sent() {
         // As Ogg Opus: no packet durations, unstamped frames.
         let mut spec = Spec::new(1, 48000, 1024, 4);
-        spec.mode = Mode::DropFirst;
+        spec.silent_packets = 1;
         spec.durations = false;
         spec.packets[2].discard = 100;
         assert_eq!(decode_fixture(&spec), vec![(1024, 3 * 1024 - 100), (3 * 1024, 4 * 1024)]);
@@ -776,17 +813,26 @@ mod tests {
     }
 
     #[test]
+    fn long_decoder_silence_keeps_output_without_a_trim_panic() {
+        let mut spec = Spec::new(1, 48000, 4, 104);
+        spec.silent_packets = 100;
+        spec.stamp = true;
+        spec.packets[102].discard = 1;
+        assert_eq!(decode_fixture(&spec), vec![(400, 411), (412, 416)]);
+    }
+
+    #[test]
     fn hostile_trims_are_bounded_and_invalid_ones_ignored() {
         // A skip of u32::MAX seconds' worth drops everything, quickly.
         let mut spec = Spec::new(1, 48000, 1024, 3);
         spec.packets[0].skip = u32::MAX;
         spec.packets[0].trim_rate = 1;
         assert_eq!(decode_fixture(&spec), range(0, 0));
-        // Padding larger than the packet's output drops that output only.
+        // Padding larger than the packet's output is ignored.
         let mut spec = Spec::new(1, 48000, 1024, 3);
         spec.packets[2].discard = u32::MAX;
         spec.packets[2].trim_rate = 1;
-        assert_eq!(decode_fixture(&spec), range(0, 2 * 1024));
+        assert_eq!(decode_fixture(&spec), range(0, 3 * 1024));
         // A trim without a rate means nothing.
         let mut spec = Spec::new(1, 48000, 1024, 3);
         spec.packets[0].skip = 1000;

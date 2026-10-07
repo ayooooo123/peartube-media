@@ -34,14 +34,11 @@ pub enum Mode {
     Delayed,
     /// Two frames per packet (halves), right after it is sent.
     Split,
-    /// As `Direct`, but the first packet decodes to nothing (an Opus
-    /// decoder whose pre-skip covers it does that).
-    DropFirst,
 }
 
 impl Mode {
-    const ALL: [(Mode, &'static str); 4] =
-        [(Mode::Direct, "direct"), (Mode::Delayed, "delayed"), (Mode::Split, "split"), (Mode::DropFirst, "dropfirst")];
+    const ALL: [(Mode, &'static str); 3] =
+        [(Mode::Direct, "direct"), (Mode::Delayed, "delayed"), (Mode::Split, "split")];
 }
 
 /// One packet: its duration at the declared rate, and its trim.
@@ -77,6 +74,16 @@ pub struct Spec {
     pub stamp: bool,
     /// Packets declare their durations.
     pub durations: bool,
+    /// Packets accepted without output when a decoder starts or restarts.
+    pub silent_packets: usize,
+    /// Offset from packet PTS to stamped frame PTS.
+    pub frame_pts_offset: i64,
+    /// Override the packet's declared duration without changing its PCM.
+    pub duration_override: Option<i64>,
+    /// The decoder panics when asked for its output layout
+    /// (`Decoder::output_audio_format`) once it has output a frame: a
+    /// failure outside the calls a consumer guards.
+    pub panic_on_layout: bool,
 }
 
 impl Spec {
@@ -94,6 +101,10 @@ impl Spec {
             skip_after_seek: false,
             stamp: false,
             durations: true,
+            silent_packets: 0,
+            frame_pts_offset: 0,
+            duration_override: None,
+            panic_on_layout: false,
         }
     }
 
@@ -111,14 +122,18 @@ impl Spec {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mode = Mode::ALL.iter().find(|m| m.0 == self.mode).map_or("direct", |m| m.1);
         let mut s = format!(
-            "{} {} {} {mode} {} {} {} {}\n",
+            "{} {} {} {mode} {} {} {} {} {} {} {} {}\n",
             self.channels,
             self.declared_rate,
             self.output_rate,
             self.start_pts,
             self.skip_after_seek as u8,
             self.stamp as u8,
-            self.durations as u8
+            self.durations as u8,
+            self.silent_packets,
+            self.frame_pts_offset,
+            self.duration_override.map_or_else(|| "-".into(), |d| d.to_string()),
+            self.panic_on_layout as u8
         );
         for p in &self.packets {
             s.push_str(&format!("{} {} {} {}\n", p.duration, p.skip, p.discard, p.trim_rate));
@@ -131,7 +146,11 @@ impl Spec {
         let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
         let mut lines = text.lines();
         let head: Vec<&str> = lines.next().ok_or_else(bad)?.split_whitespace().collect();
-        let [channels, declared, output, mode, start, seek, stamp, durations] = head[..] else { return Err(bad()) };
+        let [channels, declared, output, mode, start, seek, stamp, durations, silent, offset, override_duration, panic] =
+            head[..]
+        else {
+            return Err(bad());
+        };
         let mode = Mode::ALL.iter().find(|m| m.1 == mode).ok_or_else(bad)?.0;
         let mut packets = Vec::new();
         for line in lines {
@@ -149,6 +168,10 @@ impl Spec {
             skip_after_seek: seek == "1",
             stamp: stamp == "1",
             durations: durations == "1",
+            silent_packets: silent.parse().map_err(|_| bad())?,
+            frame_pts_offset: offset.parse().map_err(|_| bad())?,
+            duration_override: if override_duration == "-" { None } else { Some(override_duration.parse().map_err(|_| bad())?) },
+            panic_on_layout: panic == "1",
         };
         if spec.channels == 0 || spec.declared_rate == 0 || spec.output_rate == 0 {
             return Err(bad());
@@ -214,7 +237,14 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
     params.channels = Some(spec.channels);
     params.sample_format = Some(SampleFormat::F32);
     let mode = Mode::ALL.iter().position(|m| m.0 == spec.mode).unwrap_or(0) as u8;
-    params.extradata = [&[mode, spec.stamp as u8][..], &spec.output_rate.to_le_bytes(), &spec.channels.to_le_bytes()].concat();
+    params.extradata = [
+        &[mode, spec.stamp as u8][..],
+        &spec.output_rate.to_le_bytes(),
+        &spec.channels.to_le_bytes(),
+        &(spec.silent_packets as u64).to_le_bytes(),
+        &spec.frame_pts_offset.to_le_bytes(),
+        &[spec.panic_on_layout as u8],
+    ].concat();
     let time_base = TimeBase::new(1, i64::from(spec.declared_rate));
     let stream = StreamInfo { index: 0, time_base, duration: None, start_time: None, params };
     let mut starts = Vec::with_capacity(spec.packets.len());
@@ -254,7 +284,7 @@ impl Demuxer for FixtureDemuxer {
         let mut packet = Packet::new(0, self.streams[0].time_base, data);
         packet.pts = Some(pts);
         packet.dts = Some(pts);
-        packet.duration = self.spec.durations.then_some(i64::from(p.duration));
+        packet.duration = self.spec.duration_override.or_else(|| self.spec.durations.then_some(i64::from(p.duration)));
         packet.flags.keyframe = true;
         let skip = self.seek_skip.take().unwrap_or(p.skip);
         if skip > 0 || p.discard > 0 {
@@ -285,18 +315,23 @@ struct FixtureDecoder {
     id: CodecId,
     mode: Mode,
     stamp: bool,
+    silent_packets: u64,
+    frame_pts_offset: i64,
+    panic_on_layout: bool,
     format: AudioFormat,
     /// Delayed: the packet not output yet, as (first, count, pts).
     held: Option<(u64, u32, Option<i64>)>,
     sent: usize,
     queue: VecDeque<Frame>,
+    /// A frame has been received.
+    output: bool,
     flushed: bool,
 }
 
 fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let e = &params.extradata;
     let bad = || Error::invalid("refcheck trim fixture: extradata");
-    if e.len() != 8 {
+    if e.len() != 25 {
         return Err(bad());
     }
     let mode = Mode::ALL.get(usize::from(e[0])).ok_or_else(bad)?.0;
@@ -309,10 +344,14 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         id: CodecId::new(CODEC),
         mode,
         stamp: e[1] == 1,
+        silent_packets: u64::from_le_bytes(e[8..16].try_into().unwrap()),
+        frame_pts_offset: i64::from_le_bytes(e[16..24].try_into().unwrap()),
+        panic_on_layout: e[24] == 1,
         format,
         held: None,
         sent: 0,
         queue: VecDeque::new(),
+        output: false,
         flushed: false,
     }))
 }
@@ -320,7 +359,7 @@ fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 impl FixtureDecoder {
     fn emit(&mut self, first: u64, count: u32, pts: Option<i64>) {
         let channels = self.format.channels as usize;
-        let pts = if self.stamp { pts } else { None };
+        let pts = if self.stamp { pts.map(|p| p.saturating_add(self.frame_pts_offset)) } else { None };
         let frame = |first: u64, count: u32| {
             let mut bytes = Vec::with_capacity(count as usize * channels * 4);
             for i in 0..u64::from(count) {
@@ -353,13 +392,15 @@ impl Decoder for FixtureDecoder {
         let first = u64::from_le_bytes(d[..8].try_into().unwrap());
         let count = u32::from_le_bytes(d[8..].try_into().unwrap());
         self.sent += 1;
+        if self.sent as u64 <= self.silent_packets {
+            return Ok(());
+        }
         match self.mode {
             Mode::Delayed => {
                 if let Some((f, c, pts)) = self.held.replace((first, count, packet.pts)) {
                     self.emit(f, c, pts);
                 }
             }
-            Mode::DropFirst if self.sent == 1 => {}
             _ => self.emit(first, count, packet.pts),
         }
         Ok(())
@@ -367,7 +408,10 @@ impl Decoder for FixtureDecoder {
 
     fn receive_frame(&mut self) -> Result<Frame> {
         match self.queue.pop_front() {
-            Some(frame) => Ok(frame),
+            Some(frame) => {
+                self.output = true;
+                Ok(frame)
+            }
             None if self.flushed => Err(Error::Eof),
             None => Err(Error::NeedMore),
         }
@@ -382,6 +426,7 @@ impl Decoder for FixtureDecoder {
     }
 
     fn output_audio_format(&self) -> Option<AudioFormat> {
+        assert!(!(self.panic_on_layout && self.output), "refcheck trim fixture: layout report failed");
         Some(self.format)
     }
 }

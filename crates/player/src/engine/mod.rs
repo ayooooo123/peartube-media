@@ -73,6 +73,9 @@ pub struct State {
     pub video_size: Option<(u32, u32)>,
     pub video_decoder: Option<String>,
     pub dropped_frames: u64,
+    /// Trim work lost to input limits. Playback continues with untrimmed
+    /// samples; this is not an audio decoder error.
+    pub audio_trim_fallbacks: audio_trim::Fallbacks,
 }
 
 #[derive(Clone, Debug)]
@@ -978,7 +981,16 @@ fn spawn_audio(
             sink: Some(sink),
         };
         if let Some(sink) = output.sink.as_deref_mut() {
-            run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
+            // However the pipeline fails, the track stops being the audio
+            // track, as when its decoder fails: a panic outside the decoder
+            // calls included.
+            let failed = Arc::clone(&shared);
+            let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired)
+            }));
+            if run.is_err() {
+                audio_failed(&failed, "audio pipeline failed".into());
+            }
         }
     })
 }
@@ -1356,6 +1368,21 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let _ = run.demuxer.set_active_streams(active);
 }
 
+fn audio_failed(shared: &SharedState, message: String) {
+    let mut st = shared.state.lock();
+    st.error.get_or_insert(message);
+    st.audio = None;
+    drop(st);
+    notify_changed(shared);
+}
+
+fn record_trim_fallbacks(shared: &SharedState, trimmer: &mut Trimmer<Chunk>) {
+    let fallbacks = trimmer.take_fallbacks();
+    if !fallbacks.is_empty() {
+        shared.state.lock().audio_trim_fallbacks.add(fallbacks);
+    }
+}
+
 /// Packet lanes → decoder → sink, for one audio stream. The sink follows the
 /// clock's run state (`play`/`pause`); while the clock stands still, PCM goes
 /// out only up to `PREROLL` past it. From its first samples of each seek the
@@ -1364,7 +1391,8 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
 /// switch sets `retired`. The encoder delay and end padding the container
 /// declares (`PacketMetadata::audio_trim`) never reach the sink: they come
 /// off the decoder's output through `audio_trim`, as `refcheck` removes
-/// them, so the reference tests check what plays.
+/// them, so the reference tests check what plays. A decoder's own start
+/// delay comes off there too, once, unless the container's skip replaces it.
 fn run_audio_thread(
     stream: StreamInfo,
     sink: &mut dyn AudioSink,
@@ -1374,16 +1402,14 @@ fn run_audio_thread(
     realtime: bool,
     retired: Arc<AtomicBool>,
 ) {
-    let mut decoder = match make_decoder(&shared.ctx, &stream.params) {
+    let mut decoder_params = stream.params.clone();
+    let decoder_delay = audio_trim::take_decoder_delay(&mut decoder_params);
+    let mut decoder = match make_decoder(&shared.ctx, &decoder_params) {
         Ok(d) => d,
         Err(e) => {
             // No decoder: the track is skipped (still listed in `tracks`)
             // and the rest plays on.
-            let mut st = shared.state.lock();
-            st.error.get_or_insert_with(|| format!("no audio decoder found: {e}"));
-            st.audio = None;
-            drop(st);
-            notify_changed(&shared);
+            audio_failed(&shared, format!("no audio decoder found: {e}"));
             return;
         }
     };
@@ -1402,7 +1428,7 @@ fn run_audio_thread(
     let mut starved = false;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
-    let mut trimmer: Trimmer<Chunk> = Trimmer::new();
+    let mut trimmer: Trimmer<Chunk> = Trimmer::with_decoder_delay(decoder_delay);
     let mut kept: Vec<Chunk> = Vec::new();
     // Where the decoder's output so far ends: where a frame without a pts
     // of its own starts.
@@ -1429,14 +1455,10 @@ fn run_audio_thread(
             out.written.end = None;
             trimmer.reset();
             decoded_end = None;
-            decoder = match make_decoder(&shared.ctx, &stream.params) {
+            decoder = match make_decoder(&shared.ctx, &decoder_params) {
                 Ok(d) => d,
                 Err(e) => {
-                    let mut st = shared.state.lock();
-                    st.error.get_or_insert_with(|| format!("audio decoder failed to restart: {e}"));
-                    st.audio = None;
-                    drop(st);
-                    notify_changed(&shared);
+                    audio_failed(&shared, format!("audio decoder failed to restart: {e}"));
                     return;
                 }
             };
@@ -1468,16 +1490,19 @@ fn run_audio_thread(
                         break;
                     }
                     let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
-                    if let Err(e) = trimmer.frame(chunk, af.pts, &mut kept) {
-                        shared.state.lock().error.get_or_insert_with(|| e.to_string());
-                        notify_changed(&shared);
-                        return;
-                    }
+                    trimmer.frame(chunk, af.pts, &mut kept);
+                    record_trim_fallbacks(&shared, &mut trimmer);
                     if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
                         break;
                     }
                 }
-                trimmer.finish();
+                // A tail the trimmer held as padding but finds too short for
+                // it plays (FFmpeg ignores such padding).
+                trimmer.finish(&mut kept);
+                record_trim_fallbacks(&shared, &mut trimmer);
+                if !quit() {
+                    let _ = present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired);
+                }
                 // The output plays what it holds before the pipeline ends:
                 // the audio leads the clock up to its last sample, and the
                 // playback ends after that sample is heard.
@@ -1503,22 +1528,13 @@ fn run_audio_thread(
         match send_res {
             Ok(Ok(())) => {
                 consecutive_errors = 0;
-                if let Err(e) = trimmer.packet(&packet, metadata.audio_trim) {
-                    shared.state.lock().error.get_or_insert_with(|| e.to_string());
-                    notify_changed(&shared);
-                    return;
-                }
+                trimmer.packet(&packet, metadata.audio_trim);
+                record_trim_fallbacks(&shared, &mut trimmer);
             }
             Ok(Err(_)) | Err(_) => {
                 consecutive_errors += 1;
                 if consecutive_errors >= 3 {
-                    let mut st = shared.state.lock();
-                    let _ = st.error.get_or_insert_with(|| {
-                        format!("audio decoder failed 3 times on stream {}", stream.index)
-                    });
-                    st.audio = None;
-                    drop(st);
-                    notify_changed(&shared);
+                    audio_failed(&shared, format!("audio decoder failed 3 times on stream {}", stream.index));
                     return;
                 }
                 continue;
@@ -1544,13 +1560,7 @@ fn run_audio_thread(
                 Ok(Err(_)) | Err(_) => {
                     consecutive_errors += 1;
                     if consecutive_errors >= 3 {
-                        let mut st = shared.state.lock();
-                        let _ = st.error.get_or_insert_with(|| {
-                            format!("audio decoder failed 3 times on stream {}", stream.index)
-                        });
-                        st.audio = None;
-                        drop(st);
-                        notify_changed(&shared);
+                        audio_failed(&shared, format!("audio decoder failed 3 times on stream {}", stream.index));
                         return;
                     }
                     break;
@@ -1558,11 +1568,8 @@ fn run_audio_thread(
             };
             let Frame::Audio(af) = frame else { continue };
             let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
-            if let Err(e) = trimmer.frame(chunk, af.pts, &mut kept) {
-                shared.state.lock().error.get_or_insert_with(|| e.to_string());
-                notify_changed(&shared);
-                return;
-            }
+            trimmer.frame(chunk, af.pts, &mut kept);
+            record_trim_fallbacks(&shared, &mut trimmer);
             if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
                 // Stopped, retired or a seek: the rest of this packet is stale.
                 break;
@@ -1578,6 +1585,8 @@ struct Chunk {
     channels: usize,
     rate: u32,
     pts: f64,
+    /// The first sample after a declared start skip (`Pcm::begins_presentation`).
+    begins: bool,
 }
 
 impl Pcm for Chunk {
@@ -1601,7 +1610,11 @@ impl Pcm for Chunk {
     fn split_off(&mut self, n: usize) -> Self {
         let rest = self.pcm.split_off(n.saturating_mul(self.channels).min(self.pcm.len()));
         let pts = self.pts + n as f64 / f64::from(self.rate.max(1));
-        Chunk { pcm: rest, channels: self.channels, rate: self.rate, pts }
+        Chunk { pcm: rest, channels: self.channels, rate: self.rate, pts, begins: false }
+    }
+
+    fn begins_presentation(&mut self) {
+        self.begins = true;
     }
 }
 
@@ -1625,7 +1638,7 @@ fn decoded_chunk(
     };
     let frames = pcm.len() / channels.max(1);
     *decoded_end = Some(pts + frames as f64 / f64::from(rate.max(1)));
-    Chunk { pcm, channels, rate, pts }
+    Chunk { pcm, channels, rate, pts, begins: false }
 }
 
 /// What an audio pipeline's output is set up for and has taken.
@@ -1663,8 +1676,9 @@ fn present_kept(
 
 /// One chunk of decoded audio to the sink, which is (re)opened for its
 /// layout. Samples stamped before zero precede the presentation (codec
-/// priming no container trim covered), and after a seek those before its
-/// target never play.
+/// priming no container trim covered), unless a declared start skip just
+/// came off: those begin the presentation at zero, as FFmpeg plays them.
+/// After a seek, those before its target never play.
 fn present_audio(
     sink: &mut dyn AudioSink,
     shared: &SharedState,
@@ -1674,7 +1688,7 @@ fn present_audio(
     realtime: bool,
     retired: &AtomicBool,
 ) -> bool {
-    let Chunk { mut pcm, channels, rate: sample_rate, pts } = chunk;
+    let Chunk { mut pcm, channels, rate: sample_rate, pts, begins } = chunk;
     if !out.open || sample_rate != out.rate || channels as u16 != out.channels {
         out.rate = sample_rate;
         out.channels = channels as u16;
@@ -1683,12 +1697,16 @@ fn present_audio(
     }
     let sink_failed = !out.open;
 
-    // Clamping samples stamped before zero to zero would overlap the first
-    // real samples on the output's timeline.
+    // Clamping undeclared priming stamped before zero to zero would overlap
+    // the first real samples on the output's timeline. Declared priming is
+    // gone already; what follows it starts the presentation even when the
+    // container's timestamps disagree with its skip.
     let mut pts_secs = pts;
     if pts_secs < 0.0 {
-        let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
-        pcm.drain(..(before.saturating_mul(channels)).min(pcm.len()));
+        if !begins {
+            let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
+            pcm.drain(..(before.saturating_mul(channels)).min(pcm.len()));
+        }
         pts_secs = 0.0;
     }
 

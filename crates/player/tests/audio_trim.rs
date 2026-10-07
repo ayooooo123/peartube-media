@@ -3,10 +3,12 @@
 //! does: the same samples reach the sink as refcheck keeps. The synthetic
 //! fixture's samples carry their own decoder-output index.
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use oxideav_core::{MediaType, RuntimeContext};
+use parking_lot::Mutex;
+use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleSink, VideoSink};
 use player::{Capture, Headless, Player, PlayerOptions};
 use refcheck::trim_fixture::{self, Mode, Spec};
 
@@ -25,9 +27,8 @@ fn context() -> Arc<RuntimeContext> {
     Arc::new(ctx)
 }
 
-/// Plays `spec` to the end (seeking to `seek` first, when given) and
-/// returns the capture.
-fn play(spec: &Spec, seek: Option<Duration>) -> Capture {
+/// Plays `spec` to the end, optionally seeking first.
+fn play(spec: &Spec, seek: Option<Duration>) -> (Capture, audio_trim::Fallbacks) {
     let path = write_spec(spec);
     let backend = Headless::new();
     let p = Player::open(
@@ -44,7 +45,8 @@ fn play(spec: &Spec, seek: Option<Duration>) -> Capture {
     drop(p);
     let _ = std::fs::remove_file(&path);
     assert!(state.error.is_none(), "playback error: {:?}", state.error);
-    backend.capture()
+    assert_eq!(state.audio, Some(0), "audio track was disabled");
+    (backend.capture(), state.audio_trim_fallbacks)
 }
 
 /// The decoder-output samples the sink took after its last flush (a seek
@@ -59,20 +61,26 @@ fn played(capture: &Capture) -> Vec<(u64, u64)> {
 }
 
 /// What `refcheck::decode` keeps of the same stream.
-fn refcheck_keeps(spec: &Spec) -> Vec<(u64, u64)> {
+fn refcheck_keeps(spec: &Spec) -> (Vec<(u64, u64)>, audio_trim::Fallbacks) {
     let path = write_spec(spec);
     let decoded = refcheck::decode(&path, &[trim_fixture::register], MediaType::Audio, 0);
     let _ = std::fs::remove_file(&path);
-    trim_fixture::runs(&trim_fixture::indices(&refcheck::interleaved_f32(&decoded), spec.channels as usize))
+    (
+        trim_fixture::runs(&trim_fixture::indices(&refcheck::interleaved_f32(&decoded), spec.channels as usize)),
+        decoded.trim_fallbacks,
+    )
 }
 
 fn range(start: u64, end: u64) -> Vec<(u64, u64)> {
     vec![(start, end)]
 }
 
-fn assert_plays(spec: &Spec, expected: Vec<(u64, u64)>) {
-    assert_eq!(played(&play(spec, None)), expected, "the engine's output");
-    assert_eq!(refcheck_keeps(spec), expected, "refcheck keeps the same samples");
+fn assert_plays(spec: &Spec, expected: Vec<(u64, u64)>) -> (audio_trim::Fallbacks, audio_trim::Fallbacks) {
+    let (capture, engine_fallbacks) = play(spec, None);
+    let (kept, reference_fallbacks) = refcheck_keeps(spec);
+    assert_eq!(played(&capture), expected, "the engine's output");
+    assert_eq!(kept, expected, "refcheck keeps the same samples");
+    (engine_fallbacks, reference_fallbacks)
 }
 
 #[test]
@@ -132,28 +140,104 @@ fn padding_spans_the_frames_of_one_packet() {
 
 #[test]
 fn a_seek_restarts_the_trims_from_the_landing_packet() {
-    // Seeking to zero lands on the packet straddling it, which carries the
-    // rest of the priming; the end padding still goes.
+    // The seek lands at positive PTS, so the before-zero gate cannot
+    // hide a missing 1196-sample priming trim on the landing packet.
     let mut spec = Spec::new(1, 48000, 1024, 40);
-    spec.start_pts = -2220;
     spec.skip_after_seek = true;
     spec.packets[0].skip = 2220;
     spec.packets[39].discard = 340;
-    let capture = play(&spec, Some(Duration::ZERO));
+    let (capture, _) = play(&spec, Some(Duration::from_secs_f64(1024.0 / 48000.0)));
     assert_eq!(played(&capture), range(2220, 40 * 1024 - 340));
 }
 
+/// Headless output whose first audio write waits for the test, so the test
+/// seeks while the engine is inside a known packet.
+struct FirstWriteGate {
+    inner: Arc<Headless>,
+    gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+}
+
+impl Backend for FirstWriteGate {
+    fn audio(&self) -> Box<dyn AudioSink> {
+        Box::new(GatedAudio { sink: self.inner.audio(), gate: self.gate.lock().take() })
+    }
+    fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
+        self.inner.video(clock)
+    }
+    fn subtitles(&self) -> Box<dyn SubtitleSink> {
+        self.inner.subtitles()
+    }
+}
+
+struct GatedAudio {
+    sink: Box<dyn AudioSink>,
+    gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+}
+
+impl AudioSink for GatedAudio {
+    fn open(&mut self, rate: u32, channels: u16) -> Result<(), SinkError> {
+        self.sink.open(rate, channels)
+    }
+    fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
+        if let Some((entered, release)) = self.gate.take() {
+            entered.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(10)).expect("the test never released the first write");
+        }
+        self.sink.write(pcm, pts)
+    }
+    fn play(&mut self) {
+        self.sink.play();
+    }
+    fn pause(&mut self) {
+        self.sink.pause();
+    }
+    fn flush(&mut self) {
+        self.sink.flush();
+    }
+    fn clock(&self) -> Arc<dyn Clock> {
+        self.sink.clock()
+    }
+}
+
 #[test]
-fn excessive_padding_reports_an_error_without_reaching_the_sink() {
-    // One stereo f32 frame already owns 32 MiB before retained-object
-    // overhead. A hostile padding count must not retain it indefinitely.
-    let mut spec = Spec::new(2, 48000, 1 << 22, 1);
-    spec.packets[0].discard = u32::MAX;
+fn a_seek_forgets_the_trims_of_packets_sent_before_it() {
+    // A delayed decoder without timestamps: when packet 0's output is
+    // written, packet 1 and its 2000-sample skip are queued. The seek lands
+    // on packet 20, which has no trim; none of packet 1's skip comes off it.
+    let mut spec = Spec::new(1, 48000, 1024, 40);
+    spec.mode = Mode::Delayed;
+    spec.packets[1].skip = 2000;
     let path = write_spec(&spec);
-    let backend = Headless::new();
+    let (entered, first_write) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let headless = Headless::new();
+    let backend = Arc::new(FirstWriteGate { inner: headless.clone(), gate: Mutex::new(Some((entered, gate))) });
     let p = Player::open(
         path.to_str().unwrap(),
-        backend.clone(),
+        backend,
+        context(),
+        PlayerOptions { realtime: false, ..PlayerOptions::default() },
+        |_| {},
+    );
+    first_write.recv_timeout(Duration::from_secs(10)).expect("no audio was written");
+    p.seek(Duration::from_secs_f64(20.0 * 1024.0 / 48000.0));
+    release.send(()).unwrap();
+    let state = p.wait();
+    drop(p);
+    let _ = std::fs::remove_file(&path);
+    assert!(state.error.is_none(), "playback error: {:?}", state.error);
+    assert_eq!(played(&headless.capture()), range(20 * 1024, 40 * 1024));
+}
+
+#[test]
+fn a_failed_audio_pipeline_gives_up_its_track() {
+    // The decoder fails outside the calls the engine guards one by one.
+    let mut spec = Spec::new(1, 48000, 1024, 4);
+    spec.panic_on_layout = true;
+    let path = write_spec(&spec);
+    let p = Player::open(
+        path.to_str().unwrap(),
+        Headless::new(),
         context(),
         PlayerOptions { realtime: false, ..PlayerOptions::default() },
         |_| {},
@@ -161,6 +245,42 @@ fn excessive_padding_reports_an_error_without_reaching_the_sink() {
     let state = p.wait();
     drop(p);
     let _ = std::fs::remove_file(&path);
-    assert!(state.error.is_some(), "oversized PCM retention was accepted");
-    assert!(backend.capture().audio.iter().all(|a| a.pcm.is_empty()), "padding reached the sink");
+    assert_eq!(state.audio, None, "the failed pipeline still holds the audio track");
+    assert!(state.error.is_some(), "the failure was not reported");
+}
+
+#[test]
+fn excessive_padding_falls_back_to_audio_without_disabling_the_track() {
+    // One stereo f32 frame owns 32 MiB before retained-object overhead.
+    let mut spec = Spec::new(2, 48000, 1 << 22, 1);
+    spec.packets[0].discard = u32::MAX;
+    let (engine, reference) = assert_plays(&spec, range(0, 1 << 22));
+    assert_eq!(engine.released_padding_spans, 1);
+    assert_eq!(reference, engine);
+}
+
+#[test]
+fn long_decoder_silence_keeps_playing_and_stamped_padding_stays_local() {
+    for stamp in [false, true] {
+        let mut spec = Spec::new(1, 48000, 4, 104);
+        spec.silent_packets = 100;
+        spec.stamp = stamp;
+        spec.packets[102].discard = 1;
+        let expected = if stamp { vec![(400, 411), (412, 416)] } else { range(400, 416) };
+        let (engine, reference) = assert_plays(&spec, expected);
+        assert!(engine.lost_packets > 0, "lost association was not reported");
+        assert_eq!(reference, engine);
+    }
+}
+
+#[test]
+fn unrelated_frame_timestamps_and_hostile_duration_do_not_stop_audio() {
+    let mut spec = Spec::new(1, 48000, 4, 140);
+    spec.stamp = true;
+    spec.frame_pts_offset = 1;
+    spec.duration_override = Some(i64::MAX);
+    spec.silent_packets = 2;
+    let (engine, reference) = assert_plays(&spec, range(8, 560));
+    assert!(engine.lost_packets > 0, "hostile duration was not reported");
+    assert_eq!(reference, engine);
 }
