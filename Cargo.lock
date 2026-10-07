@@ -1038,7 +1038,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h265"
 version = "0.0.14"
-source = "git+https://github.com/ayooooo123/oxideav-h265?rev=4e23b956b7996620f1edc897be04ed3a2b7758cf#4e23b956b7996620f1edc897be04ed3a2b7758cf"
+source = "git+https://github.com/ayooooo123/oxideav-h265?rev=29cf54638f58ee3393474a172831c9c32582b7ad#29cf54638f58ee3393474a172831c9c32582b7ad"
 dependencies = [
  "oxideav-core",
 ]
