@@ -951,7 +951,7 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.1.37"
-source = "git+https://github.com/ayooooo123/oxideav-core?rev=80948860b817c416ca405430e890a8f8cda9d6a3#80948860b817c416ca405430e890a8f8cda9d6a3"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=96094a916d8b9f2695f70bb0d53e5956b8a79847#96094a916d8b9f2695f70bb0d53e5956b8a79847"
 dependencies = [
  "bytemuck",
  "serde_json",
@@ -1164,7 +1164,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg12video"
 version = "0.0.13"
-source = "git+https://github.com/OxideAV/oxideav-mpeg12video?rev=aac677c54865e6fce01f576876cf564b327c09bf#aac677c54865e6fce01f576876cf564b327c09bf"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=2484f1dd71429b565d09b389402fa21d92c1ccc5#2484f1dd71429b565d09b389402fa21d92c1ccc5"
 dependencies = [
  "oxideav-core",
 ]

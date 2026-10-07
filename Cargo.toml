@@ -100,7 +100,7 @@ oxideav-avi = { git = "https://github.com/ayooooo123/oxideav-avi", rev = "b919db
 oxideav-basic = { git = "https://github.com/OxideAV/oxideav-basic", rev = "c44bb55f9f94e18ede7e9267493b0b6776a8e1c4" }
 oxideav-cinepak = { git = "https://github.com/OxideAV/oxideav-cinepak", rev = "4dae215ff7509dfd7e2e7d1bae72128630ccce7d" }
 oxideav-cook = { git = "https://github.com/OxideAV/oxideav-cook", rev = "f8584e427c6f87de24e2f2de124e0242824f7006" }
-oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "80948860b817c416ca405430e890a8f8cda9d6a3" }
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }
 oxideav-dirac = { git = "https://github.com/OxideAV/oxideav-dirac", rev = "1315f66f5f222dcafa5594bee401c797e5f5a769" }
 oxideav-dts = { git = "https://github.com/OxideAV/oxideav-dts", rev = "9a7c128366aa4914331825e3b5d40a3d3304c090" }
 oxideav-dvd = { git = "https://github.com/OxideAV/oxideav-dvd", rev = "f237f8c05fb3a70d0d9c7e7c99c56110c570d849" }
@@ -125,7 +125,7 @@ oxideav-mp1 = { git = "https://github.com/OxideAV/oxideav-mp1", rev = "e01e2d0df
 oxideav-mp2 = { git = "https://github.com/OxideAV/oxideav-mp2", rev = "701c9e6b7b3bce9c72e56453633b53429c387180" }
 oxideav-mp3 = { git = "https://github.com/OxideAV/oxideav-mp3", rev = "eef86cb33fe7f334c2b9ec64ec8342ddbd595d08" }
 oxideav-mp4 = { git = "https://github.com/OxideAV/oxideav-mp4", rev = "2bcca725fb8d450fc4aad60cb3528a981878af41" }
-oxideav-mpeg12video = { git = "https://github.com/OxideAV/oxideav-mpeg12video", rev = "aac677c54865e6fce01f576876cf564b327c09bf" }
+oxideav-mpeg12video = { git = "https://github.com/ayooooo123/oxideav-mpeg12video", rev = "2484f1dd71429b565d09b389402fa21d92c1ccc5" }
 oxideav-mpeg4video = { git = "https://github.com/ayooooo123/oxideav-mpeg4video", rev = "ac636cd9e44744a17088cb6a4b02ed02ba232a49" }
 oxideav-mpegts = { git = "https://github.com/OxideAV/oxideav-mpegts", rev = "0162e6db4e7b60d2c10ba52c1339a6f65c7ce9a3" }
 oxideav-msmpeg4 = { git = "https://github.com/OxideAV/oxideav-msmpeg4", rev = "f0de9a8c24ca29c79ee453a39f8c4a052334c8a9" }
