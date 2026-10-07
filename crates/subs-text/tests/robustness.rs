@@ -123,7 +123,7 @@ fn finish(decoder: &mut Box<dyn Decoder>) -> usize {
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("subs-text-robustness-{}", std::process::id()));
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("subs-text-robustness");
     std::fs::create_dir_all(&dir).unwrap();
     dir.join(name)
 }

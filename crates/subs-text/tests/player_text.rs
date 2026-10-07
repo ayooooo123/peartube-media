@@ -75,11 +75,16 @@ fn run(program: &str, args: &[&str]) {
     assert!(output.status.success(), "{program} {args:?}: {}", String::from_utf8_lossy(&output.stderr));
 }
 
+/// A generated file's path in Cargo's test scratch directory.
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("subs-text-player");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(name)
+}
+
 /// `source` converted by FFmpeg with subtitle codec `codec` into `name`.
 fn ffmpeg_file(source: &str, codec: &str, name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("subs-text-player-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let out = dir.join(name);
+    let out = scratch(name);
     let source = data(source);
     run("ffmpeg", &["-nostdin", "-v", "error", "-y", "-i", source.to_str().unwrap(), "-c:s", codec, out.to_str().unwrap()]);
     out
@@ -266,9 +271,7 @@ fn matroska_ass_copied_from_ssa() {
 
 #[test]
 fn matroska_ssa_from_mkvmerge() {
-    let dir = std::env::temp_dir().join(format!("subs-text-player-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("ssa_mkvmerge.mkv");
+    let path = scratch("ssa_mkvmerge.mkv");
     run("mkvmerge", &["-q", "-o", path.to_str().unwrap(), data("styled.ssa").to_str().unwrap()]);
     assert_plays_like_ffmpeg(&path, "ssa", true, &[(1, CYAN)]);
 }
