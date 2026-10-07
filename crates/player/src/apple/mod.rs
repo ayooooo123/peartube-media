@@ -1,6 +1,8 @@
 //! The Apple platform backend (macOS 11+, iOS 16): one
 //! `AVSampleBufferRenderSynchronizer` per playback driving an
-//! `AVSampleBufferDisplayLayer` and an `AVSampleBufferAudioRenderer`.
+//! `AVSampleBufferAudioRenderer` and the `AVSampleBufferDisplayLayer`, so
+//! video is shown on the audio clock and the engine reads that clock from
+//! the synchronizer's timebase.
 
 pub mod audio;
 pub mod clock;
@@ -8,7 +10,7 @@ pub mod subtitles;
 pub mod util;
 pub mod video;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -40,9 +42,8 @@ use crate::backend::{AudioSink, Backend, Clock, SubtitleSink, VideoSink};
 /// the caller for the lifetime of the backend — the backend only adds a
 /// sublayer to it).
 pub struct AppleBackend {
-    /// Created per playback in `audio()`; keeps the synchronizer alive for
-    /// the sinks that reference it.
-    _playback: Mutex<Option<Retained<AVSampleBufferRenderSynchronizer>>>,
+    /// The current playback's synchronizer (see `PlaybackSlot`).
+    playback: PlaybackSlot,
     main: DispatchRetained<DispatchQueue>,
     /// Container layer added to the parent view.
     container: Mutex<Option<SendSync<Retained<CALayer>>>>,
@@ -50,10 +51,14 @@ pub struct AppleBackend {
     video_layer: SendSync<Retained<objc2_av_foundation::AVSampleBufferDisplayLayer>>,
     subtitle_layer: SendSync<Retained<CALayer>>,
     frame: Mutex<[f64; 4]>,
-    /// Software frames display as decoded instead of at `pts` (video-only
-    /// playback without an audio clock anchor). See `set_display_immediately`.
-    display_immediately: AtomicBool,
+    /// Audio renderers made from now on are muted (see `set_muted`).
+    muted: AtomicBool,
 }
+
+/// The current playback's synchronizer: `Backend::audio` makes it, the
+/// video sink made after it joins it, and the audio sink clears it when the
+/// playback lets go of it.
+pub(crate) type PlaybackSlot = Arc<Mutex<Option<SendSync<Retained<AVSampleBufferRenderSynchronizer>>>>>;
 
 // SAFETY: AVF/CoreMedia objects here are documented thread-safe, and all
 // AppKit/UIKit view/layer work is dispatched onto `main`.
@@ -75,13 +80,13 @@ impl AppleBackend {
         let subtitle_layer = CALayer::new();
         subtitle_layer.setMasksToBounds(true);
         std::sync::Arc::new(Self {
-            _playback: Mutex::new(None),
+            playback: Arc::new(Mutex::new(None)),
             main: main_queue(),
             container: Mutex::new(None),
             video_layer: SendSync(video_layer),
             subtitle_layer: SendSync(subtitle_layer),
             frame: Mutex::new([0.0; 4]),
-            display_immediately: AtomicBool::new(true),
+            muted: AtomicBool::new(false),
         })
     }
 
@@ -178,7 +183,7 @@ impl AppleBackend {
                 layer.removeFromSuperlayer();
             });
         }
-        *self._playback.lock().expect("backend lock") = None;
+        *self.playback.lock().expect("playback lock") = None;
     }
 }
 
@@ -222,53 +227,11 @@ fn black_background() -> Retained<objc2_core_graphics::CGColor> {
 type CFRetainedColor = objc2_core_foundation::CFRetained<objc2_core_graphics::CGColor>;
 
 impl AppleBackend {
-    /// Marks software-decoded frames `kCMSampleAttachmentKey_DisplayImmediately`
-    /// instead of presenting at `pts`. For video-only playback where no
-    /// audio stream anchors the synchronizer timebase: without it frames
-    /// never reach their presentation time and are never displayed.
-    /// Audio-anchored playback keeps timed presentation.
-    pub fn set_display_immediately(&self, on: bool) {
-        self.display_immediately
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Starts the playback clock when there is no audio stream to anchor
-    /// it: sets the synchronizer's rate to 1 and its time to 0. The engine
-    /// calls this for video-only files.
-    pub fn start_manual_clock(&self) {
-        // With no audio renderer buffers, the synchronizer's source clock
-        // never advances; drive the display layer through its own control
-        // timebase anchored to the host clock instead.
-        let layer = self.video_layer.0.clone();
-        let ptr = std::sync::Arc::new(SendPtr(Retained::into_raw(layer)));
-        #[allow(deprecated)] // create_with_master_clock: the only bound constructor
-        run_on_main(move |_mtm| {
-            // SAFETY: non-null by construction; reclaimed and released here
-            // on main.
-            let layer = unsafe { Retained::from_raw(ptr.0) }.expect("layer null");
-            // SAFETY: plain CF allocations + documented setters.
-            unsafe {
-                let host = objc2_core_media::CMClock::host_time_clock();
-                let mut tb_raw: *mut objc2_core_media::CMTimebase = std::ptr::null_mut();
-                let st = objc2_core_media::CMTimebase::create_with_master_clock(
-                    None,
-                    &host,
-                    std::ptr::NonNull::from(&mut tb_raw),
-                );
-                assert_eq!(st, 0, "CMTimebase create failed: {st}");
-                // SAFETY: Create-rule function returned +1.
-                let timebase = objc2_core_foundation::CFRetained::from_raw(
-                    std::ptr::NonNull::new_unchecked(tb_raw),
-                );
-                let _ = timebase.set_rate(1.0);
-                let _ = timebase.set_time(objc2_core_media::CMTime::new(0, 600));
-                // SAFETY: setter on a main-thread AVF object.
-                let _: () = objc2::msg_send![&*layer, setControlTimebase: &*timebase];
-                // The layer retains the timebase; leak our +1 (the layer
-                // lives for the process here) so the count balances.
-                std::mem::forget(timebase);
-            }
-        });
+    /// Mutes the audio renderers of the playbacks opened from now on: the
+    /// audio still runs the clock, nothing is heard (verification
+    /// harnesses on a shared machine).
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
     }
 }
 
@@ -277,8 +240,9 @@ impl Backend for AppleBackend {
         // One synchronizer + renderer per playback, created on main.
         // The new objects are `!Send`, so they stay on the main thread and
         // cross back as raw +1 pointers.
-        let ptrs = run_on_main(|_mtm| {
-            // SAFETY: object allocation and the two method calls; all run on
+        let muted = self.muted.load(Ordering::Relaxed);
+        let ptrs = run_on_main(move |_mtm| {
+            // SAFETY: object allocation and the method calls; all run on
             // the main thread.
             let synchronizer = unsafe { AVSampleBufferRenderSynchronizer::new() };
             let renderer = unsafe { AVSampleBufferAudioRenderer::new() };
@@ -286,6 +250,7 @@ impl Backend for AppleBackend {
                 dyn objc2_av_foundation::AVQueuedSampleBufferRendering,
             >> = objc2::runtime::ProtocolObject::from_retained(renderer.clone());
             unsafe {
+                renderer.setMuted(muted);
                 synchronizer.addRenderer(&proto);
                 let timebase: Retained<objc2_core_media::CMTimebase> =
                     objc2::msg_send![&*synchronizer, timebase];
@@ -301,20 +266,26 @@ impl Backend for AppleBackend {
         };
         let renderer = unsafe { Retained::from_raw(ptrs.1 .0).expect("renderer null") };
         let clock = Arc::new(AppleClock::from_timebase(ptrs.2.into_inner()));
-        *self._playback.lock().expect("backend lock") = Some(synchronizer.clone());
-        Box::new(AppleAudioSink::new(synchronizer, renderer, clock))
+        *self.playback.lock().expect("playback lock") = Some(SendSync(synchronizer.clone()));
+        Box::new(AppleAudioSink::new(
+            synchronizer,
+            renderer,
+            clock,
+            Arc::clone(&self.playback),
+        ))
     }
 
-    fn video(&self, _clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
-        let layer = self.video_layer.0.clone();
-        // The layer was created on main; we hold the +1 from clone. Wrap the
-        // raw pointer for the side-thread hop and give the sink ownership.
-        let ptr = SendPtr(Retained::into_raw(layer));
-        let layer = unsafe { Retained::from_raw(ptr.0) }.expect("layer null");
-        Box::new(AppleVideoSink::new(
-            layer,
-            self.display_immediately.load(std::sync::atomic::Ordering::Relaxed),
-        ))
+    /// The playback's audio output, made first, left its synchronizer here:
+    /// the layer joins it and shows video on the audio clock. Without audio
+    /// the layer follows `clock` on a timebase of its own.
+    fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
+        let synchronizer = self
+            .playback
+            .lock()
+            .expect("playback lock")
+            .as_ref()
+            .map(|synchronizer| synchronizer.0.clone());
+        Box::new(AppleVideoSink::new(self.video_layer.0.clone(), synchronizer, clock))
     }
 
     fn subtitles(&self) -> Box<dyn SubtitleSink> {

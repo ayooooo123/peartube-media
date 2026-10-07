@@ -14,3 +14,8 @@ oxideav-core.workspace = true
 oxideav-mkv.workspace = true
 refcheck.workspace = true
 parking_lot = "0.12"
+
+[dev-dependencies]
+# Actual playback of Matroska random-access cases through the engine.
+codecs = { path = "../codecs" }
+player = { path = "../player" }

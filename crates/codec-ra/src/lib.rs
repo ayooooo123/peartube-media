@@ -31,9 +31,9 @@ fn audio_info(id: &str, name: &str, max_channels: u16, max_rate: u32) -> CodecIn
         .with_resolution_priority(50)
 }
 
-/// Register the RealAudio decoder family. Priority 50 puts these ahead of
-/// any OxideAV implementation of the same ids (OxideAV software sits at
-/// 100+); tag claims cover the containers the formats travel under.
+/// Register the RealAudio family. Priority 50 controls container-tag resolution;
+/// production registers these factories before upstream implementations because
+/// `first_decoder` selects by registration order.
 pub fn register(ctx: &mut RuntimeContext) {
     // RealAudio 1.0 (14.4K). RM fourcc "14_4"/"lpcJ", Matroska "A_REAL/14_4".
     ctx.codecs.register(

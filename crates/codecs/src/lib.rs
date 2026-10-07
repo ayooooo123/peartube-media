@@ -14,6 +14,9 @@ pub fn context() -> RuntimeContext {
 
 /// Installs every container and decoder into `ctx`.
 pub fn register_all(ctx: &mut RuntimeContext) {
+    // The player uses first_decoder, not the priority-walking pipeline.
+    // Install container-aware subtitle factories before standalone ones.
+    subs_text::register(ctx);
     for register in [
         codec_mlp::register_codecs,
         codec_dca::register_codecs,

@@ -30,7 +30,7 @@ ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-leve
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = "0.3"
-objc2-av-foundation = "0.3"
+objc2-av-foundation = { version = "0.3", features = ["objc2-core-media", "block2"] }
 objc2-core-media = "0.3"
 objc2-core-video = "0.3"
 objc2-quartz-core = "0.3"
@@ -62,3 +62,7 @@ required-features = ["probe"]
 
 [[example]]
 name = "apple_play"
+
+[[example]]
+name = "android_sync"
+required-features = ["probe"]

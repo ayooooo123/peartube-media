@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 oxideav-core.workspace = true
+oxideav-subtitle.workspace = true
 
 [dev-dependencies]
 codecs = { path = "../codecs" }
@@ -15,5 +16,4 @@ refcheck.workspace = true
 oxideav-mkv.workspace = true
 oxideav-mp4.workspace = true
 oxideav-ogg.workspace = true
-oxideav-subtitle.workspace = true
 oxideav-ass.workspace = true

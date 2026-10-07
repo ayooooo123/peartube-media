@@ -96,9 +96,11 @@ dependencies = [
 name = "check-mkv"
 version = "0.1.0"
 dependencies = [
+ "codecs",
  "oxideav-core",
  "oxideav-mkv",
  "parking_lot",
+ "player",
  "refcheck",
 ]
 
@@ -129,9 +131,8 @@ dependencies = [
 name = "codec-dca"
 version = "0.1.0"
 dependencies = [
- "oxideav-basic",
+ "codecs",
  "oxideav-core",
- "oxideav-mpegts",
  "refcheck",
 ]
 
@@ -584,6 +585,7 @@ dependencies = [
  "objc2-core-foundation",
  "objc2-core-graphics",
  "objc2-core-image",
+ "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation",
  "objc2-image-io",
@@ -867,7 +869,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "oxideav-aac"
 version = "0.1.7"
-source = "git+https://github.com/ayooooo123/oxideav-aac?rev=b0ad51fa7b1839911b3e7c0843b89e5225d8791f#b0ad51fa7b1839911b3e7c0843b89e5225d8791f"
+source = "git+https://github.com/ayooooo123/oxideav-aac?rev=d9f6d8eb2a62b19518e957868702d57eb0123124#d9f6d8eb2a62b19518e957868702d57eb0123124"
 dependencies = [
  "oxideav-core",
 ]
@@ -919,7 +921,7 @@ dependencies = [
 [[package]]
 name = "oxideav-avi"
 version = "0.0.10"
-source = "git+https://github.com/OxideAV/oxideav-avi?rev=2a5aa9fc78381d4d8db1d066849bc35ce6ad9442#2a5aa9fc78381d4d8db1d066849bc35ce6ad9442"
+source = "git+https://github.com/ayooooo123/oxideav-avi?rev=b919db191b3bc6f5da0fe250e660b37c231d1c26#b919db191b3bc6f5da0fe250e660b37c231d1c26"
 dependencies = [
  "oxideav-core",
 ]
@@ -951,7 +953,7 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.1.37"
-source = "git+https://github.com/ayooooo123/oxideav-core?rev=80948860b817c416ca405430e890a8f8cda9d6a3#80948860b817c416ca405430e890a8f8cda9d6a3"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=96094a916d8b9f2695f70bb0d53e5956b8a79847#96094a916d8b9f2695f70bb0d53e5956b8a79847"
 dependencies = [
  "bytemuck",
  "serde_json",
@@ -1036,7 +1038,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h265"
 version = "0.0.14"
-source = "git+https://github.com/OxideAV/oxideav-h265?rev=66097811d122959efcc9e07e20810d46ee18e3e2#66097811d122959efcc9e07e20810d46ee18e3e2"
+source = "git+https://github.com/ayooooo123/oxideav-h265?rev=fa2860ee2a1e921e90534ef2faf146d1796b9021#fa2860ee2a1e921e90534ef2faf146d1796b9021"
 dependencies = [
  "oxideav-core",
 ]
@@ -1104,8 +1106,9 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=f07b1a79317f53d31385715e6969b479219d10a1#f07b1a79317f53d31385715e6969b479219d10a1"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=aa9f12773755bca4d01340d88c3854408bc43b34#aa9f12773755bca4d01340d88c3854408bc43b34"
 dependencies = [
+ "compcol",
  "oxideav-core",
 ]
 
@@ -1164,7 +1167,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg12video"
 version = "0.0.13"
-source = "git+https://github.com/OxideAV/oxideav-mpeg12video?rev=aac677c54865e6fce01f576876cf564b327c09bf#aac677c54865e6fce01f576876cf564b327c09bf"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=9c4c24c2d336ffde2e23f29d55812e75c40d780a#9c4c24c2d336ffde2e23f29d55812e75c40d780a"
 dependencies = [
  "oxideav-core",
 ]
@@ -1180,7 +1183,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpegts"
 version = "0.0.3"
-source = "git+https://github.com/OxideAV/oxideav-mpegts?rev=0162e6db4e7b60d2c10ba52c1339a6f65c7ce9a3#0162e6db4e7b60d2c10ba52c1339a6f65c7ce9a3"
+source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=3fcd78e3b86e90d7edca97356b3d7195dba22711#3fcd78e3b86e90d7edca97356b3d7195dba22711"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",

@@ -648,7 +648,7 @@ impl NutDemuxer {
             stream_index: stream_id as u32,
             time_base: st.time_base,
             pts: Some(pts),
-            dts: Some(pts),
+            dts: None,
             duration: None,
             flags: Default::default(),
             data,

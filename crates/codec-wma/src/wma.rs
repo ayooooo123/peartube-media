@@ -145,7 +145,9 @@ impl WmaDecoder {
         if block_align == 0 {
             return Err(Error::invalid("wma: block_align is not set"));
         }
-        if sample_rate > 50_000 || channels > MAX_CHANNELS || bit_rate == 0 {
+        if sample_rate == 0 || sample_rate > 50_000
+            || channels == 0 || channels > MAX_CHANNELS || bit_rate == 0
+        {
             return Err(Error::invalid("wma: unsupported stream parameters"));
         }
 

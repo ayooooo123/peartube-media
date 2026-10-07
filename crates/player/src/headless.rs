@@ -1,3 +1,8 @@
+//! The headless backend, for tests. Every sink records what it got
+//! ([`Capture`]). Audio plays into a simulated sound card whose clock leads
+//! the playback like a real device's; video frames are shown when the
+//! engine hands them over, which it does when they are due on that clock.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -13,7 +18,9 @@ use crate::clock::current_monotonic_ns;
 
 pub struct Headless {
     inner: Arc<Mutex<HeadlessInner>>,
-    clock: Arc<HeadlessClock>,
+    /// The clock of the playback being captured; subtitle shows are stamped
+    /// with it.
+    clock: Arc<Mutex<Option<Arc<dyn Clock>>>>,
 }
 
 pub struct Capture {
@@ -31,6 +38,10 @@ pub struct VideoCapture {
     pub height: u32,
     pub frame_md5: Vec<String>,
     pub pts: Vec<Duration>,
+    /// When each frame was shown: CLOCK_MONOTONIC nanoseconds, one per entry
+    /// of `pts`. The engine hands a frame over when it is due on the clock,
+    /// and this sink shows it at once.
+    pub shown_at: Vec<i64>,
     /// One entry per `VideoSink::flush` (the engine flushes on a seek): how
     /// many frames had been captured by then.
     pub flushes: Vec<usize>,
@@ -49,6 +60,15 @@ pub struct AudioCapture {
     /// One entry per `AudioSink::flush` (the engine flushes on a seek): how
     /// many writes had been captured by then.
     pub flushes: Vec<usize>,
+    /// When the samples were heard (realtime playback): runs of continuous
+    /// playback, each `(start, end, at)`: the device played `pcm[start..end]`
+    /// (interleaved sample indices) from CLOCK_MONOTONIC `at` nanoseconds on,
+    /// `device_rate` frames a second. Samples in no run were never heard
+    /// (flushed by a seek, or still queued when the playback ended).
+    pub played: Vec<(usize, usize, i64)>,
+    /// Frames a second the simulated device plays: the sample rate times its
+    /// speed (`Headless::set_audio_speed`).
+    pub device_rate: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +80,9 @@ pub struct SubtitleCapture {
 
 struct HeadlessInner {
     realtime: bool,
+    /// How fast the simulated audio device plays, relative to its sample
+    /// rate.
+    audio_speed: f64,
     video: Vec<VideoCapture>,
     audio: Vec<AudioCapture>,
     subtitles: Vec<SubtitleCapture>,
@@ -71,112 +94,130 @@ struct HeadlessInner {
     active_subtitle_codec: Option<String>,
 }
 
-pub struct HeadlessClock {
-    state: Mutex<HeadlessClockState>,
+impl HeadlessInner {
+    fn active_audio(&mut self) -> Option<&mut AudioCapture> {
+        let stream = self.active_audio_stream.unwrap_or(0);
+        self.audio.iter_mut().find(|a| a.stream == stream)
+    }
 }
 
-struct HeadlessClockState {
+/// How much audio the simulated device holds.
+const DEVICE_BUFFER: Duration = Duration::from_millis(100);
+
+/// The simulated sound card behind a headless audio sink. In realtime it
+/// holds up to `DEVICE_BUFFER` of audio and, while it plays, plays it
+/// `speed` times as fast as its sample rate (a device whose crystal is off);
+/// its clock is the media time of the sample being heard, and stands still
+/// while paused or when it has played everything it was given. Without
+/// realtime it takes everything at once and its clock is the end of the
+/// audio written.
+struct Device {
     realtime: bool,
-    /// Without realtime: the end of the audio written so far.
-    now: Option<Duration>,
-    /// Realtime: media time at `run_start_ns` while playing, or where the
-    /// clock stands while paused; set by the first write after a flush.
-    base: Option<Duration>,
-    /// Realtime: CLOCK_MONOTONIC when the clock last started running.
-    run_start_ns: Option<i64>,
-    /// The sink's `play` / `pause`: like an audio device, the clock only
-    /// advances while the output plays.
+    rate: u32,
+    channels: u16,
+    speed: f64,
     playing: bool,
+    /// Media time of the first frame written since the last open/flush.
+    base: Option<Duration>,
+    /// Frames taken since the last open/flush.
+    written: u64,
+    /// Frames played when playback last stopped.
+    played: f64,
+    /// Playback in progress: from frame `.0` on, since CLOCK_MONOTONIC `.1`.
+    run: Option<(f64, i64)>,
+    /// Where frame 0 since the last open/flush sits in the capture's `pcm`.
+    pcm_base: usize,
 }
 
-impl Default for HeadlessClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HeadlessClock {
-    pub fn new() -> Self {
+impl Device {
+    fn new(realtime: bool, speed: f64) -> Self {
         Self {
-            state: Mutex::new(HeadlessClockState {
-                realtime: false,
-                now: None,
-                base: None,
-                run_start_ns: None,
-                playing: true,
-            }),
+            realtime,
+            rate: 0,
+            channels: 0,
+            speed,
+            playing: false,
+            base: None,
+            written: 0,
+            played: 0.0,
+            run: None,
+            pcm_base: 0,
         }
     }
 
-    pub fn set_realtime(&self, rt: bool) {
-        self.state.lock().realtime = rt;
+    fn frames_per_sec(&self) -> f64 {
+        f64::from(self.rate) * self.speed
     }
 
-    pub fn set_now(&self, pts: Duration) {
-        let mut st = self.state.lock();
-        st.now = Some(pts);
+    fn capacity(&self) -> f64 {
+        (DEVICE_BUFFER.as_secs_f64() * f64::from(self.rate)).floor()
     }
 
-    pub fn on_audio_write(&self, pts: Duration) {
-        let mut st = self.state.lock();
-        if st.realtime && st.base.is_none() {
-            st.base = Some(pts);
-            if st.playing {
-                st.run_start_ns = Some(current_monotonic_ns());
+    /// Frames played by `now`.
+    fn played_at(&self, now: i64) -> f64 {
+        match self.run {
+            Some((from, since)) => {
+                let played = from + (now - since) as f64 * self.frames_per_sec() / 1e9;
+                played.min(self.written as f64)
             }
-        }
-        st.now = Some(pts);
-    }
-
-    /// Starts or stops the realtime clock with the output.
-    pub fn set_playing(&self, playing: bool) {
-        let mut st = self.state.lock();
-        if st.playing == playing {
-            return;
-        }
-        st.playing = playing;
-        if playing {
-            if st.base.is_some() {
-                st.run_start_ns = Some(current_monotonic_ns());
-            }
-        } else if let (Some(base), Some(start_ns)) = (st.base, st.run_start_ns.take()) {
-            let elapsed_ns = (current_monotonic_ns() - start_ns).max(0) as u64;
-            st.base = Some(base + Duration::from_nanos(elapsed_ns));
+            None => self.played,
         }
     }
 
-    pub fn flush(&self) {
-        let mut st = self.state.lock();
-        st.now = None;
-        st.base = None;
-        st.run_start_ns = None;
+    /// Ends the playback in progress at `now`, or where it ran out of audio
+    /// before that: `(first frame, end frame, start time)`.
+    fn stop(&mut self, now: i64) -> Option<(f64, f64, i64)> {
+        let played = self.played_at(now);
+        let (from, since) = self.run.take()?;
+        self.played = played;
+        Some((from, played, since))
+    }
+
+    /// Forgets everything written (open, flush): the clock restarts at the
+    /// next write.
+    fn restart(&mut self) {
+        self.base = None;
+        self.written = 0;
+        self.played = 0.0;
+        self.run = None;
+    }
+
+    fn now(&self) -> Option<Duration> {
+        let base = self.base?;
+        let frames = if self.realtime {
+            self.played_at(current_monotonic_ns())
+        } else {
+            self.written as f64
+        };
+        Some(base + Duration::from_secs_f64(frames / f64::from(self.rate.max(1))))
+    }
+
+    /// When media time `at` plays: known while the device plays and `at` is
+    /// within the audio it holds.
+    fn monotonic_ns_at(&self, at: Duration) -> Option<i64> {
+        if !self.realtime {
+            return None;
+        }
+        let base = self.base?;
+        let (from, since) = self.run?;
+        let frame = (at.as_secs_f64() - base.as_secs_f64()) * f64::from(self.rate);
+        if frame > self.written as f64 {
+            return None;
+        }
+        Some(since + ((frame - from) / self.frames_per_sec() * 1e9).round() as i64)
     }
 }
 
-impl Clock for HeadlessClock {
+/// A headless audio sink's clock: its device's.
+struct HeadlessAudioClock(Arc<Mutex<Device>>);
+
+impl Clock for HeadlessAudioClock {
     fn now(&self) -> Option<Duration> {
-        let st = self.state.lock();
-        match (st.realtime, st.base) {
-            (true, Some(base)) => Some(match st.run_start_ns {
-                Some(start_ns) => {
-                    let elapsed_ns = (current_monotonic_ns() - start_ns).max(0) as u64;
-                    base + Duration::from_nanos(elapsed_ns)
-                }
-                None => base,
-            }),
-            _ => st.now,
-        }
+        self.0.lock().now()
     }
 
     fn monotonic_ns_at(&self, at: Duration) -> Option<i64> {
-        let st = self.state.lock();
-        if let (Some(start_ns), Some(base)) = (st.run_start_ns, st.base) {
-            let at_ns = at.as_nanos() as i64;
-            let base_ns = base.as_nanos() as i64;
-            Some(start_ns + (at_ns - base_ns))
-        } else {
-            Some(current_monotonic_ns())
-        }
+        self.0.lock().monotonic_ns_at(at)
     }
 }
 
@@ -191,13 +232,12 @@ pub fn find_headless(backend_ptr: usize) -> Option<Arc<Headless>> {
     }
 }
 
-
 impl Headless {
     pub fn new() -> Arc<Headless> {
-        let clock = Arc::new(HeadlessClock::new());
         let this = Arc::new(Headless {
             inner: Arc::new(Mutex::new(HeadlessInner {
                 realtime: true,
+                audio_speed: 1.0,
                 video: Vec::new(),
                 audio: Vec::new(),
                 subtitles: Vec::new(),
@@ -208,7 +248,7 @@ impl Headless {
                 active_subtitle_stream: None,
                 active_subtitle_codec: None,
             })),
-            clock,
+            clock: Arc::new(Mutex::new(None)),
         });
 
         let ptr = Arc::as_ptr(&this) as *const () as usize;
@@ -226,7 +266,6 @@ impl Headless {
         subtitle: Option<(u32, String)>,
         realtime: bool,
     ) {
-        self.clock.set_realtime(realtime);
         let mut inner = self.inner.lock();
         inner.realtime = realtime;
         if let Some((idx, codec)) = video {
@@ -241,6 +280,19 @@ impl Headless {
             inner.active_subtitle_stream = Some(idx);
             inner.active_subtitle_codec = Some(codec);
         }
+    }
+
+    /// The clock of the playback being captured: subtitle shows are stamped
+    /// with it.
+    pub fn set_clock(&self, clock: Arc<dyn Clock>) {
+        *self.clock.lock() = Some(clock);
+    }
+
+    /// Makes the simulated audio device of the next playbacks play `speed`
+    /// times as fast as its sample rate: 0.98 is a device running 2% slow.
+    pub fn set_audio_speed(&self, speed: f64) {
+        assert!(speed.is_finite() && speed > 0.0, "audio speed {speed}");
+        self.inner.lock().audio_speed = speed;
     }
 
     pub fn capture(&self) -> Capture {
@@ -265,19 +317,19 @@ impl Drop for Headless {
 
 impl Backend for Headless {
     fn audio(&self) -> Box<dyn AudioSink> {
+        let device = {
+            let inner = self.inner.lock();
+            Device::new(inner.realtime, inner.audio_speed)
+        };
         Box::new(HeadlessAudioSink {
             inner: Arc::clone(&self.inner),
-            clock: Arc::clone(&self.clock),
-            sample_rate: 0,
-            channels: 0,
+            device: Arc::new(Mutex::new(device)),
         })
     }
 
-    fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
+    fn video(&self, _clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
         Box::new(HeadlessVideoSink {
             inner: Arc::clone(&self.inner),
-            clock,
-            headless_clock: Arc::clone(&self.clock),
             stream_index: 0,
             codec: String::new(),
             pixel_format: PixelFormat::Yuv420P,
@@ -296,25 +348,59 @@ impl Backend for Headless {
 
 struct HeadlessAudioSink {
     inner: Arc<Mutex<HeadlessInner>>,
-    clock: Arc<HeadlessClock>,
-    sample_rate: u32,
-    channels: u16,
+    device: Arc<Mutex<Device>>,
+}
+
+/// Records a run of playback that ended in the active stream's capture.
+fn record_run(inner: &mut HeadlessInner, device: &Device, (from, to, since): (f64, f64, i64)) {
+    if to <= from {
+        return;
+    }
+    // Whole frames: the run starts at the frame nearest `from`, played when
+    // the device got to it.
+    let start = from.round();
+    let at = since + ((start - from) / device.frames_per_sec() * 1e9).round() as i64;
+    let channels = usize::from(device.channels);
+    let base = device.pcm_base;
+    if let Some(capture) = inner.active_audio() {
+        capture.played.push((
+            base + start as usize * channels,
+            base + to.round() as usize * channels,
+            at,
+        ));
+    }
+}
+
+impl HeadlessAudioSink {
+    /// Ends the device's playback in progress at `now` and records it.
+    fn stop(&self, inner: &mut HeadlessInner, device: &mut Device, now: i64) {
+        if let Some(run) = device.stop(now) {
+            record_run(inner, device, run);
+        }
+    }
 }
 
 impl AudioSink for HeadlessAudioSink {
     fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), SinkError> {
-        self.sample_rate = sample_rate;
-        self.channels = channels;
         let mut inner = self.inner.lock();
+        let mut device = self.device.lock();
+        self.stop(&mut inner, &mut device, current_monotonic_ns());
+        device.realtime = inner.realtime;
+        device.speed = inner.audio_speed;
+        device.rate = sample_rate;
+        device.channels = channels;
+        device.restart();
+        let device_rate = device.frames_per_sec();
+
         let stream = inner.active_audio_stream.unwrap_or(0);
         let codec = inner
             .active_audio_codec
             .clone()
             .unwrap_or_else(|| "audio".into());
-
         if let Some(ac) = inner.audio.iter_mut().find(|a| a.stream == stream) {
             ac.sample_rate = sample_rate;
             ac.channels = channels;
+            ac.device_rate = device_rate;
         } else {
             inner.audio.push(AudioCapture {
                 stream,
@@ -324,73 +410,113 @@ impl AudioSink for HeadlessAudioSink {
                 pcm: Vec::new(),
                 writes: Vec::new(),
                 flushes: Vec::new(),
+                played: Vec::new(),
+                device_rate,
             });
         }
         Ok(())
     }
 
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
-        if self.channels == 0 || self.sample_rate == 0 {
-            return Ok(0);
-        }
-        let frames = pcm.len() / (self.channels as usize);
-        let dur = Duration::from_secs_f64(frames as f64 / self.sample_rate as f64);
-
-        {
+        loop {
             let mut inner = self.inner.lock();
-            let stream = inner.active_audio_stream.unwrap_or(0);
-            if let Some(ac) = inner.audio.iter_mut().find(|a| a.stream == stream) {
+            let mut device = self.device.lock();
+            let channels = usize::from(device.channels);
+            if channels == 0 || device.rate == 0 {
+                return Ok(0);
+            }
+            let frames = pcm.len() / channels;
+            let now = current_monotonic_ns();
+            if device.run.is_some() && device.played_at(now) >= device.written as f64 {
+                // It ran dry: that playback ended where the audio did.
+                self.stop(&mut inner, &mut device, now);
+            }
+            let take = if device.realtime {
+                let room = device.capacity() - (device.written as f64 - device.played_at(now));
+                (room.max(0.0) as usize).min(frames)
+            } else {
+                frames
+            };
+            if take == 0 && frames > 0 {
+                if !device.playing {
+                    // Paused and full.
+                    return Ok(0);
+                }
+                // Playing and full: the device makes room at its own pace.
+                let room = device.capacity() - (device.written as f64 - device.played_at(now));
+                let want = (frames as f64).min(device.capacity() / 4.0).max(1.0);
+                let wait = Duration::from_secs_f64((want - room).max(1.0) / device.frames_per_sec());
+                drop(device);
+                drop(inner);
+                std::thread::sleep(wait);
+                continue;
+            }
+
+            if device.base.is_none() {
+                device.base = Some(pts);
+                device.pcm_base = inner.active_audio().map_or(0, |ac| ac.pcm.len());
+            }
+            if let Some(ac) = inner.active_audio() {
                 let offset = ac.pcm.len();
-                ac.pcm.extend_from_slice(pcm);
+                ac.pcm.extend_from_slice(&pcm[..take * channels]);
                 ac.writes.push((pts, offset));
             }
-        }
-
-        self.clock.on_audio_write(pts);
-        if !self.inner.lock().realtime {
-            self.clock.set_now(pts + dur);
-        } else {
-            // Realtime pacing: do not buffer more than 100 ms ahead of the clock
-            if let Some(now) = self.clock.now() {
-                if pts + dur > now + Duration::from_millis(100) {
-                    let sleep_time = (pts + dur) - (now + Duration::from_millis(100));
-                    std::thread::sleep(sleep_time);
-                }
+            device.written += take as u64;
+            if device.realtime && device.playing && device.run.is_none() {
+                // New audio for an idle device plays from now.
+                device.run = Some((device.played, now));
             }
+            return Ok(take);
         }
-
-        Ok(frames)
     }
 
     fn play(&mut self) {
-        self.clock.set_playing(true);
+        let mut device = self.device.lock();
+        if device.playing {
+            return;
+        }
+        device.playing = true;
+        if device.realtime && device.base.is_some() && device.played < device.written as f64 {
+            device.run = Some((device.played, current_monotonic_ns()));
+        }
     }
 
     fn pause(&mut self) {
-        self.clock.set_playing(false);
+        let mut inner = self.inner.lock();
+        let mut device = self.device.lock();
+        if !device.playing {
+            return;
+        }
+        device.playing = false;
+        self.stop(&mut inner, &mut device, current_monotonic_ns());
     }
 
     fn flush(&mut self) {
-        {
-            let mut inner = self.inner.lock();
-            let stream = inner.active_audio_stream.unwrap_or(0);
-            if let Some(ac) = inner.audio.iter_mut().find(|a| a.stream == stream) {
-                let writes = ac.writes.len();
-                ac.flushes.push(writes);
-            }
+        let mut inner = self.inner.lock();
+        if let Some(ac) = inner.active_audio() {
+            let writes = ac.writes.len();
+            ac.flushes.push(writes);
         }
-        self.clock.flush();
+        let mut device = self.device.lock();
+        self.stop(&mut inner, &mut device, current_monotonic_ns());
+        device.restart();
     }
 
     fn clock(&self) -> Arc<dyn Clock> {
-        self.clock.clone()
+        Arc::new(HeadlessAudioClock(Arc::clone(&self.device)))
+    }
+}
+
+impl Drop for HeadlessAudioSink {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock();
+        let mut device = self.device.lock();
+        self.stop(&mut inner, &mut device, current_monotonic_ns());
     }
 }
 
 struct HeadlessVideoSink {
     inner: Arc<Mutex<HeadlessInner>>,
-    clock: Arc<dyn Clock>,
-    headless_clock: Arc<HeadlessClock>,
     stream_index: u32,
     codec: String,
     pixel_format: PixelFormat,
@@ -404,7 +530,7 @@ impl VideoSink for HeadlessVideoSink {
         false
     }
 
-    fn push_packet(&mut self, _packet: &Packet, _pts: Duration) -> Result<(), SinkError> {
+    fn push_packet(&mut self, _packet: &Packet, _pts: Duration, _random_access: bool) -> Result<(), SinkError> {
         Ok(())
     }
 
@@ -437,6 +563,7 @@ impl VideoSink for HeadlessVideoSink {
                 height: self.height,
                 frame_md5: Vec::new(),
                 pts: Vec::new(),
+                shown_at: Vec::new(),
                 flushes: Vec::new(),
             });
         }
@@ -444,6 +571,8 @@ impl VideoSink for HeadlessVideoSink {
     }
 
     fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> {
+        // Shown on arrival: the engine hands it over when it is due.
+        let shown_at = current_monotonic_ns();
         let packed = pack_frame(frame, self.pixel_format, self.width, self.height);
         let md5_str = format!("{:x}", md5::compute(&packed));
 
@@ -455,11 +584,17 @@ impl VideoSink for HeadlessVideoSink {
         {
             vc.frame_md5.push(md5_str);
             vc.pts.push(pts);
+            vc.shown_at.push(shown_at);
         }
+        Ok(())
+    }
 
-        if !inner.realtime && self.clock.now().is_none() {
-            self.headless_clock.set_now(pts);
-        }
+    fn frame_lead(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Declines compressed input: no decoder to drain.
+    fn finish(&mut self) -> Result<(), SinkError> {
         Ok(())
     }
 
@@ -516,18 +651,23 @@ pub fn pack_frame(frame: &VideoFrame, pix_fmt: PixelFormat, width: u32, height: 
 
 struct HeadlessSubtitleSink {
     inner: Arc<Mutex<HeadlessInner>>,
-    clock: Arc<HeadlessClock>,
+    clock: Arc<Mutex<Option<Arc<dyn Clock>>>>,
 }
 
 impl SubtitleSink for HeadlessSubtitleSink {
     fn show(&mut self, images: &[SubtitleImage], _video_width: u32, _video_height: u32) {
+        let time = self
+            .clock
+            .lock()
+            .as_ref()
+            .and_then(|clock| clock.now())
+            .unwrap_or(Duration::ZERO);
         let mut inner = self.inner.lock();
         let stream = inner.active_subtitle_stream.unwrap_or(0);
         let codec = inner
             .active_subtitle_codec
             .clone()
             .unwrap_or_else(|| "subtitle".into());
-        let time = self.clock.now().unwrap_or(Duration::ZERO);
 
         if let Some(sc) = inner.subtitles.iter_mut().find(|s| s.stream == stream) {
             sc.shows.push((time, images.len()));

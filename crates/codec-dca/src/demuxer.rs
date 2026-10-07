@@ -6,7 +6,12 @@
 //! plus full frame-length parsing from `dca_parser.c`) and the `dtshd`
 //! chunked wrapper demuxer.
 
+use crate::bitreader::BitReader;
+use crate::data::{FF_DCA_FREQ_RANGES, FF_DCA_SAMPLE_RATES, FF_DCA_SAMPLING_FREQS};
 use crate::dca::{self, CoreFrameHeader, DCA_CORE_FRAME_HEADER_SIZE};
+use crate::decoder::MAX_PACKET_SIZE;
+use crate::exss::{ExssParser, exss_parse};
+use crate::lbr::{DCA_LBR_HEADER_DECODER_INIT, DCA_LBR_HEADER_SYNC_ONLY};
 use oxideav_core::{
     CodecParameters, ContainerRegistry, Demuxer, Error, MediaType, Packet, ProbeData, ProbeScore,
     ReadSeek, Result, SampleFormat, StreamInfo, TimeBase,
@@ -204,16 +209,23 @@ struct ParseState {
     framesize: usize,
     lastmarker: u32,
     startpos: usize,
+    /// Bytes of the caller's buffer already fed through the state machine.
+    /// FFmpeg hands the parser only new input; the demuxers here pass their
+    /// whole pending buffer, so a call resumes where the last one stopped.
+    scanned: usize,
 }
 
 impl ParseState {
     /// Returns the position of the first byte of the next frame, or `None`.
+    /// After `Some(end)` the caller drops `buf[..end]` and the next call
+    /// scans the remainder from its start with the reset state, as
+    /// `ff_combine_frame` restarts the parser at the frame boundary.
     fn find_frame_end(&mut self, buf: &[u8]) -> Option<usize> {
         let mut start_found = self.frame_start_found;
         let mut state = self.state64;
         let mut size = self.size;
 
-        let mut i = 0usize;
+        let mut i = self.scanned.min(buf.len());
         if start_found == 0 {
             while i < buf.len() {
                 size += 1;
@@ -315,7 +327,9 @@ impl ParseState {
                     self.frame_start_found = 0;
                     self.state64 = u64::MAX; // -1
                     self.size = 0;
-                    return Some(if is_exss_marker(state) { i - 3 } else { i - 5 });
+                    self.scanned = 0;
+                    let back = if is_exss_marker(state) { 3 } else { 5 };
+                    return Some(i.saturating_sub(back));
                 }
                 i += 1;
             }
@@ -324,7 +338,147 @@ impl ParseState {
         self.frame_start_found = start_found;
         self.state64 = state;
         self.size = size;
+        self.scanned = buf.len();
         None
+    }
+}
+
+/// Bytes of the next frame's marker read before the parser knows the
+/// frame ahead of it ended: a core marker is recognised on its sixth byte.
+const MARKER_TAIL: usize = 5;
+
+/// The longest sync marker (core, in any of its four encodings): a frame
+/// is known to start this many bytes after its first byte arrived.
+pub(crate) const MARKER_LEN: usize = MARKER_TAIL + 1;
+
+/// Input kept while no frame has started: a marker starts at most six
+/// bytes before the byte that completes it.
+const SCAN_TAIL: usize = 8;
+
+/// The most a [`FrameSplitter`] holds: the largest frame the decoder takes
+/// (a 16 KiB core and a 1 MiB extension substream), the start of the
+/// marker that would end it, and one byte to tell that it does not.
+const MAX_HELD: usize = MAX_PACKET_SIZE + MARKER_TAIL + 1;
+
+/// Of a dropped frame: the bytes kept to read its header from.
+const DROPPED_HEAD: usize = 4096;
+
+/// A frame that grew past what the decoder takes and was dropped: the
+/// stream offset of its first byte, and its first bytes, from which its
+/// header still tells its duration.
+pub(crate) struct Oversized {
+    pub(crate) at: u64,
+    pub(crate) head: Vec<u8>,
+}
+
+/// FFmpeg's dca parser over input that arrives in pieces: whole frames,
+/// cut where `dca_find_frame_end` cuts them, the bytes ahead of the first
+/// frame dropped as its initial padding and bytes between frames kept
+/// with the frame before them. It holds one frame in progress, never one
+/// longer than [`MAX_PACKET_SIZE`]: such a frame is an error, after which
+/// cutting resumes at the next marker.
+#[derive(Default)]
+pub(crate) struct FrameSplitter {
+    pc: ParseState,
+    /// The frame in progress, or input scanned before one starts.
+    pending: Vec<u8>,
+    /// Stream offset of `pending[0]`.
+    base: u64,
+    /// Input was dropped since the last frame for lack of a frame start.
+    skipped: bool,
+}
+
+impl FrameSplitter {
+    /// Bytes [`push`](Self::push) takes now; at least one after
+    /// [`next_frame`](Self::next_frame) returned `Ok(None)`.
+    pub(crate) fn room(&self) -> usize {
+        MAX_HELD.saturating_sub(self.pending.len())
+    }
+
+    /// Append input, at most [`room`](Self::room) bytes.
+    pub(crate) fn push(&mut self, data: &[u8]) {
+        debug_assert!(data.len() <= self.room());
+        self.pending.extend_from_slice(data);
+    }
+
+    /// The next complete frame, and the stream offset of its first byte;
+    /// `Ok(None)` until more input completes one.
+    pub(crate) fn next_frame(&mut self) -> std::result::Result<Option<(u64, Vec<u8>)>, Oversized> {
+        if let Some(end) = self.pc.find_frame_end(&self.pending) {
+            let start = std::mem::take(&mut self.pc.startpos).min(end);
+            let at = self.base + start as u64;
+            let len = end - start;
+            let frame = if len > MAX_PACKET_SIZE {
+                Err(Oversized { at, head: self.pending[start..start + DROPPED_HEAD].to_vec() })
+            } else {
+                Ok(Some((at, self.pending[start..end].to_vec())))
+            };
+            self.drop_front(end);
+            self.skipped = false;
+            return frame;
+        }
+        if self.pc.frame_start_found != 0 {
+            // Initial padding before the first frame.
+            let lead = std::mem::take(&mut self.pc.startpos).min(self.pending.len());
+            if lead > 0 {
+                self.drop_front(lead);
+                self.skipped = true;
+            }
+            if self.pending.len() > MAX_PACKET_SIZE + MARKER_TAIL {
+                // Not a frame the decoder takes, whatever ends it: start
+                // over on what may begin the next marker.
+                let dropped = Oversized { at: self.base, head: self.pending[..DROPPED_HEAD].to_vec() };
+                let keep = self.pending.split_off(self.pending.len() - SCAN_TAIL);
+                self.base += self.pending.len() as u64;
+                self.pending = keep;
+                self.pc = ParseState::default();
+                return Err(dropped);
+            }
+        } else if self.pending.len() > SCAN_TAIL {
+            let junk = self.pending.len() - SCAN_TAIL;
+            self.drop_front(junk);
+            self.pc.size -= junk;
+            self.skipped = true;
+        }
+        Ok(None)
+    }
+
+    /// The end of the input: the frame in progress, as FFmpeg's parser
+    /// flush hands it over, and the stream offset of its first byte. One
+    /// longer than [`MAX_PACKET_SIZE`] is the error
+    /// [`next_frame`](Self::next_frame) gives a marker-ended one. Starts
+    /// over afterwards.
+    pub(crate) fn finish(&mut self) -> std::result::Result<Option<(u64, Vec<u8>)>, Oversized> {
+        let start = self.pc.startpos.min(self.pending.len());
+        let at = self.base + start as u64;
+        let frame = &self.pending[start..];
+        let result = if self.pc.frame_start_found == 0 {
+            Ok(None)
+        } else if frame.len() > MAX_PACKET_SIZE {
+            Err(Oversized { at, head: frame[..DROPPED_HEAD].to_vec() })
+        } else {
+            Ok(Some((at, frame.to_vec())))
+        };
+        *self = Self::default();
+        result
+    }
+
+    /// The stream offset of the frame in progress, once its start is known.
+    pub(crate) fn frame_start(&self) -> Option<u64> {
+        (self.pc.frame_start_found != 0).then(|| self.base + self.pc.startpos as u64)
+    }
+
+    /// Whether input was dropped for lack of a frame start since the last
+    /// frame.
+    pub(crate) fn skipped(&self) -> bool {
+        self.skipped
+    }
+
+    /// Drop `n` scanned bytes from the front.
+    fn drop_front(&mut self, n: usize) {
+        self.pending.drain(..n);
+        self.base += n as u64;
+        self.pc.scanned = self.pc.scanned.saturating_sub(n);
     }
 }
 
@@ -336,11 +490,10 @@ impl ParseState {
 pub struct RawDtsDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    pc: ParseState,
-    /// Bytes not yet consumed by the parser.
-    pending: Vec<u8>,
-    /// Sample position of the next frame.
-    next_pts: u64,
+    /// Frames cut from the input read so far.
+    split: FrameSplitter,
+    /// Timestamps of the frames cut so far.
+    clock: FrameClock,
     eof: bool,
 }
 
@@ -390,35 +543,33 @@ impl RawDtsDemuxer {
             params,
         };
 
+        let mut split = FrameSplitter::default();
+        split.push(&head);
         Ok(Box::new(RawDtsDemuxer {
             input,
             streams: vec![stream],
-            pc: ParseState {
-                lastmarker: 0,
-                ..ParseState::default()
-            },
-            pending: head,
-            next_pts: 0,
+            split,
+            clock: FrameClock::default(),
             eof: false,
         }))
     }
 
-    fn read_more(&mut self) -> Result<usize> {
-        let mut buf = vec![0u8; RAW_PACKET_SIZE];
+    /// `ff_raw_read_partial_packet`: up to 1024 more bytes, as many as the
+    /// splitter takes.
+    fn read_more(&mut self) -> Result<()> {
+        let mut buf = [0u8; RAW_PACKET_SIZE];
+        let want = RAW_PACKET_SIZE.min(self.split.room());
         let mut filled = 0usize;
-        loop {
-            let n = self.input.read(&mut buf[filled..])?;
+        while filled < want {
+            let n = self.input.read(&mut buf[filled..want])?;
             if n == 0 {
                 self.eof = true;
                 break;
             }
             filled += n;
-            if filled == buf.len() {
-                break;
-            }
         }
-        self.pending.extend_from_slice(&buf[..filled]);
-        Ok(filled)
+        self.split.push(&buf[..filled]);
+        Ok(())
     }
 }
 
@@ -458,53 +609,21 @@ impl Demuxer for RawDtsDemuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
-            // Try to find a complete frame in `pending`.
-            let end = self.pc.find_frame_end(&self.pending);
-            if let Some(end) = end {
-                // Frame data is pending[..end]; skip initial padding.
-                self.pc.startpos = self.pc.startpos.min(end);
-                let start = self.pc.startpos;
-                self.pc.startpos = 0;
-                let frame = self.pending[start..end].to_vec();
-                self.pending.drain(..end);
-
-                if frame.len() < MIN_FRAME {
-                    continue;
-                }
-
-                let samples = frame_samples(&frame).unwrap_or(0);
-                let pts = self.next_pts;
-                self.next_pts += samples as u64;
-
-                let tb = self.streams[0].time_base;
-                return Ok(Packet::new(0, tb, frame)
-                    .with_pts(pts as i64)
-                    .with_dts(pts as i64)
-                    .with_keyframe(true));
+            match self.split.next_frame() {
+                Err(frame) => return Err(self.clock.drop_frame(&self.streams[0], &frame)),
+                Ok(Some((_, frame))) if frame.len() < MIN_FRAME => continue,
+                Ok(Some((_, frame))) => return Ok(self.clock.packet(&self.streams[0], frame)),
+                Ok(None) => {}
             }
-
             if self.eof {
-                // Drain trailing frame if the parser holds one (FFmpeg
-                // flushes the parser at EOF; without it the tail frame is
-                // lost, so emit what remains when it looks like a frame).
-                if self.pending.len() > MIN_FRAME && self.pc.lastmarker != 0 {
-                    let start = self.pc.startpos.min(self.pending.len());
-                    self.pc.startpos = 0;
-                    let frame = self.pending[start..].to_vec();
-                    self.pending.clear();
-                    self.pc.lastmarker = 0;
-                    let samples = frame_samples(&frame).unwrap_or(0);
-                    let pts = self.next_pts;
-                    self.next_pts += samples as u64;
-                    let tb = self.streams[0].time_base;
-                    return Ok(Packet::new(0, tb, frame)
-                        .with_pts(pts as i64)
-                        .with_dts(pts as i64)
-                        .with_keyframe(true));
-                }
-                return Err(Error::Eof);
+                // FFmpeg flushes the parser at the end of the input; the
+                // tail frame it holds comes out when it looks like one.
+                return match self.split.finish() {
+                    Err(frame) => Err(self.clock.drop_frame(&self.streams[0], &frame)),
+                    Ok(Some((_, frame))) if frame.len() > MIN_FRAME => Ok(self.clock.packet(&self.streams[0], frame)),
+                    Ok(_) => Err(Error::Eof),
+                };
             }
-
             self.read_more()?;
         }
     }
@@ -520,14 +639,110 @@ impl Demuxer for RawDtsDemuxer {
 
 const MIN_FRAME: usize = 16;
 
-/// Samples per frame from the frame header (dca_parse_params duration).
-fn frame_samples(frame: &[u8]) -> Option<usize> {
-    let mut hdr = vec![0u8; DCA_CORE_FRAME_HEADER_SIZE];
-    dca::convert_bitstream(frame, &mut hdr)?;
-    let mut gb = crate::bitreader::BitReader::new(&hdr);
+fn oversized() -> Error {
+    Error::invalid(format!("dts: frame longer than the {MAX_PACKET_SIZE} bytes the decoder takes"))
+}
+
+/// `dca_parse_params` (dca_parser.c): a frame's duration in samples at its
+/// own rate, and that rate — from the core frame header, or for a frame
+/// that starts with an extension substream, from its LBR or XLL asset.
+/// `lbr_sr_code` is the parser context's `sr_code`: an LBR sync-only
+/// header reuses the rate of the last decoder-init header.
+pub(crate) fn parse_params(frame: &[u8], lbr_sr_code: &mut Option<u8>) -> Option<(u64, u32)> {
+    if frame.len() < DCA_CORE_FRAME_HEADER_SIZE {
+        return None;
+    }
+    if u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) == dca::DCA_SYNCWORD_SUBSTREAM {
+        let mut exss = ExssParser::default();
+        exss_parse(&mut exss, frame).ok()?;
+        let asset = &exss.assets[0];
+        let component = |offset: usize, size: usize| frame.get(offset..offset.checked_add(size)?);
+        if asset.has_lbr() {
+            let mut gb = BitReader::new(component(asset.lbr_offset, asset.lbr_size)?);
+            if gb.get_bits_long(32) != dca::DCA_SYNCWORD_LBR {
+                return None;
+            }
+            match gb.get_bits(8) as u8 {
+                DCA_LBR_HEADER_DECODER_INIT => *lbr_sr_code = Some(gb.get_bits(8) as u8),
+                DCA_LBR_HEADER_SYNC_ONLY => {}
+                _ => return None,
+            }
+            let code = usize::from((*lbr_sr_code)?);
+            let rate = *FF_DCA_SAMPLING_FREQS.get(code)?;
+            return Some((1024 << FF_DCA_FREQ_RANGES[code], rate));
+        }
+        if asset.has_xll() {
+            let mut gb = BitReader::new(component(asset.xll_offset, asset.xll_size)?);
+            if gb.get_bits_long(32) != dca::DCA_SYNCWORD_XLL || gb.get_bits(4) != 0 {
+                return None;
+            }
+            gb.skip(8);
+            let header_bits = gb.get_bits(5) + 1;
+            gb.skip(header_bits);
+            gb.skip(4);
+            let nsamples_log2 = gb.get_bits(4) + gb.get_bits(4);
+            if nsamples_log2 > 24 {
+                return None;
+            }
+            let rate = u32::try_from(asset.max_sample_rate).ok()?;
+            return Some((u64::from(1 + u32::from(rate > 96_000)) << nsamples_log2, rate));
+        }
+        return None;
+    }
+    let mut hdr = [0u8; DCA_CORE_FRAME_HEADER_SIZE];
+    dca::convert_bitstream(&frame[..DCA_CORE_FRAME_HEADER_SIZE], &mut hdr)?;
     let mut h = CoreFrameHeader::default();
-    dca::parse_core_frame_header(&mut h, &mut gb).ok()?;
-    Some(h.npcmblocks as usize * dca::DCA_PCMBLOCK_SAMPLES)
+    dca::parse_core_frame_header(&mut h, &mut BitReader::new(&hdr)).ok()?;
+    let samples = u64::from(h.npcmblocks) * dca::DCA_PCMBLOCK_SAMPLES as u64;
+    Some((samples, FF_DCA_SAMPLE_RATES[usize::from(h.sr_code)]))
+}
+
+/// Packet timing for DTS input that carries no timestamps, as libavformat
+/// stamps a parsed raw stream: a frame lasts its [`parse_params`] duration
+/// rescaled to the stream's sample rate (`dca_parse`'s `s->duration`; 0
+/// when the header does not parse), and its pts and dts are the sum of
+/// the durations before it (`cur_dts`), starting at 0.
+#[derive(Default)]
+struct FrameClock {
+    lbr_sr_code: Option<u8>,
+    next_pts: i64,
+}
+
+impl FrameClock {
+    fn packet(&mut self, stream: &StreamInfo, frame: Vec<u8>) -> Packet {
+        let pts = self.next_pts;
+        let duration = self.advance(stream, &frame);
+        Packet::new(0, stream.time_base, frame)
+            .with_pts(pts)
+            .with_dts(pts)
+            .with_duration(duration)
+            .with_keyframe(true)
+    }
+
+    /// Move past a frame: its duration from its header, rescaled to the
+    /// stream's sample rate, 0 when the header does not parse.
+    fn advance(&mut self, stream: &StreamInfo, frame: &[u8]) -> i64 {
+        let duration = match parse_params(frame, &mut self.lbr_sr_code) {
+            Some((samples, rate)) if rate != 0 => match stream.params.sample_rate {
+                // av_rescale(duration, avctx->sample_rate, sample_rate)
+                Some(to) => ((u128::from(samples) * u128::from(to) + u128::from(rate / 2)) / u128::from(rate))
+                    .try_into()
+                    .unwrap_or(i64::MAX),
+                None => i64::try_from(samples).unwrap_or(i64::MAX),
+            },
+            _ => 0,
+        };
+        self.next_pts = self.next_pts.saturating_add(duration);
+        duration
+    }
+
+    /// Move past a frame longer than the decoder takes, as FFmpeg times
+    /// the oversized packet it would return (the next frame follows it),
+    /// and the error for it.
+    fn drop_frame(&mut self, stream: &StreamInfo, frame: &Oversized) -> Error {
+        self.advance(stream, &frame.head);
+        oversized()
+    }
 }
 
 // ───────────────────────── dtshd demuxer ─────────────────────────
@@ -541,8 +756,8 @@ const STRMDATA: u64 = 0x5354_524D_4441_5441;
 pub struct DtshdDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    pc: ParseState,
-    pending: Vec<u8>,
+    /// Frames cut from the STRMDATA read so far.
+    split: FrameSplitter,
     data_end: u64,
     /// Sample rate from AUPR_HDR.
     sample_rate: u32,
@@ -550,30 +765,28 @@ pub struct DtshdDemuxer {
     /// Read position inside the STRMDATA extent.
     pos: u64,
     eof: bool,
+    clock: FrameClock,
 }
 
 impl DtshdDemuxer {
+    /// `dtshd_read_header`. The input is seekable, so like FFmpeg on a
+    /// seekable source it reads every chunk header (an AUPR_HDR after the
+    /// STRMDATA chunk still counts) and then returns to the stream data.
     fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn oxideav_core::CodecResolver) -> Result<Box<dyn Demuxer>> {
         input.seek(SeekFrom::Start(0))?;
 
         let mut sample_rate = 0u32;
         let mut duration_samples = 0u64;
         let mut initial_padding = 0u16;
+        let mut orig_nb_samples = 0u64;
         let mut channels = 0u16;
         let mut data_end = 0u64;
         let mut data_start = 0u64;
-        let mut orig_nb_samples = 0u64;
-        #[allow(unused_assignments)]
-        let read_orig = &mut orig_nb_samples;
-        let _ = read_orig;
 
         let mut chunk_type = [0u8; 8];
         let mut chunk_size = [0u8; 8];
         loop {
-            if input.read_exact(&mut chunk_type).is_err() {
-                break;
-            }
-            if input.read_exact(&mut chunk_size).is_err() {
+            if input.read_exact(&mut chunk_type).is_err() || input.read_exact(&mut chunk_size).is_err() {
                 break;
             }
             let ctype = u64::from_be_bytes(chunk_type);
@@ -586,42 +799,38 @@ impl DtshdDemuxer {
                 return Err(Error::InvalidData("dtshd: chunk size too big".into()));
             }
 
-            if ctype == STRMDATA {
+            let skip = if ctype == STRMDATA {
                 data_start = input.stream_position()?;
                 data_end = data_start.checked_add(csize).ok_or_else(|| Error::InvalidData("dtshd: bad extent".into()))?;
                 if data_end <= csize {
                     return Err(Error::InvalidData("dtshd: bad extent".into()));
                 }
-                break;
+                csize
             } else if ctype == AUPR_HDR {
                 if csize < 21 {
                     return Err(Error::InvalidData("dtshd: AUPR_HDR too small".into()));
                 }
-                let mut buf = vec![0u8; 24];
+                // skip(3) rb24 rate, rb32 num_frames, rb16 samples_per_frame,
+                // rb32+r8 orig_nb_samples, rb16 channel mask, rb16 padding.
+                let mut buf = [0u8; 21];
                 input.read_exact(&mut buf)?;
-                // avio_skip(3) then rb24.
                 sample_rate = u32::from(buf[3]) << 16 | u32::from(buf[4]) << 8 | u32::from(buf[5]);
                 if sample_rate == 0 {
                     return Err(Error::InvalidData("dtshd: zero sample rate".into()));
                 }
-                duration_samples = u64::from(u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]));
-                duration_samples *= u64::from(u16::from_be_bytes([buf[10], buf[11]]));
-                // AUPR_HDR layout: 0..3 skip; 3..6 rate; 6..10 num_frames;
-                // 10..12 samples_per_frame; 12..17 orig_nb_samples (5 bytes);
-                // 17..19 channel mask; 19..21 initial_padding.
-                initial_padding = u16::from_be_bytes([buf[19], buf[20]]);
+                duration_samples = u64::from(u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]))
+                    * u64::from(u16::from_be_bytes([buf[10], buf[11]]));
                 orig_nb_samples = u64::from(u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]])) << 8
                     | u64::from(buf[16]);
-                let _ = orig_nb_samples;
                 channels = dca_count_chs_for_mask(u16::from_be_bytes([buf[17], buf[18]]));
-                let skip = csize as usize - 24;
-                if skip > 0 {
-                    input.seek(SeekFrom::Current(skip as i64))?;
-                }
+                initial_padding = u16::from_be_bytes([buf[19], buf[20]]);
+                csize - 21
             } else {
-                // FILEINFO and others: skip
-                input.seek(SeekFrom::Current(csize as i64))?;
-            }
+                // FILEINFO and others
+                csize
+            };
+            let skip = i64::try_from(skip).map_err(|_| Error::InvalidData("dtshd: chunk size too big".into()))?;
+            input.seek(SeekFrom::Current(skip))?;
         }
 
         if data_end == 0 {
@@ -640,17 +849,15 @@ impl DtshdDemuxer {
             params.channels = Some(channels);
         }
         params.sample_format = Some(SampleFormat::S32);
-        // dtshd padding (FFmpeg: skip-samples side data): the decoder trims
-        // `initial_padding` leading samples and keeps orig_nb_samples.
-        if initial_padding != 0 || duration_samples != 0 {
-            params.options.insert(
-                String::from("dtshd_initial_padding"),
-                initial_padding.to_string(),
-            );
-            params.options.insert(
-                String::from("dtshd_keep_samples"),
-                (duration_samples - u64::from(initial_padding)).to_string(),
-            );
+        // FFmpeg skips `start_skip_samples` (the initial padding) and drops
+        // samples from `first_discard_sample` = orig_nb_samples + padding
+        // on, unless that is 0: the decoder keeps `orig_nb_samples` after
+        // the padding.
+        if initial_padding != 0 {
+            params.options.insert(String::from("dtshd_initial_padding"), initial_padding.to_string());
+        }
+        if orig_nb_samples + u64::from(initial_padding) != 0 {
+            params.options.insert(String::from("dtshd_keep_samples"), orig_nb_samples.to_string());
         }
 
         let stream = StreamInfo {
@@ -668,13 +875,13 @@ impl DtshdDemuxer {
         Ok(Box::new(DtshdDemuxer {
             input,
             streams: vec![stream],
-            pc: ParseState::default(),
-            pending: Vec::new(),
+            split: FrameSplitter::default(),
             data_end,
             sample_rate,
             duration_samples,
             pos: data_start,
             eof: false,
+            clock: FrameClock::default(),
         }))
     }
 }
@@ -698,47 +905,33 @@ impl Demuxer for DtshdDemuxer {
         // FFmpeg reads 1024-byte partial packets and reassembles frames in
         // the parser (AVSTREAM_PARSE_FULL_RAW). OxideAV has no parser, so
         // reassemble whole frames here with the dca_parser state machine.
-        let mut frame_end = None;
-        while frame_end.is_none() {
-            frame_end = self.pc.find_frame_end(&self.pending);
-            if frame_end.is_some() || self.eof {
-                break;
+        loop {
+            match self.split.next_frame() {
+                Err(frame) => return Err(self.clock.drop_frame(&self.streams[0], &frame)),
+                Ok(Some((_, frame))) if frame.len() < MIN_FRAME => continue,
+                Ok(Some((_, frame))) => return Ok(self.clock.packet(&self.streams[0], frame)),
+                Ok(None) => {}
+            }
+            if self.eof {
+                // The parser flush emits what it holds as the last frame,
+                // after any initial padding.
+                return match self.split.finish() {
+                    Err(frame) => Err(self.clock.drop_frame(&self.streams[0], &frame)),
+                    Ok(Some((_, frame))) if !frame.is_empty() => Ok(self.clock.packet(&self.streams[0], frame)),
+                    Ok(_) => Err(Error::Eof),
+                };
             }
             let left = self.data_end.saturating_sub(self.pos);
-            let chunk = left.min(1024);
+            let chunk = left.min(RAW_PACKET_SIZE as u64).min(self.split.room() as u64) as usize;
             if chunk == 0 {
                 self.eof = true;
-                break;
+                continue;
             }
-            let start = self.pending.len();
-            self.pending.resize(start + chunk as usize, 0);
-            self.input.read_exact(&mut self.pending[start..])?;
-            self.pos += chunk;
+            let mut buf = [0u8; RAW_PACKET_SIZE];
+            self.input.read_exact(&mut buf[..chunk])?;
+            self.split.push(&buf[..chunk]);
+            self.pos += chunk as u64;
         }
-
-        let Some(end) = frame_end else {
-            // EOF: flush any trailing data as one packet (parser flush).
-            if self.pending.is_empty() {
-                return Err(Error::Eof);
-            }
-            let data = std::mem::take(&mut self.pending);
-            self.eof = true;
-            let tb = self.streams[0].time_base;
-            return Ok(Packet::new(0, tb, data).with_keyframe(true));
-        };
-
-        self.pc.startpos = self.pc.startpos.min(end);
-        let start = self.pc.startpos;
-        self.pc.startpos = 0;
-        let frame = self.pending[start..end].to_vec();
-        self.pending.drain(..end);
-
-        if frame.len() < MIN_FRAME {
-            return self.next_packet();
-        }
-
-        let tb = self.streams[0].time_base;
-        Ok(Packet::new(0, tb, frame).with_keyframe(true))
     }
 
     fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
@@ -752,7 +945,16 @@ impl Demuxer for DtshdDemuxer {
         if self.sample_rate == 0 {
             return None;
         }
-        Some(((self.duration_samples * 1_000_000) / u64::from(self.sample_rate)) as i64)
+        i64::try_from(u128::from(self.duration_samples) * 1_000_000 / u128::from(self.sample_rate)).ok()
+    }
+}
+
+/// `dtshd_probe`: the DTSHDHDR chunk that opens every DTS-HD file.
+fn dtshd_probe(p: &ProbeData) -> ProbeScore {
+    if p.buf.starts_with(b"DTSHDHDR") {
+        oxideav_core::MAX_PROBE_SCORE
+    } else {
+        0
     }
 }
 
@@ -761,6 +963,7 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer("dts", open_dts);
     reg.register_demuxer("dtshd", open_dtshd);
     reg.register_probe("dts", dts_probe);
+    reg.register_probe("dtshd", dtshd_probe);
     reg.register_extension("dts", "dts");
     reg.register_extension("dtshd", "dtshd");
 }

@@ -93,7 +93,7 @@ pub(crate) fn run_subtitle_loop(
             let mut q = lane.queue.lock();
             loop {
                 match q.first() {
-                    Some(p) if p.stream_index == u32::MAX => {
+                    Some(p) if p.packet.stream_index == u32::MAX => {
                         q.remove(0);
                         break None;
                     }
@@ -108,7 +108,8 @@ pub(crate) fn run_subtitle_loop(
                 }
             }
         };
-        let Some(packet) = packet else { break };
+        let Some(input) = packet else { break };
+        let packet = input.packet;
         demux_cv.notify_one();
 
         if decoder.send_packet(&packet).is_err() {

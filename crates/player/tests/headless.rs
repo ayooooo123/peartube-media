@@ -1559,3 +1559,352 @@ fn track_without_decoder_is_skipped() {
     let end = samples.last().unwrap().position;
     assert!(end + Duration::from_millis(200) >= last, "the clock stopped at {end:?}, last frame {last:?}");
 }
+
+/// One white frame and a 40 ms, 1 kHz beep at each integer second. PCM and
+/// short indexed clusters keep HTTP read-ahead from swallowing the stall.
+fn sync_clip(seconds: u32) -> Vec<u8> {
+    ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i",
+        "color=black:size=160x96:rate=25,drawbox=color=white:t=fill:enable='lt(mod(t,1),0.039)',geq=lum='if(lt(Y,8)*lt(X,128),if(bitand(N,pow(2,floor(X/16))),220,32),lum(X,Y))':cb='cb(X,Y)':cr='cr(X,Y)'",
+        "-f", "lavfi", "-i",
+        "aevalsrc=if(lt(mod(t\\,1)\\,0.04)\\,0.5*sin(2*PI*1000*t)\\,0):s=48000",
+        "-t", &seconds.to_string(), "-c:v", "libx264", "-preset", "ultrafast",
+        "-g", "25", "-bf", "0", "-pix_fmt", "yuv420p",
+        "-c:a", "pcm_s16le", "-ac", "2", "-reserve_index_space", "4096",
+        "-cluster_size_limit", "100000", "-cluster_time_limit", "200",
+    ])
+}
+
+/// Compare independent output records, not video PTS against the clock the
+/// scheduler just read. Locate the actual beep samples in captured PCM and
+/// interpolate their device presentation times in recorded playback runs.
+fn assert_flash_beeps(capture: &Capture, bytes: &[u8], expected: &[Vec<u32>], name: &str) {
+    let video = &capture.video[0];
+    let audio = &capture.audio[0];
+    let reference = ffmpeg_video_frames(bytes);
+    let mut bounds = vec![0];
+    bounds.extend_from_slice(&video.flushes);
+    bounds.push(video.pts.len());
+    assert_eq!(bounds.len() - 1, expected.len(), "seek generations");
+    let mut offsets = Vec::new();
+    let mut csv = String::from("generation,pts_s,video_mono_ns,beep_mono_ns,offset_ms\n");
+    for (generation, (range, seconds)) in bounds.windows(2).zip(expected).enumerate() {
+        for &second in seconds {
+            let pts = Duration::from_secs(u64::from(second));
+            let frame = (range[0]..range[1]).find(|&i| video.pts[i] == pts)
+                .unwrap_or_else(|| panic!("missing flash at {pts:?}, generation {generation}"));
+            let expected_frame = &reference.iter().find(|(p, _)| *p == pts).expect("reference flash").1;
+            assert_eq!(&video.frame_md5[frame], expected_frame, "flash/frame identifier differs from FFmpeg");
+            let shown = video.shown_at[frame];
+            let channels = usize::from(audio.channels);
+            let mut heard = Vec::new();
+            for (i, &(start_pts, from)) in audio.writes.iter().enumerate() {
+                let to = audio.writes.get(i + 1).map_or(audio.pcm.len(), |w| w.1);
+                let span = Duration::from_secs_f64((to - from) as f64 / channels as f64 / audio.sample_rate as f64);
+                if pts < start_pts || pts >= start_pts + span {
+                    continue;
+                }
+                let offset = ((pts - start_pts).as_secs_f64() * audio.sample_rate as f64).round() as usize;
+                let estimated = from / channels + offset;
+                // Matroska packet stamps round to milliseconds. Find the
+                // waveform's actual onset near that estimate, after silence,
+                // rather than assigning a rounded stamp to a silent sample.
+                let radius = audio.sample_rate as usize / 500;
+                let sample_frame = (estimated.saturating_sub(radius)..=(estimated + radius).min(audio.pcm.len() / channels - 1))
+                    .find(|&n| audio.pcm[n * channels].abs() > 0.01
+                        && (n.saturating_sub(16)..n).all(|k| audio.pcm[k * channels].abs() <= 0.01))
+                    .unwrap_or_else(|| panic!("no beep onset near {pts:?}"));
+                let sample = sample_frame * channels;
+                for &(begin, end, at) in &audio.played {
+                    if (begin..end).contains(&sample) {
+                        heard.push(at + ((sample - begin) as f64 / channels as f64 / audio.device_rate * 1e9).round() as i64);
+                    }
+                }
+            }
+            let beep = heard.into_iter().min_by_key(|at| shown.abs_diff(*at))
+                .unwrap_or_else(|| panic!("beep at {pts:?} was never played"));
+            let offset = (shown - beep) as f64 / 1e6;
+            csv.push_str(&format!("{generation},{second},{shown},{beep},{offset:.6}\n"));
+            offsets.push(offset);
+        }
+    }
+    let root = std::env::var_os("CARGO_TARGET_DIR").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("../../target"));
+    let dir = root.join("engine-sync");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{name}.csv")), csv).unwrap();
+    eprintln!("{name}: offsets_ms={offsets:?}");
+    assert!(offsets.iter().all(|v| v.abs() <= 40.0), "A/V offsets exceed 40 ms: {offsets:?}");
+}
+
+#[test]
+fn audio_master_follows_two_percent_slow_device_for_thirty_seconds() {
+    let _cpu = realtime_test();
+    let bytes = sync_clip(32);
+    let path = tempfile("mkv");
+    std::fs::write(&path, &bytes).unwrap();
+    let backend = Headless::new();
+    backend.set_audio_speed(0.98);
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(50), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    assert_flash_beeps(&backend.capture(), &bytes, &[(0..32).collect()], "headless-drift");
+}
+
+#[test]
+fn flash_beeps_remain_synchronized_after_stall_pause_and_seek() {
+    let _cpu = realtime_test();
+    let bytes = Arc::new(sync_clip(8));
+    let server = HttpServer::start_with(bytes.clone(), Delivery {
+        mid_stall: Some(Duration::from_secs(6)),
+        ..Delivery::default()
+    });
+    let (player, backend, _) = open_realtime(&server.url());
+    let (samples, state) = sample_until(&player, Duration::from_secs(25), |s| finished(s) || s.position >= Duration::from_millis(6200));
+    assert!(!finished(&state), "{state:?}");
+    assert!(samples.windows(2).any(|w| !w[0].buffering && w[1].buffering), "no mid-stream hold");
+    player.pause();
+    let held = player.state().position;
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(player.state().position, held, "paused master moved");
+    player.seek(Duration::from_millis(2100));
+    player.play();
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    assert_flash_beeps(&backend.capture(), &bytes, &[(0..7).collect(), (3..8).collect()], "headless-stall-seek");
+}
+
+#[test]
+fn far_future_final_timestamp_does_not_hold_the_end() {
+    let _cpu = realtime_test();
+    // A hostile last video packet stamped a minute after the rest.
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25:duration=2",
+        "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=2",
+        "-c:v", "libx264", "-bf", "0", "-g", "25", "-c:a", "pcm_s16le",
+        "-bsf:v", "setts=pts=if(gte(N\\,49)\\,PTS+60/TB\\,PTS):dts=if(gte(N\\,49)\\,DTS+60/TB\\,DTS)",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let opened = Instant::now();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    let elapsed = opened.elapsed();
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    // Two seconds of media, then at most the queue horizon and a second.
+    assert!(elapsed < Duration::from_secs(8), "end held {elapsed:?} by a bogus timestamp");
+    assert!(state.position < Duration::from_secs(6), "position ran to {:?}", state.position);
+}
+
+/// Wraps the registry's MPEG-2 decoder and releases every picture only at
+/// flush, as a hardware decoder or a flush-only software decoder may: the
+/// demuxer reaches the end while the clock is still held at zero.
+struct FlushOnly {
+    inner: Box<dyn oxideav_core::Decoder>,
+    held: std::collections::VecDeque<oxideav_core::Frame>,
+    flushed: bool,
+}
+
+static FLUSH_ONLY_OPENED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl FlushOnly {
+    fn open(params: &oxideav_core::CodecParameters) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
+        FLUSH_ONLY_OPENED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let inner = codecs::context().codecs.first_decoder(params)?;
+        Ok(Box::new(FlushOnly { inner, held: Default::default(), flushed: false }))
+    }
+
+    fn drain(&mut self) -> oxideav_core::Result<()> {
+        loop {
+            match self.inner.receive_frame() {
+                Ok(frame) => self.held.push_back(frame),
+                Err(oxideav_core::Error::NeedMore | oxideav_core::Error::Eof) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl oxideav_core::Decoder for FlushOnly {
+    fn codec_id(&self) -> &oxideav_core::CodecId {
+        self.inner.codec_id()
+    }
+    fn send_packet(&mut self, packet: &oxideav_core::Packet) -> oxideav_core::Result<()> {
+        self.inner.send_packet(packet)?;
+        self.drain()
+    }
+    fn receive_frame(&mut self) -> oxideav_core::Result<oxideav_core::Frame> {
+        match (self.flushed, self.held.pop_front()) {
+            (true, Some(frame)) => Ok(frame),
+            (true, None) => Err(oxideav_core::Error::Eof),
+            (false, frame) => {
+                if let Some(frame) = frame {
+                    self.held.push_front(frame);
+                }
+                Err(oxideav_core::Error::NeedMore)
+            }
+        }
+    }
+    fn flush(&mut self) -> oxideav_core::Result<()> {
+        self.inner.flush()?;
+        self.drain()?;
+        self.flushed = true;
+        Ok(())
+    }
+    fn reset(&mut self) -> oxideav_core::Result<()> {
+        self.inner.reset()?;
+        self.held.clear();
+        self.flushed = false;
+        Ok(())
+    }
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.inner.output_video_dimensions()
+    }
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> {
+        self.inner.output_pixel_format()
+    }
+}
+
+#[test]
+fn decoder_held_frames_play_after_demux_eof() {
+    let _cpu = realtime_test();
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25:duration=6",
+        "-c:v", "mpeg2video", "-g", "25", "-bf", "0",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, bytes).unwrap();
+    // The player takes the first registered decoder, so the wrapper goes in
+    // before the full registry.
+    let mut context = oxideav_core::RuntimeContext::new();
+    context.codecs.register(
+        oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("mpeg2video"))
+            .capabilities(oxideav_core::CodecCapabilities::video("flush_only"))
+            .decoder(FlushOnly::open),
+    );
+    codecs::register_all(&mut context);
+    let backend = Headless::new();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), Arc::new(context), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let video = &backend.capture().video[0];
+    // Capping the tail at "clock + queue horizon" while the clock was held
+    // dropped every picture past 3 s (74 of 150). A few late frames under
+    // machine load are a timing matter, not this one.
+    assert_eq!(video.pts.last().copied(), Some(Duration::from_millis(5960)),
+        "the final picture was not shown ({} shown, {} dropped)", video.pts.len(), state.dropped_frames);
+    assert!(video.pts.len() >= 135, "only {} of 150 pictures shown ({} dropped)", video.pts.len(), state.dropped_frames);
+    assert!(FLUSH_ONLY_OPENED.load(std::sync::atomic::Ordering::SeqCst) > 0, "the flush-only decoder was not used");
+}
+
+/// A platform-like output: takes MPEG-2 compressed and counts what it gets;
+/// software frames go to the wrapped Headless capture.
+struct CompressedOutput {
+    inner: Arc<Headless>,
+    pushed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct CompressedSink {
+    inner: Box<dyn player::backend::VideoSink>,
+    pushed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl player::backend::Backend for CompressedOutput {
+    fn audio(&self) -> Box<dyn player::backend::AudioSink> {
+        player::backend::Backend::audio(&*self.inner)
+    }
+    fn video(&self, clock: Arc<dyn player::backend::Clock>) -> Box<dyn player::backend::VideoSink> {
+        let inner = player::backend::Backend::video(&*self.inner, clock);
+        Box::new(CompressedSink { inner, pushed: self.pushed.clone() })
+    }
+    fn subtitles(&self) -> Box<dyn player::backend::SubtitleSink> {
+        player::backend::Backend::subtitles(&*self.inner)
+    }
+}
+
+impl player::backend::VideoSink for CompressedSink {
+    fn open_compressed(&mut self, params: &oxideav_core::CodecParameters) -> bool {
+        params.codec_id.as_str() == "mpeg2video"
+    }
+    fn push_packet(&mut self, _: &oxideav_core::Packet, _: Duration, _: bool) -> Result<(), player::backend::SinkError> {
+        self.pushed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn open_frames(&mut self, params: &oxideav_core::CodecParameters) -> Result<(), player::backend::SinkError> {
+        self.inner.open_frames(params)
+    }
+    fn push_frame(&mut self, frame: &oxideav_core::VideoFrame, pts: Duration) -> Result<(), player::backend::SinkError> {
+        self.inner.push_frame(frame, pts)
+    }
+    fn frame_lead(&self) -> Duration {
+        self.inner.frame_lead()
+    }
+    fn finish(&mut self) -> Result<(), player::backend::SinkError> {
+        self.inner.finish()
+    }
+    fn flush(&mut self) {
+        self.inner.flush()
+    }
+    fn set_playing(&mut self, playing: bool) {
+        self.inner.set_playing(playing)
+    }
+}
+
+#[test]
+fn untimed_raw_mpeg_switches_to_software_decoding() {
+    // Raw MPEG-2 leaves I and P pictures untimed (only B pictures carry a
+    // PTS), which a platform decoder cannot present: the stream must move to
+    // the software decoder before any packet reaches the compressed sink,
+    // and play every picture with FFmpeg's pixels and times.
+    let bytes = ffmpeg_file("m2v", &[
+        "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25:duration=2",
+        "-c:v", "mpeg2video", "-g", "12", "-bf", "2",
+    ]);
+    let path = tempfile("m2v");
+    std::fs::write(&path, bytes).unwrap();
+    let inner = Headless::new();
+    inner.set_active_streams(Some((0, "mpeg2video".into())), None, None, false);
+    let pushed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = Arc::new(CompressedOutput { inner: inner.clone(), pushed: pushed.clone() });
+    let options = PlayerOptions { realtime: false, ..PlayerOptions::default() };
+    let player = Player::open(path.to_str().unwrap(), backend, test_context(), options, |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    assert_eq!(pushed.load(std::sync::atomic::Ordering::SeqCst), 0, "untimed packets reached the compressed sink");
+    let capture = inner.capture();
+    let video = &capture.video[0];
+    let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &["-idct", "simple"]);
+    assert_eq!(expected.len(), 50);
+    assert_eq!(video.frame_md5, expected, "pictures differ from FFmpeg");
+    let probe = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0"])
+        .arg(&path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    std::fs::remove_file(&path).unwrap();
+    // FFmpeg leaves a picture untimed when it cannot derive a time (N/A);
+    // there ours must still continue the timeline.
+    let theirs: Vec<Option<u128>> = String::from_utf8(probe.stdout).unwrap().lines()
+        .map(|t| t.trim().trim_end_matches(',').parse::<f64>().ok().map(|s| Duration::from_secs_f64(s).as_millis()))
+        .collect();
+    let ours: Vec<u128> = video.pts.iter().map(Duration::as_millis).collect();
+    assert_eq!(ours.len(), theirs.len());
+    assert!(theirs.iter().filter(|t| t.is_some()).count() >= 45, "FFmpeg times too few pictures: {theirs:?}");
+    for (i, (ours_t, theirs_t)) in ours.iter().zip(&theirs).enumerate() {
+        match theirs_t {
+            Some(t) => assert_eq!(ours_t, t, "picture {i}: ours {ours:?}, FFmpeg {theirs:?}"),
+            None => assert!(i == 0 || *ours_t > ours[i - 1], "picture {i} does not continue the timeline: {ours:?}"),
+        }
+    }
+}
+
+

@@ -1,10 +1,8 @@
-use super::clock::{monotonic_now_ns, AudioClock, AudioClockInner, SendAudioStream};
+use super::clock::{AudioClock, AudioClockState, SendAudioStream};
 use crate::backend::{AudioSink, Clock, SinkError};
-use ndk::audio::{
-    AudioDirection, AudioFormat, AudioPerformanceMode, AudioStreamBuilder, AudioStreamState,
-};
+use crate::clock::current_monotonic_ns;
+use ndk::audio::{AudioDirection, AudioFormat, AudioPerformanceMode, AudioStreamBuilder};
 use parking_lot::Mutex;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,223 +10,134 @@ pub struct AndroidAudioSink {
     clock: AudioClock,
     sample_rate: u32,
     channels: u16,
-    is_suspended: Arc<Mutex<bool>>,
+    suspended: bool,
 }
 
 impl AndroidAudioSink {
     pub fn new() -> (Self, Arc<dyn Clock>) {
-        let clock_inner = Arc::new(AudioClockInner::new());
-        let clock = AudioClock { inner: clock_inner };
-        let clock_dyn: Arc<dyn Clock> = Arc::new(clock.clone());
-
-        let sink = Self {
-            clock,
-            sample_rate: 48000,
-            channels: 2,
-            is_suspended: Arc::new(Mutex::new(false)),
-        };
-
-        (sink, clock_dyn)
+        let clock = AudioClock { inner: Arc::new(Mutex::new(AudioClockState::new())) };
+        let clock_dyn = Arc::new(clock.clone());
+        (Self { clock, sample_rate: 0, channels: 0, suspended: false }, clock_dyn)
     }
 
-    pub fn suspend(&self) {
-        *self.is_suspended.lock() = true;
-        let mut stream_lock = self.clock.inner.stream.lock();
-        if let Some(stream) = stream_lock.take() {
-            let _ = stream.0.request_stop();
-            // Dropping SendAudioStream closes AAudioStream
-        }
+    pub fn suspend(&mut self) {
+        self.pause();
+        self.suspended = true;
+        let old = self.clock.inner.lock().stream.take();
+        if let Some(stream) = old { let _ = stream.0.request_stop(); }
     }
 
-    pub fn resume(&self) -> Result<(), SinkError> {
-        // Same guard as `open`: never hand AAudio a zero channel count on
-        // the recreate path.
-        let sample_rate = self.sample_rate;
-        let channels = self.channels;
-        if channels == 0 || channels > 64 || sample_rate == 0 {
-            return Err(SinkError::Fatal(
-                "resume with unconfigured rate/channels".into(),
-            ));
-        }
-        *self.is_suspended.lock() = false;
-        self.create_stream(sample_rate, channels)?;
-
-        if self.clock.inner.is_playing.load(Ordering::SeqCst) {
-            let stream_opt = self.clock.inner.stream.lock().clone();
-            if let Some(stream) = stream_opt {
-                let _ = stream.0.request_start();
-            }
-        }
+    pub fn resume(&mut self) -> Result<(), SinkError> {
+        self.suspended = false;
+        if self.sample_rate != 0 { self.create_stream(self.sample_rate, self.channels)?; }
         Ok(())
     }
 
-    fn create_stream(&self, sample_rate: u32, channels: u16) -> Result<(), SinkError> {
-        let builder = AudioStreamBuilder::new().map_err(|e| {
-            SinkError::Fatal(format!("failed to create AudioStreamBuilder: {e:?}"))
-        })?;
-
-        let builder = builder
-            .channel_count(channels as i32)
-            .sample_rate(sample_rate as i32)
-            .format(AudioFormat::PCM_Float)
-            .direction(AudioDirection::Output)
-            .performance_mode(AudioPerformanceMode::PowerSaving);
-
-        let stream = builder
-            .open_stream()
-            .map_err(|e| SinkError::Fatal(format!("failed to open AAudio stream: {e:?}")))?;
-
-        *self.clock.inner.stream.lock() = Some(Arc::new(SendAudioStream(stream)));
-        self.clock
-            .inner
-            .sample_rate
-            .store(sample_rate, Ordering::SeqCst);
-        self.clock
-            .inner
-            .channels
-            .store(channels as u32, Ordering::SeqCst);
-
+    fn create_stream(&self, rate: u32, channels: u16) -> Result<(), SinkError> {
+        let stream = AudioStreamBuilder::new()
+            .map_err(|e| SinkError::Fatal(format!("AAudio builder: {e:?}")))?
+            .channel_count(i32::from(channels)).sample_rate(rate as i32)
+            .format(AudioFormat::PCM_Float).direction(AudioDirection::Output)
+            .performance_mode(AudioPerformanceMode::LowLatency)
+            .open_stream().map_err(|e| SinkError::Fatal(format!("AAudio open: {e:?}")))?;
+        let old = {
+            let mut state = self.clock.inner.lock();
+            let old = state.stream.take();
+            *state = AudioClockState::new();
+            state.rate = rate;
+            state.stream = Some(Arc::new(SendAudioStream(stream)));
+            old
+        };
+        if let Some(stream) = old { let _ = stream.0.request_stop(); }
         Ok(())
     }
 }
 
 impl AudioSink for AndroidAudioSink {
     fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), SinkError> {
-        // Reject before touching AAudio: channels = 0 maps to
-        // AAUDIO_UNSPECIFIED, which can open stereo while `write` would
-        // compute frame counts from a different channel count.
-        if channels == 0 || channels > 64 {
-            return Err(SinkError::Fatal(format!(
-                "invalid channel count {channels}"
-            )));
+        if sample_rate == 0 || sample_rate > i32::MAX as u32 || channels == 0 || channels > 64 {
+            return Err(SinkError::Fatal(format!("invalid audio format {sample_rate} Hz / {channels} channels")));
         }
-        if sample_rate == 0 {
-            return Err(SinkError::Fatal("invalid sample rate 0".into()));
+        // Suspended (app in the background): keep the format and let
+        // `resume` create the stream. Opening here would restart audio in
+        // the background; writes report `Unavailable` until then.
+        if !self.suspended {
+            self.create_stream(sample_rate, channels)?;
         }
-        // Open first, commit the configured values only on success: a
-        // failed reopen must leave the previous stream paired with its
-        // original rate/channels.
-        self.create_stream(sample_rate, channels)?;
         self.sample_rate = sample_rate;
         self.channels = channels;
-        *self.is_suspended.lock() = false;
-        self.flush();
-
         Ok(())
     }
 
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
-        if *self.is_suspended.lock() {
-            return Err(SinkError::Unavailable);
-        }
-
-        let stream = match self.clock.inner.stream.lock().clone() {
-            Some(s) => s,
-            None => return Err(SinkError::Unavailable),
+        if self.suspended { return Err(SinkError::Unavailable); }
+        let (stream, playing) = {
+            let state = self.clock.inner.lock();
+            (state.stream.clone().ok_or(SinkError::Unavailable)?, state.playing)
         };
-
-        // `open` rejects 0 before any write can happen, so no clamp: a
-        // clamp here would misinterpret the buffer's frame count.
-        let channels = self.channels as usize;
-        let num_frames = pcm.len() / channels;
-        if num_frames == 0 {
-            return Ok(0);
+        let frames = pcm.len() / usize::from(self.channels);
+        if frames == 0 { return Ok(0); }
+        let before = stream.0.frames_written();
+        // One bounded write lets the engine react to a hold/seek/drop even
+        // if the device is full. Paused preroll is strictly non-blocking.
+        let timeout = if playing { 20_000_000 } else { 0 };
+        let result = unsafe { stream.0.write(pcm.as_ptr().cast(), frames.min(i32::MAX as usize) as i32, timeout) };
+        // ndk 0.9 misclassifies positive AAudio frame counts as errors.
+        let written = match result {
+            Ok(n) => n as usize,
+            Err(ndk::audio::AudioError::__Unknown(n)) if n > 0 => n as usize,
+            Err(e) => return Err(SinkError::Fatal(format!("AAudio write: {e:?}"))),
+        };
+        let mut state = self.clock.inner.lock();
+        if written > 0 && state.base.is_none() {
+            state.base = Some(pts);
+            state.base_frame = before;
+            state.started_ns = current_monotonic_ns();
         }
-
-        // Initialize clock on first write after open/flush
-        {
-            let mut base_pts_guard = self.clock.inner.base_pts.lock();
-            if base_pts_guard.is_none() {
-                *base_pts_guard = Some(pts);
-                self.clock
-                    .inner
-                    .start_mono_ns
-                    .store(monotonic_now_ns(), Ordering::SeqCst);
-                let written_before = stream.0.frames_written();
-                self.clock
-                    .inner
-                    .base_frame_offset
-                    .store(written_before, Ordering::SeqCst);
+        state.written += written as u64;
+        #[cfg(debug_assertions)]
+        if super::clock::tracing() {
+            if let Ok(ts) = stream.0.timestamp(ndk::audio::Clockid::Monotonic) {
+                eprintln!("ENGINE_SYNC audio base_pts_ns={} base_frame={} written={} frame={} mono_ns={} rate={}",
+                    state.base.unwrap_or_default().as_nanos(), state.base_frame, state.written,
+                    ts.frame_position, ts.time_nanoseconds, state.rate);
             }
         }
-
-        // Blocking write. ndk 0.9 maps any non-zero AAudio result to an
-        // error, but `AAudioStream_write` returns the positive frame count
-        // on success; treat positive results as success.
-        let mut total_written = 0usize;
-        let timeout_ns = 1_000_000_000i64; // 1 second timeout per chunk
-
-        while total_written < num_frames {
-            let offset_frames = total_written;
-            let remaining_frames = (num_frames - total_written) as i32;
-            let slice_offset = offset_frames * channels;
-            let ptr = unsafe { pcm.as_ptr().add(slice_offset) };
-
-            let written = unsafe { stream.0.write(ptr.cast(), remaining_frames, timeout_ns) };
-            let written = match written {
-                Ok(n) => n as usize,
-                Err(ndk::audio::AudioError::__Unknown(code)) if code > 0 => code as usize,
-                Err(e) => return Err(SinkError::Fatal(format!("AAudioStream write error: {e:?}"))),
-            };
-
-            if written == 0 {
-                break;
-            }
-            total_written += written as usize;
-            self.clock
-                .inner
-                .frames_written
-                .fetch_add(written as u64, Ordering::SeqCst);
-        }
-
-        Ok(total_written)
+        Ok(written)
     }
 
     fn play(&mut self) {
-        self.clock.inner.is_playing.store(true, Ordering::SeqCst);
-        let stream_opt = self.clock.inner.stream.lock().clone();
-        if let Some(stream) = stream_opt {
-            let _ = stream.0.request_start();
-        }
+        // Every master-clock reader takes the clock state lock: update the
+        // state under it, make the platform call after releasing it.
+        let stream = {
+            let mut state = self.clock.inner.lock();
+            if state.playing { return; }
+            state.started_ns = current_monotonic_ns();
+            state.playing = true;
+            state.stream.clone()
+        };
+        if let Some(stream) = stream { let _ = stream.0.request_start(); }
     }
 
     fn pause(&mut self) {
-        self.clock.inner.is_playing.store(false, Ordering::SeqCst);
-        self.clock
-            .inner
-            .pause_mono_ns
-            .store(monotonic_now_ns(), Ordering::SeqCst);
-        let stream_opt = self.clock.inner.stream.lock().clone();
-        if let Some(stream) = stream_opt {
-            let _ = stream.0.request_pause();
-        }
+        let stream = {
+            let mut state = self.clock.inner.lock();
+            if !state.playing { return; }
+            state.held_frames = state.presented_frames();
+            state.playing = false;
+            state.stream.clone()
+        };
+        if let Some(stream) = stream { let _ = stream.0.request_pause(); }
     }
 
     fn flush(&mut self) {
-        *self.clock.inner.base_pts.lock() = None;
-        self.clock.inner.frames_written.store(0, Ordering::SeqCst);
-        self.clock.inner.start_mono_ns.store(0, Ordering::SeqCst);
-        self.clock
-            .inner
-            .base_frame_offset
-            .store(0, Ordering::SeqCst);
-
-        let stream_opt = self.clock.inner.stream.lock().clone();
-        if let Some(stream) = stream_opt {
-            let state = stream.0.state();
-            if state == AudioStreamState::Started {
-                let _ = stream.0.request_pause();
-                let _ = stream.0.request_flush();
-                if self.clock.inner.is_playing.load(Ordering::SeqCst) {
-                    let _ = stream.0.request_start();
-                }
-            } else {
-                let _ = stream.0.request_flush();
-            }
+        // Recreating makes seek atomic with respect to AAudio's async state
+        // transitions; an old timestamp can never anchor the new samples.
+        if self.sample_rate != 0 && !self.suspended {
+            let playing = self.clock.inner.lock().playing;
+            if self.create_stream(self.sample_rate, self.channels).is_ok() && playing { self.play(); }
         }
     }
 
-    fn clock(&self) -> Arc<dyn Clock> {
-        Arc::new(self.clock.clone())
-    }
+    fn clock(&self) -> Arc<dyn Clock> { Arc::new(self.clock.clone()) }
 }

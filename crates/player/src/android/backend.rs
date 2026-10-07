@@ -139,8 +139,8 @@ impl VideoSink for VideoSinkWrapper {
         self.inner.lock().open_compressed(params)
     }
 
-    fn push_packet(&mut self, packet: &Packet, pts: Duration) -> Result<(), SinkError> {
-        self.inner.lock().push_packet(packet, pts)
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+        self.inner.lock().push_packet(packet, pts, random_access)
     }
 
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> {
@@ -150,6 +150,10 @@ impl VideoSink for VideoSinkWrapper {
     fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> {
         self.inner.lock().push_frame(frame, pts)
     }
+
+    fn frame_lead(&self) -> Duration { self.inner.lock().frame_lead() }
+
+    fn finish(&mut self) -> Result<(), SinkError> { self.inner.lock().finish() }
 
     fn flush(&mut self) {
         self.inner.lock().flush()
@@ -175,6 +179,12 @@ impl Backend for AndroidBackend {
         let (sink, _clock) = AndroidAudioSink::new();
         let sink_arc = Arc::new(Mutex::new(sink));
         *self.shared.active_audio.lock() = Some(Arc::downgrade(&sink_arc));
+        // Registered first: a concurrent `suspend` either finds this sink or
+        // has already set the flag read here, so no sink opens a stream in
+        // the background.
+        if self.shared.is_suspended.load(Ordering::SeqCst) {
+            sink_arc.lock().suspend();
+        }
         Box::new(AudioSinkWrapper { inner: sink_arc })
     }
 
