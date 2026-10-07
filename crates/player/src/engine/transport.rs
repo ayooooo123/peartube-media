@@ -471,7 +471,15 @@ impl SharedState {
             if self.superseded(seen_seek, retired) {
                 return false;
             }
-            apply_running(t.running);
+            // Sink play/pause are platform calls: never under the lock.
+            let running = t.running;
+            parking_lot::MutexGuard::unlocked(&mut t, || apply_running(running));
+            if self.superseded(seen_seek, retired) {
+                return false;
+            }
+            if t.running != running {
+                continue;
+            }
             let now = self.master.now().unwrap_or_default();
             if now + END_SLACK >= at.min(t.tail_limit.unwrap_or(at)) {
                 return true;

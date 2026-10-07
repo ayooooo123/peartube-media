@@ -103,19 +103,27 @@ impl AudioSink for AndroidAudioSink {
     }
 
     fn play(&mut self) {
-        let mut state = self.clock.inner.lock();
-        if state.playing { return; }
-        state.started_ns = current_monotonic_ns();
-        state.playing = true;
-        if let Some(stream) = &state.stream { let _ = stream.0.request_start(); }
+        // Every master-clock reader takes the clock state lock: update the
+        // state under it, make the platform call after releasing it.
+        let stream = {
+            let mut state = self.clock.inner.lock();
+            if state.playing { return; }
+            state.started_ns = current_monotonic_ns();
+            state.playing = true;
+            state.stream.clone()
+        };
+        if let Some(stream) = stream { let _ = stream.0.request_start(); }
     }
 
     fn pause(&mut self) {
-        let mut state = self.clock.inner.lock();
-        if !state.playing { return; }
-        state.held_frames = state.presented_frames();
-        state.playing = false;
-        if let Some(stream) = &state.stream { let _ = stream.0.request_pause(); }
+        let stream = {
+            let mut state = self.clock.inner.lock();
+            if !state.playing { return; }
+            state.held_frames = state.presented_frames();
+            state.playing = false;
+            state.stream.clone()
+        };
+        if let Some(stream) = stream { let _ = stream.0.request_pause(); }
     }
 
     fn flush(&mut self) {
