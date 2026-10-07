@@ -110,7 +110,7 @@ oxideav-g711 = { git = "https://github.com/OxideAV/oxideav-g711", rev = "72af018
 oxideav-h261 = { git = "https://github.com/OxideAV/oxideav-h261", rev = "bba9abb79f6e54cefa189ea92997a91dd46e1e56" }
 oxideav-h263 = { git = "https://github.com/OxideAV/oxideav-h263", rev = "25bf0a12102969034d57ab96f29e686d8d61ddc3" }
 oxideav-h264 = { git = "https://github.com/OxideAV/oxideav-h264", rev = "9392f7330f2bccafdc3cd175e16f568abbed9430" }
-oxideav-h265 = { git = "https://github.com/ayooooo123/oxideav-h265", rev = "fa2860ee2a1e921e90534ef2faf146d1796b9021" }
+oxideav-h265 = { git = "https://github.com/ayooooo123/oxideav-h265", rev = "4e23b956b7996620f1edc897be04ed3a2b7758cf" }
 oxideav-http = { git = "https://github.com/OxideAV/oxideav-http", rev = "f54f106e1e131300387d1df1a71d2686690ccdca" }
 oxideav-id3 = { git = "https://github.com/OxideAV/oxideav-id3", rev = "d1b462e3da204f2010844648cf1a6bbc65f10dd0" }
 oxideav-iff = { git = "https://github.com/OxideAV/oxideav-iff", rev = "5a4bdb43c14007975137543ecf1aa8fa6e4a476c" }
