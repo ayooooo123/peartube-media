@@ -1,5 +1,7 @@
-// Ported from FFmpeg libavformat/vc1dec.c, libavformat/vc1test.c, and
-// libavcodec/vc1_parser.c (commit 2da55bf).
+// Ported from FFmpeg libavformat/vc1dec.c, libavformat/vc1test.c,
+// libavcodec/vc1_parser.c, and the generic-index seek of
+// libavformat/seek.c (seek_frame_generic, ff_add_index_entry,
+// ff_reduce_index, ff_index_search_timestamp) (commit 2da55bf).
 // License: LGPL-2.1-or-later.
 
 use std::io::{Read, Seek, SeekFrom};
@@ -15,6 +17,85 @@ use crate::bits::BitReader;
 pub const CODEC_ID_VC1: &str = "vc1";
 /// Codec id of the WMV3 (VC-1 Simple/Main) streams in `.rcv` files.
 pub const CODEC_ID_WMV3: &str = "wmv3";
+
+// ───────────────────────── Generic index (seek.c) ─────────────────────────
+
+/// avformat's max_index_size (1 MiB) over sizeof(AVIndexEntry) (24 bytes).
+const MAX_INDEX_ENTRIES: usize = (1 << 20) / 24;
+
+/// AVFMT_GENERIC_INDEX: av_read_frame indexes each key packet it returns,
+/// its position and dts, sorted by dts (ff_add_index_entry replaces an
+/// entry of the same dts; ff_reduce_index keeps every other entry of a
+/// full index).
+#[derive(Default)]
+struct KeyIndex(Vec<(u64, i64)>);
+
+impl KeyIndex {
+    fn add(&mut self, pos: u64, dts: i64) {
+        if self.0.len() >= MAX_INDEX_ENTRIES {
+            self.0 = self.0.iter().step_by(2).copied().collect();
+        }
+        match self.0.binary_search_by_key(&dts, |e| e.1) {
+            Ok(at) => self.0[at].0 = pos,
+            Err(at) => self.0.insert(at, (pos, dts)),
+        }
+    }
+
+    /// av_index_search_timestamp with AVSEEK_FLAG_BACKWARD: the last entry
+    /// at or before `ts`.
+    fn search(&self, ts: i64) -> Option<usize> {
+        self.0.partition_point(|e| e.1 <= ts).checked_sub(1)
+    }
+}
+
+/// A demuxer seekable the way seek.c seek_frame_generic seeks it.
+trait GenericSeek {
+    fn index(&self) -> &KeyIndex;
+    /// The next packet (indexing it when key), with its key flag and dts.
+    fn read(&mut self) -> Result<(bool, Option<i64>)>;
+    /// Read on from `pos` (ff_read_frame_flush), the dts at `ts`
+    /// (avpriv_update_cur_dts) or, at the start of the data, where opening
+    /// left it.
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()>;
+    fn data_offset(&self) -> u64;
+}
+
+/// seek_frame_generic with AVSEEK_FLAG_BACKWARD: the last key packet at
+/// or before `ts` among those returned so far; past the last of them
+/// packets are read on, bounded by the input, until a key packet starts
+/// after the target or more than 1000 others did.
+fn seek_generic(d: &mut dyn GenericSeek, ts: i64) -> Result<i64> {
+    let mut found = d.index().search(ts);
+    let entries = &d.index().0;
+    if found.is_none() && entries.first().is_some_and(|e| ts < e.1) {
+        return Err(Error::invalid("seek before the first key frame"));
+    }
+    if found.is_none() || found == Some(entries.len() - 1) {
+        match entries.last().copied() {
+            Some((pos, dts)) => d.restart(pos, Some(dts))?,
+            None => d.restart(d.data_offset(), None)?,
+        }
+        let mut nonkey = 0;
+        while let Ok((key, dts)) = d.read() {
+            if dts.is_some_and(|dts| dts > ts) {
+                if key {
+                    break;
+                }
+                nonkey += 1;
+                if nonkey > 1001 {
+                    break;
+                }
+            }
+        }
+        found = d.index().search(ts);
+    }
+    let Some(i) = found else {
+        return Err(Error::invalid("no key frame to seek to"));
+    };
+    let (pos, dts) = d.index().0[i];
+    d.restart(pos, Some(dts))?;
+    Ok(dts)
+}
 
 // ───────────────────────── VC-1 Test Format (.rcv) ─────────────────────────
 
@@ -38,6 +119,9 @@ pub struct Vc1TestDemuxer {
     streams: Vec<StreamInfo>,
     fps: u32,
     pts: i64,
+    /// Where the frames start.
+    data_offset: u64,
+    index: KeyIndex,
 }
 
 impl Vc1TestDemuxer {
@@ -91,25 +175,20 @@ impl Vc1TestDemuxer {
             start_time: Some(0),
         };
 
+        let data_offset = input.stream_position().map_err(Error::Io)?;
         Ok(Self {
             input,
             streams: vec![stream],
             fps,
             pts: 0,
+            data_offset,
+            index: KeyIndex::default(),
         })
     }
-}
 
-impl Demuxer for Vc1TestDemuxer {
-    fn format_name(&self) -> &str {
-        "vc1test"
-    }
-
-    fn streams(&self) -> &[StreamInfo] {
-        &self.streams
-    }
-
-    fn next_packet(&mut self) -> Result<Packet> {
+    /// vc1t_read_packet: one frame and where its frame header starts.
+    fn read_frame(&mut self) -> Result<(Packet, u64)> {
+        let pos = self.input.stream_position().map_err(Error::Io)?;
         let mut hdr = [0u8; 8];
         match self.input.read_exact(&mut hdr) {
             Ok(()) => {}
@@ -142,9 +221,54 @@ impl Demuxer for Vc1TestDemuxer {
             data,
         };
         pkt.flags.keyframe = keyframe;
-        Ok(pkt)
+        if let (true, Some(dts)) = (keyframe, pkt.dts) {
+            self.index.add(pos, dts);
+        }
+        Ok((pkt, pos))
+    }
+}
+
+impl GenericSeek for Vc1TestDemuxer {
+    fn index(&self) -> &KeyIndex {
+        &self.index
     }
 
+    fn read(&mut self) -> Result<(bool, Option<i64>)> {
+        let (pkt, _) = self.read_frame()?;
+        Ok((pkt.flags.keyframe, pkt.dts))
+    }
+
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos)).map_err(Error::Io)?;
+        self.pts = ts.unwrap_or(0);
+        Ok(())
+    }
+
+    fn data_offset(&self) -> u64 {
+        self.data_offset
+    }
+}
+
+impl Demuxer for Vc1TestDemuxer {
+    fn format_name(&self) -> &str {
+        "vc1test"
+    }
+
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> Result<Packet> {
+        Ok(self.read_frame()?.0)
+    }
+
+    /// vc1test.c is AVFMT_GENERIC_INDEX: seek.c seek_frame_generic over
+    /// the key frames the file flags. FFmpeg times frames only with a
+    /// millisecond time base or without B-frame delay, and cannot seek the
+    /// others; this demuxer numbers their frames and seeks those too.
+    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+        seek_generic(self, pts)
+    }
 }
 
 // ───────────────────────── Raw VC-1 Elementary Stream (.vc1) ─────────────────────────
@@ -363,12 +487,20 @@ impl Vc1EsHeaders {
             None => VC1_TIME_BASE / 25,
         }
     }
+
+    /// After a seek FFmpeg's new parser knows no sequence header yet; the
+    /// frame rate it set is the codec context's, which stays.
+    fn reset(&self) -> Self {
+        Self { framerate: self.framerate, ..Self::default() }
+    }
 }
 
 pub struct Vc1Demuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     buffer: Vec<u8>,
+    /// Where `buffer` starts in the input.
+    buffer_pos: u64,
     /// Next buffer offset the frame-boundary search examines.
     scan: usize,
     /// A frame or field start code was seen in the pending packet
@@ -377,10 +509,12 @@ pub struct Vc1Demuxer {
     eof_reached: bool,
     headers: Vc1EsHeaders,
     next_dts: i64,
+    index: KeyIndex,
 }
 
 impl Vc1Demuxer {
     pub fn open(mut input: Box<dyn ReadSeek>) -> Result<Self> {
+        let buffer_pos = input.stream_position().map_err(Error::Io)?;
         let mut buffer = vec![0u8; 16384];
         let n = input.read(&mut buffer).map_err(Error::Io)?;
         buffer.truncate(n);
@@ -408,11 +542,13 @@ impl Vc1Demuxer {
             input,
             streams: vec![stream],
             buffer,
+            buffer_pos,
             scan: 0,
             pic_found: false,
             eof_reached: n == 0,
             headers: Vc1EsHeaders::default(),
             next_dts: 0,
+            index: KeyIndex::default(),
         })
     }
 
@@ -445,6 +581,8 @@ impl Vc1Demuxer {
     /// dts advances by each frame's duration, I pictures are key frames.
     /// FFmpeg leaves the pts of some frames unset; ours equals the dts.
     fn packet(&mut self, data: Vec<u8>) -> Packet {
+        let pos = self.buffer_pos;
+        self.buffer_pos += data.len() as u64;
         self.headers.scan(&data);
         let duration = self.headers.duration();
         let ts = self.next_dts;
@@ -459,7 +597,39 @@ impl Vc1Demuxer {
             data,
         };
         pkt.flags.keyframe = self.headers.key;
+        if pkt.flags.keyframe {
+            self.index.add(pos, ts);
+        }
         pkt
+    }
+}
+
+impl GenericSeek for Vc1Demuxer {
+    fn index(&self) -> &KeyIndex {
+        &self.index
+    }
+
+    fn read(&mut self) -> Result<(bool, Option<i64>)> {
+        let pkt = self.next_packet()?;
+        Ok((pkt.flags.keyframe, pkt.dts))
+    }
+
+    /// A new parser at `pos`; its frames timed from `ts` on, or from 0 at
+    /// the start of the data, at the frame rate the codec context kept.
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos)).map_err(Error::Io)?;
+        self.buffer.clear();
+        self.buffer_pos = pos;
+        self.scan = 0;
+        self.pic_found = false;
+        self.eof_reached = false;
+        self.headers = self.headers.reset();
+        self.next_dts = ts.unwrap_or(0);
+        Ok(())
+    }
+
+    fn data_offset(&self) -> u64 {
+        0
     }
 }
 
@@ -488,6 +658,7 @@ impl Demuxer for Vc1Demuxer {
                     let data = std::mem::take(&mut self.buffer);
                     return Ok(self.packet(data));
                 }
+                self.buffer_pos += self.buffer.len() as u64;
                 self.buffer.clear();
                 return Err(Error::Eof);
             }
@@ -501,6 +672,12 @@ impl Demuxer for Vc1Demuxer {
                 self.buffer.extend_from_slice(&chunk[..n]);
             }
         }
+    }
+
+    /// vc1dec.c is FF_DEF_RAWVIDEO_DEMUXER2 with AVFMT_GENERIC_INDEX:
+    /// seek.c seek_frame_generic over the I pictures the parser flags.
+    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+        seek_generic(self, pts)
     }
 }
 
