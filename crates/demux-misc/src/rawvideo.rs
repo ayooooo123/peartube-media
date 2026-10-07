@@ -3,7 +3,7 @@
 // splitting and key-frame rules of libavcodec/h264_parser.c
 // (h264_find_frame_end, parse_nal_units, with h264_sei.c for recovery
 // points and h264_ps.c for reference counts), hevc/parser.c
-// (hevc_find_frame_end, parse_nal_units) and
+// (hevc_find_frame_end, parse_nal_units, see hevc_parse.rs) and
 // mpegvideo_parser.c (mpeg1_find_frame_end, mpegvideo_extract_headers),
 // with avpriv_find_start_code (utils.c).
 // License: LGPL-2.1-or-later
@@ -12,8 +12,8 @@
 // cut into the access units FFmpeg's parser for the codec cuts, each
 // flagged key as FFmpeg flags it. The streams carry no timestamps: MPEG-1/2
 // units are timed as FFmpeg's demuxer layer times them (demux.c
-// compute_pkt_fields), H.264 and HEVC units are numbered in the stream
-// time base.
+// compute_pkt_fields), H.264 and HEVC units stay untimed, as FFmpeg's do,
+// with the duration their parser's frame rate gives.
 
 use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom};
@@ -21,6 +21,7 @@ use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{Demuxer, Error, Packet, ReadSeek, Result, StreamInfo};
 
 use crate::h264_parse::H264Parse;
+use crate::hevc_parse::HevcParse;
 use crate::parser::{Combine, Parser, Split, Unit, VideoCut, END_NOT_FOUND};
 use demux_seek_core::{read_on, Allowance, Index};
 
@@ -244,11 +245,17 @@ pub(crate) struct Stamp {
 }
 
 impl Stamp {
-    /// Timed by its index: each unit lasts one tick of the stream time
-    /// base. Not what FFmpeg does for H.264 and HEVC (which leave raw
-    /// streams' timestamps to the decoder); kept as it was for them.
-    fn numbered(key: bool, index: i64) -> Self {
-        Self { key, pts: Some(index), dts: Some(index), duration: Some(1) }
+    /// A unit of a raw H.264 or HEVC stream as av_read_frame returns it:
+    /// no pts or dts (compute_pkt_fields does not interpolate either
+    /// codec), the key flag and duration its parser gave. Where the
+    /// parser has no frame rate, compute_frame_duration falls back to the
+    /// raw demuxer's 25 fps (avg_frame_rate, AVFMT_NOTIMESTAMPS), as FFmpeg
+    /// does while analysing the stream; FFmpeg times the packets after
+    /// that by its r_frame_rate guess, one tick of 1/1200000, which plays
+    /// as no duration and is not modelled.
+    fn untimed(video: VideoCut) -> Self {
+        let duration = if video.rate_known { video.duration } else { RAW_VIDEO_CLOCK / 25 };
+        Self { key: video.key, pts: None, dts: None, duration: (duration > 0).then_some(duration) }
     }
 }
 
@@ -840,37 +847,30 @@ impl Split for H264 {
     }
 }
 
-/// The NAL header indices of an Annex B unit, in order.
-fn nal_starts(unit: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    let mut p = 0;
-    std::iter::from_fn(move || {
-        let mut state = u32::MAX;
-        let at = find_start_code(unit, p, unit.len(), &mut state);
-        if at >= unit.len() || (state & 0xFFFF_FF00) != 0x100 {
-            return None;
-        }
-        p = at;
-        Some(at - 1)
-    })
-}
-
 impl Units for H264 {
     fn buffered_bytes(&self) -> usize {
         self.pc.buffered_bytes()
     }
 
-    fn unit(&mut self, unit: &Unit, index: i64) -> Stamp {
-        Stamp::numbered(unit.video.is_some_and(|v| v.key), index)
+    fn unit(&mut self, unit: &Unit, _index: i64) -> Stamp {
+        Stamp::untimed(unit.video.unwrap_or_default())
     }
 }
 
 // ───────────────────────── HEVC ─────────────────────────
 
-/// hevc/parser.c: an access unit, cut where FFmpeg's parser cuts it.
-#[derive(Default)]
+/// hevc/parser.c: an access unit, cut where FFmpeg's parser cuts it,
+/// with what parse_nal_units makes of it.
 pub(crate) struct Hevc {
     pc: Combine,
     frame_start_found: bool,
+    units: HevcParse,
+}
+
+impl Default for Hevc {
+    fn default() -> Self {
+        Self { pc: Combine::default(), frame_start_found: false, units: HevcParse::new((1, RAW_VIDEO_CLOCK)) }
+    }
 }
 
 impl Hevc {
@@ -913,9 +913,17 @@ impl Split for Hevc {
     fn parse(&mut self, buf: &[u8]) -> (isize, Option<Vec<u8>>) {
         let next = self.find_frame_end(buf);
         match self.pc.combine(next, buf) {
-            Some(unit) => (next, Some(unit)),
+            Some(unit) => {
+                self.units.parse_nal_units(&unit);
+                (next, Some(unit))
+            }
             None => (buf.len() as isize, None),
         }
+    }
+
+    /// What parse_nal_units set: the key flag, the frame rate, repeat_pict.
+    fn cut(&mut self, pts: Option<i64>, dts: Option<i64>) -> (Option<i64>, Option<i64>, Option<VideoCut>) {
+        (pts, dts, Some(self.units.video()))
     }
 }
 
@@ -924,22 +932,7 @@ impl Units for Hevc {
         self.pc.buffered_bytes()
     }
 
-    /// parse_nal_units: key when the first base-layer slice is IRAP.
-    fn unit(&mut self, unit: &Unit, index: i64) -> Stamp {
-        let unit = &unit.data[..];
-        let mut key = false;
-        for h in nal_starts(unit) {
-            let Some(&second) = unit.get(h + 1) else { break };
-            let nut = (unit[h] >> 1) & 0x3F;
-            let layer = ((unit[h] & 1) << 5) | (second >> 3);
-            if layer > 0 {
-                continue;
-            }
-            if nut <= 9 || (16..=21).contains(&nut) {
-                key = (16..=23).contains(&nut);
-                break;
-            }
-        }
-        Stamp::numbered(key, index)
+    fn unit(&mut self, unit: &Unit, _index: i64) -> Stamp {
+        Stamp::untimed(unit.video.unwrap_or_default())
     }
 }

@@ -499,7 +499,7 @@ impl H264Parse {
             (b, c) if frame.0 != 0 && frame.1 != 0 && b >= 0 && c > 0 => b / c,
             _ => 0,
         };
-        VideoCut { key: self.key_frame, b_picture: self.pict_type == PICT_B, duration }
+        VideoCut { key: self.key_frame, b_picture: self.pict_type == PICT_B, duration, rate_known: num != 0 }
     }
 
     /// h264_parse after parse_nal_units: the timestamps of the unit just

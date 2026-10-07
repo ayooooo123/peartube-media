@@ -911,6 +911,8 @@ pub(crate) struct VideoCut {
     /// compute_frame_duration from the frame rate and repeat_pict the
     /// parser set, in the stream time base; 0 for none.
     pub duration: i64,
+    /// The parser has set a frame rate on the codec context.
+    pub rate_known: bool,
 }
 
 /// compute_pkt_fields (demux.c:983-1170) for a parsed H.264 stream: the
