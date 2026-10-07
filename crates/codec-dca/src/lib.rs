@@ -310,18 +310,20 @@ impl Decoder for DcaDecoderImpl {
         self.audio_format()
     }
 
-    /// The end of the input: the frame still held is decoded. Input that
-    /// never started a frame since the last one is an error.
+    /// The end of the input: the frame still held is decoded, or is an
+    /// error when longer than the decoder takes. Input that never started
+    /// a frame since the last one is an error.
     fn flush(&mut self) -> CoreResult<()> {
         let mut outcome = Outcome::default();
         let skipped = self.stream.split.skipped();
         match self.stream.split.finish() {
-            Some((at, frame)) => {
+            Ok(Some((at, frame))) => {
                 let pts = self.stream.pts_of(at);
                 outcome.add(self.decode_frame(&frame, pts));
             }
-            None if skipped => outcome.add(Err("no frame starts in the input")),
-            None => {}
+            Ok(None) if skipped => outcome.add(Err("no frame starts in the input")),
+            Ok(None) => {}
+            Err(_) => outcome.add(Err("frame longer than the decoder takes")),
         }
         self.stream = FrameStream::default();
         self.inner.flush();

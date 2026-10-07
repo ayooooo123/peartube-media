@@ -444,14 +444,23 @@ impl FrameSplitter {
     }
 
     /// The end of the input: the frame in progress, as FFmpeg's parser
-    /// flush hands it over, and the stream offset of its first byte.
-    /// Starts over afterwards.
-    pub(crate) fn finish(&mut self) -> Option<(u64, Vec<u8>)> {
-        let started = self.pc.frame_start_found != 0;
+    /// flush hands it over, and the stream offset of its first byte. One
+    /// longer than [`MAX_PACKET_SIZE`] is the error
+    /// [`next_frame`](Self::next_frame) gives a marker-ended one. Starts
+    /// over afterwards.
+    pub(crate) fn finish(&mut self) -> std::result::Result<Option<(u64, Vec<u8>)>, Oversized> {
         let start = self.pc.startpos.min(self.pending.len());
-        let frame = started.then(|| (self.base + start as u64, self.pending[start..].to_vec()));
+        let at = self.base + start as u64;
+        let frame = &self.pending[start..];
+        let result = if self.pc.frame_start_found == 0 {
+            Ok(None)
+        } else if frame.len() > MAX_PACKET_SIZE {
+            Err(Oversized { at, head: frame[..DROPPED_HEAD].to_vec() })
+        } else {
+            Ok(Some((at, frame.to_vec())))
+        };
         *self = Self::default();
-        frame
+        result
     }
 
     /// The stream offset of the frame in progress, once its start is known.
@@ -601,12 +610,7 @@ impl Demuxer for RawDtsDemuxer {
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
             match self.split.next_frame() {
-                Err(dropped) => {
-                    // Timed as FFmpeg times the oversized packet it would
-                    // return: the next frame follows it.
-                    self.clock.advance(&self.streams[0], &dropped.head);
-                    return Err(oversized());
-                }
+                Err(frame) => return Err(self.clock.drop_frame(&self.streams[0], &frame)),
                 Ok(Some((_, frame))) if frame.len() < MIN_FRAME => continue,
                 Ok(Some((_, frame))) => return Ok(self.clock.packet(&self.streams[0], frame)),
                 Ok(None) => {}
@@ -615,8 +619,9 @@ impl Demuxer for RawDtsDemuxer {
                 // FFmpeg flushes the parser at the end of the input; the
                 // tail frame it holds comes out when it looks like one.
                 return match self.split.finish() {
-                    Some((_, frame)) if frame.len() > MIN_FRAME => Ok(self.clock.packet(&self.streams[0], frame)),
-                    _ => Err(Error::Eof),
+                    Err(frame) => Err(self.clock.drop_frame(&self.streams[0], &frame)),
+                    Ok(Some((_, frame))) if frame.len() > MIN_FRAME => Ok(self.clock.packet(&self.streams[0], frame)),
+                    Ok(_) => Err(Error::Eof),
                 };
             }
             self.read_more()?;
@@ -729,6 +734,14 @@ impl FrameClock {
         };
         self.next_pts = self.next_pts.saturating_add(duration);
         duration
+    }
+
+    /// Move past a frame longer than the decoder takes, as FFmpeg times
+    /// the oversized packet it would return (the next frame follows it),
+    /// and the error for it.
+    fn drop_frame(&mut self, stream: &StreamInfo, frame: &Oversized) -> Error {
+        self.advance(stream, &frame.head);
+        oversized()
     }
 }
 
@@ -894,10 +907,7 @@ impl Demuxer for DtshdDemuxer {
         // reassemble whole frames here with the dca_parser state machine.
         loop {
             match self.split.next_frame() {
-                Err(dropped) => {
-                    self.clock.advance(&self.streams[0], &dropped.head);
-                    return Err(oversized());
-                }
+                Err(frame) => return Err(self.clock.drop_frame(&self.streams[0], &frame)),
                 Ok(Some((_, frame))) if frame.len() < MIN_FRAME => continue,
                 Ok(Some((_, frame))) => return Ok(self.clock.packet(&self.streams[0], frame)),
                 Ok(None) => {}
@@ -906,8 +916,9 @@ impl Demuxer for DtshdDemuxer {
                 // The parser flush emits what it holds as the last frame,
                 // after any initial padding.
                 return match self.split.finish() {
-                    Some((_, frame)) if !frame.is_empty() => Ok(self.clock.packet(&self.streams[0], frame)),
-                    _ => Err(Error::Eof),
+                    Err(frame) => Err(self.clock.drop_frame(&self.streams[0], &frame)),
+                    Ok(Some((_, frame))) if !frame.is_empty() => Ok(self.clock.packet(&self.streams[0], frame)),
+                    Ok(_) => Err(Error::Eof),
                 };
             }
             let left = self.data_end.saturating_sub(self.pos);

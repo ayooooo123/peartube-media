@@ -16,8 +16,8 @@
 //!   skip-samples trimming: every dca.mak DTS-HD input, and copies whose
 //!   initial padding ends inside a frame or several frames in.
 //! - Reassembly holds at most the largest frame the decoder takes, in the
-//!   decoder and in both demuxers: a longer frame is an error, and
-//!   reading goes on after it.
+//!   decoder and in both demuxers: a longer frame is an error, the last
+//!   one of the input too, and reading goes on after it.
 
 use oxideav_core::{
     AudioFormat, CodecId, CodecParameters, Decoder, Error, Frame, MediaType, Packet, ReadSeek, RuntimeContext, SampleFormat,
@@ -688,6 +688,35 @@ fn demuxers_hold_at_most_the_largest_decodable_frame() {
             let p = demuxer.next_packet().unwrap_or_else(|e| panic!("{what}: after the first frame: {e}"));
             assert!(p.data == second, "{what}: the frame after it ({} bytes)", p.data.len());
             assert_eq!(p.pts, Some(first_duration), "{what}: the frame after it starts where the first ends");
+            assert!(matches!(demuxer.next_packet(), Err(Error::Eof)), "{what}: end");
+        }
+    }
+}
+
+/// The last frame of the input, with no marker after it, comes out of the
+/// parser flush. At the largest size the decoder takes it is a packet; up
+/// to five bytes longer (all a demuxer holds while no marker says the
+/// frame ended) it is the oversized-frame error a marker-ended frame
+/// gives, and then the end of the input.
+#[test]
+fn demuxers_hold_the_last_frame_to_the_largest_decodable_size() {
+    for (format, wrap) in [("dts", false), ("dtshd", true)] {
+        for extra in 0..=5usize {
+            let (frame, _, _, _) = padded_frames(MAX_PACKET_SIZE + extra);
+            let bytes = if wrap { dtshd_file(&frame) } else { frame.clone() };
+            let mut ctx = RuntimeContext::new();
+            codec_dca::register(&mut ctx);
+            let mut demuxer = ctx.containers.open_demuxer(format, Box::new(std::io::Cursor::new(bytes)), &ctx.codecs).unwrap();
+            let what = format!("{format}: last frame of {} bytes", frame.len());
+            if extra == 0 {
+                let p = demuxer.next_packet().unwrap_or_else(|e| panic!("{what}: {e}"));
+                assert!(p.data == frame, "{what}: packet of {} bytes", p.data.len());
+            } else {
+                match demuxer.next_packet() {
+                    Err(Error::InvalidData(_)) => {}
+                    other => panic!("{what}: expected an oversized-frame error, got {:?}", other.map(|p| p.data.len())),
+                }
+            }
             assert!(matches!(demuxer.next_packet(), Err(Error::Eof)), "{what}: end");
         }
     }
