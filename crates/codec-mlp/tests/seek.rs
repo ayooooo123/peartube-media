@@ -64,6 +64,7 @@ fn ffprobe_after(path: &Path, format: &str, target: &str, n: usize) -> (TimeBase
             _ => {}
         }
     }
+    assert!(!packets.is_empty(), "ffprobe {} @ {target}: no packets", path.display());
     (tb, packets)
 }
 
@@ -175,6 +176,78 @@ fn a_run_of_false_headers_is_crossed_without_nesting() {
     }
     worker.join().expect("crossing the run panicked");
     assert_eq!(read, Ok(37), "the units from the landing to the end of the head ({units} bytes)");
+}
+
+/// Every packet the port's ffprobe prints for `path` read as `format`.
+fn ffprobe_all(path: &Path, format: &str) -> Vec<Pkt> {
+    let out = Command::new(port_ffprobe())
+        .args(["-v", "error", "-f", format, "-show_data_hash", "md5"])
+        .args(["-show_entries", "packet=pts,dts,size,flags,data_hash", "-of", "compact"])
+        .arg(path)
+        .output()
+        .expect("port ffprobe");
+    assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("packet|"))
+        .map(|line| {
+            let kv: HashMap<&str, &str> = line.split('|').filter_map(|f| f.split_once('=')).collect();
+            Pkt {
+                size: kv["size"].parse().unwrap(),
+                md5: kv["data_hash"].trim_start_matches("MD5:").to_string(),
+                key: kv["flags"].starts_with('K'),
+                pts: num(kv.get("pts")),
+                dts: num(kv.get("dts")),
+            }
+        })
+        .collect()
+}
+
+/// mlp_parser.c flags key only an access unit whose major sync
+/// ff_mlp_read_major_sync reads (the header in full, its checksum right)
+/// and drops the others as lost sync. Between the valid units of a
+/// TrueHD sample: a unit too short for a major sync, and one whose major
+/// sync has a bad checksum. Every packet, and a seek to them, is FFmpeg's.
+#[test]
+fn malformed_major_syncs_are_not_key_frames() {
+    let sample = std::fs::read(fate("truehd/ticket-1726-monocut.thd")).unwrap();
+    let units = whole_units(&sample);
+    let mut at = 0;
+    let mut chain = Vec::new();
+    while at < units.len() {
+        let len = usize::from(u16::from_be_bytes([units[at], units[at + 1]]) & 0xfff) * 2;
+        chain.push(&units[at..at + len]);
+        at += len;
+    }
+    let sync = |u: &[u8]| u.get(4..8) == Some(&[0xF8, 0x72, 0x6F, 0xBA][..]);
+    let majors: Vec<usize> = (0..chain.len()).filter(|&i| sync(chain[i])).collect();
+    assert!(majors.len() > 3, "the sample has major syncs");
+    // Unit A: 8 bytes, a sync word and nothing of the header after it.
+    let short = [0x00, 0x04, 0x00, 0x00, 0xF8, 0x72, 0x6F, 0xBA];
+    // Unit B: the second major-sync unit with its header checksum broken.
+    let mut bad = chain[majors[1]].to_vec();
+    bad[4 + 26] ^= 0xFF;
+    let mut data = Vec::new();
+    for (i, unit) in chain.iter().enumerate() {
+        if i == majors[1] {
+            data.extend_from_slice(&short);
+            data.extend_from_slice(&bad);
+        }
+        data.extend_from_slice(unit);
+    }
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("codec-mlp-seek");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("bad-syncs-{}.thd", std::process::id()));
+    std::fs::write(&path, &data).unwrap();
+    let want = ffprobe_all(&path, "truehd");
+    let mut demuxer = open("truehd", data.clone()).unwrap();
+    let got: Vec<Pkt> = std::iter::from_fn(|| demuxer.next_packet().ok())
+        .map(|p| Pkt { size: p.data.len(), md5: refcheck::md5_hex(&p.data), key: p.flags.keyframe, pts: p.pts, dts: p.dts })
+        .collect();
+    assert_eq!(got.len(), want.len(), "packet count");
+    assert_eq!(got, want, "every packet");
+    let _ = std::fs::remove_file(&path);
 }
 
 struct Rng(u64);

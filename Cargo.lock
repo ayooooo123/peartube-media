@@ -141,6 +141,7 @@ dependencies = [
 name = "codec-mlp"
 version = "0.1.0"
 dependencies = [
+ "demux-seek-core",
  "md5",
  "oxideav-core",
  "oxideav-mkv",
