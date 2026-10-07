@@ -318,6 +318,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "demux-seek-core"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

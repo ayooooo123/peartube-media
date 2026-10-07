@@ -74,6 +74,8 @@ oxideav-sub-image = "*"
 oxideav-subtitle = "*"
 
 refcheck = { path = "crates/refcheck" }
+# libavformat/seek.c for the workspace's demuxers (DemuxSeek attempt 2).
+demux-seek-core = { path = "crates/demux-seek-core" }
 
 [profile.release]
 lto = "fat"
