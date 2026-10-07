@@ -57,11 +57,13 @@ pub const MUTATION_SAMPLES: &[&str] = &[
 ];
 
 /// USAC FD corpus: `(path, initial_skip, final_padding, ffmpeg_snr_floor_db)`.
-/// Skip and padding are the MP4 edit-list trim in samples per channel. The
-/// raw decoder cannot apply them until container-provided sample-trim
-/// metadata reaches the decode pipeline. FFmpeg floors are the first
-/// measured SNR (fork `e03fbe6`) minus 0.5 dB. `None`: FFmpeg is not the
-/// oracle. FFmpeg 2da55bf never primes from AudioPreRoll, so its
+/// Skip and padding are the MP4 edit-list trim in samples per channel, as
+/// FFprobe reports them (`skip_samples` on the first packet,
+/// `discard_padding` on the last, plus any whole AU past the edit):
+/// [`decoded_f32`] removes them through the MP4 demuxer's trims, the raw
+/// packets ([`usac_packets`], [`decoded_raw_f32`]) keep them. FFmpeg floors
+/// are the first measured SNR (fork `e03fbe6`) minus 0.5 dB. `None`: FFmpeg
+/// is not the oracle. FFmpeg 2da55bf never primes from AudioPreRoll, so its
 /// `xhe_target_level` output is wrong; `tests/native_reference.rs` compares
 /// that stream with libxaac's decoder instead.
 pub const USAC_SAMPLES: &[(&str, usize, usize, Option<f64>)] = &[
@@ -74,7 +76,7 @@ pub const USAC_SAMPLES: &[(&str, usize, usize, Option<f64>)] = &[
     ("aac/usac/Fd_2_c1_Tns_0x04.mp4", 2220, 859, Some(137.773368)),
     ("aac/usac/Ext_2_c1_Ln_0x03.mp4", 1600, 704, Some(139.604440)),
     // FFmpeg omits the final whole AU outside the edit, then trims 128
-    // samples from the preceding AU. OxideAV returns both raw AUs.
+    // samples from the preceding AU; the raw packets hold both AUs whole.
     ("aac/usac/xhe_target_level.m4a", 0, 1024 + 128, None),
 ];
 
@@ -133,6 +135,13 @@ pub fn decoded_usac_target(rel: &str, target: i32) -> (Vec<f32>, std::path::Path
     }
     let channels = decoder.output_audio_format().unwrap().channels;
     (pcm, refcheck::fate(rel), channels)
+}
+
+/// Every packet of an MP4 sample's first audio stream ([`usac_packets`])
+/// decoded without any container trim, as interleaved f32: the untrimmed
+/// counterpart of [`decoded_f32`].
+pub fn decoded_raw_f32(rel: &str) -> Vec<f32> {
+    decoded_usac_target(rel, 0).0
 }
 
 /// A test reference file under `tests/data/`.
