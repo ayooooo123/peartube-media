@@ -58,23 +58,27 @@ first child is one, then in fixed chunks; a third SeekHead, or a SeekHead,
 Tracks or Tags master larger than its budget (about 184 KiB, 32 MiB, 32 MiB),
 is refused before any of it is read. A CRC-32 on an Info, Cues, Chapters or
 Attachments master is still checked over its whole body (small heap, but a
-known network cost: their declared size has no limit). Every element in a
-Tracks or Tags tree must fit its parent. Only a Segment or Cluster may use the
-unknown size; any other Top-Level element doing so is InvalidData (a resilient
-open skips it, and between Clusters playback resumes at the next Cluster).
+known network cost: their declared size has no limit). Optional metadata never
+stops playback: damage in Chapters, Attachments, Tags, Cues, a SeekHead or any
+other Top-Level master but Info and Tracks drops it, or cuts it to the records
+before the damage, with one damage event, in strict opens too; damage in the
+EBML header, the Segment, Info or Tracks still fails a strict open. Every
+element in a Tracks, Tags, Chapters, Cues or SeekHead tree must fit its parent.
+Only a Segment or Cluster may use the unknown size; any other Top-Level element
+doing so is damage (between Clusters, playback resumes at the next Cluster).
 SegmentUUID, PrevUUID and NextUUID must be 16 octets. Text fields in Info,
 Chapters and Attachments hold at most 64 KiB, and each of these masters keeps
 at most 1 MiB. Past it, Chapters and Attachments keep the records that fit, in
-order, and record one damage event, and the open goes on, strict or resilient:
-a long chapter list never stops playback. Attachment payloads are never read at
-open; one fetched on request grows only as bytes arrive, and a payload reaching
-past its AttachedFile or the Segment is refused unread. Everything the open
-keeps from Tracks or Tags, including tag resolution, the per-stream views and
-room to parse or decompress a codec configuration, stays within the master's
-32 MiB limit at its peak and after the open. The Cues index
-keeps at most 32 MiB: past that it keeps the CuePoints that fit and records a
-damage event, and a seek past the last point kept for its track scans the
-Clusters from the first one (a known read cost on large remote files). Cluster
+order: a long chapter list never stops playback. Attachment payloads are never
+read at open; one fetched on request grows only as bytes arrive, a payload
+reaching past its AttachedFile or the Segment is refused unread, and a source
+failure while it reads is returned as itself. Everything the open keeps from
+Tracks or Tags, including tag resolution, the per-stream views and room to
+parse or decompress a codec configuration, stays within the master's 32 MiB
+limit at its peak and after the open. The Cues index keeps at most 32 MiB:
+past that, or past damage, it keeps the CuePoints before it, and a seek past
+the last point kept for its track, or with no Cues, scans the Clusters from
+the first one (a known read cost on large remote files). Cluster
 records, their index, and the EncryptedBlocks and SilentTracks numbers they
 keep share one 32 MiB budget, lists included, and are recorded once even when
 a seek revisits them. A block past the budget is damage and the walk resumes
