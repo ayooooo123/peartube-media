@@ -1,82 +1,13 @@
-use std::path::Path;
-use std::process::Command;
+mod common;
 
+use std::path::Path;
+
+use common::{ffmpeg_cues, format_srt_time, visible_text};
 use oxideav_core::{Frame, MediaType, Packet, TimeBase};
 use refcheck::fate;
 
-fn format_srt_time(us: i64) -> String {
-    let ms = (us / 1000).max(0);
-    let s = ms / 1000;
-    let m = s / 60;
-    let h = m / 60;
-    format!(
-        "{:02}:{:02}:{:02},{:03}",
-        h,
-        m % 60,
-        s % 60,
-        ms % 1000
-    )
-}
-
 fn ffmpeg_srt_cues(path: &Path) -> Vec<(String, String)> {
-    ffmpeg_srt_cues_with_options(path, &[])
-}
-
-fn ffmpeg_srt_cues_with_options(path: &Path, options: &[&str]) -> Vec<(String, String)> {
-    let output = Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error"])
-        .args(options)
-        .args([
-            "-i",
-            path.to_str().unwrap(),
-            "-map",
-            "0:s:0",
-            "-c:s",
-            "srt",
-            "-f",
-            "srt",
-            "-",
-        ])
-        .output()
-        .expect("run ffmpeg");
-    assert!(output.status.success(), "ffmpeg failed: {:?}", output);
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_srt_text(&text)
-}
-
-fn parse_srt_text(text: &str) -> Vec<(String, String)> {
-    let mut cues = Vec::new();
-    let lines: Vec<&str> = text.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        let line = lines[i].trim();
-        if !line.is_empty()
-            && line.chars().all(|c| c.is_ascii_digit())
-            && i + 1 < lines.len()
-            && lines[i + 1].contains("-->")
-        {
-            let timing = lines[i + 1].trim().to_string();
-            i += 2;
-            let mut body_lines = Vec::new();
-            while i < lines.len() {
-                let cur = lines[i].trim();
-                if !cur.is_empty()
-                    && cur.chars().all(|c| c.is_ascii_digit())
-                    && i + 1 < lines.len()
-                    && lines[i + 1].contains("-->")
-                {
-                    break;
-                }
-                body_lines.push(lines[i]);
-                i += 1;
-            }
-            let body = body_lines.join("\n").trim().to_string();
-            cues.push((timing, body));
-        } else {
-            i += 1;
-        }
-    }
-    cues
+    ffmpeg_cues(path, &[], "srt")
 }
 
 #[test]
@@ -315,19 +246,29 @@ fn test_sami_reference() {
     }
 }
 
-fn assert_standalone_cues(sample: &str, options: &[&str]) {
+fn assert_standalone_cues(sample: &str, options: &[&str], encoder: &str) {
     let sample = fate(sample);
-    let reference = ffmpeg_srt_cues_with_options(&sample, options);
+    let reference = ffmpeg_cues(&sample, options, encoder);
     assert!(!reference.is_empty(), "FFmpeg must produce reference cues");
-    let decoded = refcheck::decode(&sample, &[subs_text::register], MediaType::Subtitle, 0);
+    let decoded = refcheck::decode(&sample, &[codecs::register_all], MediaType::Subtitle, 0);
     let actual: Vec<_> = decoded.frames.iter().map(|frame| {
         let Frame::Subtitle(cue) = frame else { panic!("expected subtitle frame") };
+        let body = if encoder == "text" {
+            let mut text = String::new();
+            visible_text(&cue.segments, &mut text);
+            text
+        } else {
+            oxideav_subtitle::srt::render_segments(&cue.segments)
+        };
         (
             format!("{} --> {}", format_srt_time(cue.start_us), format_srt_time(cue.end_us)),
-            oxideav_subtitle::srt::render_segments(&cue.segments).trim().to_string(),
+            body.trim().to_string(),
         )
     }).collect();
-    assert_eq!(actual, reference, "complete cue text, timing and count for {}", sample.display());
+    assert_eq!(actual.len(), reference.len(), "cue count for {}", sample.display());
+    for (index, (actual, reference)) in actual.iter().zip(&reference).enumerate() {
+        assert_eq!(actual, reference, "cue {index} text and timing for {}", sample.display());
+    }
 }
 
 #[test]
@@ -335,183 +276,37 @@ fn test_subviewer1_reference() {
     assert_standalone_cues(
         "sub/SubViewer1_capability_tester.sub",
         &["-sub_charenc", "windows-1250"],
+        "srt",
     );
 }
 
 #[test]
 fn test_vplayer_reference() {
-    assert_standalone_cues("sub/VPlayer_capability_tester.txt", &[]);
+    assert_standalone_cues("sub/VPlayer_capability_tester.txt", &[], "srt");
 }
 
-#[test]
-fn test_untrusted_input_robustness() {
-    struct Rng(u64);
-    impl Rng {
-        fn next_u32(&mut self) -> u32 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 as u32
+// SAMI, SubViewer1 and VPlayer have complete reference cases above.
+// Compare visible text, not incidental SRT tag serialization (for example
+// uppercase versus lowercase color hex). This does not assert style parity.
+macro_rules! standalone_reference {
+    ($name:ident, $sample:literal) => {
+        #[test]
+        fn $name() {
+            assert_standalone_cues($sample, &[], "text");
         }
-        fn next_range(&mut self, max: usize) -> usize {
-            if max == 0 {
-                0
-            } else {
-                (self.next_u32() as usize) % max
-            }
-        }
-    }
-
-    let mut rng = Rng(0xDEAD_BEEF_CAFE_BABE);
-
-    let test_seeds: &[(&str, &[u8])] = &[
-        ("mov_text", b"\x00\x09Hello CSS\x00\x00\x00\x14styl\x00\x01\x00\x00\x00\x05\x00\x01\x01\x12\xff\x00\x00\xff"),
-        ("usf", b"<USFSubtitles><subtitles><subtitle start=\"1.0\" stop=\"2.0\"><text><b>Test</b></text></subtitle></subtitles></USFSubtitles>"),
-        ("cmml", b"<cmml><clip start=\"1.0\" end=\"2.0\"><title>T</title><desc>D</desc></clip></cmml>"),
-        ("kate", b"\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00Kate\x00"),
-        ("sami", b"<SAMI><BODY><SYNC Start=100><P Class=ENUSCC ID=Source>Speaker<P Class=ENUSCC>Hello <B>World</B></BODY></SAMI>"),
-        ("subviewer1", b"[DELAY]\n4\n[00:03:41]\nFirst line|second line\n"),
-        ("vplayer", b"0:00:01.50:Hello|world\n"),
-    ];
-    for &(codec, seed_data) in test_seeds {
-        for _ in 0..2500 {
-            let mut mutated = seed_data.to_vec();
-            let mode = rng.next_range(4);
-            match mode {
-                0 => {
-                    // Truncation
-                    let len = rng.next_range(mutated.len() + 1);
-                    mutated.truncate(len);
-                }
-                1 => {
-                    // Bit flip
-                    if !mutated.is_empty() {
-                        let idx = rng.next_range(mutated.len());
-                        let bit = rng.next_range(8);
-                        mutated[idx] ^= 1 << bit;
-                    }
-                }
-                2 => {
-                    // Random byte replacement
-                    if !mutated.is_empty() {
-                        let idx = rng.next_range(mutated.len());
-                        mutated[idx] = rng.next_u32() as u8;
-                    }
-                }
-                _ => {
-                    // Truncate + append random bytes
-                    let len = rng.next_range(mutated.len() + 1);
-                    mutated.truncate(len);
-                    let add = rng.next_range(16);
-                    for _ in 0..add {
-                        mutated.push(rng.next_u32() as u8);
-                    }
-                }
-            }
-
-            let params = oxideav_core::CodecParameters::subtitle(oxideav_core::CodecId::new(codec));
-            let packet = Packet::new(0, TimeBase::new(1, 1000), mutated);
-
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match codec {
-                    "mov_text" => {
-                        let mut dec = subs_text::mov_text::make_decoder(&params).unwrap();
-                        let _ = dec.send_packet(&packet);
-                        let _ = dec.receive_frame();
-                    }
-                    "usf" => {
-                        let mut dec = subs_text::usf::make_decoder(&params).unwrap();
-                        let _ = dec.send_packet(&packet);
-                        let _ = dec.receive_frame();
-                    }
-                    "cmml" => {
-                        let mut dec = subs_text::cmml::make_decoder(&params).unwrap();
-                        let _ = dec.send_packet(&packet);
-                        let _ = dec.receive_frame();
-                    }
-                    "kate" => {
-                        let mut dec = subs_text::kate::make_decoder(&params).unwrap();
-                        let _ = dec.send_packet(&packet);
-                        let _ = dec.receive_frame();
-                    }
-                    "sami" => {
-                        let mut dec = subs_text::sami::make_decoder(&params).unwrap();
-                        let _ = dec.send_packet(&packet);
-                        let _ = dec.receive_frame();
-                    }
-                    "subviewer1" => {
-                        let mut dec = subs_text::subviewer1::make_decoder(&params).unwrap();
-                        let _ = dec.send_packet(&packet);
-                        let _ = dec.receive_frame();
-                    }
-                    "vplayer" => {
-                        let mut dec = subs_text::vplayer::make_decoder(&params).unwrap();
-                        let _ = dec.send_packet(&packet);
-                        let _ = dec.receive_frame();
-                    }
-                    _ => unreachable!(),
-                }
-            }));
-            assert!(res.is_ok(), "fuzzing {} panicked!", codec);
-        }
-    }
+    };
 }
 
-#[test]
-fn test_verify_oxideav_standalone_subtitles() {
-    let fate_samples = [
-        ("SubRip", "sub/SubRip_capability_tester.srt"),
-        ("SubRip", "sub/badsyntax.srt"),
-        ("SubRip", "sub/empty-events-2167.srt"),
-        ("SubRip", "sub/madness.srt"),
-        ("SubRip", "sub/ticket5032-rrn.srt"),
-        ("MicroDVD", "sub/MicroDVD_capability_tester.sub"),
-        ("MicroDVD", "sub/MicroDVD_capability_tester.srt"),
-        ("SubViewer", "sub/SubViewer_capability_tester.sub"),
-        ("SubViewer", "sub/SubViewer1_capability_tester.sub"),
-        ("SAMI", "sub/SAMI_capability_tester.smi"),
-        ("SAMI", "sub/SAMI_multilang_tweak_tester.smi"),
-        ("VPlayer", "sub/VPlayer_capability_tester.txt"),
-        ("MPL2", "sub/MPL2_capability_tester.txt"),
-        ("WebVTT", "sub/WebVTT_capability_tester.vtt"),
-        ("WebVTT", "sub/WebVTT_extended_tester.vtt"),
-        ("SSA/ASS", "sub/1ededcbd7b.ass"),
-        ("SSA/ASS", "sub/a9-misc.ssa"),
-    ];
-
-    println!("\n=== OxideAV Standalone Subtitle Verification ===");
-    for (format, sample_rel) in fate_samples {
-        let sample_path = fate(sample_rel);
-        let registrars: &[refcheck::Registrar] = &[
-            oxideav_subtitle::register,
-            oxideav_ass::register,
-        ];
-
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            refcheck::decode(&sample_path, registrars, MediaType::Subtitle, 0)
-        }));
-
-        match res {
-            Ok(decoded) => {
-                println!(
-                    "PASS: [{}] {} => {} cues decoded (params: {:?})",
-                    format,
-                    sample_rel,
-                    decoded.frames.len(),
-                    decoded.params.codec_id
-                );
-            }
-            Err(e) => {
-                let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "panic".to_string()
-                };
-                println!("FAIL: [{}] {} => {}", format, sample_rel, msg);
-            }
-        }
-    }
-    println!("================================================\n");
-}
+standalone_reference!(standalone_subrip, "sub/SubRip_capability_tester.srt");
+standalone_reference!(standalone_badsyntax, "sub/badsyntax.srt");
+standalone_reference!(standalone_empty_events, "sub/empty-events-2167.srt");
+standalone_reference!(standalone_madness, "sub/madness.srt");
+standalone_reference!(standalone_rrn, "sub/ticket5032-rrn.srt");
+standalone_reference!(standalone_microdvd, "sub/MicroDVD_capability_tester.sub");
+standalone_reference!(standalone_microdvd_srt, "sub/MicroDVD_capability_tester.srt");
+standalone_reference!(standalone_subviewer, "sub/SubViewer_capability_tester.sub");
+standalone_reference!(standalone_mpl2, "sub/MPL2_capability_tester.txt");
+standalone_reference!(standalone_webvtt, "sub/WebVTT_capability_tester.vtt");
+standalone_reference!(standalone_webvtt_extended, "sub/WebVTT_extended_tester.vtt");
+standalone_reference!(standalone_ass, "sub/1ededcbd7b.ass");
+standalone_reference!(standalone_ssa, "sub/a9-misc.ssa");

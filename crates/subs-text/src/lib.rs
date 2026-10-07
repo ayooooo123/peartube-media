@@ -1,29 +1,43 @@
-//! In-container text subtitle decoders for OxideAV.
+//! Text subtitle demuxers and decoders for OxideAV.
 //!
 //! | Format  | Codec id   | Travels under                                       | Source                    |
 //! |---------|------------|-----------------------------------------------------|---------------------------|
+//! | SubRip  | `subrip`   | `.srt`; Matroska `S_TEXT/UTF8`                      | FFmpeg `srtdec.c` (both), `htmlsubtitles.c` (LGPL-2.1-or-later, ported) |
+//! | ASS/SSA | `ass`, `ssa` | `.ass`/`.ssa`; Matroska `S_TEXT/ASS` / `S_TEXT/SSA` | FFmpeg `assdec.c` (both), `ass_split.c` (LGPL-2.1-or-later, ported) |
+//! | WebVTT  | `webvtt`   | `.vtt`; Matroska / WebM WebVTT tracks               | FFmpeg `webvttdec.c` (both) (LGPL-2.1-or-later, ported) |
+//! | MicroDVD| `microdvd` | `.sub`                                              | FFmpeg `microdvddec.c` (both) (LGPL-2.1-or-later, ported) |
+//! | SubViewer 2 | `subviewer2` | `.sub`                                       | FFmpeg `subviewerdec.c` (both) (LGPL-2.1-or-later, ported) |
 //! | mov_text| `mov_text` | MP4 sample entries `tx3g` / `text`                  | FFmpeg `movtextdec.c` (LGPL-2.1-or-later, ported) |
 //! | USF     | `usf`      | Matroska `S_TEXT/USF`                               | VLC `subsusf.c` + `subsdec.c` (LGPL-2.1-or-later, ported) |
 //! | CMML    | `cmml`     | Ogg logical stream, ident `CMML\0\0\0\0`            | Xiph CMML spec (clean-room) |
 //! | Kate    | `kate`     | Ogg logical stream, ident `\x80kate\0\0\0`; Matroska `S_KATE` | Xiph OggKate spec + libkate bitstream docs (clean-room) |
-//! | WebVTT  | `webvtt`   | Matroska / WebM text packets                       | OxideAV inline parser + container timing |
 //!
 //! Decoders consume one packet per cue and emit `Frame::Subtitle`
-//! (`oxideav_core::SubtitleCue`) — the same representation the
-//! `oxideav-subtitle` standalone-format decoders produce.
+//! (`oxideav_core::SubtitleCue`). Formats FFmpeg decodes to ASS go through
+//! the same conversion here ([`ass_text`]): a cue shows the text FFmpeg's
+//! decode of it holds, styled by the event's ASS style and overrides.
 //!
 //! Every byte comes from untrusted peers: all reads are bounds-checked,
 //! allocations are capped, and malformed input yields `Error::InvalidData`,
 //! never a panic.
 #![forbid(unsafe_code)]
 
+pub mod ass;
+pub mod ass_split;
+pub mod ass_text;
 pub mod bitpack;
 pub mod cmml;
+mod html_color;
 pub mod kate;
+pub mod microdvd;
 pub mod mov_text;
 pub mod sami;
+mod scan;
+pub mod srt;
+pub mod subviewer;
 pub mod subviewer1;
 pub mod text_common;
+mod text_reader;
 pub mod usf;
 pub mod vplayer;
 pub mod webvtt;
@@ -79,15 +93,40 @@ fn subtitle_caps(impl_name: &str) -> CodecCapabilities {
 
 /// Register every subtitle decoder this crate provides.
 pub fn register_codecs(reg: &mut CodecRegistry) {
+    use oxideav_core::CodecTag;
     reg.register(
-        CodecInfo::new(CodecId::new("webvtt"))
-            .capabilities(subtitle_caps("webvtt_packet_sw"))
+        CodecInfo::new(CodecId::new(srt::CODEC_ID))
+            .capabilities(subtitle_caps("subrip_ffmpeg_sw"))
+            .decoder(srt::make_decoder)
+            .tag(CodecTag::matroska("S_TEXT/UTF8")),
+    );
+    for (id, tag) in [(ass::ASS_CODEC_ID, "S_TEXT/ASS"), (ass::SSA_CODEC_ID, "S_TEXT/SSA")] {
+        reg.register(
+            CodecInfo::new(CodecId::new(id))
+                .capabilities(subtitle_caps("ass_ffmpeg_sw"))
+                .decoder(ass::make_decoder)
+                .tag(CodecTag::matroska(tag)),
+        );
+    }
+    reg.register(
+        CodecInfo::new(CodecId::new(webvtt::CODEC_ID))
+            .capabilities(subtitle_caps("webvtt_ffmpeg_sw"))
             .decoder(webvtt::make_decoder)
-            .tag(oxideav_core::CodecTag::matroska("D_WEBVTT/SUBTITLES"))
-            .tag(oxideav_core::CodecTag::matroska("D_WEBVTT/CAPTIONS"))
-            .tag(oxideav_core::CodecTag::matroska("D_WEBVTT/DESCRIPTIONS"))
-            .tag(oxideav_core::CodecTag::matroska("D_WEBVTT/METADATA"))
-            .tag(oxideav_core::CodecTag::matroska("S_TEXT/WEBVTT")),
+            .tag(CodecTag::matroska("D_WEBVTT/SUBTITLES"))
+            .tag(CodecTag::matroska("D_WEBVTT/CAPTIONS"))
+            .tag(CodecTag::matroska("D_WEBVTT/DESCRIPTIONS"))
+            .tag(CodecTag::matroska("D_WEBVTT/METADATA"))
+            .tag(CodecTag::matroska("S_TEXT/WEBVTT")),
+    );
+    reg.register(
+        CodecInfo::new(CodecId::new(microdvd::CODEC_ID))
+            .capabilities(subtitle_caps("microdvd_ffmpeg_sw"))
+            .decoder(microdvd::make_decoder),
+    );
+    reg.register(
+        CodecInfo::new(CodecId::new(subviewer::CODEC_ID))
+            .capabilities(subtitle_caps("subviewer_ffmpeg_sw"))
+            .decoder(subviewer::make_decoder),
     );
     // mov_text: MP4 `tx3g` (3GPP TS 26.245) and QuickTime `text` sample
     // entries. The MP4 demuxer maps both to the `mov_text` / `text`
@@ -147,8 +186,36 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     );
 }
 
-/// Register standalone subtitle containers (demuxers + probes) provided by this crate.
+/// Register standalone subtitle containers (demuxers + probes) provided by
+/// this crate. Names shared with OxideAV's containers replace them when
+/// this runs after them.
 pub fn register_containers(reg: &mut oxideav_core::ContainerRegistry) {
+    // SubRip
+    reg.register_demuxer(srt::CONTAINER_NAME, srt::open_demuxer);
+    reg.register_probe_with_priority(srt::CONTAINER_NAME, srt::probe, 50);
+    reg.register_extension_with_priority("srt", srt::CONTAINER_NAME, 50);
+
+    // ASS / SSA
+    reg.register_demuxer(ass::CONTAINER_NAME, ass::open_demuxer);
+    reg.register_probe_with_priority(ass::CONTAINER_NAME, ass::probe, 50);
+    reg.register_extension_with_priority("ass", ass::CONTAINER_NAME, 50);
+    reg.register_extension_with_priority("ssa", ass::CONTAINER_NAME, 50);
+
+    // WebVTT
+    reg.register_demuxer(webvtt::CONTAINER_NAME, webvtt::open_demuxer);
+    reg.register_probe_with_priority(webvtt::CONTAINER_NAME, webvtt::probe, 50);
+    reg.register_extension_with_priority("vtt", webvtt::CONTAINER_NAME, 50);
+    reg.register_extension_with_priority("webvtt", webvtt::CONTAINER_NAME, 50);
+
+    // MicroDVD
+    reg.register_demuxer(microdvd::CONTAINER_NAME, microdvd::open_demuxer);
+    reg.register_probe_with_priority(microdvd::CONTAINER_NAME, microdvd::probe, 50);
+
+    // SubViewer 2 (FFmpeg's `subviewer`; claims `.sub` as FFmpeg does)
+    reg.register_demuxer(subviewer::CONTAINER_NAME, subviewer::open_demuxer);
+    reg.register_probe_with_priority(subviewer::CONTAINER_NAME, subviewer::probe, 50);
+    reg.register_extension_with_priority("sub", subviewer::CONTAINER_NAME, 50);
+
     // SAMI
     reg.register_demuxer(sami::CONTAINER_NAME, sami::open_demuxer);
     reg.register_probe_with_priority(sami::CONTAINER_NAME, sami::probe, 50);

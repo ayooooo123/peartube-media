@@ -1,5 +1,6 @@
 //! Pure-Rust ASF (Advanced Systems Format) container demuxer.
-//! Ported from FFmpeg commit 2da55bf (libavformat/asfdec_f.c, asf.c, asf.h, asf_tags.c).
+//! Ported from FFmpeg commit 2da55bf (libavformat/asfdec_f.c, asf.c, asf.h,
+//! asf_tags.c, argo_asf.c; seeking over demux-seek-core's seek.c).
 //! Licensed under LGPL-2.1-or-later.
 
 #![forbid(unsafe_code)]

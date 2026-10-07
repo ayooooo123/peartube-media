@@ -4,6 +4,7 @@ use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use audio_trim::{Pcm, Trimmer};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use oxideav_core::{
@@ -11,14 +12,19 @@ use oxideav_core::{
     SampleFormat, StreamInfo, TimeBase, PROBE_SCORE_EXTENSION,
 };
 
+mod captions;
+
 use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
 use crate::clock::MasterClock;
 use crate::headless::find_headless;
 use crate::source::{open_source, ReadAheadSource, SourceMonitor};
-use crate::subs::run_subtitle_loop;
+use crate::subs::{run_subtitle_loop, SubtitlePipeline};
 
 mod transport;
 use transport::{Due, Live, Pipe, Preroll, Transport};
+
+#[cfg(test)]
+mod subtitle_tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
@@ -72,6 +78,9 @@ pub struct State {
     pub video_size: Option<(u32, u32)>,
     pub video_decoder: Option<String>,
     pub dropped_frames: u64,
+    /// Trim work lost to input limits. Playback continues with untrimmed
+    /// samples; this is not an audio decoder error.
+    pub audio_trim_fallbacks: audio_trim::Fallbacks,
 }
 
 #[derive(Clone, Debug)]
@@ -111,7 +120,7 @@ pub(crate) struct Lane {
     pub(crate) cv: Condvar,
     /// Seek generation the queued packets belong to; changed only with
     /// `queue` locked, when the demuxer empties the lane for a seek.
-    seek_gen: AtomicU64,
+    pub(crate) seek_gen: AtomicU64,
     /// A pipeline thread drains the lane (see `Consumer`); changed only with
     /// `queue` locked. Without one, packets for the lane are dropped:
     /// queued, they would fill it and park the demuxer for good.
@@ -370,11 +379,15 @@ struct SharedState {
     active_seek: Mutex<Option<Seek>>,
     /// Selection written by `select_audio` / `select_subtitle`; the demux
     /// loop applies it (flush + respawn the pipeline) and mirrors `state`.
-    wanted_audio: Mutex<Option<u32>>,
+    wanted_audio: Mutex<AudioChoice>,
     wanted_video: Mutex<Option<u32>>,
     wanted_subtitle: Mutex<Option<u32>>,
     /// Bumped on every selection change; the demux loop compares to detect it.
     select_gen: AtomicU64,
+    /// The playback has video or audio pipelines (playing or played out),
+    /// as its selection stands: subtitles beside them end with the screen
+    /// clear. Set by the demux thread whenever it starts or retires them.
+    beside_media: AtomicBool,
     backend: Arc<dyn Backend>,
     /// The playback's clock (see `MasterClock`); `transport` decides when
     /// it runs.
@@ -403,6 +416,14 @@ struct Seek {
     generation: u64,
     /// Target in seconds.
     target: f64,
+}
+
+/// The audio track asked for: the playback's default, or one the caller
+/// chose (`None`: no audio). A switch of another kind keeps the default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AudioChoice {
+    Default,
+    Chosen(Option<u32>),
 }
 
 impl SharedState {
@@ -461,10 +482,11 @@ impl Player {
             seek_gen: AtomicU64::new(0),
             seek_target: Mutex::new(None),
             active_seek: Mutex::new(None),
-            wanted_audio: Mutex::new(options.audio),
+            wanted_audio: Mutex::new(options.audio.map_or(AudioChoice::Default, |stream| AudioChoice::Chosen(Some(stream)))),
             wanted_video: Mutex::new(options.video),
             wanted_subtitle: Mutex::new(options.subtitle),
             select_gen: AtomicU64::new(1),
+            beside_media: AtomicBool::new(false),
             backend,
             master: Arc::new(MasterClock::new()),
             audio_sink: Mutex::new(None),
@@ -510,7 +532,7 @@ impl Player {
     }
 
     pub fn select_audio(&self, stream: Option<u32>) {
-        *self.shared.wanted_audio.lock() = stream;
+        *self.shared.wanted_audio.lock() = AudioChoice::Chosen(stream);
         self.shared.select_gen.fetch_add(1, Ordering::SeqCst);
         self.shared.condvar.notify_all();
         notify_changed(&self.shared);
@@ -690,7 +712,7 @@ fn run_player_pipeline(
     // 4. Streams (cap 64; drop video tracks above the size limits).
     let streams_all = demuxer.streams();
     let count = streams_all.len().min(64);
-    let streams: Vec<StreamInfo> = streams_all[..count].to_vec();
+    let mut streams: Vec<StreamInfo> = streams_all[..count].to_vec();
 
     let mut tracks = Vec::new();
     let mut first_audio = None;
@@ -752,6 +774,8 @@ fn run_player_pipeline(
                 })
                 .max()
         });
+    // Captions in the video: selectable streams, tracks once data shows up.
+    captions::add_streams(&mut streams, shared.wanted_video.lock().or(first_video));
 
     // 5. Selection. The pipeline thread owns `current_*`; `select_*` writes
     // `wanted_*` and bumps `select_gen` so the demux loop applies switches.
@@ -760,7 +784,10 @@ fn run_player_pipeline(
     let select_gen = shared.select_gen.load(Ordering::SeqCst);
     let options_video = *shared.wanted_video.lock();
     let current_video = options_video.or(first_video);
-    let current_audio = (*shared.wanted_audio.lock()).or(first_audio);
+    let current_audio = match *shared.wanted_audio.lock() {
+        AudioChoice::Default => first_audio,
+        AudioChoice::Chosen(stream) => stream,
+    };
     let current_subtitle = *shared.wanted_subtitle.lock();
 
     {
@@ -863,6 +890,7 @@ fn run_player_pipeline(
         video_stream.map(|stream| spawn_video(&shared, stream, &video_lane, &demux_cv, realtime));
     run.audio_thread =
         audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
+    shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
     run.sub_thread = find_stream(&streams, current_subtitle)
         .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime));
 
@@ -870,11 +898,21 @@ fn run_player_pipeline(
     shared.pipelines_started();
     run_demux_loop(&mut run);
 
-    for thread in [run.video_thread.take(), run.audio_thread.take(), run.sub_thread.take()]
-        .into_iter()
-        .flatten()
-    {
+    // Subtitles never hold the end of a playback with video or audio: a
+    // state still up when those have played (its end can be minutes or
+    // hours out) comes down with them. Alone, subtitles play to their last
+    // end; without realtime nothing waits on the clock and the pipeline
+    // ends once its lane has drained.
+    let paced = run.video_thread.is_some() || run.audio_thread.is_some();
+    for thread in [run.video_thread.take(), run.audio_thread.take()].into_iter().flatten() {
         thread.join();
+    }
+    if let Some(subtitles) = run.sub_thread.take() {
+        if paced && realtime {
+            subtitles.retire(&shared, &sub_lane);
+        } else {
+            subtitles.join();
+        }
     }
     // Everything has played: the idle audio output stops with the clock.
     if let Some(sink) = shared.audio_sink.lock().as_mut() {
@@ -977,7 +1015,16 @@ fn spawn_audio(
             sink: Some(sink),
         };
         if let Some(sink) = output.sink.as_deref_mut() {
-            run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
+            // However the pipeline fails, the track stops being the audio
+            // track, as when its decoder fails: a panic outside the decoder
+            // calls included.
+            let failed = Arc::clone(&shared);
+            let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired)
+            }));
+            if run.is_err() {
+                audio_failed(&failed, "audio pipeline failed".into());
+            }
         }
     })
 }
@@ -1008,27 +1055,49 @@ fn spawn_subtitles(
     let consumer = Consumer::new(lane, demux_cv);
     let sink = shared.backend.subtitles();
     let clock = shared.sink_clock();
-    let (w, h) = shared.state.lock().video_size.unwrap_or((320, 240));
     let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
     PipelineThread::spawn("peartube-subtitles", move |retired| {
         let _consumer = consumer;
-        let decoder = match shared.ctx.codecs.first_decoder(&stream.params) {
+        let mut params = stream.params.clone();
+        let (video_size, lanes) = (shared.state.lock().video_size, shared.lanes.lock().clone());
+        // DVD, CVD and OGT place regions in video pixels. For a stream that
+        // declares no canvas, FFmpeg's is the video's (fftools/ffmpeg_demux.c
+        // sub2video); the DVD decoder's own `size:` line still takes
+        // precedence, as dvdsubdec's does. The video size is known only from
+        // the container at open: nothing publishes a decoded one, so without
+        // it the decoders keep their 720x576, and nothing waits for a size.
+        let video_pixels = matches!(params.codec_id.as_str(), "dvd_subtitle" | "dvdsub" | "vobsub" | "cvd_subtitle" | "ogt");
+        let declared = params.width.unwrap_or(0) > 0 && params.height.unwrap_or(0) > 0;
+        if let Some((width, height)) = video_size.filter(|_| video_pixels && !declared) {
+            params.width = Some(params.width.unwrap_or(0).max(width));
+            params.height = Some(params.height.unwrap_or(0).max(height));
+        }
+        let (w, h) = video_size.unwrap_or((320, 240));
+        let decoder = match shared.ctx.codecs.first_decoder(&params) {
             Ok(d) => d,
             Err(_) => return,
         };
-        run_subtitle_loop(
+        let ctx = Arc::clone(&shared.ctx);
+        let (seeks, members) = (Arc::clone(&shared), Arc::clone(&shared));
+        let pipeline = SubtitlePipeline {
             decoder,
-            sink,
+            new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
             clock,
-            stream.time_base,
-            w,
-            h,
+            time_base: stream.time_base,
+            video_width: w,
+            video_height: h,
             realtime,
             lane,
             demux_cv,
-            shared.stopped.clone(),
+            seek_generation: Box::new(move || seeks.seek_gen.load(Ordering::SeqCst)),
+            // A video or audio pipeline drains its lane: the demuxer's
+            // read-ahead is bounded by theirs.
+            paced: Box::new(move || lanes.iter().take(2).any(|lane| lane.consumed.load(Ordering::SeqCst))),
+            beside_media: Box::new(move || members.beside_media.load(Ordering::SeqCst)),
+            stopped: shared.stopped.clone(),
             retired,
-        );
+        };
+        run_subtitle_loop(pipeline, sink);
     })
 }
 
@@ -1113,6 +1182,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
     let _ = run.demuxer.set_active_streams(&active);
     let mut eof = false;
     let mut full = false;
+    let mut captions = captions::Captions::new(run);
 
     while !shared.stopped.load(Ordering::SeqCst) {
         // Selection switch: replace the changed pipelines.
@@ -1159,8 +1229,12 @@ fn run_demux_loop(run: &mut Run<'_>) {
             // lane without a consumer is always empty (see `Consumer`).
             // Leaving ends `run_player_pipeline`, which joins the pipelines
             // and sets Ended. A seek or a selection switch clears lanes and
-            // reopens `eof` at the top of this loop.
-            let drained = [run.video_thread.as_ref(), run.audio_thread.as_ref(), run.sub_thread.as_ref()]
+            // reopens `eof` at the top of this loop. In realtime, subtitles
+            // beside video or audio do not hold the end: their last state
+            // comes down when those have played (`run_player_pipeline`).
+            let paced = run.options.realtime && (run.video_thread.is_some() || run.audio_thread.is_some());
+            let subtitles = run.sub_thread.as_ref().filter(|_| !paced);
+            let drained = [run.video_thread.as_ref(), run.audio_thread.as_ref(), subtitles]
                 .into_iter().flatten().all(|thread| thread.handle.is_finished());
             if drained {
                 return;
@@ -1189,6 +1263,9 @@ fn run_demux_loop(run: &mut Run<'_>) {
                     None
                 };
                 let end = pipe.and_then(|_| packet_end_secs(&packet.packet));
+                if pipe == Some(Pipe::Video) {
+                    captions.video_packet(run, &packet.packet);
+                }
                 match pipe {
                     Some(Pipe::Video) => run.video_lane.push(packet),
                     Some(Pipe::Audio) => run.audio_lane.push(packet),
@@ -1201,6 +1278,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
                 }
             }
             Ok(Err(oxideav_core::Error::Eof)) => {
+                captions.finish(run);
                 eof = true;
                 run.video_lane.push_eof();
                 run.audio_lane.push_eof();
@@ -1273,11 +1351,16 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
 /// pipeline, start the new one, and refresh the headless registry entry. A
 /// new audio track resumes where playback is: the demuxer re-reads from the
 /// clock's position (a refresh seek) instead of starting the track wherever
-/// it has read ahead to.
+/// it has read ahead to. A subtitle switch never seeks: the new track shows
+/// from its next cue the demuxer reads.
 fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let shared = run.shared;
 
-    let wanted_audio = *shared.wanted_audio.lock();
+    // The default audio track stays whatever else changes.
+    let wanted_audio = match *shared.wanted_audio.lock() {
+        AudioChoice::Default => run.current_audio,
+        AudioChoice::Chosen(stream) => stream,
+    };
     let wanted_subtitle = *shared.wanted_subtitle.lock();
     let audio_changed = wanted_audio != run.current_audio;
     let sub_changed = wanted_subtitle != run.current_subtitle;
@@ -1340,6 +1423,8 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
             run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
         }
     }
+    // Subtitles beside video or audio, running or new, end with them.
+    shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
     if sub_changed {
         let stream = find_stream(run.streams, run.current_subtitle)
             .filter(|s| s.params.media_type == MediaType::Subtitle);
@@ -1355,12 +1440,31 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let _ = run.demuxer.set_active_streams(active);
 }
 
+fn audio_failed(shared: &SharedState, message: String) {
+    let mut st = shared.state.lock();
+    st.error.get_or_insert(message);
+    st.audio = None;
+    drop(st);
+    notify_changed(shared);
+}
+
+fn record_trim_fallbacks(shared: &SharedState, trimmer: &mut Trimmer<Chunk>) {
+    let fallbacks = trimmer.take_fallbacks();
+    if !fallbacks.is_empty() {
+        shared.state.lock().audio_trim_fallbacks.add(fallbacks);
+    }
+}
+
 /// Packet lanes → decoder → sink, for one audio stream. The sink follows the
 /// clock's run state (`play`/`pause`); while the clock stands still, PCM goes
 /// out only up to `PREROLL` past it. From its first samples of each seek the
 /// output's clock leads the playback. At EOF the pipeline ends once its last
 /// samples are heard; it ends early when the player stops or a selection
-/// switch sets `retired`.
+/// switch sets `retired`. The encoder delay and end padding the container
+/// declares (`PacketMetadata::audio_trim`) never reach the sink: they come
+/// off the decoder's output through `audio_trim`, as `refcheck` removes
+/// them, so the reference tests check what plays. A decoder's own start
+/// delay comes off there too, once, unless the container's skip replaces it.
 fn run_audio_thread(
     stream: StreamInfo,
     sink: &mut dyn AudioSink,
@@ -1370,31 +1474,37 @@ fn run_audio_thread(
     realtime: bool,
     retired: Arc<AtomicBool>,
 ) {
-    let mut decoder = match make_decoder(&shared.ctx, &stream.params) {
+    let mut decoder_params = stream.params.clone();
+    let decoder_delay = audio_trim::take_decoder_delay(&mut decoder_params);
+    let mut decoder = match make_decoder(&shared.ctx, &decoder_params) {
         Ok(d) => d,
         Err(e) => {
             // No decoder: the track is skipped (still listed in `tracks`)
             // and the rest plays on.
-            let mut st = shared.state.lock();
-            st.error.get_or_insert_with(|| format!("no audio decoder found: {e}"));
-            st.audio = None;
-            drop(st);
-            notify_changed(&shared);
+            audio_failed(&shared, format!("no audio decoder found: {e}"));
             return;
         }
     };
 
-    let mut current_rate = stream.params.sample_rate.unwrap_or(48000);
-    let mut current_channels = stream.params.channels.unwrap_or(2);
+    let mut out = AudioOut {
+        rate: stream.params.sample_rate.unwrap_or(48000),
+        channels: stream.params.channels.unwrap_or(2),
+        open: false,
+        written: Written::default(),
+        seen_seek_target: 0,
+        primed: None,
+    };
     // The output may come from the previous track: none of that plays on.
     sink.flush();
-    let mut sink_open = sink.open(current_rate, current_channels).is_ok();
-    let mut written = Written::default();
+    out.open = sink.open(out.rate, out.channels).is_ok();
     let mut starved = false;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
-    let mut seen_seek_target: u64 = 0;
-    let mut primed: Option<u64> = None;
+    let mut trimmer: Trimmer<Chunk> = Trimmer::with_decoder_delay(decoder_delay);
+    let mut kept: Vec<Chunk> = Vec::new();
+    // Where the decoder's output so far ends: where a frame without a pts
+    // of its own starts.
+    let mut decoded_end: Option<f64> = None;
     let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
     while !quit() {
@@ -1405,24 +1515,22 @@ fn run_audio_thread(
                 break;
             }
         }
-        sync_audio_sink(sink, &shared, &mut written.running);
+        sync_audio_sink(sink, &shared, &mut out.written.running);
 
-        // Seek generation: start the decoder and the sink over, drop
-        // pre-target output after the demuxer's seek lands.
+        // Seek generation: start the decoder, the trims and the sink over,
+        // drop pre-target output after the demuxer's seek lands.
         let gen_now = shared.seek_gen.load(Ordering::SeqCst);
         if gen_now != seen_seek {
             seen_seek = gen_now;
             sink.flush();
-            written.running = None;
-            written.end = None;
-            decoder = match make_decoder(&shared.ctx, &stream.params) {
+            out.written.running = None;
+            out.written.end = None;
+            trimmer.reset();
+            decoded_end = None;
+            decoder = match make_decoder(&shared.ctx, &decoder_params) {
                 Ok(d) => d,
                 Err(e) => {
-                    let mut st = shared.state.lock();
-                    st.error.get_or_insert_with(|| format!("audio decoder failed to restart: {e}"));
-                    st.audio = None;
-                    drop(st);
-                    notify_changed(&shared);
+                    audio_failed(&shared, format!("audio decoder failed to restart: {e}"));
                     return;
                 }
             };
@@ -1430,49 +1538,52 @@ fn run_audio_thread(
         }
 
         // Pull a packet; the EOF marker ends this pipeline.
-        let applied = written.running;
+        let applied = out.written.running;
         let woken = || quit() || Some(shared.running()) != applied;
         let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
-        let QueuedPacket { packet, .. } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+        let QueuedPacket { packet, metadata } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
-                // Drain the decoder's tail into the sink.
+                // Drain the decoder's tail into the sink. What the trimmer
+                // still holds after that is the stream's end padding.
                 let _ = decoder.flush();
+                let mut packet_pts = None;
                 while !quit() {
                     let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
-                    match recv {
-                        Ok(Ok(Frame::Audio(af))) => {
-                            let (format, rate, channels) =
-                                audio_layout(decoder.as_ref(), &stream.params, &af);
-                            let pcm = convert_audio_to_f32(&af, format, channels as usize);
-                            if pcm.is_empty() {
-                                break;
-                            }
-                            let pts = match af.pts {
-                                Some(ticks) => Duration::from_secs_f64(stream.time_base.seconds_of(ticks.max(0)).max(0.0)),
-                                None => written.end.unwrap_or_default(),
-                            };
-                            if !write_pcm(
-                                sink, &shared, &pcm, channels as usize, rate, pts, seen_seek,
-                                realtime, &mut written, &retired,
-                            ) {
-                                break;
-                            }
-                        }
-                        Ok(Ok(_)) => {}
+                    let af = match recv {
+                        Ok(Ok(Frame::Audio(af))) => af,
+                        Ok(Ok(_)) => continue,
                         _ => break,
+                    };
+                    // An empty frame ends the tail: a decoder may return
+                    // them forever.
+                    if af.samples == 0 {
+                        break;
                     }
+                    let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
+                    trimmer.frame(chunk, af.pts, &mut kept);
+                    record_trim_fallbacks(&shared, &mut trimmer);
+                    if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
+                        break;
+                    }
+                }
+                // A tail the trimmer held as padding but finds too short for
+                // it plays (FFmpeg ignores such padding).
+                trimmer.finish(&mut kept);
+                record_trim_fallbacks(&shared, &mut trimmer);
+                if !quit() {
+                    let _ = present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired);
                 }
                 // The output plays what it holds before the pipeline ends:
                 // the audio leads the clock up to its last sample, and the
                 // playback ends after that sample is heard.
-                if let (true, Some(end), Some(leads)) = (realtime, written.end, written.leads) {
+                if let (true, Some(end), Some(leads)) = (realtime, out.written.end, out.written.leads) {
                     if leads == seen_seek {
                         shared.wait_heard(end, seen_seek, &retired, |running| {
-                            if written.running != Some(running) {
+                            if out.written.running != Some(running) {
                                 if running { sink.play(); } else { sink.pause(); }
-                                written.running = Some(running);
+                                out.written.running = Some(running);
                             }
                         });
                     }
@@ -1489,17 +1600,13 @@ fn run_audio_thread(
         match send_res {
             Ok(Ok(())) => {
                 consecutive_errors = 0;
+                trimmer.packet(&packet, metadata.audio_trim);
+                record_trim_fallbacks(&shared, &mut trimmer);
             }
             Ok(Err(_)) | Err(_) => {
                 consecutive_errors += 1;
                 if consecutive_errors >= 3 {
-                    let mut st = shared.state.lock();
-                    let _ = st.error.get_or_insert_with(|| {
-                        format!("audio decoder failed 3 times on stream {}", stream.index)
-                    });
-                    st.audio = None;
-                    drop(st);
-                    notify_changed(&shared);
+                    audio_failed(&shared, format!("audio decoder failed 3 times on stream {}", stream.index));
                     return;
                 }
                 continue;
@@ -1525,89 +1632,190 @@ fn run_audio_thread(
                 Ok(Err(_)) | Err(_) => {
                     consecutive_errors += 1;
                     if consecutive_errors >= 3 {
-                        let mut st = shared.state.lock();
-                        let _ = st.error.get_or_insert_with(|| {
-                            format!("audio decoder failed 3 times on stream {}", stream.index)
-                        });
-                        st.audio = None;
-                        drop(st);
-                        notify_changed(&shared);
+                        audio_failed(&shared, format!("audio decoder failed 3 times on stream {}", stream.index));
                         return;
                     }
                     break;
                 }
             };
             let Frame::Audio(af) = frame else { continue };
-
-            let (format, sample_rate, channels) = audio_layout(decoder.as_ref(), &stream.params, &af);
-            let channels = channels as usize;
-
-            if !sink_open || sample_rate != current_rate || (channels as u16) != current_channels {
-                current_rate = sample_rate;
-                current_channels = channels as u16;
-                written.reopen(&shared);
-                sink_open = sink.open(current_rate, current_channels).is_ok();
-            }
-            let sink_failed = !sink_open;
-
-            let mut pcm = convert_audio_to_f32(&af, format, channels);
-            let ticks = af.pts.or(packet_pts.take());
-            let mut pts_secs = match (ticks, written.end) {
-                (Some(ticks), _) => stream.time_base.seconds_of(ticks),
-                (None, Some(end)) => end.as_secs_f64(),
-                (None, None) => 0.0,
-            };
-            // Samples stamped before zero precede the presentation (codec
-            // priming); clamping them to zero would overlap the first real
-            // samples on the output's timeline.
-            if pts_secs < 0.0 {
-                let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
-                pcm.drain(..(before * channels).min(pcm.len()));
-                pts_secs = 0.0;
-            }
-
-            // Drop pre-target output after a seek: audio before the target
-            // never reaches the sink. The frame that holds the target loses
-            // its samples before it, so the clock restarts at the target with
-            // the target's own sample.
-            if let Some(seek) = *shared.active_seek.lock() {
-                if seek.generation > seen_seek_target && pts_secs < seek.target {
-                    let frames = pcm.len() / channels.max(1);
-                    let before = ((seek.target - pts_secs) * f64::from(sample_rate)).round() as usize;
-                    if before < frames {
-                        pcm.drain(..before * channels);
-                        pts_secs = seek.target;
-                    } else {
-                        pcm.clear();
-                    }
-                }
-                if !pcm.is_empty() {
-                    seen_seek_target = seen_seek;
-                }
-            }
-            if pcm.is_empty() {
-                continue;
-            }
-
-            // A failed output cannot prime; let the remaining streams run.
-            // A working output primes only after it has actually taken PCM.
-            if sink_failed {
-                if primed != Some(seen_seek) {
-                    primed = Some(seen_seek);
-                    shared.pipe_primed(Pipe::Audio, seen_seek);
-                }
-                continue;
-            }
-            let pts = Duration::from_secs_f64(pts_secs);
-            if !write_pcm(
-                sink, &shared, &pcm, channels, sample_rate, pts, seen_seek, realtime,
-                &mut written, &retired,
-            ) {
+            let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
+            trimmer.frame(chunk, af.pts, &mut kept);
+            record_trim_fallbacks(&shared, &mut trimmer);
+            if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
                 // Stopped, retired or a seek: the rest of this packet is stale.
                 break;
             }
         }
     }
+}
+
+/// Decoded audio on its way to the sink: interleaved f32 in its own layout
+/// and the time its first sample plays.
+struct Chunk {
+    pcm: Vec<f32>,
+    channels: usize,
+    rate: u32,
+    pts: f64,
+    /// The first sample after a declared start skip (`Pcm::begins_presentation`).
+    begins: bool,
+}
+
+impl Pcm for Chunk {
+    fn samples(&self) -> usize {
+        self.pcm.len() / self.channels.max(1)
+    }
+
+    fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.pcm.capacity() * std::mem::size_of::<f32>()
+    }
+
+    fn drop_front(&mut self, n: usize) {
+        self.pcm.drain(..n.saturating_mul(self.channels).min(self.pcm.len()));
+        self.pts += n as f64 / f64::from(self.rate.max(1));
+    }
+
+    fn split_off(&mut self, n: usize) -> Self {
+        let rest = self.pcm.split_off(n.saturating_mul(self.channels).min(self.pcm.len()));
+        let pts = self.pts + n as f64 / f64::from(self.rate.max(1));
+        Chunk { pcm: rest, channels: self.channels, rate: self.rate, pts, begins: false }
+    }
+
+    fn begins_presentation(&mut self) {
+        self.begins = true;
+    }
+}
+
+/// A decoded frame as a `Chunk`, stamped where it starts: its own pts, else
+/// the packet's for the first frame after a send, else where the decoder's
+/// previous frame ended.
+fn decoded_chunk(
+    decoder: &dyn Decoder,
+    stream: &StreamInfo,
+    af: &oxideav_core::AudioFrame,
+    packet_pts: &mut Option<i64>,
+    decoded_end: &mut Option<f64>,
+) -> Chunk {
+    let layout = audio_trim::frame_layout(decoder.output_audio_format(), &stream.params, af);
+    let (format, rate, channels) = (layout.sample_format, layout.sample_rate, layout.channels as usize);
+    let pcm = convert_audio_to_f32(af, format, channels);
+    let pts = match (af.pts.or(packet_pts.take()), *decoded_end) {
+        (Some(ticks), _) => stream.time_base.seconds_of(ticks),
+        (None, Some(end)) => end,
+        (None, None) => 0.0,
+    };
+    let frames = pcm.len() / channels.max(1);
+    *decoded_end = Some(pts + frames as f64 / f64::from(rate.max(1)));
+    Chunk { pcm, channels, rate, pts, begins: false }
+}
+
+/// What an audio pipeline's output is set up for and has taken.
+struct AudioOut {
+    /// The layout the sink was last opened with, and whether that worked.
+    rate: u32,
+    channels: u16,
+    open: bool,
+    written: Written,
+    /// The newest seek generation whose target the output has reached.
+    seen_seek_target: u64,
+    /// The seek generation a failed output last let the playback go for.
+    primed: Option<u64>,
+}
+
+/// Hands what the trimmer released to the sink, in order. False when the
+/// player stopped, the pipeline was retired, or a seek superseded the
+/// audio; the rest is dropped then.
+fn present_kept(
+    sink: &mut dyn AudioSink,
+    shared: &SharedState,
+    out: &mut AudioOut,
+    kept: &mut Vec<Chunk>,
+    seen_seek: u64,
+    realtime: bool,
+    retired: &AtomicBool,
+) -> bool {
+    for chunk in kept.drain(..) {
+        if !present_audio(sink, shared, out, chunk, seen_seek, realtime, retired) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One chunk of decoded audio to the sink, which is (re)opened for its
+/// layout. Samples stamped before zero precede the presentation (codec
+/// priming no container trim covered), unless a declared start skip just
+/// came off: those begin the presentation at zero, as FFmpeg plays them.
+/// After a seek, those before its target never play.
+fn present_audio(
+    sink: &mut dyn AudioSink,
+    shared: &SharedState,
+    out: &mut AudioOut,
+    chunk: Chunk,
+    seen_seek: u64,
+    realtime: bool,
+    retired: &AtomicBool,
+) -> bool {
+    let Chunk { mut pcm, channels, rate: sample_rate, pts, begins } = chunk;
+    if !out.open || sample_rate != out.rate || channels as u16 != out.channels {
+        out.rate = sample_rate;
+        out.channels = channels as u16;
+        out.written.reopen(shared);
+        out.open = sink.open(out.rate, out.channels).is_ok();
+    }
+    let sink_failed = !out.open;
+
+    // Clamping undeclared priming stamped before zero to zero would overlap
+    // the first real samples on the output's timeline. Declared priming is
+    // gone already; what follows it starts the presentation even when the
+    // container's timestamps disagree with its skip.
+    let mut pts_secs = pts;
+    if pts_secs < 0.0 {
+        if !begins {
+            let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
+            pcm.drain(..(before.saturating_mul(channels)).min(pcm.len()));
+        }
+        pts_secs = 0.0;
+    }
+
+    // Drop pre-target output after a seek: audio before the target never
+    // reaches the sink. The chunk that holds the target loses its samples
+    // before it, so the clock restarts at the target with the target's own
+    // sample.
+    if let Some(seek) = *shared.active_seek.lock() {
+        if seek.generation > out.seen_seek_target && pts_secs < seek.target {
+            let frames = pcm.len() / channels.max(1);
+            let before = ((seek.target - pts_secs) * f64::from(sample_rate)).round() as usize;
+            if before < frames {
+                pcm.drain(..before * channels);
+                pts_secs = seek.target;
+            } else {
+                pcm.clear();
+            }
+        }
+        if !pcm.is_empty() {
+            out.seen_seek_target = seen_seek;
+        }
+    }
+    if pcm.is_empty() {
+        return true;
+    }
+
+    // A failed output cannot prime; let the remaining streams run. A
+    // working output primes only after it has actually taken PCM.
+    if sink_failed {
+        if out.primed != Some(seen_seek) {
+            out.primed = Some(seen_seek);
+            shared.pipe_primed(Pipe::Audio, seen_seek);
+        }
+        return true;
+    }
+    let pts = Duration::from_secs_f64(pts_secs);
+    write_pcm(sink, shared, &pcm, channels, sample_rate, pts, seen_seek, realtime, &mut out.written, retired)
 }
 
 /// What an audio pipeline knows about its output across writes.
@@ -1727,54 +1935,6 @@ fn write_pcm(
     true
 }
 
-/// The layout of `af`: what the decoder says it emits, else the container's
-/// declaration corrected by the frame's actual plane count and byte length.
-/// Containers often declare a different format, rate or channel count than
-/// the decoder produces (HE-AAC, parametric stereo, S16 decoders), and
-/// reading S16 bytes as f32 yields garbage and NaNs.
-fn audio_layout(
-    decoder: &dyn oxideav_core::Decoder,
-    params: &oxideav_core::CodecParameters,
-    af: &oxideav_core::AudioFrame,
-) -> (SampleFormat, u32, u16) {
-    if let Some(f) = decoder.output_audio_format() {
-        return (f.sample_format, f.sample_rate, f.channels);
-    }
-    let rate = params.sample_rate.unwrap_or(48000);
-    let declared = params.sample_format;
-    let planar = af.data.len() > 1;
-    let channels = if planar { af.data.len() as u16 } else { params.channels.unwrap_or(1).max(1) };
-    let per_plane = if planar { 1 } else { channels as usize };
-    let samples = (af.samples as usize).max(1);
-    let bytes = af.data.first().map_or(0, Vec::len);
-    let width = bytes / (samples * per_plane);
-    let fits = |f: SampleFormat| f.is_planar() == planar && f.bytes_per_sample() == width;
-    let format = match declared {
-        Some(f) if fits(f) => f,
-        _ => {
-            // 4-byte samples are f32 or s32: keep the declared family.
-            let float = declared.map_or(true, |f| {
-                matches!(f, SampleFormat::F32 | SampleFormat::F32P | SampleFormat::F64 | SampleFormat::F64P)
-            });
-            match (width, planar, float) {
-                (1, false, _) => SampleFormat::U8,
-                (1, true, _) => SampleFormat::U8P,
-                (2, false, _) => SampleFormat::S16,
-                (2, true, _) => SampleFormat::S16P,
-                (3, false, _) => SampleFormat::S24,
-                (4, false, true) => SampleFormat::F32,
-                (4, false, false) => SampleFormat::S32,
-                (4, true, true) => SampleFormat::F32P,
-                (4, true, false) => SampleFormat::S32P,
-                (8, false, _) => SampleFormat::F64,
-                (8, true, _) => SampleFormat::F64P,
-                _ => declared.unwrap_or(SampleFormat::F32),
-            }
-        }
-    };
-    (format, rate, channels)
-}
-
 fn convert_audio_to_f32(
     af: &oxideav_core::AudioFrame,
     format: SampleFormat,
@@ -1855,6 +2015,7 @@ fn run_video_thread(
     let mut starved = false;
     let mut primed: Option<u64> = None;
     let mut last_end = Duration::ZERO;
+    let mut frame_clock = FrameClock::default();
     let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
     if !compressed {
@@ -1897,6 +2058,7 @@ fn run_video_thread(
             seen_seek = gen_now;
             sink.flush();
             last_end = Duration::ZERO;
+            frame_clock = FrameClock::default();
             if sw_decoder.is_some() {
                 match make_decoder(&shared.ctx, &stream.params) {
                     Ok(d) => sw_decoder = Some(d),
@@ -1930,7 +2092,7 @@ fn run_video_thread(
                         let recv = std::panic::catch_unwind(AssertUnwindSafe(|| dec.receive_frame()));
                         match recv {
                             Ok(Ok(Frame::Video(vf))) => {
-                                let ticks = vf.pts.unwrap_or(0).max(0);
+                                let ticks = frame_clock.time(vf.pts, None);
                                 let secs = stream.time_base.seconds_of(ticks).max(0.0);
                                 if before_seek_target(&shared, secs, seen_seek, &mut shown_seek) {
                                     continue;
@@ -1973,6 +2135,7 @@ fn run_video_thread(
         if let Some(end) = packet_end_secs(&packet) {
             last_end = last_end.max(Duration::from_secs_f64(end.max(0.0)));
         }
+        frame_clock.note_duration(packet.duration);
 
         let random_access = packet.flags.keyframe || metadata.container_keyframe;
         if need_keyframe && !random_access {
@@ -2110,7 +2273,7 @@ fn run_video_thread(
                 let Frame::Video(vf) = frame else { continue };
                 sync_frame_format(&mut *sink, &shared, &stream.params, &**decoder, &mut frame_format);
 
-                let frame_ticks = vf.pts.or(packet.pts).unwrap_or(0).max(0);
+                let frame_ticks = frame_clock.time(vf.pts, packet.pts);
                 let frame_pts_secs = stream.time_base.seconds_of(frame_ticks).max(0.0);
 
                 // Drop everything before the seek target, for seeks this
@@ -2129,6 +2292,35 @@ fn run_video_thread(
                 }
             }
         }
+    }
+}
+
+/// Timestamps for decoded pictures that carry none. FFmpeg leaves many
+/// pictures untimed (raw and MPEG-PS H.264 time only some access units);
+/// its consumers continue the timeline from the previous picture's time
+/// plus its duration (fftools `ffmpeg_dec.c` video_frame_process). A
+/// timed picture always keeps its own time.
+#[derive(Default)]
+struct FrameClock {
+    /// Where the next untimed picture goes: the last picture plus `duration`.
+    next: Option<i64>,
+    /// The latest positive packet duration, in stream ticks.
+    duration: Option<i64>,
+}
+
+impl FrameClock {
+    fn note_duration(&mut self, duration: Option<i64>) {
+        if let Some(d) = duration.filter(|&d| d > 0) {
+            self.duration = Some(d);
+        }
+    }
+
+    /// The picture's time in stream ticks: its own, else the continued
+    /// timeline, else (first picture) the packet's, else zero.
+    fn time(&mut self, frame_pts: Option<i64>, packet_pts: Option<i64>) -> i64 {
+        let ticks = frame_pts.or(self.next).or(packet_pts).unwrap_or(0).max(0);
+        self.next = self.duration.map(|d| ticks.saturating_add(d));
+        ticks
     }
 }
 

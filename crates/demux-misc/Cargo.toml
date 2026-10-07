@@ -7,7 +7,10 @@ publish.workspace = true
 
 [dependencies]
 oxideav-core.workspace = true
+demux-seek-core.workspace = true
 
 [dev-dependencies]
 codecs = { path = "../codecs" }
+# Playback after a seek through the engine (tests/player_seek.rs).
+player = { path = "../player" }
 refcheck.workspace = true

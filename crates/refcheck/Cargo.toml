@@ -7,5 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+audio-trim = { path = "../audio-trim" }
 oxideav-core.workspace = true
 md5 = "0.7"

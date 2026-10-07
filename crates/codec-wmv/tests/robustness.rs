@@ -203,6 +203,65 @@ fn fuzz_container(name: &'static str, sample: &str, container: &'static str, see
     });
 }
 
+/// Seeks `MUTATIONS` mutated copies of `original` opened with `container`
+/// to 1 s, an hour, 0 and i64::MAX, reading after each; the intact file
+/// must seek. A seek reads at most to the input's end.
+fn fuzz_seek(name: &'static str, original: Vec<u8>, container: &'static str, seed: u64) {
+    guarded(name, move |tick| {
+        let mut ctx = RuntimeContext::new();
+        codec_wmv::register(&mut ctx);
+        let mut rng = Rng(seed);
+        for step in 0..=MUTATIONS {
+            let mut data = original.clone();
+            if step > 0 {
+                mutate(&mut rng, &mut data);
+            }
+            let Ok(mut demuxer) = ctx.containers.open_demuxer(container, Box::new(std::io::Cursor::new(data)), &ctx.codecs) else {
+                assert!(step > 0, "{name}: the intact file does not open");
+                continue;
+            };
+            let tb = demuxer.streams()[0].time_base.as_rational();
+            let second = tb.den / tb.num.max(1);
+            for (n, target) in [second, 3600 * second, 0, i64::MAX].into_iter().enumerate() {
+                let seeked = demuxer.seek_to(0, target);
+                assert!(step > 0 || n > 0 || seeked.is_ok(), "{name}: the intact file does not seek: {seeked:?}");
+                for _ in 0..4 {
+                    if demuxer.next_packet().is_err() {
+                        break;
+                    }
+                }
+            }
+            tick(step);
+        }
+    });
+}
+
+/// Each FATE VC-1 sample twice over, so a seek has two key frames.
+fn twice(sample: &str) -> Vec<u8> {
+    let one = std::fs::read(fate(sample)).unwrap_or_else(|e| panic!("read {sample}: {e}"));
+    if sample.ends_with(".rcv") {
+        let header = 8 + u32::from_le_bytes(one[4..8].try_into().unwrap()) as usize + 24;
+        let frames = u32::from_le_bytes([one[0], one[1], one[2], 0]) * 2;
+        let mut out = frames.to_le_bytes()[..3].to_vec();
+        out.extend_from_slice(&one[3..header]);
+        out.extend_from_slice(&one[header..]);
+        out.extend_from_slice(&one[header..]);
+        out
+    } else {
+        [one.clone(), one].concat()
+    }
+}
+
+#[test]
+fn vc1_seeks_never_panic_or_hang() {
+    fuzz_seek("vc1 seeks", twice("vc1/SA10091.vc1"), "vc1", 0x5747_0005_0000_0001);
+}
+
+#[test]
+fn vc1test_seeks_never_panic_or_hang() {
+    fuzz_seek("vc1test seeks", twice("vc1/SMM0015.rcv"), "vc1test", 0x5747_0005_0000_0002);
+}
+
 #[test]
 fn wmv2_packets_never_panic() {
     let (params, packets) =

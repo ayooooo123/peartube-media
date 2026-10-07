@@ -64,12 +64,15 @@ demux-asf = { path = "../demux-asf" }
 codec-mlp = { path = "../codec-mlp" }
 demux-misc = { path = "../demux-misc" }
 demux-rm = { path = "../demux-rm" }
+demux-mxf = { path = "../demux-mxf" }
 codec-dca = { path = "../codec-dca" }
 subs-text = { path = "../subs-text" }
+subs-cc = { path = "../subs-cc" }
 codec-ra = { path = "../codec-ra" }
 codec-rv = { path = "../codec-rv" }
 codec-wmv = { path = "../codec-wmv" }
 codec-wma = { path = "../codec-wma" }
+subs-bitmap = { path = "../subs-bitmap" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

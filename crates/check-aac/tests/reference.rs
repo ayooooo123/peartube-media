@@ -4,11 +4,13 @@
 //! registries. The float reference floor is at least 90 dB, with exact
 //! sample counts. Previously passing profiles retain their stronger floors.
 //!
-//! ELD and USAC cases with MP4 edit-list boundaries assert their *exact*
-//! raw-output surplus separately and compare every presented sample, not an
-//! arbitrary common prefix. These codec-fidelity tests do not claim the
-//! missing container sample-trim propagation is implemented. USAC also checks
-//! the ISO conformance S16 references and every FATE loudness target.
+//! MP4 edit-list and iTunSMPB trims (encoder delay, end padding) reach the
+//! decode through `Demuxer::packet_metadata`, and `refcheck::decode` applies
+//! them as the player does, so ELD and USAC samples match FFmpeg's sample
+//! counts exactly; the USAC checks also hold the trims to the per-channel
+//! FFprobe figures in `check_aac::USAC_SAMPLES` against the raw decode.
+//! USAC also checks the ISO conformance S16 references and every FATE
+//! loudness target.
 //!
 //! The FATE suite must be present: `FATE_SUITE` (default
 //! `~/projects/fate-suite`).
@@ -62,13 +64,13 @@ const PASSING: &[(&str, f64)] = &[
     ("aac/er_eld2100np_48_ep0.mp4", 137.241180),
 ];
 
-/// ER AAC ELD samples whose MP4 edit list trims the tail of the last
-/// frame: FFmpeg's mov demuxer attaches `discard_padding` to the last
-/// packet (55 mono samples for `er_eld1001np_44`, 32 per channel for
-/// `er_eld2000np_48`; FATE's `SIZE_TOLERANCE` for the same pair) and
-/// libavcodec drops them, while the fork emits the whole frame — the
-/// trim is container data the decoder never sees. Each entry pins the
-/// SNR floor over FFmpeg's length and the exact interleaved surplus.
+/// ER AAC ELD samples whose last frame reaches past the track's duration:
+/// FFmpeg's mov demuxer attaches `discard_padding` to the last packet (55
+/// mono samples for `er_eld1001np_44`, 32 per channel for
+/// `er_eld2000np_48`; FATE's `SIZE_TOLERANCE` for the same pair). The MP4
+/// demuxer exposes the same trim, so the decode is FFmpeg's length; each
+/// entry pins the SNR floor and the padding (interleaved samples) the
+/// untrimmed frame carries.
 const PASSING_END_TRIMMED: &[(&str, f64, usize)] = &[
     ("aac/er_eld1001np_44_ep0.mp4", 137.538027, 55),
     ("aac/er_eld2000np_48_ep0.mp4", 137.490163, 64),
@@ -92,16 +94,21 @@ fn reference_passing_samples() {
 
 #[test]
 fn reference_end_trimmed_samples() {
-    for (rel, floor, surplus) in PASSING_END_TRIMMED {
+    for &(rel, floor, padding) in PASSING_END_TRIMMED {
         let (ours, path, _ch) = decoded_f32(rel);
         let ff = refcheck::ffmpeg_audio_f32(&path, 0);
-        assert_eq!(ours.len(), ff.len() + surplus, "{rel}: sample count");
-        let snr = refcheck::snr_db(&ff, &ours[..ff.len()], 0);
-        eprintln!("{rel}: {} interleaved samples (surplus {surplus}), SNR {snr:.6} dB", ours.len());
+        assert_eq!(ours.len(), ff.len(), "{rel}: sample count");
+        let snr = refcheck::snr_db(&ff, &ours, 0);
+        eprintln!("{rel}: {} interleaved samples, SNR {snr:.6} dB", ours.len());
         assert!(
-            snr >= *floor,
+            snr >= floor,
             "{rel}: SNR {snr:.2} dB below floor {floor} dB"
         );
+        // The trim is the container's: the raw packets decode to exactly
+        // `padding` more samples, which are the ones dropped.
+        let raw = check_aac::decoded_raw_f32(rel);
+        assert_eq!(raw.len(), ours.len() + padding, "{rel}: raw sample count");
+        assert_eq!(raw[..ours.len()], ours[..], "{rel}: the presented samples are the raw decode's");
     }
 }
 
@@ -117,29 +124,34 @@ fn reference_config_change_samples() {
 }
 
 
-/// Keep the raw FD PCM and container presentation trim separate. These
-/// assertions verify the exact untrimmed length and compare every presented
-/// sample, including the first block; no codec startup region is omitted.
-/// xhe_target_level uses the independent native oracle in native_reference.rs;
-/// these eight entries retain their original stronger FFmpeg floors.
+/// The decode is FFmpeg's presentation exactly: the MP4 demuxer's trims are
+/// the FFprobe skip/discard figures of `check_aac::USAC_SAMPLES` (per
+/// channel), checked against the untrimmed decode of the same packets, and
+/// every presented sample is compared, including the first block; no codec
+/// startup region is omitted. xhe_target_level's content uses the
+/// independent native oracle in native_reference.rs (FFmpeg is not one);
+/// here only its trims are checked. The FFmpeg entries retain their
+/// original floors.
 #[test]
 fn reference_usac_samples() {
     for &(rel, initial_skip, final_padding, floor) in check_aac::USAC_SAMPLES {
-        let Some(floor) = floor else { continue };
         let (ours, path, channels) = decoded_f32(rel);
-        let ff = refcheck::ffmpeg_audio_f32(&path, 0);
         let start = initial_skip * channels as usize;
         let end_padding = final_padding * channels as usize;
-        assert_eq!(ours.len(), ff.len() + start + end_padding, "{rel}: raw sample count");
-        let presented = &ours[start..ours.len() - end_padding];
-        let snr = refcheck::snr_db(&ff, presented, 0);
-        eprintln!("{rel}: {} raw interleaved samples, skip {start}, tail {end_padding}, SNR {snr:.6} dB", ours.len());
+        let raw = check_aac::decoded_raw_f32(rel);
+        assert_eq!(raw.len(), ours.len() + start + end_padding, "{rel}: the trims are the FFprobe figures");
+        assert_eq!(raw[start..raw.len() - end_padding], ours[..], "{rel}: the presented samples are the raw decode's");
+        let Some(floor) = floor else { continue };
+        let ff = refcheck::ffmpeg_audio_f32(&path, 0);
+        assert_eq!(ours.len(), ff.len(), "{rel}: sample count");
+        let snr = refcheck::snr_db(&ff, &ours, 0);
+        eprintln!("{rel}: {} interleaved samples (skip {start}, tail {end_padding} raw), SNR {snr:.6} dB", ours.len());
         assert!(snr >= floor, "{rel}: USAC FD SNR {snr:.6} dB below floor {floor} dB");
         let stem = path.file_stem().unwrap().to_str().unwrap();
         if stem.starts_with("Fd_") {
             // The two older Ms references retain final padding; the newer
             // FD references cover exactly the presentation interval.
-            let fate_pcm = if stem.starts_with("Fd_2_c1_Ms_") { &ours[start..] } else { presented };
+            let fate_pcm = if stem.starts_with("Fd_2_c1_Ms_") { &raw[start..] } else { &ours[..] };
             assert_fate_pcm(&path.with_extension("s16"), fate_pcm);
         }
     }

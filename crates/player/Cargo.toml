@@ -14,6 +14,7 @@ autoexamples = false
 probe = []
 
 [dependencies]
+audio-trim = { path = "../audio-trim" }
 oxideav-core.workspace = true
 oxideav-http.workspace = true
 oxideav-ass = { workspace = true, features = ["render"] }
@@ -23,6 +24,7 @@ libc = "0.2"
 thiserror = "2"
 oxideav-pixfmt.workspace = true
 parking_lot = "0.12"
+subs-cc = { path = "../subs-cc" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-29"] }
@@ -48,10 +50,12 @@ objc2-ui-kit = "0.3"
 
 [dev-dependencies]
 oxideav-mp4.workspace = true
+oxideav-ogg.workspace = true
 oxideav-h264.workspace = true
 parking_lot = "0.12"
 codecs = { path = "../codecs" }
 refcheck = { path = "../refcheck" }
+subs-bitmap = { path = "../subs-bitmap" }
 
 [[example]]
 name = "android_probe"

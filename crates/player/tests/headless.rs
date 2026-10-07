@@ -1908,6 +1908,32 @@ fn untimed_raw_mpeg_switches_to_software_decoding() {
 }
 
 #[test]
+fn untimed_pictures_continue_the_timeline_in_realtime() {
+    let _cpu = realtime_test();
+    // H.264 with B-pictures in MPEG-PS: FFmpeg's parser times only some
+    // access units, so most decoded pictures carry no timestamp. They must
+    // follow the previous picture by its duration, as FFmpeg's consumers
+    // place them, instead of piling up at time zero and arriving late.
+    let bytes = ffmpeg_file("vob", &[
+        "-f", "lavfi", "-i", "testsrc=size=176x144:rate=25:duration=2",
+        "-c:v", "libx264", "-bf", "2", "-g", "25", "-pix_fmt", "yuv420p", "-f", "vob",
+    ]);
+    let path = tempfile("vob");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    std::fs::remove_file(&path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    assert!(video.pts.len() >= 45, "only {} of 50 pictures shown ({} late)", video.pts.len(), state.dropped_frames);
+    assert!(video.pts.windows(2).all(|w| w[0] < w[1]), "pictures out of order: {:?}", video.pts);
+    assert!(video.pts.last().copied().unwrap_or_default() >= Duration::from_millis(1880), "timeline ended at {:?}", video.pts.last());
+}
+
+#[test]
 fn video_without_container_size_plays_at_the_decoded_size() {
     // A raw H.264 stream declares no picture size; only the decoder knows
     // it. Every picture must still reach the sink at that size, matching
@@ -1998,5 +2024,3 @@ fn ivf_av1_without_size_plays_at_the_decoded_size() {
     let bytes = ivf_without_size(&["-c:v", "libaom-av1", "-cpu-used", "8", "-b:v", "200k"]);
     assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25);
 }
-
-

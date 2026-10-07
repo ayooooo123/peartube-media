@@ -406,7 +406,14 @@ struct Mode {
 }
 
 const CONTAINER: Mode = Mode { unparsed: false, times: true, durations: false, keys: false, port: false };
-const RAW_VIDEO: Mode = Mode { unparsed: false, times: false, durations: false, keys: true, port: false };
+/// Raw H.264 and HEVC: access units, key flags, and FFmpeg 2da55bf's
+/// timing of them: no pts or dts (FFmpeg does not interpolate H.264 or
+/// HEVC timestamps), and the duration compute_frame_duration gives. Where
+/// the stream has no frame rate FFmpeg times the packets it reads while
+/// analysing the stream by the raw demuxer's 25 fps and later ones by
+/// one tick (its r_frame_rate fallback, the time base); the port keeps
+/// 25 fps, so those one-tick durations are not compared.
+const RAW_VIDEO: Mode = Mode { unparsed: false, times: true, durations: true, keys: true, port: true };
 /// Raw MPEG-1/2 video: access units, key flags, and the pts, dts (a
 /// missing one included) and duration FFmpeg 2da55bf's demuxer layer
 /// gives each.
@@ -468,9 +475,12 @@ fn compare(path: &Path, rel: &str, format: &str, mode: Mode) -> Result<(), Strin
             duration: duration.map(|t| rescale(t, tb, to)),
             key,
         };
+        // FFmpeg's r_frame_rate fallback for a raw stream without a frame
+        // rate: one tick of 1/1200000 per packet after stream analysis.
+        let one_tick = want.duration == Some(1) && to.as_rational().num == 1 && to.as_rational().den == 1_200_000;
         if got.stream != want.stream || got.size != want.size || got.md5 != want.md5
             || (mode.times && (got.pts != want.pts || got.dts != want.dts))
-            || (mode.durations && got.duration != want.duration)
+            || (mode.durations && !one_tick && got.duration != want.duration)
             || (mode.keys && got.key != want.key)
         {
             return Err(format!("{rel}: packet {n}: ours {got:?}, ffprobe {want:?}"));
@@ -696,17 +706,50 @@ fn mpegvideo_frames_of_a_fractional_tick_count() {
 }
 
 /// h264.mak (the conformance suite) and every other raw H.264 input:
-/// the access units FFmpeg's h264 parser cuts.
+/// the access units FFmpeg's h264 parser cuts, untimed, with the duration
+/// of their frame rate and picture structure.
 #[test]
 fn h264() {
     check_inventory("h264", &["264", "26l", "avc", "h264", "jsv", "jvt"], RAW_VIDEO);
 }
 
 /// hevc.mak (the conformance suite) and every other raw HEVC input: the
-/// access units FFmpeg's hevc parser cuts.
+/// access units FFmpeg's hevc parser cuts, untimed, with the duration of
+/// their frame rate.
 #[test]
 fn hevc() {
     check_inventory("hevc", &["bit", "bin", "hevc", "h265", "265"], RAW_VIDEO);
+}
+
+/// `x264`/`x265` output with B-frames, as JD's check made it
+/// (testsrc 176x144 at 25 fps for 2 s, -bf 2 -g 25), and at 30000/1001:
+/// untimed packets lasting a frame (48000 and 40040 of 1/1200000; H.264
+/// counts fields, r_frame_rate 50/1).
+#[test]
+fn x264_and_x265_streams_are_untimed_with_their_frame_durations() {
+    let dir = scratch_dir("raw-es-timing");
+    let mut failures = Vec::new();
+    for (name, codec, format, rate) in [
+        ("x25.h264", "libx264", "h264", "25"),
+        ("x30.h264", "libx264", "h264", "30000/1001"),
+        ("x25.hevc", "libx265", "hevc", "25"),
+        ("x30.hevc", "libx265", "hevc", "30000/1001"),
+    ] {
+        let path = dir.join(name);
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("testsrc=size=176x144:rate={rate}:duration=2"))
+            .args(["-c:v", codec, "-bf", "2", "-g", "25", "-x265-params", "log-level=error", "-f", format])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg must be on PATH");
+        assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        if let Err(e) = compare(&path, &format!("generated {name}"), format, RAW_VIDEO) {
+            failures.push(e);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// PES payloads with the PTS each PES carries.
@@ -732,10 +775,12 @@ fn caf() {
     }
 }
 
-/// cbs.mak, av1.mak, vpx.mak: frame headers carry size and pts.
+/// cbs.mak, av1.mak, vpx.mak: frame headers carry size and pts; key
+/// flags are those of FFmpeg's VP8 / VP9 / AV1 parsers, which seeking
+/// depends on.
 #[test]
 fn ivf() {
-    check_inventory("ivf", &["ivf"], CONTAINER);
+    check_inventory("ivf", &["ivf"], Mode { keys: true, ..CONTAINER });
 }
 
 /// NUT: FATE muxes its NUT inputs (lavf.mak); mux one here with FFmpeg
