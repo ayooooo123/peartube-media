@@ -61,6 +61,7 @@ fn ffprobe_after(path: &Path, format: &str, target: &str, n: usize) -> (TimeBase
             _ => {}
         }
     }
+    assert!(!packets.is_empty(), "ffprobe {} @ {target}: no packets", path.display());
     (tb, packets)
 }
 
@@ -125,6 +126,64 @@ fn dts_lands_on_ffmpegs_frame() {
 fn dtshd_lands_on_ffmpegs_frame() {
     check("dts/dcadec-suite/xll_51_24_48_768.dtshd", "dtshd", &["0.015", "0.03", "0.25"], 2);
     check("dts/dcadec-suite/core_51_24_48_768_0.dtshd", "dtshd", &["0.025"], 2);
+}
+
+/// A reader of `unit` repeated up to `len` bytes, made as it is read.
+struct Repeat {
+    unit: Vec<u8>,
+    len: u64,
+    pos: u64,
+}
+
+impl std::io::Read for Repeat {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let unit = self.unit.len() as u64;
+        let n = (buf.len() as u64).min(self.len.saturating_sub(self.pos)) as usize;
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b = self.unit[((self.pos + i as u64) % unit) as usize];
+        }
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for Repeat {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.pos = match to {
+            std::io::SeekFrom::Start(p) => p,
+            std::io::SeekFrom::End(d) => self.len.saturating_add_signed(d),
+            std::io::SeekFrom::Current(d) => self.pos.saturating_add_signed(d),
+        };
+        Ok(self.pos)
+    }
+}
+
+/// dts_es.dts's first frame 140,000 times (281 MB of DTS): seeking past
+/// the end reads frame after frame for one after the target, and stops
+/// on the seek's allowance (1 M packets, 256 MiB) with
+/// ResourceExhausted, reading resuming where it was.
+#[test]
+fn a_long_dts_stream_exhausts_the_seek_allowance() {
+    let sample = std::fs::read(fate("dts/dts_es.dts")).unwrap();
+    let unit = sample[..2012].to_vec();
+    let input = move || -> Box<dyn oxideav_core::ReadSeek> {
+        Box::new(Repeat { unit: unit.clone(), len: 2012 * 140_000, pos: 0 })
+    };
+    let open = |input: Box<dyn oxideav_core::ReadSeek>| {
+        let mut ctx = RuntimeContext::new();
+        codec_dca::register(&mut ctx);
+        ctx.containers.open_demuxer("dts", input, &ctx.codecs).unwrap()
+    };
+    let first = open(input()).next_packet().map(|p| (p.pts, refcheck::md5_hex(&p.data))).ok();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut demuxer = open(input());
+        let result = demuxer.seek_to(0, i64::MAX / 2);
+        let _ = tx.send((result, demuxer.next_packet().map(|p| (p.pts, refcheck::md5_hex(&p.data))).ok()));
+    });
+    let (result, after) = rx.recv_timeout(std::time::Duration::from_secs(300)).expect("the seek ends");
+    assert!(matches!(result, Err(oxideav_core::Error::ResourceExhausted(_))), "the seek ends on its allowance: {result:?}");
+    assert_eq!(after, first, "reading resumes where it was");
 }
 
 struct Rng(u64);
