@@ -206,6 +206,7 @@ dependencies = [
  "codec-wmv",
  "demux-asf",
  "demux-misc",
+ "demux-mxf",
  "demux-rm",
  "oxideav-aac",
  "oxideav-ac3",
@@ -313,6 +314,16 @@ version = "0.1.0"
 dependencies = [
  "codecs",
  "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
+name = "demux-mxf"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "oxideav-core",
+ "player",
  "refcheck",
 ]
 
