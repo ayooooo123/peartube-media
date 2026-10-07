@@ -1,0 +1,18 @@
+[package]
+name = "codec-apple-audio"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LGPL-2.1-or-later"
+description = "Apple audio decoders: alac, qdm2, qdmc, mace3, mace6"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-mov.workspace = true
+oxideav-mp4.workspace = true
+oxideav-mkv.workspace = true
+oxideav-iff.workspace = true
+demux-misc = { path = "../demux-misc" }

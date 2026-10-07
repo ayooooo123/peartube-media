@@ -26,6 +26,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_rv::register_codecs,
         codec_wmv::register_codecs,
         codec_wma::lib_registration::register_codecs,
+        // ALAC, QDM2, QDMC, MACE 3:1 and 6:1.
+        codec_apple_audio::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }

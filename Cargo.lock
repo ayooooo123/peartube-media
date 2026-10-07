@@ -135,6 +135,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-apple-audio"
+version = "0.1.0"
+dependencies = [
+ "demux-misc",
+ "oxideav-core",
+ "oxideav-iff",
+ "oxideav-mkv",
+ "oxideav-mov",
+ "oxideav-mp4",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-dca"
 version = "0.1.0"
 dependencies = [
@@ -201,6 +214,7 @@ dependencies = [
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "codec-apple-audio",
  "codec-dca",
  "codec-mlp",
  "codec-ra",
