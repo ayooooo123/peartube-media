@@ -263,14 +263,21 @@ fn libass_colours(path: &Path, t: f64, palette: &[(u8, u8, u8)]) -> Vec<(u8, u8,
 /// renderer, draws. FFmpeg's SubRip conversion resets a bare `\r` to
 /// `Default` and drops all styling for a missing name, so it cannot be the
 /// oracle here; libass's own render is.
+///
+/// Each reset's effect is the only source of one colour in its cue (the
+/// event style is Yellow): a reset that does nothing, or goes to another
+/// style, changes that cue's colours. Cue 0 resets an inline colour, cue 1
+/// names a style, cue 2 resets a named style, cue 3 names a missing one.
 #[test]
 fn ass_style_resets_render_as_libass_renders_them() {
     let path = data("reset.ass");
     let palette = [YELLOW, BLUE, WHITE, RED];
+    let designed = [[YELLOW, BLUE], [YELLOW, RED], [YELLOW, RED], [YELLOW, RED]];
     let shown = play(&path, 0, "ass");
-    assert_eq!(shown.len(), 3, "cues shown");
-    for (i, t) in [1.0, 2.5, 4.0].into_iter().enumerate() {
+    assert_eq!(shown.len(), designed.len(), "cues shown");
+    for (i, t) in [1.0, 2.5, 4.0, 5.5].into_iter().enumerate() {
         let expected = libass_colours(&path, t, &palette);
+        assert_eq!(expected, designed[i], "cue {i}: libass draws the colours the fixture is built around");
         let ours: Vec<(u8, u8, u8)> = palette.iter().copied().filter(|&c| pixels_of(&shown[i].images[0], c) >= 20).collect();
         assert_eq!(ours, expected, "cue {i}: text colours drawn vs libass");
     }

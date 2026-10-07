@@ -13,6 +13,7 @@ Style: Red,Arial,32,&H000000FF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-Dialogue: 0,0:00:00.50,0:00:01.50,Yellow,,0,0,0,,HHHH{\c&HFF0000&}MMMM{\r}WWWW
+Dialogue: 0,0:00:00.50,0:00:01.50,Yellow,,0,0,0,,{\c&HFF0000&}MMMM{\r}WWWW
 Dialogue: 0,0:00:02.00,0:00:03.00,Yellow,,0,0,0,,HHHH{\rRed}MMMM
-Dialogue: 0,0:00:03.50,0:00:04.50,Yellow,,0,0,0,,HHHH{\rMissing}MMMM
+Dialogue: 0,0:00:03.50,0:00:04.50,Yellow,,0,0,0,,{\rRed}MMMM{\r}WWWW
+Dialogue: 0,0:00:05.00,0:00:06.00,Yellow,,0,0,0,,{\rRed}MMMM{\rMissing}WWWW
