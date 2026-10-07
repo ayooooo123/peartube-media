@@ -1,11 +1,13 @@
 //! Pure-Rust ASF (Advanced Systems Format) container demuxer.
-//! Ported from FFmpeg commit 2da55bf (libavformat/asfdec_f.c, asf.c, asf.h, asf_tags.c).
+//! Ported from FFmpeg commit 2da55bf (libavformat/asfdec_f.c, asf.c, asf.h,
+//! asf_tags.c, argo_asf.c, and the seek.c search asf_read_seek uses).
 //! Licensed under LGPL-2.1-or-later.
 
 #![forbid(unsafe_code)]
 
 pub mod demuxer;
 pub mod guid;
+mod seek;
 
 use oxideav_core::{ContainerRegistry, ProbeData};
 
