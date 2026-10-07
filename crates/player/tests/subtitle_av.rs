@@ -11,7 +11,7 @@ mod scripted;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bitmap::{Scratch, ffmpeg};
@@ -357,11 +357,15 @@ fn overlapping_text_cues_stay_bounded_beside_1080p_video() {
 static GATE_TESTS: Mutex<()> = Mutex::new(());
 
 /// Subtitle selections made while the Player opens never cost the audio
-/// track chosen by default, and an explicit audio choice made then
-/// stands. The demuxer is held, deterministically, while the selections
-/// are made: inside its open (before the Player reads the selection), and
-/// before its first packet (after it has, before its first switch). The
-/// test waits for the whole selection to be applied.
+/// track chosen by default, and an explicit audio choice made then stands.
+/// Held cases: the selections are made while the demuxer is held inside its
+/// open (before the Player reads its selection) or before its first packet
+/// (after the demux loop's first look for switches). Concurrent cases:
+/// subtitles are selected over and over from before the Player reads its
+/// selection until it publishes its tracks, so some selections land while
+/// it picks the default audio track. A default recorded only when no
+/// selection came meanwhile (92ae878) is lost there. Each case checks the
+/// selection once the playback has run past every selection.
 #[test]
 fn subtitle_selections_while_opening_keep_the_audio_choice() {
     let _gate = GATE_TESTS.lock();
@@ -372,38 +376,70 @@ fn subtitle_selections_while_opening_keep_the_audio_choice() {
     movie(&mkv, 4, None, &[440, 880], &[&cues]);
     let path = scratch.file("opening.ptscript");
     scripted::write_gated(&path, &mkv, Mode::Seekable);
+    let settled = |player: &Player, backend: &Watched, what: &str, explicit: bool| {
+        // Well past every selection: the demux loop has applied them all.
+        let state = wait_until(player, Duration::from_secs(20), &format!("{what}: media time 0.3 s"), |state| {
+            state.position >= Duration::from_millis(300)
+        });
+        let want = if explicit { Some(1) } else { Some(0) };
+        assert_eq!((state.audio, state.subtitle), (want, Some(2)), "{what}: the audio and subtitle choice");
+        assert!(backend.headless.capture().audio.iter().any(|audio| !audio.pcm.is_empty()), "{what}: no audio played");
+    };
     for at in [Hold::Open, Hold::FirstPacket] {
         for explicit in [false, true] {
             let what = format!("held at {at:?}, explicit audio {explicit}");
-            scripted::arm(at);
+            scripted::arm(&[at]);
             let (player, backend) = play(&path, None::<u32>);
-            assert!(scripted::entered(Duration::from_secs(10)), "{what}: the demuxer held");
+            assert!(scripted::entered(at, Duration::from_secs(10)), "{what}: the demuxer held");
             player.select_subtitle(Some(2));
             if explicit {
                 player.select_audio(Some(1));
             }
             player.select_subtitle(Some(2));
             scripted::release();
-            let want = if explicit { Some(1) } else { Some(0) };
-            let state = wait_until(&player, Duration::from_secs(20), &format!("{what}: the selection applied"), |state| {
-                state.subtitle == Some(2) && state.audio == want
-            });
-            assert!(!state.ended, "{what}: still playing");
-            let begun = Instant::now();
-            while backend.headless.capture().audio.iter().all(|audio| audio.pcm.is_empty()) {
-                assert!(begun.elapsed() < Duration::from_secs(10), "{what}: no audio played");
-                std::thread::sleep(Duration::from_millis(5));
-            }
+            settled(&player, &backend, &what, explicit);
             drop(player);
         }
     }
+    for attempt in 0..40 {
+        let explicit = attempt % 4 == 3;
+        let what = format!("concurrent attempt {attempt}, explicit audio {explicit}");
+        scripted::arm(&[Hold::Open]);
+        let (player, backend) = play(&path, None::<u32>);
+        assert!(scripted::entered(Hold::Open, Duration::from_secs(10)), "{what}: the demuxer held");
+        if explicit {
+            player.select_audio(Some(1));
+        }
+        let (selecting, published) = (AtomicBool::new(false), AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            scope.spawn(|| loop {
+                player.select_subtitle(Some(2));
+                selecting.store(true, Ordering::SeqCst);
+                if published.load(Ordering::SeqCst) {
+                    break;
+                }
+            });
+            // The selections run before the Player reads its selection and
+            // go on until it has published its tracks.
+            while !selecting.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            scripted::release();
+            wait_until(&player, Duration::from_secs(10), &format!("{what}: the tracks"), |state| !state.tracks.is_empty());
+            published.store(true, Ordering::SeqCst);
+        });
+        settled(&player, &backend, &what, explicit);
+        drop(player);
+    }
 }
 
-/// A subtitle-only playback (audio switched off at once) whose audio is
-/// switched on while its subtitle pipeline runs: the playback now has
-/// audio, so it ends with the open-ended PGS state down, realtime or not.
-/// The demuxer is held before its first packet while audio is switched off
-/// and on again.
+/// A subtitle-only playback whose audio is switched on while its subtitle
+/// pipeline runs: the playback now has audio, so it ends with the
+/// open-ended PGS state down, realtime or not. Two holds make the start
+/// subtitle-only for sure: audio is switched off while the demuxer is held
+/// inside its open (before the Player reads its selection), and on again
+/// while it is held before its first packet (the subtitle pipeline started
+/// without audio).
 #[test]
 fn subtitles_joined_by_audio_end_cleared() {
     let _gate = GATE_TESTS.lock();
@@ -420,30 +456,22 @@ fn subtitles_joined_by_audio_end_cleared() {
     let path = scratch.file("joined.ptscript");
     scripted::write_gated(&path, &mkv, Mode::Seekable);
     for realtime in [false, true] {
-        let attempts = 5;
-        let mut tried = 0;
-        let (player, backend) = loop {
-            tried += 1;
-            scripted::arm(Hold::FirstPacket);
-            let (player, backend) = play_with(&path, Some(1), realtime);
-            player.select_audio(None);
-            assert!(scripted::entered(Duration::from_secs(10)), "realtime {realtime}: the demuxer held");
-            let state = player.state();
-            if state.audio.is_none() && !state.tracks.is_empty() {
-                break (player, backend);
-            }
-            // Switched off too late to take effect before the hold.
-            assert!(tried < attempts, "realtime {realtime}: audio never off before the first packet");
-            scripted::release();
-            drop(player);
-        };
+        let what = format!("realtime {realtime}");
+        scripted::arm(&[Hold::Open, Hold::FirstPacket]);
+        let (player, backend) = play_with(&path, Some(1), realtime);
+        assert!(scripted::entered(Hold::Open, Duration::from_secs(10)), "{what}: the demuxer held in its open");
+        player.select_audio(None);
+        scripted::release();
+        assert!(scripted::entered(Hold::FirstPacket, Duration::from_secs(10)), "{what}: the demuxer held before its first packet");
+        let state = player.state();
+        assert_eq!((state.audio, state.subtitle), (None, Some(1)), "{what}: subtitles alone at the start");
         player.select_audio(Some(0));
         scripted::release();
-        let state = wait_until(&player, Duration::from_secs(20), &format!("realtime {realtime}: playback end"), |state| state.ended);
-        assert_eq!(state.audio, Some(0), "realtime {realtime}: audio on");
+        let state = wait_until(&player, Duration::from_secs(20), &format!("{what}: playback end"), |state| state.ended);
+        assert_eq!(state.audio, Some(0), "{what}: audio on");
         let shows = backend.watch.shows.lock().clone();
-        assert!(shows.iter().any(|show| show.images > 0), "realtime {realtime}: the state shows: {shows:?}");
-        assert!(shows.last().is_some_and(|show| show.images == 0), "realtime {realtime}: cleared at Ended: {shows:?}");
+        assert!(shows.iter().any(|show| show.images > 0), "{what}: the state shows: {shows:?}");
+        assert!(shows.last().is_some_and(|show| show.images == 0), "{what}: cleared at Ended: {shows:?}");
         drop(player);
     }
 }

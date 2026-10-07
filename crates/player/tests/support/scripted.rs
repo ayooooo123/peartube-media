@@ -79,43 +79,46 @@ pub enum Hold {
 }
 
 struct GateState {
-    armed: Option<Hold>,
-    entered: bool,
-    released: bool,
+    /// Holds still to come, in order.
+    armed: Vec<Hold>,
+    /// Where the demuxer waits now.
+    held: Option<Hold>,
 }
 
-/// Holds the next demuxer at `Hold` until the test lets it go. One
-/// process-wide gate: tests that arm it run one at a time.
-static GATE: Mutex<GateState> = Mutex::new(GateState { armed: None, entered: false, released: false });
+/// Holds the next demuxer at each armed `Hold` in turn until the test lets
+/// it go. One process-wide gate: tests that arm it run one at a time.
+static GATE: Mutex<GateState> = Mutex::new(GateState { armed: Vec::new(), held: None });
 static GATE_CHANGED: Condvar = Condvar::new();
 
-/// The next demuxer opened waits at `at` for `release`.
-pub fn arm(at: Hold) {
-    *GATE.lock() = GateState { armed: Some(at), entered: false, released: false };
+/// The next demuxer opened waits at each of `holds`, in order, for
+/// `release`. Arming again lets a demuxer still held go.
+pub fn arm(holds: &[Hold]) {
+    *GATE.lock() = GateState { armed: holds.to_vec(), held: None };
+    GATE_CHANGED.notify_all();
 }
 
-/// Waits until the armed demuxer is held.
-pub fn entered(within: Duration) -> bool {
+/// Waits until the demuxer is held at `at`.
+pub fn entered(at: Hold, within: Duration) -> bool {
     let mut state = GATE.lock();
-    GATE_CHANGED.wait_while_for(&mut state, |state| !state.entered, within);
-    state.entered
+    GATE_CHANGED.wait_while_for(&mut state, |state| state.held != Some(at), within);
+    state.held == Some(at)
 }
 
-/// Lets the held demuxer go on.
+/// Lets the held demuxer go on, to its next armed hold if any.
 pub fn release() {
-    GATE.lock().released = true;
+    GATE.lock().held = None;
     GATE_CHANGED.notify_all();
 }
 
 fn hold(at: Hold) {
     let mut state = GATE.lock();
-    if state.armed != Some(at) {
+    if state.armed.first() != Some(&at) {
         return;
     }
-    state.armed = None;
-    state.entered = true;
+    state.armed.remove(0);
+    state.held = Some(at);
     GATE_CHANGED.notify_all();
-    GATE_CHANGED.wait_while_for(&mut state, |state| !state.released, Duration::from_secs(60));
+    GATE_CHANGED.wait_while_for(&mut state, |state| state.held == Some(at), Duration::from_secs(60));
 }
 
 static INNER: LazyLock<RuntimeContext> = LazyLock::new(codecs::context);
