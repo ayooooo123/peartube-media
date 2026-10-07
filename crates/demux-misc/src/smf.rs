@@ -114,11 +114,21 @@ impl Demuxer for SmfDemuxer {
             return Err(Error::Eof);
         }
         self.sent = true;
-        let mut pkt = Packet::new(0, self.stream.time_base, std::mem::take(&mut self.data));
+        // Kept for a later seek: the song is a few kilobytes as a rule.
+        let mut pkt = Packet::new(0, self.stream.time_base, self.data.clone());
         pkt.pts = Some(0);
         pkt.dts = Some(0);
         pkt.flags.keyframe = true;
         Ok(pkt)
+    }
+
+    /// libavformat has no SMF demuxer, so no FFmpeg landing to follow:
+    /// the song is one packet, its only random access point, and any seek
+    /// hands it out again from its start (the decoder renders up to the
+    /// target, which the player then drops).
+    fn seek_to(&mut self, _stream_index: u32, _pts: i64) -> Result<i64> {
+        self.sent = false;
+        Ok(0)
     }
 }
 
