@@ -12,6 +12,8 @@ use oxideav_core::{
     SampleFormat, StreamInfo, TimeBase, PROBE_SCORE_EXTENSION,
 };
 
+mod captions;
+
 use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
 use crate::clock::MasterClock;
 use crate::headless::find_headless;
@@ -710,7 +712,7 @@ fn run_player_pipeline(
     // 4. Streams (cap 64; drop video tracks above the size limits).
     let streams_all = demuxer.streams();
     let count = streams_all.len().min(64);
-    let streams: Vec<StreamInfo> = streams_all[..count].to_vec();
+    let mut streams: Vec<StreamInfo> = streams_all[..count].to_vec();
 
     let mut tracks = Vec::new();
     let mut first_audio = None;
@@ -772,6 +774,8 @@ fn run_player_pipeline(
                 })
                 .max()
         });
+    // Captions in the video: selectable streams, tracks once data shows up.
+    captions::add_streams(&mut streams, shared.wanted_video.lock().or(first_video));
 
     // 5. Selection. The pipeline thread owns `current_*`; `select_*` writes
     // `wanted_*` and bumps `select_gen` so the demux loop applies switches.
@@ -1178,6 +1182,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
     let _ = run.demuxer.set_active_streams(&active);
     let mut eof = false;
     let mut full = false;
+    let mut captions = captions::Captions::new(run);
 
     while !shared.stopped.load(Ordering::SeqCst) {
         // Selection switch: replace the changed pipelines.
@@ -1258,6 +1263,9 @@ fn run_demux_loop(run: &mut Run<'_>) {
                     None
                 };
                 let end = pipe.and_then(|_| packet_end_secs(&packet.packet));
+                if pipe == Some(Pipe::Video) {
+                    captions.video_packet(run, &packet.packet);
+                }
                 match pipe {
                     Some(Pipe::Video) => run.video_lane.push(packet),
                     Some(Pipe::Audio) => run.audio_lane.push(packet),
@@ -1270,6 +1278,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
                 }
             }
             Ok(Err(oxideav_core::Error::Eof)) => {
+                captions.finish(run);
                 eof = true;
                 run.video_lane.push_eof();
                 run.audio_lane.push_eof();

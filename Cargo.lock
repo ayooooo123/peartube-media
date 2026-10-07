@@ -265,6 +265,7 @@ dependencies = [
  "oxideav-wma",
  "refcheck",
  "subs-bitmap",
+ "subs-cc",
  "subs-text",
 ]
 
@@ -1484,6 +1485,7 @@ dependencies = [
  "parking_lot",
  "refcheck",
  "subs-bitmap",
+ "subs-cc",
  "thiserror 2.0.21",
 ]
 
@@ -1674,6 +1676,18 @@ dependencies = [
  "oxideav-sub-image",
  "parking_lot",
  "refcheck",
+]
+
+[[package]]
+name = "subs-cc"
+version = "0.1.0"
+dependencies = [
+ "demux-misc",
+ "oxideav-core",
+ "oxideav-mkv",
+ "oxideav-mpegts",
+ "refcheck",
+ "serde_json",
 ]
 
 [[package]]

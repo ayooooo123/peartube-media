@@ -187,7 +187,16 @@ fn decoded_cue(frame: Frame, packet: &Packet, time_base: TimeBase, width: u32, h
         Frame::Subtitle(cue) => {
             let start = Duration::from_micros(cue.start_us.max(0) as u64);
             let end = Duration::from_micros(cue.end_us.max(cue.start_us).max(0) as u64);
-            Some(Cue { start, end: Some(end), content: Content::Text(render_text_cue(&cue, width, height)) })
+            let image = render_text_cue(&cue, width, height);
+            if cue.style_ref.as_deref() == Some(subs_cc::STATE_STYLE) {
+                // A caption screen: a display state, up until the next one
+                // replaces it (or its end), as bitmap states are.
+                let (canvas_width, canvas_height) = text_space(width, height);
+                let end = (cue.end_us != i64::MAX).then_some(end);
+                let image = (image.width > 0).then_some(image);
+                return Some(Cue { start, end, content: Content::Bitmap(BitmapCue { canvas_width, canvas_height, image }) });
+            }
+            Some(Cue { start, end: Some(end), content: Content::Text(image) })
         }
         Frame::Video(vf) => {
             let start = media_time(vf.pts.or(packet.pts).unwrap_or(0), time_base);

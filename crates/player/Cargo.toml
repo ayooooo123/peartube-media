@@ -24,6 +24,7 @@ libc = "0.2"
 thiserror = "2"
 oxideav-pixfmt.workspace = true
 parking_lot = "0.12"
+subs-cc = { path = "../subs-cc" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-29"] }
