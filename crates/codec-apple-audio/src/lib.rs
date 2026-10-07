@@ -21,6 +21,8 @@ mod getbits;
 mod mace;
 mod qdm2;
 mod qdmc;
+mod tx;
+mod vlc;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, RuntimeContext};
 
