@@ -196,6 +196,16 @@ struct PesHeader {
     pos: i64,
 }
 
+/// How far reading for the next PES got.
+enum Next<T> {
+    Found(T),
+    /// The end of the input.
+    End,
+    /// Discovery's input budget ran out first; reading resumes where it
+    /// stopped.
+    Budget,
+}
+
 pub struct MpegPsDemuxer {
     input: BufReader<Box<dyn ReadSeek>>,
     streams: Vec<StreamInfo>,
@@ -207,6 +217,11 @@ pub struct MpegPsDemuxer {
     imkh_cctv: bool,
     raw_ac3: bool,
     discovering: bool,
+    /// While discovering: the input position no scan for a start code
+    /// passes.
+    limit: Option<i64>,
+    /// PES payload bytes delivered while discovering (FFmpeg's read_size).
+    probed: u64,
     queue: VecDeque<Packet>,
     eof: bool,
 }
@@ -361,8 +376,10 @@ impl MpegPsDemuxer {
         }
     }
 
-    /// mpegps_read_pes_header. `Ok(None)` at the end of the input.
-    fn read_pes_header(&mut self) -> Result<Option<PesHeader>> {
+    /// mpegps_read_pes_header. While discovering, the scan for a start
+    /// code stops at the input budget, leaving any bytes that may begin
+    /// one for playback to read again.
+    fn read_pes_header(&mut self) -> Result<Next<PesHeader>> {
         let mut last_sync = self.position()?;
         let mut error_redo = false;
         loop {
@@ -370,10 +387,20 @@ impl MpegPsDemuxer {
                 self.input.seek(SeekFrom::Start(last_sync as u64))?;
                 error_redo = false;
             }
+            let room = match self.limit {
+                Some(limit) => limit - self.position()?,
+                None => i64::MAX,
+            };
             // find_next_start_code
             let mut state: u32 = 0xFF;
+            let mut scanned = 0i64;
             let mut startcode = loop {
-                let Some(v) = self.byte()? else { return Ok(None) };
+                if scanned >= room {
+                    self.skip(-scanned.min(3))?;
+                    return Ok(Next::Budget);
+                }
+                let Some(v) = self.byte()? else { return Ok(Next::End) };
+                scanned += 1;
                 if state == 0x000001 {
                     break 0x100 | u32::from(v);
                 }
@@ -409,7 +436,7 @@ impl MpegPsDemuxer {
                 continue;
             }
             let pos = self.position()? - 4;
-            let Some(mut len) = self.rb16()? else { return Ok(None) };
+            let Some(mut len) = self.rb16()? else { return Ok(Next::End) };
             let mut pts = None;
             let mut dts = None;
             if startcode != PRIVATE_STREAM_2 {
@@ -418,7 +445,7 @@ impl MpegPsDemuxer {
                     if len < 1 {
                         break None;
                     }
-                    let Some(b) = self.byte()? else { return Ok(None) };
+                    let Some(b) = self.byte()? else { return Ok(Next::End) };
                     len -= 1;
                     if b != 0xFF {
                         break Some(b);
@@ -431,7 +458,7 @@ impl MpegPsDemuxer {
                 if (c & 0xC0) == 0x40 {
                     // buffer scale & size
                     self.skip(1)?;
-                    let Some(b) = self.byte()? else { return Ok(None) };
+                    let Some(b) = self.byte()? else { return Ok(Next::End) };
                     c = b;
                     len -= 2;
                 }
@@ -445,8 +472,8 @@ impl MpegPsDemuxer {
                     }
                 } else if (c & 0xC0) == 0x80 {
                     // MPEG-2 PES
-                    let Some(flags_byte) = self.byte()? else { return Ok(None) };
-                    let Some(header_len_byte) = self.byte()? else { return Ok(None) };
+                    let Some(flags_byte) = self.byte()? else { return Ok(Next::End) };
+                    let Some(header_len_byte) = self.byte()? else { return Ok(Next::End) };
                     let mut flags = flags_byte;
                     let mut header_len = i64::from(header_len_byte);
                     len -= 2;
@@ -469,7 +496,7 @@ impl MpegPsDemuxer {
                     }
                     if flags & 0x01 != 0 {
                         // PES extension
-                        let Some(mut pes_ext) = self.byte()? else { return Ok(None) };
+                        let Some(mut pes_ext) = self.byte()? else { return Ok(Next::End) };
                         header_len -= 1;
                         // PES private data, pack header field, sequence
                         // counter, P-STD buffer
@@ -483,10 +510,10 @@ impl MpegPsDemuxer {
                         header_len -= skip;
                         if pes_ext & 0x01 != 0 {
                             // PES extension 2
-                            let Some(ext2_len) = self.byte()? else { return Ok(None) };
+                            let Some(ext2_len) = self.byte()? else { return Ok(Next::End) };
                             header_len -= 1;
                             if (ext2_len & 0x7F) > 0 {
-                                let Some(id_ext) = self.byte()? else { return Ok(None) };
+                                let Some(id_ext) = self.byte()? else { return Ok(Next::End) };
                                 if id_ext & 0x80 == 0 {
                                     startcode = ((startcode & 0xFF) << 8) | u32::from(id_ext);
                                 }
@@ -505,11 +532,11 @@ impl MpegPsDemuxer {
             }
 
             if startcode == PRIVATE_STREAM_1 {
-                let Some(sub) = self.byte()? else { return Ok(None) };
+                let Some(sub) = self.byte()? else { return Ok(Next::End) };
                 startcode = u32::from(sub);
                 self.raw_ac3 = false;
                 if sub == 0x0B {
-                    let Some(second) = self.byte()? else { return Ok(None) };
+                    let Some(second) = self.byte()? else { return Ok(Next::End) };
                     if second == 0x77 {
                         startcode = 0x80;
                         self.raw_ac3 = true;
@@ -525,7 +552,7 @@ impl MpegPsDemuxer {
                 error_redo = true;
                 continue;
             }
-            return Ok(Some(PesHeader { startcode, len, pts, dts, pos }));
+            return Ok(Next::Found(PesHeader { startcode, len, pts, dts, pos }));
         }
     }
 }
@@ -533,12 +560,14 @@ impl MpegPsDemuxer {
 impl MpegPsDemuxer {
     /// mpegps_read_packet: reads PES packets until one belongs to a
     /// stream (creating streams while discovering) and queues what it
-    /// yields. `Ok(None)` at the end of the input, else the stream and the
-    /// packet's timestamp.
-    fn read_packet(&mut self) -> Result<Option<(usize, Option<i64>)>> {
+    /// yields: the stream and the packet's timestamp, the end of the
+    /// input, or, while discovering, the input budget running out.
+    fn read_packet(&mut self) -> Result<Next<(usize, Option<i64>)>> {
         loop {
-            let Some(PesHeader { startcode, mut len, pts, dts, pos }) = self.read_pes_header()? else {
-                return Ok(None);
+            let PesHeader { startcode, mut len, pts, dts, pos } = match self.read_pes_header()? {
+                Next::Found(header) => header,
+                Next::End => return Ok(Next::End),
+                Next::Budget => return Ok(Next::Budget),
             };
             // DVD-Video LPCM carries a dynamic range byte where DVD-Audio
             // LPCM and MLP do not: (pcm_dvd, pcm_dvda).
@@ -556,7 +585,7 @@ impl MpegPsDemuxer {
                         }
                         let mut header = [0u8; 6];
                         if self.read_up_to(&mut header)? != 6 {
-                            return Ok(None);
+                            return Ok(Next::End);
                         }
                         self.skip(-6)?;
                         let pcm_dvd = header[5] == 0x80;
@@ -617,7 +646,7 @@ impl MpegPsDemuxer {
             let mut data = vec![0u8; len as usize];
             let got = self.read_up_to(&mut data)?;
             if got == 0 && len > 0 {
-                return Ok(None);
+                return Ok(Next::End);
             }
             data.truncate(got);
             let buffered = match &self.tracks[track].framing {
@@ -629,7 +658,7 @@ impl MpegPsDemuxer {
                 return Err(Error::invalid("mpeg: audio access unit exceeds 8 MiB"));
             }
             self.deliver(track, data, pts, dts, pos);
-            return Ok(Some((track, dts.or(pts))));
+            return Ok(Next::Found((track, dts.or(pts))));
         }
     }
 
@@ -723,6 +752,7 @@ impl MpegPsDemuxer {
     fn deliver(&mut self, track: usize, data: Vec<u8>, pts: Option<i64>, dts: Option<i64>, pos: i64) {
         let t = &mut self.tracks[track];
         if self.discovering {
+            self.probed += data.len() as u64;
             if t.start_time.is_none() {
                 t.start_time = pts;
             }
@@ -790,16 +820,27 @@ impl MpegPsDemuxer {
 
     /// avformat_find_stream_info for a header-less container: read until
     /// the probe size, the end of the input, or a stream's timestamps span
-    /// the analyze duration, then fix the streams.
+    /// the analyze duration, then fix the streams. The probe size bounds
+    /// two things on their own: the PES payload kept for playback (FFmpeg's
+    /// read_size), and how far the search for packets goes into the input,
+    /// scans and skips past input that yields none included (a PES whose
+    /// start code lies within it is still read whole). Running out is not
+    /// the end of the input: the parsers keep what they hold, and playback
+    /// reads on from where discovery stopped.
     fn discover(&mut self) -> Result<()> {
-        let start = self.position()?;
+        let budget_end = self.position()? + PROBE_SIZE as i64;
+        self.limit = Some(budget_end);
         loop {
-            if (self.position()? - start) as u64 >= PROBE_SIZE {
+            if self.position()? >= budget_end || self.probed >= PROBE_SIZE {
                 break;
             }
-            let Some((track, ts)) = self.read_packet()? else {
-                self.end_of_input();
-                break;
+            let (track, ts) = match self.read_packet()? {
+                Next::Found(read) => read,
+                Next::End => {
+                    self.end_of_input();
+                    break;
+                }
+                Next::Budget => break,
             };
             let Some(ts) = ts else { continue };
             let first = *self.tracks[track].first_ts.get_or_insert(ts);
@@ -815,6 +856,7 @@ impl MpegPsDemuxer {
             }
         }
         self.discovering = false;
+        self.limit = None;
         for t in &mut self.tracks {
             if !t.probe_done {
                 t.probe(true);
@@ -1090,6 +1132,8 @@ pub fn open_mpegps(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Res
         imkh_cctv: false,
         raw_ac3: false,
         discovering: true,
+        limit: None,
+        probed: 0,
         queue: VecDeque::new(),
         eof: false,
     };
@@ -1117,7 +1161,7 @@ impl Demuxer for MpegPsDemuxer {
             if self.eof {
                 return Err(Error::Eof);
             }
-            if self.read_packet()?.is_none() {
+            if let Next::End = self.read_packet()? {
                 self.end_of_input();
             }
         }
