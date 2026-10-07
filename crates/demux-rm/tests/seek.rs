@@ -175,6 +175,233 @@ fn realaudio_cannot_seek_like_ffmpeg() {
     assert!(matches!(demuxer.seek_to(0, ts), Err(Error::Unsupported(_))));
 }
 
+/// Every packet `ffprobe -read_intervals INTERVALS` printed, in order:
+/// stream, size, payload, key flag and pts.
+fn ffprobe_packets(path: &Path, intervals: &str) -> Vec<(u32, Pkt)> {
+    let mut args = vec!["-v", "error"];
+    if !intervals.is_empty() {
+        args.extend(["-read_intervals", intervals]);
+    }
+    let out = Command::new(port_ffprobe())
+        .args(args)
+        .args(["-show_data_hash", "md5", "-show_entries", "packet=stream_index,pts,size,flags,data_hash", "-of", "compact"])
+        .arg(path)
+        .output()
+        .expect("port ffprobe");
+    assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("packet|"))
+        .map(|line| {
+            let kv: HashMap<&str, &str> = line.split('|').filter_map(|f| f.split_once('=')).collect();
+            let pkt = Pkt {
+                size: kv["size"].parse().unwrap(),
+                md5: kv["data_hash"].trim_start_matches("MD5:").to_string(),
+                key: kv["flags"].starts_with('K'),
+                pts: kv.get("pts").and_then(|v| v.parse().ok()),
+            };
+            (kv["stream_index"].parse().unwrap(), pkt)
+        })
+        .collect()
+}
+
+fn as_pkt(p: &oxideav_core::Packet) -> (u32, Pkt) {
+    let pkt = Pkt { size: p.data.len(), md5: refcheck::md5_hex(&p.data), key: p.flags.keyframe, pts: p.pts };
+    (p.stream_index, pkt)
+}
+
+/// `data` as a file in the scratch directory Cargo gives integration tests.
+fn scratch(name: &str, data: &[u8]) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("demux-rm-seek-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, data).unwrap();
+    path
+}
+
+/// Where the header chunk `tag` starts.
+fn chunk(data: &[u8], tag: &[u8; 4]) -> usize {
+    let mut at = 0;
+    loop {
+        if &data[at..at + 4] == tag {
+            return at;
+        }
+        assert!(&data[at..at + 4] != b"DATA", "no {} chunk", String::from_utf8_lossy(tag));
+        at += u32::from_be_bytes(data[at + 4..at + 8].try_into().unwrap()) as usize;
+    }
+}
+
+/// Run `f` on a worker thread; its result, or a panic when it does not
+/// end within a minute (a loop) or panics itself.
+fn bounded<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(value) => {
+            worker.join().unwrap();
+            value
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{what} does not end"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            panic!("{what} panicked")
+        }
+    }
+}
+
+/// A DATA chunk whose next-data pointer names itself, with a literal
+/// DATA tag where its first packet starts: rm_sync logs the tag and
+/// scans on (rmdec.c:745-751), it never follows the pointer. Reading and
+/// seeking end, and the packets (stream, size, payload, key flag) are
+/// FFmpeg's. Their timestamps are not compared: the lost first chunk
+/// leaves the second block first, whose first packet FFmpeg's new cook
+/// parser gives no timestamp (a cached packet's pos is -1), so its
+/// block is timed from the stream's relative origin, 0, where this port
+/// keeps the chunk's 1856.
+#[test]
+fn a_data_pointer_back_to_its_own_chunk_does_not_loop() {
+    let mut data = std::fs::read(fate("real/ra_cook.rm")).unwrap();
+    let at = chunk(&data, b"DATA");
+    data[at + 14..at + 18].copy_from_slice(&(at as u32).to_be_bytes());
+    data[at + 18..at + 22].copy_from_slice(b"DATA");
+    let path = scratch("data-loop.rm", &data);
+    let untimed = |(stream, p): (u32, Pkt)| (stream, Pkt { pts: None, ..p });
+    let want: Vec<(u32, Pkt)> = ffprobe_packets(&path, "").into_iter().map(untimed).collect();
+    assert!(!want.is_empty(), "FFmpeg reads the file");
+    let got = bounded("reading", {
+        let data = data.clone();
+        move || {
+            let mut demuxer = open(data).unwrap();
+            std::iter::from_fn(|| demuxer.next_packet().ok()).map(|p| untimed(as_pkt(&p))).collect::<Vec<_>>()
+        }
+    });
+    assert_eq!(got, want, "packets of the file");
+    let landed = bounded("seeking", move || open(data).unwrap().seek_to(0, 2000).map_err(|e| e.to_string()));
+    assert!(matches!(landed, Ok(ts) if ts <= 2000), "the seek lands at or before 2 s: {landed:?}");
+}
+
+/// A version-2 INDX whose first entry puts a key frame at i64::MIN: the
+/// position is outside the file, so the entry is not indexed, and a
+/// seek between it and the next entry neither overflows nor loops.
+#[test]
+fn a_v2_index_position_outside_the_file_is_not_indexed() {
+    let mut data = std::fs::read(fate("real/ra_cook.rm")).unwrap();
+    let prop = chunk(&data, b"PROP");
+    let stream = u16::from_be_bytes(data[chunk(&data, b"MDPR") + 10..][..2].try_into().unwrap());
+    let indx = data.len() as u32;
+    data[prop + 38..prop + 42].copy_from_slice(&indx.to_be_bytes());
+    data.extend_from_slice(b"INDX");
+    data.extend_from_slice(&(24u32 + 2 * 18).to_be_bytes());
+    data.extend_from_slice(&2u16.to_be_bytes());
+    data.extend_from_slice(&2u32.to_be_bytes());
+    data.extend_from_slice(&stream.to_be_bytes());
+    data.extend_from_slice(&[0; 8]); // next index, then the version-2 skip
+    for (pts, pos) in [(0u32, i64::MIN), (1000, 100)] {
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&pts.to_be_bytes());
+        data.extend_from_slice(&pos.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+    }
+    let landed = bounded("seeking", move || open(data).unwrap().seek_to(0, 500).map_err(|e| e.to_string()));
+    assert!(matches!(landed, Ok(ts) if ts <= 500), "the seek lands at or before 500 ms: {landed:?}");
+}
+
+/// A seek's allowance (1 MiB packets, 256 MiB): one video key frame,
+/// then 1.1 M one-byte audio packets. Searching the video stream reads
+/// through them; the seek stops when its allowance runs out, whatever
+/// the file's length, fails with ResourceExhausted, and reading resumes
+/// where it was.
+#[test]
+fn a_long_run_of_another_streams_packets_exhausts_the_seek_allowance() {
+    let sample = std::fs::read(fate("sipr/sipr_5k0.rm")).unwrap();
+    let data_start = chunk(&sample, b"DATA") + 18;
+    let mut data = sample[..data_start].to_vec();
+    // The first video packet (stream 1, key) as the file has it.
+    let mut at = data_start;
+    loop {
+        let len = usize::from(u16::from_be_bytes([sample[at + 2], sample[at + 3]]));
+        if u16::from_be_bytes([sample[at + 4], sample[at + 5]]) == 1 && sample[at + 11] & 2 != 0 {
+            data.extend_from_slice(&sample[at..at + len]);
+            break;
+        }
+        at += len;
+    }
+    for n in 0..1_100_000u32 {
+        // version 0, length 13, stream 0, timestamp, group 0, flags 0, one byte
+        data.extend_from_slice(&[0, 0, 0, 13, 0, 0]);
+        data.extend_from_slice(&(n / 8).to_be_bytes());
+        data.extend_from_slice(&[0, 0, 0]);
+    }
+    let first = open(data.clone()).unwrap().next_packet().map(|p| as_pkt(&p)).ok();
+    let (counted, read) = counting(data);
+    let (result, during, first_after) = bounded("seeking", move || {
+        let mut ctx = RuntimeContext::new();
+        demux_rm::register(&mut ctx);
+        let mut demuxer = ctx.containers.open_demuxer("rm", counted, &ctx.codecs).unwrap();
+        let before = read.load(std::sync::atomic::Ordering::Relaxed);
+        let result = demuxer.seek_to(1, 10_000);
+        let during = read.load(std::sync::atomic::Ordering::Relaxed) - before;
+        (result, during, demuxer.next_packet().map(|p| as_pkt(&p)).ok())
+    });
+    assert!(matches!(result, Err(Error::ResourceExhausted(_))), "the seek ends on its allowance: {result:?}");
+    assert!(during <= (1 << 20) * 13 + (1 << 20), "the seek read {during} bytes");
+    assert_eq!(first_after, first, "reading resumes where it was");
+}
+
+/// A reader over `data` that counts the bytes read.
+fn counting(data: Vec<u8>) -> (Box<dyn oxideav_core::ReadSeek>, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    struct Counting(std::io::Cursor<Vec<u8>>, std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl std::io::Read for Counting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buf)?;
+            self.1.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+    impl std::io::Seek for Counting {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(to)
+        }
+    }
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    (Box::new(Counting(std::io::Cursor::new(data), read.clone())), read)
+}
+
+/// SIPR in RM: from the start FFmpeg times the first block early by the
+/// decoder's priming, after a seek it does not. The audio after a seek is
+/// timed as FFmpeg times it, and is the same whether or not packets were
+/// read before the seek.
+#[test]
+fn sipr_audio_after_a_seek_is_timed_like_ffmpegs_and_independent_of_history() {
+    let path = fate("sipr/sipr_5k0.rm");
+    let audio_after = |read_first: usize, target_ms: i64| {
+        let mut demuxer = open(std::fs::read(&path).unwrap()).unwrap();
+        for _ in 0..read_first {
+            demuxer.next_packet().unwrap();
+        }
+        demuxer.seek_to(1, target_ms).unwrap();
+        std::iter::from_fn(|| demuxer.next_packet().ok())
+            .filter(|p| p.stream_index == 0)
+            .take(6)
+            .map(|p| (p.pts, refcheck::md5_hex(&p.data)))
+            .collect::<Vec<_>>()
+    };
+    for (target, ms) in [("10.0", 10_000), ("13.0", 13_000)] {
+        let want: Vec<Option<i64>> = ffprobe_packets(&path, &format!("{target}%+#24"))
+            .into_iter()
+            .filter(|(stream, _)| *stream == 0)
+            .take(6)
+            .map(|(_, p)| p.pts)
+            .collect();
+        let fresh = audio_after(0, ms);
+        let pts: Vec<Option<i64>> = fresh.iter().map(|p| p.0).collect();
+        assert_eq!(pts, want, "audio pts after a seek to {target}");
+        assert_eq!(audio_after(60, ms), fresh, "audio after reading 60 packets, then seeking to {target}");
+    }
+}
+
 struct Rng(u64);
 
 impl Rng {

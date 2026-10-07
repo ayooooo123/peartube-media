@@ -315,6 +315,7 @@ dependencies = [
 name = "demux-rm"
 version = "0.1.0"
 dependencies = [
+ "demux-seek-core",
  "oxideav-core",
  "refcheck",
 ]

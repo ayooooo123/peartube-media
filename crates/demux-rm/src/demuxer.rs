@@ -16,7 +16,7 @@ use crate::rm_tags::{
 };
 use crate::rmsipr;
 use crate::rv34::Rv34ParserState;
-use crate::seek::{gen_search, Index};
+use demux_seek_core::{gen_search, Allowance, Index};
 
 const RAW_PACKET_SIZE: usize = 1000;
 const MAX_DIMENSION: u32 = 16384;
@@ -37,6 +37,11 @@ struct AudioStreamState {
     audio_buf: Vec<u8>,
     blocks_emitted: usize,
     partial: bool,
+    /// A seek restarted the stream's parser (ff_read_frame_flush). The
+    /// new sipr parser fetches no timestamp for its first frame (a cached
+    /// packet's pos is -1, before its first frame offset), so that frame
+    /// takes the landing dts, and no block after a seek is shifted back.
+    restarted: bool,
 }
 
 #[derive(Default)]
@@ -93,8 +98,8 @@ pub struct RmDemuxer {
     // audio stream (avpriv_update_cur_dts).
     cur_dts: HashMap<u32, i64>,
 
-    // File position of the next DATA chunk header (multiple-DATA files), if any
-    next_data_pos: Option<u64>,
+    /// What the seek under way may still read.
+    allowance: Allowance,
 }
 
 
@@ -434,6 +439,7 @@ fn read_audio_stream_info<R: Read + Seek + ?Sized>(
             audio_buf,
             blocks_emitted: 0,
             partial: false,
+            restarted: false,
         };
 
         Ok((params, audio_state))
@@ -456,8 +462,6 @@ pub fn open(
     let mut stream_id_to_index = HashMap::new();
     let mut seek_index: Vec<Index> = Vec::new();
     let mut data_offset = 0;
-
-    let mut next_data_pos: Option<u64> = None;
 
     if &b4 == b".ra\xfd" {
         old_format = true;
@@ -642,17 +646,15 @@ pub fn open(
                     }
                 }
                 b"DATA" => {
-                    input.read_exact(&mut b4)?; // number of packets (informational)
+                    // header_end: number of packets, 12 more bytes in
+                    // version 2, the next data header's offset. Reading
+                    // never follows that offset: a DATA tag met while
+                    // reading is logged and scanned past (rmdec.c:745-751).
+                    input.read_exact(&mut b4)?;
                     if chunk_ver == 2 {
                         input.seek(SeekFrom::Current(12))?;
                     }
                     input.read_exact(&mut b4)?;
-                    let next_data = u32::from_be_bytes(b4) as u64;
-                    // DATA payload begins here! `next_data` points at the next
-                    // DATA chunk header (absolute file offset in rmdec.c).
-                    if next_data > 0 && next_data < u64::MAX {
-                        next_data_pos = Some(next_data);
-                    }
                     break;
                 }
                 _ => {
@@ -695,7 +697,7 @@ pub fn open(
         sync_pos: 0,
         last_audio_pts: HashMap::new(),
         cur_dts: HashMap::new(),
-        next_data_pos,
+        allowance: Allowance::default(),
     }))
 }
 
@@ -789,7 +791,9 @@ fn read_mdpr_codecdata<R: Read + Seek + ?Sized>(
 
 /// rm_read_index: the INDX chunks from the reader's position, every entry
 /// a key frame of its stream (av_add_index_entry). An error ends the
-/// index; the entries read so far stay.
+/// index; the entries read so far stay. A version-2 entry's 64-bit
+/// position outside the file is not indexed: FFmpeg keeps it and its
+/// search arithmetic overflows on it.
 fn read_index<R: Read + Seek + ?Sized>(
     reader: &mut R,
     stream_id_to_index: &HashMap<u32, usize>,
@@ -842,7 +846,9 @@ fn read_index<R: Read + Seek + ?Sized>(
                     i64::from_be_bytes(b8)
                 };
                 reader.seek(SeekFrom::Current(4))?; // packet no.
-                index[s].add(pos, pts, 0, 0);
+                if u64::try_from(pos).is_ok_and(|pos| pos < file_size) {
+                    index[s].add(pos, pts, 0, 0, true);
+                }
             }
         }
         if next_off == 0 {
@@ -880,34 +886,8 @@ impl RmDemuxer {
                 Err(e) => return Err(Error::from(e)),
             }
         } {
+            self.allowance.spend(0, 1)?;
             self.sync_state = (self.sync_state << 8) | (b1[0] as u32);
-
-            if self.sync_state == u32::from_be_bytes(*b"DATA") {
-                // rmdec.c warns and keeps scanning; rm_read_header recorded the
-                // offset of the next DATA chunk for exactly this case.
-                if let Some(pos) = self.next_data_pos {
-                    if self.io.seek(SeekFrom::Start(pos)).is_ok() {
-                        // Read the DATA chunk header and continue into its payload.
-                        let mut b4 = [0u8; 4];
-                        if self.io.read_exact(&mut b4).is_ok() && &b4 == b"DATA" {
-                            let _ = self.io.read_exact(&mut b4); // size
-                            let mut b2 = [0u8; 2];
-                            if self.io.read_exact(&mut b2).is_ok() {
-                                let ver = u16::from_be_bytes(b2);
-                                let _ = self.io.read_exact(&mut b4); // nb packets
-                                if ver == 2 {
-                                    let _ = self.io.seek(SeekFrom::Current(12));
-                                }
-                                let _ = self.io.seek(SeekFrom::Current(4)); // next data header
-                                self.sync_state = 0xFFFFFFFF;
-                                continue;
-                            }
-                        }
-                    }
-                }
-                self.sync_state = 0xFFFFFFFF;
-                continue;
-            }
 
             if self.sync_state == u32::from_be_bytes(*b"INDX") {
                 // Skip index chunk
@@ -929,6 +909,7 @@ impl RmDemuxer {
                     len
                 };
                 if real_len >= 14 {
+                    self.allowance.spend(0, real_len as u64)?;
                     self.io
                         .seek(SeekFrom::Current((real_len - 14) as i64))?;
                 }
@@ -936,6 +917,8 @@ impl RmDemuxer {
                 continue;
             }
 
+            // A DATA tag here is "in middle of chunk": FFmpeg logs it and
+            // scans on (rmdec.c:745-751), as for any other state above 0xFFFF.
             if self.sync_state > 0xFFFF || self.sync_state <= 12 {
                 continue;
             }
@@ -977,6 +960,7 @@ impl RmDemuxer {
             let s_idx = match self.stream_id_to_index.get(&full_id) {
                 Some(&i) => i,
                 None => {
+                    self.allowance.spend(1, len as u64)?;
                     self.io.seek(SeekFrom::Current(len as i64))?;
                     continue;
                 }
@@ -1288,7 +1272,9 @@ impl RmDemuxer {
                     let slice = &ast.audio_buf[start..end];
                     let pkt = Packet::new(stream_idx as u32, time_base, slice.to_vec());
                     let pts = if i == 0 {
-                        if ast.blocks_emitted == 1 {
+                        if std::mem::take(&mut ast.restarted) {
+                            None
+                        } else if ast.blocks_emitted == 1 {
                             Some(base_ts - TimeBase::from_rate(ast.sample_rate).rescale(primer, time_base))
                         } else {
                             Some(base_ts)
@@ -1406,7 +1392,12 @@ impl RmDemuxer {
         // rm_sync starts every call from a fresh state.
         self.sync_state = 0xFFFF_FFFF;
         loop {
-            let Ok(Some((s, len, dts, flags))) = self.sync_next_packet() else { return Ok(None) };
+            let (s, len, dts, flags) = match self.sync_next_packet() {
+                Ok(Some(found)) => found,
+                Err(e) if demux_seek_core::is_exhausted(&e) => return Err(e),
+                _ => return Ok(None),
+            };
+            self.allowance.spend(1, len as u64)?;
             let at = self.sync_pos as i64;
             let mut len = len as i64;
             let mut seq = 1;
@@ -1425,7 +1416,7 @@ impl RmDemuxer {
                 }
             }
             if flags & 2 != 0 && seq & 0x7F == 1 {
-                self.seek_index[s].add(at, dts, 0, 0);
+                self.seek_index[s].add(at, dts, 0, 0, true);
                 if s == stream {
                     *ppos = at;
                     return Ok(Some(dts));
@@ -1573,7 +1564,9 @@ impl Demuxer for RmDemuxer {
 
     /// rm_read_seek: ff_seek_frame_binary over rm_read_dts, bounded by the
     /// INDX entries and the key packets earlier searches met. Lands on the
-    /// last key packet of `stream_index` at or before `pts`.
+    /// last key packet of `stream_index` at or before `pts`. The search
+    /// reads within the seek's allowance; one that fails leaves reading
+    /// where it was.
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         if self.old_format {
             // rm_read_dts returns AV_NOPTS_VALUE for RealAudio (.ra) files,
@@ -1584,17 +1577,17 @@ impl Demuxer for RmDemuxer {
         if stream >= self.streams.len() {
             return Err(Error::invalid("rm: no such stream to seek"));
         }
-        let resume = (self.io.stream_position()?, self.remaining_len, self.sync_state);
+        let resume = (self.io.stream_position()?, self.remaining_len, self.sync_state, self.sync_pos);
         let bounds = self.seek_index[stream].bounds(pts);
         let file_size = self.io.seek(SeekFrom::End(0))? as i64;
         let data_offset = self.data_offset as i64;
-        let found = gen_search(pts, bounds, data_offset, file_size, &mut |pos| self.read_dts(stream, pos));
+        self.allowance.start();
+        let found = gen_search(pts, bounds, data_offset, file_size, &mut |pos, _| self.read_dts(stream, pos));
+        self.allowance.stop();
         let (pos, ts) = match found {
             Ok(Some((pos, ts))) if pos >= 0 => (pos as u64, ts),
             failed => {
-                // FFmpeg leaves the input where the search stopped; resume
-                // where reading was.
-                (self.remaining_len, self.sync_state) = (resume.1, resume.2);
+                (self.remaining_len, self.sync_state, self.sync_pos) = (resume.1, resume.2, resume.3);
                 self.io.seek(SeekFrom::Start(resume.0))?;
                 return Err(failed.err().unwrap_or_else(|| Error::invalid("rm: no key frame to seek to")));
             }
@@ -1602,7 +1595,7 @@ impl Demuxer for RmDemuxer {
         self.io.seek(SeekFrom::Start(pos))?;
 
         // ff_read_frame_flush and rm->audio_pkt_cnt = 0: queued frames and
-        // the rv34 parsers go. FFmpeg keeps the audio deinterleaver and the
+        // the parsers go. FFmpeg keeps the audio deinterleaver and the
         // video slice assembly across the seek; they restart here, so the
         // first frames after it do not depend on what was read before.
         self.packet_queue.clear();
@@ -1612,6 +1605,7 @@ impl Demuxer for RmDemuxer {
         for ast in self.audio_states.values_mut() {
             ast.sub_packet_cnt = 0;
             ast.audiotimestamp = None;
+            ast.restarted = true;
         }
         for vst in self.video_states.values_mut() {
             vst.slices = 0;

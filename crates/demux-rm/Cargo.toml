@@ -7,6 +7,7 @@ description = "RealMedia (.rm, .rmvb, .ra) demuxer ported from FFmpeg"
 
 [dependencies]
 oxideav-core.workspace = true
+demux-seek-core.workspace = true
 
 [dev-dependencies]
 refcheck.workspace = true
