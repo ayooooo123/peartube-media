@@ -6,9 +6,10 @@
 #[path = "../../tests/support/bitmap.rs"]
 mod bitmap;
 
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{self, Sender};
 
-use bitmap::{Scratch, Show, ffmpeg, oracle, pgs_with_clears};
+use bitmap::{Scratch, Show, ffmpeg, oracle, pgs_states, pgs_with_clears};
 use oxideav_core::{Error, MediaType};
 
 use super::*;
@@ -218,6 +219,8 @@ fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Refere
         seek_generation: Box::new(|| 0),
         // Subtitles alone: the lane is the only bound on the read-ahead.
         paced: Box::new(|| false),
+        beside_media: false,
+        refreshing: Box::new(|| false),
         stopped: stopped.clone(),
         retired: Arc::new(AtomicBool::new(false)),
     };
@@ -279,16 +282,29 @@ fn dvb_final_visible_state_expires_at_ffmpeg_end_exactly() {
 /// WebVTT (the text decoders reject Matroska's SubRip blocks): the
 /// subtitle stream and its packets.
 fn text_cues(scratch: &Scratch, name: &str, cues: &[(u32, u32)]) -> (StreamInfo, Vec<Packet>) {
+    let cues: Vec<_> = cues.iter().enumerate().map(|(index, &(start, end))| (start, end, format!("cue {index}"))).collect();
+    text_cues_with(scratch, name, &cues)
+}
+
+/// `text_cues` with each cue's own text.
+fn text_cues_with(scratch: &Scratch, name: &str, cues: &[(u32, u32, String)]) -> (StreamInfo, Vec<Packet>) {
     let stamp = |ms: u32| format!("{:02}:{:02}:{:02},{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
     let srt: String = cues.iter().enumerate()
-        .map(|(index, &(start, end))| format!("{}\n{} --> {}\ncue {index}\n\n", index + 1, stamp(start), stamp(end)))
+        .map(|(index, (start, end, text))| format!("{}\n{} --> {}\n{text}\n\n", index + 1, stamp(*start), stamp(*end)))
         .collect();
     let source = scratch.file(&format!("{name}.srt"));
     let mks = scratch.file(&format!("{name}.mks"));
     std::fs::write(&source, srt).unwrap();
     ffmpeg(&["-copyts", "-i", source.to_str().unwrap(), "-c:s", "webvtt", "-f", "matroska", mks.to_str().unwrap()]);
+    let (stream, packets) = stream_packets(&mks, "matroska", name);
+    assert_eq!(packets.len(), cues.len(), "{name}: one packet per cue");
+    (stream, packets)
+}
+
+/// The first subtitle stream of `path` and its packets.
+fn stream_packets(path: &std::path::Path, format: &str, name: &str) -> (StreamInfo, Vec<Packet>) {
     let ctx = codecs::context();
-    let mut demux = ctx.containers.open_demuxer("matroska", Box::new(std::fs::File::open(&mks).unwrap()), &ctx.codecs).unwrap();
+    let mut demux = ctx.containers.open_demuxer(format, Box::new(std::fs::File::open(path).unwrap()), &ctx.codecs).unwrap();
     let stream = demux.streams().iter().find(|stream| stream.params.media_type == MediaType::Subtitle).unwrap().clone();
     let mut packets = Vec::new();
     loop {
@@ -299,26 +315,50 @@ fn text_cues(scratch: &Scratch, name: &str, cues: &[(u32, u32)]) -> (StreamInfo,
             Err(error) => panic!("{name}: {error}"),
         }
     }
-    assert_eq!(packets.len(), cues.len(), "{name}: one packet per cue");
     (stream, packets)
 }
 
-/// Each sink call: when on the clock, and how many images.
+/// Each sink call: when on the clock, and how many images; the most RGBA
+/// bytes any call carried.
 struct CountSink {
     clock: Arc<TestClock>,
     shows: Sender<(Duration, usize)>,
+    max_bytes: Arc<AtomicUsize>,
 }
 
 impl SubtitleSink for CountSink {
     fn show(&mut self, images: &[SubtitleImage], _width: u32, _height: u32) {
-        self.shows.send((self.clock.now().unwrap(), images.len())).unwrap();
+        let bytes = images.iter().map(|image| image.rgba.len()).sum();
+        self.max_bytes.fetch_max(bytes, Ordering::SeqCst);
+        // The final clear of a stopped pipeline may come after the test.
+        let _ = self.shows.send((self.clock.now().unwrap(), images.len()));
     }
+}
+
+/// How a test pipeline runs.
+struct Setup {
+    /// Video or audio pipelines drain their lanes now.
+    paced: bool,
+    /// The playback has video or audio pipelines, ended or not.
+    beside_media: bool,
+    /// The injected clock from the first turn.
+    start: Duration,
+    realtime: bool,
+    video: (u32, u32),
 }
 
 /// A realtime pipeline on the injected clock, standing at `start` from the
 /// first turn, over `packets` and the lane's end marker, beside video or
 /// audio (`paced`) or alone.
 fn text_pipeline(stream: &StreamInfo, packets: &[Packet], paced: bool, start: Duration) -> (TestThread, Arc<TestClock>, mpsc::Receiver<(Duration, usize)>) {
+    let setup = Setup { paced, beside_media: paced, start, realtime: true, video: (320, 240) };
+    let (running, clock, rx, _) = pipeline(stream, packets, setup);
+    (running, clock, rx)
+}
+
+/// A pipeline over `packets` and the lane's end marker, as `setup` says:
+/// the running thread, its clock, its sink calls and their largest size.
+fn pipeline(stream: &StreamInfo, packets: &[Packet], setup: Setup) -> (TestThread, Arc<TestClock>, mpsc::Receiver<(Duration, usize)>, Arc<AtomicUsize>) {
     let ctx = Arc::new(codecs::context());
     let decoder = ctx.codecs.first_decoder(&stream.params).unwrap();
     let params = stream.params.clone();
@@ -330,30 +370,34 @@ fn text_pipeline(stream: &StreamInfo, packets: &[Packet], paced: bool, start: Du
     }
     lane.push_eof();
     let clock = Arc::new(TestClock::default());
-    *clock.state.lock() = (start, 0);
+    *clock.state.lock() = (setup.start, 0);
     let stopped = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let pipeline = SubtitlePipeline {
+    let paced = setup.paced;
+    let pipe = SubtitlePipeline {
         decoder,
         new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
         clock: clock.clone(),
         time_base: stream.time_base,
-        video_width: 320,
-        video_height: 240,
-        realtime: true,
+        video_width: setup.video.0,
+        video_height: setup.video.1,
+        realtime: setup.realtime,
         lane: lane.clone(),
         demux_cv,
         seek_generation: Box::new(|| 0),
         paced: Box::new(move || paced),
+        beside_media: setup.beside_media,
+        refreshing: Box::new(|| false),
         stopped: stopped.clone(),
         retired: Arc::new(AtomicBool::new(false)),
     };
-    let sink = Box::new(CountSink { clock: clock.clone(), shows: tx });
+    let max_bytes = Arc::new(AtomicUsize::new(0));
+    let sink = Box::new(CountSink { clock: clock.clone(), shows: tx, max_bytes: max_bytes.clone() });
     let handle = std::thread::spawn(move || {
         let _consumer = consumer;
-        run_subtitle_loop(pipeline, sink);
+        run_subtitle_loop(pipe, sink);
     });
-    (TestThread { stopped, lane, handle: Some(handle) }, clock, rx)
+    (TestThread { stopped, lane, handle: Some(handle) }, clock, rx, max_bytes)
 }
 
 /// Waits until the pipeline has taken everything from its lane, the end
@@ -425,4 +469,47 @@ fn paced_subtitles_drain_a_flood_into_a_bounded_queue() {
     clock.synchronize();
     let rest: Vec<_> = rx.try_iter().collect();
     assert!(rest.is_empty(), "nothing after the last kept cue: {rest:?}");
+}
+
+/// The subtitle worker of a video or audio playback may first run after
+/// those have ended, so it never sees them drain their lanes. Its
+/// open-ended PGS state from 0 s still comes down at the lane's end,
+/// realtime or not. Alone, the last state stays up.
+#[test]
+fn subtitles_whose_media_ended_first_still_end_cleared() {
+    let scratch = Scratch::new();
+    let sup = scratch.file("open-ended.sup");
+    pgs_states(&sup, &[(0, true)]);
+    let (stream, packets) = stream_packets(&sup, "sup", "open-ended");
+    for (beside_media, realtime) in [(true, true), (true, false), (false, true), (false, false)] {
+        let what = format!("beside media {beside_media}, realtime {realtime}");
+        let setup = Setup { paced: false, beside_media, start: Duration::from_secs(1), realtime, video: (720, 480) };
+        let (mut running, _clock, rx, _) = pipeline(&stream, &packets, setup);
+        let shown = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_else(|error| panic!("{what}: {error}"));
+        assert_eq!(shown.1, 1, "{what}: the state");
+        running.handle.take().unwrap().join().unwrap();
+        let rest: Vec<_> = rx.try_iter().map(|show| show.1).collect();
+        let want: &[usize] = if beside_media { &[0] } else { &[] };
+        assert_eq!(rest, want, "{what}: what follows the state at the lane's end");
+    }
+}
+
+/// Text cues whose visible pixels on an 8K canvas would take more than
+/// 64 MiB (120 lines of 1,000 characters; the compositor draws text at a
+/// fixed size, about 8x19 pixels a character), one already due and one
+/// still to come: they show, and no show carries more than 64 MiB.
+#[test]
+fn oversized_text_cues_stay_within_the_bounds() {
+    let scratch = Scratch::new();
+    let text = vec!["W".repeat(1000); 120].join("\n");
+    let (stream, packets) = text_cues_with(&scratch, "oversized", &[(9_000, 20_000, text.clone()), (11_000, 20_000, text)]);
+    let setup = Setup { paced: true, beside_media: true, start: Duration::from_secs(10), realtime: true, video: (7680, 4320) };
+    let (running, clock, rx, max_bytes) = pipeline(&stream, &packets, setup);
+    let first = rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    assert_eq!(first, (Duration::from_secs(10), 1), "the due cue shows at once");
+    clock.set(Duration::from_secs(11), &running.lane);
+    let second = rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    assert!(second.0 == Duration::from_secs(11) && second.1 >= 1, "the waiting cue shows at its start: {second:?}");
+    let most = max_bytes.load(Ordering::SeqCst);
+    assert!(most <= 64 << 20, "a show of {most} bytes");
 }

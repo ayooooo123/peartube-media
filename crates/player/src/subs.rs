@@ -44,16 +44,30 @@ const MAX_PENDING_BYTES: usize = 64 << 20;
 const MAX_TEXT_UP: usize = 64;
 const MAX_TEXT_UP_BYTES: usize = 64 << 20;
 
-/// Renders one text/ASS cue on a video-sized RGBA canvas and crops it to
-/// its visible pixels, positioned on that canvas (an empty image when
-/// nothing is visible).
+/// The space text cues render in: the video's (at least 320x240), scaled
+/// down to at most `MAX_CANVAS_PIXELS` (8K video renders text in 5461x3072;
+/// the sink scales it to the video). A full canvas, and so any one cue,
+/// then stays within 64 MiB.
+pub fn text_space(video_width: u32, video_height: u32) -> (u32, u32) {
+    let (width, height) = (u64::from(video_width.max(320)), u64::from(video_height.max(240)));
+    let pixels = width * height;
+    if pixels <= MAX_CANVAS_PIXELS as u64 {
+        return (width as u32, height as u32);
+    }
+    let scale = (MAX_CANVAS_PIXELS as f64 / pixels as f64).sqrt();
+    (((width as f64 * scale) as u32).max(1), ((height as f64 * scale) as u32).max(1))
+}
+
+/// Renders one text/ASS cue on a canvas of `text_space(video_width,
+/// video_height)` and crops it to its visible pixels, positioned on that
+/// canvas (an empty image when nothing is visible).
 pub fn render_text_cue(
     cue: &oxideav_core::SubtitleCue,
     video_width: u32,
     video_height: u32,
 ) -> SubtitleImage {
-    let w = video_width.max(320) as usize;
-    let h = video_height.max(240) as usize;
+    let (w, h) = text_space(video_width, video_height);
+    let (w, h) = (w as usize, h as usize);
     let comp = oxideav_subtitle::compositor::Compositor::new(w as u32, h as u32);
     let rgba = comp.render(cue);
     visible(&rgba, w * 4, w, h).unwrap_or(SubtitleImage { x: 0, y: 0, width: 0, height: 0, rgba: Vec::new() })
@@ -221,10 +235,11 @@ impl OnScreen {
                 self.bitmap = None;
                 self.text.push(image);
                 self.text_ends.push(cue.end.unwrap_or(cue.start));
-                // Past MAX_TEXT_UP*, the earliest up go first; the newest
-                // always shows.
+                // Past MAX_TEXT_UP*, the earliest up go first. Text renders
+                // within MAX_CANVAS_PIXELS (`text_space`), so a cue alone
+                // never outgrows the bytes.
                 let mut bytes: usize = self.text.iter().map(|image| image.rgba.len()).sum();
-                while self.text.len() > 1 && (self.text.len() > MAX_TEXT_UP || bytes > MAX_TEXT_UP_BYTES) {
+                while !self.text.is_empty() && (self.text.len() > MAX_TEXT_UP || bytes > MAX_TEXT_UP_BYTES) {
                     bytes -= self.text.remove(0).rgba.len();
                     self.text_ends.remove(0);
                 }
@@ -267,11 +282,12 @@ fn advance(on: &mut OnScreen, pending: &mut VecDeque<Cue>, now: Duration) -> boo
     }
 }
 
-/// Drops the cues due last while more wait than `MAX_PENDING_*` allow,
-/// keeping the next one.
+/// Drops the cues due last while more wait than `MAX_PENDING_*` allow.
+/// Every image is within the canvas bounds, so a cue alone never outgrows
+/// the bytes.
 fn bound(pending: &mut VecDeque<Cue>) {
     let mut bytes: usize = pending.iter().map(Cue::bytes).sum();
-    while pending.len() > 1 && (pending.len() > MAX_PENDING_CUES || bytes > MAX_PENDING_BYTES) {
+    while !pending.is_empty() && (pending.len() > MAX_PENDING_CUES || bytes > MAX_PENDING_BYTES) {
         if let Some(dropped) = pending.pop_back() {
             bytes -= dropped.bytes();
         }
@@ -340,6 +356,12 @@ pub(crate) struct SubtitlePipeline {
     /// Video or audio pipelines bound the demuxer's read-ahead (they drain
     /// their own lanes); otherwise only this lane does.
     pub(crate) paced: Box<dyn Fn() -> bool + Send>,
+    /// The playback has video or audio pipelines: it ends with nothing up,
+    /// even when they ended before this pipeline first ran.
+    pub(crate) beside_media: bool,
+    /// A refresh seek is inside the demuxer: at its end this pipeline waits
+    /// for it, as it may land and start the pipeline over.
+    pub(crate) refreshing: Box<dyn Fn() -> bool + Send>,
     pub(crate) stopped: Arc<AtomicBool>,
     pub(crate) retired: Arc<AtomicBool>,
 }
@@ -453,24 +475,24 @@ impl SubtitlePipeline {
 /// it), so captures see the exact cue sequence. A seek clears the screen
 /// and starts over from the demuxer's new position. Alone, it ends at the
 /// lane's end once nothing more is due (a bitmap state without an end stays
-/// up). Behind video or audio it drains its lane as packets come, and the
+/// up). Beside video or audio it drains its lane as packets come, and the
 /// playback ends with the screen clear: in realtime it stays until they
 /// have played, then clears (the engine also retires it then); otherwise
-/// it clears at the lane's end. It also ends when the player stops or a
-/// selection switch sets `retired`, clearing the screen.
+/// it clears at the lane's end. At its end it waits for a refresh seek
+/// inside the demuxer, which may start it over. It also ends when the
+/// player stops or a selection switch sets `retired`, clearing the screen.
 pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn SubtitleSink>) {
+    let (video_width, video_height) = text_space(pipe.video_width, pipe.video_height);
     let mut screen = Screen {
         sink,
-        video_width: pipe.video_width.max(320),
-        video_height: pipe.video_height.max(240),
+        video_width,
+        video_height,
         shown: false,
     };
     let mut on = OnScreen::default();
     let mut pending: VecDeque<Cue> = VecDeque::new();
     let mut seen_seek = (pipe.seek_generation)();
     let mut eof = false;
-    // Video or audio have drained their lanes during this pipeline.
-    let mut was_paced = false;
 
     while !pipe.quit() {
         let generation = (pipe.seek_generation)();
@@ -487,12 +509,17 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
         }
 
         let paced = (pipe.paced)();
-        was_paced |= paced;
         if !pipe.realtime {
             if eof {
-                // The last state goes at its end; behind video or audio the
+                // A refresh seek inside the demuxer may still start this
+                // pipeline over.
+                if (pipe.refreshing)() {
+                    pipe.wait(None, false, seen_seek);
+                    continue;
+                }
+                // The last state goes at its end; beside video or audio the
                 // playback ends with nothing up, an open-ended state too.
-                if on.next_end().is_some() || was_paced {
+                if on.next_end().is_some() || pipe.beside_media {
                     screen.clear();
                 }
                 return;
@@ -532,18 +559,17 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
         // short of the audio the clock needs to reach that cue. The decoded
         // cues wait in `pending`, bounded.
         let take = !eof && (paced || pending.is_empty());
-        if !take && next.is_none() {
-            // Nothing more is due. Alone, the last state stays up as the
-            // playback ends. Behind video or audio it stays while they
-            // play (a seek may still restart this pipeline) and comes down
-            // when they have played: the engine retires the pipeline then.
-            if !paced {
-                if was_paced {
-                    on.clear();
-                    screen.clear();
-                }
-                return;
+        if !take && next.is_none() && !paced && !(pipe.refreshing)() {
+            // Nothing more is due, and no video or audio plays on (nor may a
+            // refresh seek restart this pipeline). Alone, the last state
+            // stays up as the playback ends; beside video or audio it comes
+            // down with them, even when they ended before this pipeline first
+            // ran (in realtime the engine also retires it then).
+            if pipe.beside_media {
+                on.clear();
+                screen.clear();
             }
+            return;
         }
         match pipe.wait(next, take, seen_seek) {
             Woke::Packet(packet) => {

@@ -7,12 +7,13 @@
 #[path = "support/bitmap.rs"]
 mod bitmap;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use bitmap::{Scratch, Show, ffmpeg, oracle, pgs_states, pgs_with_clears};
-use parking_lot::Mutex;
-use player::backend::{AudioSink, Backend, Clock, SubtitleImage, SubtitleSink, VideoSink};
+use oxideav_core::{CodecId, CodecInfo, CodecParameters, Decoder, Packet, RuntimeContext, VideoFrame};
+use parking_lot::{Condvar, Mutex};
+use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleImage, SubtitleSink, VideoSink};
 use player::{Headless, Player, PlayerOptions, State};
 
 #[derive(Default)]
@@ -24,6 +25,8 @@ struct Observation {
 struct TimedHeadless {
     headless: Arc<Headless>,
     observation: Arc<Mutex<Observation>>,
+    /// The video output says when the video pipeline drops it, as it ends.
+    signal_video_end: bool,
 }
 
 impl Backend for TimedHeadless {
@@ -33,12 +36,62 @@ impl Backend for TimedHeadless {
 
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
         self.observation.lock().clock = Some(clock.clone());
-        self.headless.video(clock)
+        let sink = self.headless.video(clock);
+        if self.signal_video_end { Box::new(VideoEnd(sink)) } else { sink }
     }
 
     fn subtitles(&self) -> Box<dyn SubtitleSink> {
         Box::new(TimedSubtitles(self.observation.clone()))
     }
+}
+
+/// Set when the video pipeline has dropped its output.
+static VIDEO_ENDED: Mutex<bool> = Mutex::new(false);
+static VIDEO_ENDED_CHANGED: Condvar = Condvar::new();
+
+struct VideoEnd(Box<dyn VideoSink>);
+
+impl VideoSink for VideoEnd {
+    fn open_compressed(&mut self, params: &CodecParameters) -> bool { self.0.open_compressed(params) }
+    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+        self.0.push_packet(packet, pts, random_access)
+    }
+    fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> { self.0.open_frames(params) }
+    fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> { self.0.push_frame(frame, pts) }
+    fn frame_lead(&self) -> Duration { self.0.frame_lead() }
+    fn finish(&mut self) -> Result<(), SinkError> { self.0.finish() }
+    fn flush(&mut self) { self.0.flush() }
+    fn set_playing(&mut self, playing: bool) { self.0.set_playing(playing) }
+}
+
+impl Drop for VideoEnd {
+    fn drop(&mut self) {
+        *VIDEO_ENDED.lock() = true;
+        VIDEO_ENDED_CHANGED.notify_all();
+    }
+}
+
+static PLAIN: LazyLock<RuntimeContext> = LazyLock::new(codecs::context);
+
+/// The production PGS decoder, opened only once the video pipeline has
+/// ended (and its lane with it): a subtitle worker whose first turn comes
+/// after the media it belongs to.
+fn pgs_after_the_video(params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
+    let mut ended = VIDEO_ENDED.lock();
+    VIDEO_ENDED_CHANGED.wait_while_for(&mut ended, |ended| !*ended, Duration::from_secs(30));
+    drop(ended);
+    std::thread::sleep(Duration::from_millis(200));
+    PLAIN.codecs.first_decoder(params)
+}
+
+/// The production registry with `pgs_after_the_video` first for PGS.
+fn late_pgs_context() -> RuntimeContext {
+    let id = CodecId::new("hdmv_pgs_subtitle");
+    let caps = PLAIN.codecs.implementations(&id).iter().find(|i| i.make_decoder.is_some()).map(|i| i.caps.clone()).unwrap();
+    let mut ctx = RuntimeContext::new();
+    ctx.codecs.register(CodecInfo::new(id).capabilities(caps).decoder(pgs_after_the_video));
+    codecs::register_all(&mut ctx);
+    ctx
 }
 
 /// Stamps every show/clear with the playback clock.
@@ -59,12 +112,18 @@ fn open(path: &std::path::Path, subtitle: Option<u32>) -> (Player, Arc<TimedHead
 }
 
 fn open_with(path: &std::path::Path, subtitle: Option<u32>, realtime: bool) -> (Player, Arc<TimedHeadless>, Arc<Mutex<Observation>>) {
+    open_in(path, subtitle, realtime, codecs::context(), false)
+}
+
+fn open_in(
+    path: &std::path::Path, subtitle: Option<u32>, realtime: bool, ctx: RuntimeContext, signal_video_end: bool,
+) -> (Player, Arc<TimedHeadless>, Arc<Mutex<Observation>>) {
     let observation = Arc::new(Mutex::new(Observation::default()));
     let headless = Headless::new();
     headless.set_active_streams(None, None, None, realtime);
-    let backend = Arc::new(TimedHeadless { headless, observation: observation.clone() });
+    let backend = Arc::new(TimedHeadless { headless, observation: observation.clone(), signal_video_end });
     let player = Player::open(
-        path.to_str().unwrap(), backend.clone(), Arc::new(codecs::context()),
+        path.to_str().unwrap(), backend.clone(), Arc::new(ctx),
         PlayerOptions { subtitle, realtime, ..PlayerOptions::default() }, |_| {},
     );
     (player, backend, observation)
@@ -179,6 +238,26 @@ fn open_ended_pgs_state_is_cleared_at_ended_without_realtime() {
     let (movie, reference) = open_ended_movie(&scratch);
     let (player, backend, observation) = open_with(&movie, Some(1), false);
     wait_until(&player, Duration::from_secs(20), "playback end", |state| state.ended);
+    assert_eq!(backend.headless.capture().video[0].frame_md5.len(), 10, "every video frame");
+    assert_ends_cleared(&observation, |shows| {
+        assert_eq!(shows.len(), 2, "the state, then its clear");
+        shows[0].assert_canvas(&reference, 0);
+    });
+    drop(player);
+}
+
+/// The subtitle worker of a video playback may first run after the video
+/// has ended (here its decoder opens only then), never seeing the video
+/// drain its lane. Without realtime the playback still ends with the
+/// open-ended state down.
+#[test]
+fn a_subtitle_worker_starting_after_the_video_still_ends_cleared() {
+    *VIDEO_ENDED.lock() = false;
+    let scratch = Scratch::new();
+    let (movie, reference) = open_ended_movie(&scratch);
+    let (player, backend, observation) = open_in(&movie, Some(1), false, late_pgs_context(), true);
+    wait_until(&player, Duration::from_secs(30), "playback end", |state| state.ended);
+    assert!(*VIDEO_ENDED.lock(), "the video pipeline ended first");
     assert_eq!(backend.headless.capture().video[0].frame_md5.len(), 10, "every video frame");
     assert_ends_cleared(&observation, |shows| {
         assert_eq!(shows.len(), 2, "the state, then its clear");
