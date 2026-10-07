@@ -29,6 +29,7 @@ mod nut;
 mod parser;
 mod pva;
 mod rawvideo;
+mod seek;
 mod smf;
 mod voc;
 mod caf;
