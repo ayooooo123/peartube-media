@@ -41,7 +41,7 @@ use oxideav_core::{
 };
 
 use crate::parser::{mpa_decode_header, returned, Ac3, AudioClock, DvdSub, MpegAudio, Parser, Unit};
-use crate::seek::{gen_search, Index};
+use demux_seek_core::{gen_search, Allowance, Index};
 
 const PACK_START_CODE: u32 = 0x1BA;
 const SYSTEM_HEADER_START_CODE: u32 = 0x1BB;
@@ -236,6 +236,8 @@ pub struct MpegPsDemuxer {
     /// Where the packs start (FFmpeg's data_offset, past an IMKH or
     /// Sofdec signature).
     data_offset: i64,
+    /// What the seek under way may still read.
+    allowance: Allowance,
 }
 
 impl MpegPsDemuxer {
@@ -412,6 +414,7 @@ impl MpegPsDemuxer {
             let mut scanned = 0i64;
             let mut startcode = loop {
                 if scanned >= room {
+                    self.allowance.spend(0, scanned as u64)?;
                     self.skip(-scanned.min(3))?;
                     return Ok(Next::Budget);
                 }
@@ -422,12 +425,14 @@ impl MpegPsDemuxer {
                 }
                 state = ((state << 8) | u32::from(v)) & 0xFF_FFFF;
             };
+            self.allowance.spend(1, scanned as u64)?;
             last_sync = self.position()?;
 
             match startcode {
                 PACK_START_CODE | SYSTEM_HEADER_START_CODE => continue,
                 PADDING_STREAM => {
                     if let Some(len) = self.rb16()? {
+                        self.allowance.spend(0, len.max(0) as u64)?;
                         self.skip(len)?;
                     }
                     continue;
@@ -592,6 +597,7 @@ impl MpegPsDemuxer {
                 *pos = header.pos;
                 return Ok(header.dts);
             }
+            self.allowance.spend(0, header.len.max(0) as u64)?;
             self.skip(header.len)?;
         }
     }
@@ -1204,6 +1210,7 @@ pub fn open_mpegps(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Res
         queue: VecDeque::new(),
         eof: false,
         data_offset: 0,
+        allowance: Allowance::default(),
     };
     demuxer.read_header()?;
     demuxer.data_offset = demuxer.position()?;
@@ -1242,8 +1249,8 @@ impl Demuxer for MpegPsDemuxer {
     /// dts gives. It lands on the last PES of the stream at or before the
     /// target, mid-GOP as FFmpeg's does. Every step reads at most up to
     /// the next timestamped PES of the stream, with at most MAX_SYNC_SIZE
-    /// bytes between start codes. A search that fails leaves reading
-    /// where it was.
+    /// bytes between start codes, and the whole search within the seek's
+    /// allowance. A search that fails leaves reading where it was.
     fn seek_to(&mut self, stream_index: u32, timestamp: i64) -> Result<i64> {
         let Some(track) = self.tracks.get(stream_index as usize) else {
             return Err(Error::invalid("mpeg: no such stream to seek"));
@@ -1252,19 +1259,17 @@ impl Demuxer for MpegPsDemuxer {
         let resume = self.position()?;
         let file_size = self.input.seek(SeekFrom::End(0))? as i64;
         let data_offset = self.data_offset;
+        self.allowance.start();
         let found = gen_search(timestamp, bounds, data_offset, file_size, &mut |pos, _limit| self.read_dts(pos, id));
+        self.allowance.stop();
         match found {
             Ok(Some((pos, ts))) => {
                 self.restart(pos, ts)?;
                 Ok(ts)
             }
-            Ok(None) => {
+            failed => {
                 self.input.seek(SeekFrom::Start(resume as u64))?;
-                Err(Error::invalid("mpeg: no timestamp to seek by"))
-            }
-            Err(e) => {
-                self.input.seek(SeekFrom::Start(resume as u64))?;
-                Err(e)
+                Err(failed.err().unwrap_or_else(|| Error::invalid("mpeg: no timestamp to seek by")))
             }
         }
     }

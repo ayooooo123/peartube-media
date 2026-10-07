@@ -22,7 +22,7 @@ use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{Demuxer, Error, Packet, ReadSeek, Result, StreamInfo};
 
 use crate::parser::{Combine, Parser, Split, END_NOT_FOUND};
-use crate::seek::Index;
+use demux_seek_core::{read_on, Allowance, Index};
 
 /// ff_raw_demuxer_class raw_packet_size
 const RAW_PACKET_SIZE: usize = 1024;
@@ -41,9 +41,22 @@ pub(crate) struct RawVideoDemuxer<S> {
     eof: bool,
     /// AVFMT_GENERIC_INDEX: the key units returned so far.
     index: Index,
+    /// What the seek under way may still read.
+    allowance: Allowance,
 }
 
-impl<S: Split + Units> RawVideoDemuxer<S> {
+/// Where reading was, given back when a seek fails.
+struct Reading<S> {
+    at: u64,
+    parser: Parser<S>,
+    queue: VecDeque<Packet>,
+    positions: VecDeque<i64>,
+    pos: i64,
+    count: i64,
+    eof: bool,
+}
+
+impl<S: Split + Units + Send> RawVideoDemuxer<S> {
     pub fn new(format: &'static str, input: Box<dyn ReadSeek>, stream: StreamInfo, split: S) -> Self {
         Self {
             format,
@@ -56,6 +69,7 @@ impl<S: Split + Units> RawVideoDemuxer<S> {
             count: 0,
             eof: false,
             index: Index::default(),
+            allowance: Allowance::default(),
         }
     }
 
@@ -70,6 +84,7 @@ impl<S: Split + Units> RawVideoDemuxer<S> {
             }
             n += got;
         }
+        self.allowance.spend(1, n as u64)?;
         let mut units = Vec::new();
         if n == 0 {
             self.eof = true;
@@ -109,6 +124,24 @@ impl<S: Split + Units> RawVideoDemuxer<S> {
         self.eof = false;
         Ok(())
     }
+
+    /// seek_frame_generic from the index search's result `found`.
+    fn land(&mut self, timestamp: i64, mut found: Option<usize>) -> Result<i64> {
+        if found.is_none() || found == Some(self.index.entries().len() - 1) {
+            match self.index.entries().last().copied() {
+                Some(last) => self.restart(last.pos, Some(last.timestamp))?,
+                None => self.restart(0, None)?,
+            }
+            read_on(timestamp, || self.next_packet().map(|p| (p.flags.keyframe, p.dts)))?;
+            found = self.index.search(timestamp, true);
+        }
+        let Some(i) = found else {
+            return Err(Error::invalid("raw video: no key frame to seek to"));
+        };
+        let e = self.index.entries()[i];
+        self.restart(e.pos, Some(e.timestamp))?;
+        Ok(e.timestamp)
+    }
 }
 
 impl<S: Split + Units + Send> Demuxer for RawVideoDemuxer<S> {
@@ -140,49 +173,42 @@ impl<S: Split + Units + Send> Demuxer for RawVideoDemuxer<S> {
     /// seek.c seek_frame_generic with AVSEEK_FLAG_BACKWARD (rawdec.h
     /// FF_DEF_RAWVIDEO_DEMUXER: AVFMT_GENERIC_INDEX): the last key unit at
     /// or before the target among those returned so far; past the last of
-    /// them units are read on, bounded by the input, until a key unit
-    /// starts after the target or more than 1000 others did. FFmpeg cannot
-    /// seek raw H.264 or HEVC: compute_pkt_fields gives their packets no
-    /// dts (demux.c:993, onein_oneout), ff_add_index_entry rejects an entry
+    /// them units are read on, within the seek's allowance, until a key
+    /// unit starts after the target or more than 1000 others did. A seek
+    /// that fails leaves reading where it was. FFmpeg cannot seek raw
+    /// H.264 or HEVC: compute_pkt_fields gives their packets no dts
+    /// (demux.c:993, onein_oneout), ff_add_index_entry rejects an entry
     /// without one (seek.c:76), so seek_frame_generic finds no index entry
     /// (seek.c:581) and fails, as `ffprobe -read_intervals` reports.
     fn seek_to(&mut self, _stream_index: u32, timestamp: i64) -> Result<i64> {
-        if self.parser.split.reset(None).is_none() {
+        let Some(fresh) = self.parser.split.reset(None) else {
             return Err(Error::unsupported(format!(
                 "{}: FFmpeg's raw demuxer gives these packets no timestamps to seek by",
                 self.format
             )));
-        }
-        let mut found = self.index.search(timestamp, true);
-        let entries = self.index.entries();
-        if found.is_none() && entries.first().is_some_and(|e| timestamp < e.timestamp) {
+        };
+        let found = self.index.search(timestamp, true);
+        if found.is_none() && self.index.entries().first().is_some_and(|e| timestamp < e.timestamp) {
             return Err(Error::invalid("raw video: seek before the first key frame"));
         }
-        if found.is_none() || found == Some(entries.len() - 1) {
-            match entries.last().copied() {
-                Some(last) => self.restart(last.pos, Some(last.timestamp))?,
-                None => self.restart(0, None)?,
-            }
-            let mut nonkey = 0;
-            while let Ok(packet) = self.next_packet() {
-                if packet.dts.is_some_and(|dts| dts > timestamp) {
-                    if packet.flags.keyframe {
-                        break;
-                    }
-                    nonkey += 1;
-                    if nonkey > 1001 {
-                        break;
-                    }
-                }
-            }
-            found = self.index.search(timestamp, true);
-        }
-        let Some(i) = found else {
-            return Err(Error::invalid("raw video: no key frame to seek to"));
+        let reading = Reading {
+            at: self.input.stream_position()?,
+            parser: std::mem::replace(&mut self.parser, Parser::new(fresh)),
+            queue: std::mem::take(&mut self.queue),
+            positions: std::mem::take(&mut self.positions),
+            pos: self.pos,
+            count: self.count,
+            eof: self.eof,
         };
-        let e = self.index.entries()[i];
-        self.restart(e.pos, Some(e.timestamp))?;
-        Ok(e.timestamp)
+        self.allowance.start();
+        let landed = self.land(timestamp, found);
+        self.allowance.stop();
+        if landed.is_err() {
+            self.input.seek(SeekFrom::Start(reading.at))?;
+            (self.parser, self.queue, self.positions) = (reading.parser, reading.queue, reading.positions);
+            (self.pos, self.count, self.eof) = (reading.pos, reading.count, reading.eof);
+        }
+        landed
     }
 }
 

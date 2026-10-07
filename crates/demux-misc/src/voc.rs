@@ -14,7 +14,7 @@ use oxideav_core::{
     MAX_PROBE_SCORE,
 };
 
-use crate::seek::Index;
+use demux_seek_core::{read_on, soft, Allowance, MAX_INDEX_ENTRIES};
 
 const VOC_TYPE_EOF: u8 = 0x00;
 const VOC_TYPE_VOICE_DATA: u8 = 0x01;
@@ -79,16 +79,92 @@ struct VocDemuxer {
     first: Option<Packet>,
     remaining_size: i64,
     pts: i64,
+    /// Which packet start of the file the input is at (0 the first).
+    ordinal: u64,
     /// None until the codec is known (FFmpeg's AV_CODEC_ID_NONE).
     codec: Option<&'static str>,
     sample_rate: u32,
     channels: u16,
     sample_format: Option<SampleFormat>,
-    /// ff_voc_get_packet's index: where each packet read started, its pts
-    /// and the bytes of its block left there.
-    index: Index,
+    index: VocIndex,
     /// Where the blocks start (FFmpeg's data_offset).
     data_offset: u64,
+    /// What the seek under way may still read.
+    allowance: Allowance,
+}
+
+/// One entry of ff_voc_get_packet's index: a packet start, its pts and
+/// the bytes of its block left there (AVIndexEntry.size), and which
+/// packet start of the file it is.
+#[derive(Clone, Copy, Debug)]
+struct VocEntry {
+    ordinal: u64,
+    pos: i64,
+    pts: i64,
+    remaining: i64,
+}
+
+/// ff_voc_get_packet's index within MAX_INDEX_ENTRIES (1.4 MB).
+///
+/// FFmpeg keeps an entry for every packet start it reads, which is
+/// always a run from the first one: reading starts at the first block,
+/// and a seek lands on an entry or reads on from the last. The n-th
+/// packet start is the same entry however often it is read. Once full,
+/// this index keeps the entries whose ordinal is a multiple of a stride
+/// that doubles, and always the last entry (voc_read_seek tells the
+/// last from the others); a landing between two kept entries is found
+/// again by reading on from the earlier one, fewer than `stride`
+/// packets.
+struct VocIndex {
+    entries: Vec<VocEntry>,
+    stride: u64,
+}
+
+impl VocIndex {
+    fn new() -> Self {
+        Self { entries: Vec::new(), stride: 1 }
+    }
+
+    /// av_add_index_entry for a packet start read.
+    fn add(&mut self, e: VocEntry) {
+        // ff_add_index_entry's size check
+        if !(0..=0x3FFF_FFFF).contains(&e.remaining) {
+            return;
+        }
+        if let Some(last) = self.entries.last().copied() {
+            if e.ordinal <= last.ordinal {
+                // Read again: an entry with its timestamp replaces it.
+                if let Ok(i) = self.entries.binary_search_by_key(&e.ordinal, |k| k.ordinal) {
+                    self.entries[i] = e;
+                }
+                return;
+            }
+            if self.entries.len() > 1 && last.ordinal % self.stride != 0 {
+                self.entries.pop();
+            }
+        }
+        self.entries.push(e);
+        if self.entries.len() > MAX_INDEX_ENTRIES {
+            self.stride *= 2;
+            let (stride, last) = (self.stride, e.ordinal);
+            self.entries.retain(|k| k.ordinal % stride == 0 || k.ordinal == last);
+        }
+    }
+
+    /// av_index_search_timestamp, AVSEEK_FLAG_BACKWARD (every entry is a
+    /// key frame, pts rising with the ordinal).
+    fn search(&self, ts: i64) -> Option<usize> {
+        self.entries.partition_point(|e| e.pts <= ts).checked_sub(1)
+    }
+}
+
+/// Where reading was, given back when a seek fails.
+struct Reading {
+    at: u64,
+    first: Option<Packet>,
+    pts: i64,
+    remaining_size: i64,
+    ordinal: u64,
 }
 
 /// av_get_audio_frame_duration2 (libavcodec/utils.c): only codecs with
@@ -107,14 +183,22 @@ fn audio_duration(codec: &str, channels: u16, size: usize) -> Option<i64> {
 }
 
 impl VocDemuxer {
-    /// ff_voc_get_packet: read one block; returns Ok(None) at EOF. Like
-    /// FFmpeg it first indexes where it starts, when the pts is known.
-    #[allow(clippy::type_complexity)]
+    /// ff_voc_get_packet: index where it starts, when the pts is known,
+    /// then read one block; Ok(None) at EOF.
     fn next_block(&mut self) -> Result<Option<Packet>> {
         if self.pts >= 0 {
             let pos = self.input.stream_position()? as i64;
-            self.index.add(pos, self.pts, self.remaining_size, 0, true);
+            self.index.add(VocEntry { ordinal: self.ordinal, pos, pts: self.pts, remaining: self.remaining_size });
         }
+        let packet = self.read_block()?;
+        if packet.is_some() {
+            self.ordinal += 1;
+        }
+        Ok(packet)
+    }
+
+    /// ff_voc_get_packet after it indexed the packet start.
+    fn read_block(&mut self) -> Result<Option<Packet>> {
         let mut max_size = 0usize;
         let mut tmp_codec: Option<u16> = None;
         let mut sample_rate_hint = 0u32;
@@ -135,6 +219,7 @@ impl VocDemuxer {
             }
             let mut len3 = [0u8; 3];
             self.input.read_exact(&mut len3)?;
+            self.allowance.spend(0, 4)?;
             let mut remaining = i64::from(len3[0]) | (i64::from(len3[1]) << 8) | (i64::from(len3[2]) << 16);
             if remaining == 0 {
                 // FFmpeg reads to EOF; we cap that at MAX_BLOCK_SIZE.
@@ -229,6 +314,7 @@ impl VocDemuxer {
                     // VOC_TYPE_SILENCE / MARKER / ASCII / REPETITION_*:
                     // skip the payload, like FFmpeg's default branch.
                     let skip = usize::try_from(remaining).unwrap_or(usize::MAX).min(MAX_BLOCK_SIZE);
+                    self.allowance.spend(0, skip as u64)?;
                     std::io::copy(
                         &mut self.input.by_ref().take(skip as u64),
                         &mut std::io::sink(),
@@ -259,6 +345,7 @@ impl VocDemuxer {
         self.ensure_stream(codec)?;
 
         let size = self.remaining_size.clamp(0, 2048) as usize;
+        self.allowance.spend(1, size as u64)?;
         self.remaining_size -= size as i64;
 
         let mut data = vec![0u8; size];
@@ -306,27 +393,87 @@ impl VocDemuxer {
         Ok(())
     }
 
+    /// FFmpeg's entry for `target` from the kept entry `from` before it:
+    /// the last packet start at or before the target, read on to.
+    fn recover(&mut self, from: VocEntry, target: i64) -> Result<VocEntry> {
+        self.input.seek(SeekFrom::Start(from.pos as u64))?;
+        (self.pts, self.remaining_size) = (from.pts, from.remaining);
+        let mut found = from;
+        while let Some(Some(_)) = soft(self.read_block())? {
+            if self.pts < 0 || self.pts > target {
+                break;
+            }
+            let pos = self.input.stream_position()? as i64;
+            found = VocEntry { ordinal: found.ordinal + 1, pos, pts: self.pts, remaining: self.remaining_size };
+        }
+        Ok(found)
+    }
+
     /// voc_read_seek: the index entry at or before `timestamp`, unless it
     /// is the last one; then it leaves the last entry's pts and block bytes
     /// for seek_frame_generic to read on from, and fails.
     fn read_seek(&mut self, timestamp: i64) -> Result<Option<i64>> {
-        let entries = self.index.entries();
-        match self.index.search(timestamp, true) {
-            Some(i) if i + 1 < entries.len() => {
-                let e = entries[i];
+        let entries = self.index.entries.len();
+        match self.index.search(timestamp) {
+            Some(i) if i + 1 < entries => {
+                let (mut e, next) = (self.index.entries[i], self.index.entries[i + 1]);
+                if next.ordinal > e.ordinal + 1 {
+                    e = self.recover(e, timestamp)?;
+                }
                 self.input.seek(SeekFrom::Start(e.pos as u64))?;
-                (self.pts, self.remaining_size) = (e.timestamp, e.size);
-                Ok(Some(e.timestamp))
+                (self.pts, self.remaining_size, self.ordinal) = (e.pts, e.remaining, e.ordinal);
+                Ok(Some(e.pts))
             }
             _ => {
-                if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
-                    if first.timestamp <= timestamp {
-                        (self.pts, self.remaining_size) = (last.timestamp, last.size);
-                    }
+                if let (Some(first), Some(last)) = (self.index.entries.first(), self.index.entries.last())
+                    && first.pts <= timestamp
+                {
+                    (self.pts, self.remaining_size) = (last.pts, last.remaining);
                 }
                 Ok(None)
             }
         }
+    }
+
+    /// vocdec.c voc_read_seek, falling back to seek.c seek_frame_generic.
+    fn land(&mut self, timestamp: i64) -> Result<i64> {
+        if let Some(landed) = self.read_seek(timestamp)? {
+            return Ok(landed);
+        }
+        let mut found = self.index.search(timestamp);
+        let entries = &self.index.entries;
+        if found.is_none() && entries.first().is_some_and(|e| timestamp < e.pts) {
+            return Err(Error::invalid("voc: seek before the first packet"));
+        }
+        if found.is_none() || found == Some(entries.len() - 1) {
+            match entries.last().copied() {
+                Some(last) => {
+                    self.input.seek(SeekFrom::Start(last.pos as u64))?;
+                    self.ordinal = last.ordinal;
+                }
+                None => {
+                    self.input.seek(SeekFrom::Start(self.data_offset))?;
+                    (self.pts, self.remaining_size, self.ordinal) = (0, 0, 0);
+                }
+            }
+            // Every packet is a key frame.
+            read_on(timestamp, || match self.next_block()? {
+                Some(packet) => Ok((true, packet.dts)),
+                None => Err(Error::Eof),
+            })?;
+            found = self.index.search(timestamp);
+        }
+        let Some(i) = found else {
+            return Err(Error::invalid("voc: no packet to seek to"));
+        };
+        if let Some(landed) = self.read_seek(timestamp)? {
+            return Ok(landed);
+        }
+        // read_seek left the last entry's state, which is this one's.
+        let e = self.index.entries[i];
+        self.input.seek(SeekFrom::Start(e.pos as u64))?;
+        self.ordinal = e.ordinal;
+        Ok(e.pts)
     }
 }
 
@@ -354,49 +501,28 @@ impl Demuxer for VocDemuxer {
 
     /// vocdec.c voc_read_seek, falling back to seek.c seek_frame_generic
     /// (AVSEEK_FLAG_BACKWARD): the packet at or before the target, mid
-    /// block included. Past the index the blocks are read on (bounded by
-    /// the input) until a packet starts after the target. Without
+    /// block included. Past the index the blocks are read on, within the
+    /// seek's allowance, until a packet starts after the target. Without
     /// timestamps (SBPro ADPCM) only the first packet is indexed, and that
-    /// is where FFmpeg lands too.
+    /// is where FFmpeg lands too. A seek that fails leaves reading where
+    /// it was.
     fn seek_to(&mut self, _stream_index: u32, timestamp: i64) -> Result<i64> {
-        self.first = None;
-        if let Some(landed) = self.read_seek(timestamp)? {
-            return Ok(landed);
-        }
-        let mut index = self.index.search(timestamp, true);
-        let entries = self.index.entries();
-        if index.is_none() && entries.first().is_some_and(|e| timestamp < e.timestamp) {
-            return Err(Error::invalid("voc: seek before the first packet"));
-        }
-        if index.is_none() || index == Some(entries.len() - 1) {
-            match entries.last() {
-                Some(last) => {
-                    self.input.seek(SeekFrom::Start(last.pos as u64))?;
-                }
-                None => {
-                    self.input.seek(SeekFrom::Start(self.data_offset))?;
-                    (self.pts, self.remaining_size) = (0, 0);
-                }
-            }
-            // Every packet is a key frame: read until one starts after the
-            // target, the end, or an error.
-            while let Ok(Some(packet)) = self.next_block() {
-                if packet.dts.is_some_and(|dts| dts > timestamp) {
-                    break;
-                }
-            }
-            index = self.index.search(timestamp, true);
-        }
-        let Some(i) = index else {
-            return Err(Error::invalid("voc: no packet to seek to"));
+        let reading = Reading {
+            at: self.input.stream_position()?,
+            first: self.first.take(),
+            pts: self.pts,
+            remaining_size: self.remaining_size,
+            ordinal: self.ordinal,
         };
-        if let Some(landed) = self.read_seek(timestamp)? {
-            return Ok(landed);
+        self.allowance.start();
+        let landed = self.land(timestamp);
+        self.allowance.stop();
+        if landed.is_err() {
+            self.input.seek(SeekFrom::Start(reading.at))?;
+            self.first = reading.first;
+            (self.pts, self.remaining_size, self.ordinal) = (reading.pts, reading.remaining_size, reading.ordinal);
         }
-        // read_seek left the last entry's state, which is this one's.
-        let e = self.index.entries()[i];
-        self.input.seek(SeekFrom::Start(e.pos as u64))?;
-        Ok(e.timestamp)
+        landed
     }
 }
 
@@ -435,12 +561,14 @@ pub fn open_voc(
         first: None,
         remaining_size: 0,
         pts: 0,
+        ordinal: 0,
         codec: None,
         sample_rate: 0,
         channels: 1,
         sample_format: None,
-        index: Index::default(),
+        index: VocIndex::new(),
         data_offset,
+        allowance: Allowance::default(),
     };
     demuxer.first = demuxer.next_block()?;
     if demuxer.first.is_none() {

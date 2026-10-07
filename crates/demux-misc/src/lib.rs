@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 mod ac3;
+mod av1_cbs;
 mod h264;
 mod hevc;
 mod ivf;
@@ -29,7 +30,6 @@ mod nut;
 mod parser;
 mod pva;
 mod rawvideo;
-mod seek;
 mod smf;
 mod voc;
 mod caf;

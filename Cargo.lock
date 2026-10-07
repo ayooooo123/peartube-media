@@ -304,6 +304,7 @@ name = "demux-misc"
 version = "0.1.0"
 dependencies = [
  "codecs",
+ "demux-seek-core",
  "oxideav-core",
  "player",
  "refcheck",

@@ -9,7 +9,7 @@ use oxideav_core::{
     PROBE_SCORE_EXTENSION,
 };
 
-use crate::seek::{gen_search, Index};
+use demux_seek_core::{gen_search, Allowance, Bounds, Index};
 
 const PVA_MAGIC: u16 = 0x4156; // "AV"
 const PVA_MAX_PAYLOAD_LENGTH: usize = 0x17F8;
@@ -59,6 +59,8 @@ pub struct PvaDemuxer {
     /// Per stream: where each PVA packet with a pts starts, by pts
     /// (read_part_of_packet indexes them; pva_read_header adds 0 at 0).
     index: [Index; 2],
+    /// What the seek under way may still read.
+    allowance: Allowance,
 }
 
 pub fn open_pva(
@@ -96,6 +98,7 @@ pub fn open_pva(
         streams,
         continue_pes: 0,
         index,
+        allowance: Allowance::default(),
     }))
 }
 
@@ -119,6 +122,7 @@ impl PvaDemuxer {
     /// a new PES expected): the packet's pts, payload length and stream
     /// id, `None` where FFmpeg returns an error.
     fn read_part(&mut self) -> Result<Option<(Option<i64>, i64, u8)>> {
+        self.allowance.spend(1, 8)?;
         let startpos = self.input.stream_position()? as i64;
         let (hdr, _) = read_padded::<8>(&mut *self.input)?;
         let syncword = u16::from_be_bytes([hdr[0], hdr[1]]);
@@ -189,6 +193,12 @@ impl PvaDemuxer {
         }
         self.continue_pes = 0;
         Ok(res)
+    }
+
+    /// ff_seek_frame_binary over pva_read_timestamp.
+    fn search(&mut self, stream: usize, timestamp: i64, bounds: Bounds) -> Result<Option<(i64, i64)>> {
+        let file_size = self.input.seek(SeekFrom::End(0))? as i64;
+        gen_search(timestamp, bounds, 0, file_size, &mut |pos, limit| self.read_timestamp(pos, limit, stream))
     }
 }
 
@@ -297,29 +307,29 @@ impl Demuxer for PvaDemuxer {
     /// (seek.c ff_seek_frame_binary, ff_gen_search with
     /// AVSEEK_FLAG_BACKWARD) within the bounds of the stream's index. Video
     /// pts come in display order, so the landing follows every step of
-    /// the search. A failed search leaves reading where it was.
+    /// the search. The search reads within the seek's allowance; a failed
+    /// one leaves reading where it was, the audio PES in progress
+    /// (continue_pes) included.
     fn seek_to(&mut self, stream_index: u32, timestamp: i64) -> Result<i64> {
         let stream = stream_index as usize;
         let Some(index) = self.index.get(stream) else {
             return Err(Error::invalid("pva: no such stream to seek"));
         };
         let bounds = index.bounds(timestamp);
-        let resume = self.input.stream_position()?;
-        let file_size = self.input.seek(SeekFrom::End(0))? as i64;
-        let found = gen_search(timestamp, bounds, 0, file_size, &mut |pos, limit| self.read_timestamp(pos, limit, stream));
+        let (resume, continue_pes) = (self.input.stream_position()?, self.continue_pes);
+        self.allowance.start();
+        let found = self.search(stream, timestamp, bounds);
+        self.allowance.stop();
         match found {
             Ok(Some((pos, ts))) => {
                 self.input.seek(SeekFrom::Start(pos as u64))?;
                 self.continue_pes = 0;
                 Ok(ts)
             }
-            Ok(None) => {
+            failed => {
                 self.input.seek(SeekFrom::Start(resume))?;
-                Err(Error::invalid("pva: no timestamp to seek by"))
-            }
-            Err(e) => {
-                self.input.seek(SeekFrom::Start(resume))?;
-                Err(e)
+                self.continue_pes = continue_pes;
+                Err(failed.err().unwrap_or_else(|| Error::invalid("pva: no timestamp to seek by")))
             }
         }
     }

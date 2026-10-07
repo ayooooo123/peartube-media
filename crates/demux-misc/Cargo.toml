@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 oxideav-core.workspace = true
+demux-seek-core.workspace = true
 
 [dev-dependencies]
 codecs = { path = "../codecs" }
