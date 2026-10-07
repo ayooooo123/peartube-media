@@ -608,7 +608,13 @@ impl Split for Ac3 {
             self.remaining_size -= self.remaining_size.min(n);
             return (n, None);
         };
-        if got_frame {
+        // FFmpeg reads the parameters of a unit cut at the next header.
+        // The unit flushed at the end of the input (`buf` empty) has its
+        // own header too: read it rather than keep the frame before's,
+        // or a single frame stays untimed and a last frame with fewer
+        // blocks lasts as long as the one before it. Without a valid
+        // header both keep FFmpeg's values.
+        if got_frame || buf.is_empty() {
             self.inspect(&unit);
         }
         (i, Some(unit))
