@@ -220,6 +220,17 @@ fn ticks(samples: u64, rate: u32, tb: TimeBase) -> Option<i64> {
     i64::try_from(u128::from(samples) * u128::try_from(tb.den()).ok()? / den).ok()
 }
 
+/// `samples` at `rate` in ticks of `tb`, rounded to the nearest, as
+/// `av_rescale_q` moves a decoded frame's pts past skipped samples.
+fn ticks_nearest(samples: u64, rate: u32, tb: TimeBase) -> i64 {
+    let (Ok(num), Ok(den)) = (u128::try_from(tb.den()), u128::try_from(tb.num())) else { return 0 };
+    let den = u128::from(rate) * den;
+    if den == 0 {
+        return 0;
+    }
+    i64::try_from((u128::from(samples) * num + den / 2) / den).unwrap_or(i64::MAX)
+}
+
 impl DcaDecoderImpl {
     fn new(trim_head: u64, keep: u64) -> Self {
         Self {
@@ -382,7 +393,9 @@ impl DcaDecoderImpl {
     }
 
     /// One decoded frame in the decoder's output layout, trimmed to the
-    /// dtshd sample window; `None` when nothing of it remains.
+    /// dtshd sample window; `None` when nothing of it remains. Its pts
+    /// moves past the samples trimmed from its own head, as FFmpeg's
+    /// skip-samples handling moves it: by none once the padding is done.
     fn convert(&mut self, frame: decoder::PendingFrame) -> Option<Frame> {
         self.channels = frame.planes_f32.len().max(frame.planes_s32.len()) as u16;
         self.sample_rate = frame.sample_rate;
@@ -440,6 +453,7 @@ impl DcaDecoderImpl {
 
         // dtshd skip-samples trimming: keep the absolute sample window
         // [trim_head, trim_head + keep).
+        let mut head = 0;
         if self.trim_head != 0 || self.keep != u64::MAX {
             let win_start = self.trim_head;
             let win_end = self.trim_head.saturating_add(self.keep);
@@ -450,6 +464,7 @@ impl DcaDecoderImpl {
             if cut_end > cut_start {
                 let s = (cut_start - abs_start) as usize;
                 let e = (cut_end - abs_start) as usize;
+                head = s;
                 samples = e - s;
                 for plane in planes_f32.iter_mut() {
                     plane.drain(..s);
@@ -503,7 +518,7 @@ impl DcaDecoderImpl {
 
         let audio = AudioFrame {
             samples: samples as u32,
-            pts: frame.pts.map(|p| p + (self.trim_head as i64)),
+            pts: frame.pts.map(|p| p.saturating_add(ticks_nearest(head as u64, self.sample_rate, self.time_base))),
             data: vec![interleaved],
         };
         Some(Frame::Audio(audio))

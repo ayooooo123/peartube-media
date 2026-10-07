@@ -12,6 +12,9 @@
 //! - A frame that fails to decode keeps its place on the timeline, as
 //!   FFmpeg's parser timing keeps it; a frame whose header gives no
 //!   duration leaves the frames after it untimed rather than guessed.
+//! - Decoded DTS-HD frames carry FFmpeg's timestamps after its
+//!   skip-samples trimming: every dca.mak DTS-HD input, and copies whose
+//!   initial padding ends inside a frame or several frames in.
 //! - Reassembly holds at most the largest frame the decoder takes, in the
 //!   decoder and in both demuxers: a longer frame is an error, and
 //!   reading goes on after it.
@@ -493,6 +496,65 @@ fn a_frame_without_duration_leaves_the_frames_after_it_untimed() {
     let _ = decoder.flush();
     drain(&mut decoder);
     assert_eq!(times, [Some(pts), Some(pts + 960), None, None, None], "frames after an undated frame");
+}
+
+// ───────────────────── DTS-HD skip-samples timestamps ─────────────────────
+
+/// Every DTS-HD input of FFmpeg's dca.mak.
+const DTSHD_SUITE: [&str; 19] = [
+    "xll_51_16_192_768_0",
+    "xll_51_16_192_768_1",
+    "xll_51_24_48_768",
+    "xll_51_24_48_none",
+    "xll_71_24_48_768_0",
+    "xll_71_24_48_768_1",
+    "xll_71_24_96_768",
+    "xll_x96_51_24_96_1509",
+    "xll_xch_61_24_48_768",
+    "core_51_24_48_768_0",
+    "core_51_24_48_768_1",
+    "x96_51_24_96_1509",
+    "x96_xch_61_24_96_3840",
+    "x96_xxch_71_24_96_3840",
+    "xbr_51_24_48_3840",
+    "xbr_xch_61_24_48_3840",
+    "xbr_xxch_71_24_48_3840",
+    "xch_61_24_48_768",
+    "xxch_71_24_48_2046",
+];
+
+/// FFmpeg trims a DTS-HD file's initial padding from the decoded output
+/// and moves a frame's pts by the samples trimmed from its head, only
+/// that frame's. Every suite input pads two whole frames (one for
+/// `xll_51_24_48_none`); copies of two of them pad 100 samples (inside
+/// the first frame), 700 (the second frame) and 1500 (the third). Each
+/// decoded frame's pts and sample count equals FFmpeg's, and the copies'
+/// PCM too.
+#[test]
+fn dtshd_decoded_frames_carry_ffmpegs_trimmed_timestamps() {
+    let mut cases: Vec<(String, PathBuf, bool)> =
+        DTSHD_SUITE.iter().map(|n| (n.to_string(), fate(&format!("dts/dcadec-suite/{n}.dtshd")), false)).collect();
+    for (name, padding) in [("xll_51_24_48_768", 100u16), ("xll_51_24_48_768", 700), ("core_51_24_48_768_0", 1500)] {
+        let mut bytes = std::fs::read(fate(&format!("dts/dcadec-suite/{name}.dtshd"))).unwrap();
+        let aupr = bytes.windows(8).position(|w| w == b"AUPR-HDR").unwrap();
+        // AUPR_HDR body: ..., channel mask (2), initial padding (2) at 19
+        bytes[aupr + 16 + 19..aupr + 16 + 21].copy_from_slice(&padding.to_be_bytes());
+        let path = scratch(&format!("{name}-padding-{padding}.dtshd"), &bytes);
+        cases.push((format!("{name} with {padding} samples of padding"), path, true));
+    }
+    let mut failures = Vec::new();
+    for (name, path, compare_pcm) in &cases {
+        let ours = decode(path);
+        let theirs = ffmpeg_frames(path);
+        if ours.frames != theirs {
+            failures.push(format!("{name}: ours {:?}\n  FFmpeg {:?}", ours.frames, theirs));
+            continue;
+        }
+        if *compare_pcm {
+            assert_pcm_matches(name, path, &ours);
+        }
+    }
+    assert!(failures.is_empty(), "{} of {} inputs differ from FFmpeg's decoded frames:\n{}", failures.len(), cases.len(), failures.join("\n"));
 }
 
 // ───────────────────── reassembly bounds ─────────────────────
