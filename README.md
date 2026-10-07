@@ -58,10 +58,16 @@ first child is one, then in fixed chunks; a third SeekHead, or a SeekHead,
 Tracks or Tags master larger than its budget (about 184 KiB, 32 MiB, 32 MiB),
 is refused before any of it is read. A CRC-32 on an Info, Cues, Chapters or
 Attachments master is still checked over its whole body (small heap, but a
-known network cost: these masters have no size budget). EncryptedBlocks kept
-on Cluster records share one 32 MiB budget and are recorded once even when a
-seek revisits them; one past the budget is damage, and the walk resumes at
-the next Cluster. The 1024-packet cap counts
+known network cost: these masters have no size budget). Every element in a
+Tracks or Tags tree must fit its parent, and an unknown-size Tracks or Tags is
+InvalidData (a resilient open skips it). SegmentUUID, PrevUUID and NextUUID
+must be 16 octets, each Info text field holds at most 64 KiB, and the Info
+masters keep at most 1 MiB. The Cues index keeps at most 32 MiB: past that
+it keeps the CuePoints that fit, records a damage event, and a seek past the
+last kept point scans the Clusters. EncryptedBlocks and SilentTracks numbers
+kept on Cluster records share one 32 MiB budget, lists included, and are
+recorded once even when a seek revisits them; one past the budget is damage,
+and the walk resumes at the next Cluster. The 1024-packet cap counts
 virtual-track copies and the frames a lace actually holds (a one-frame EBML
 lace is InvalidData): compliant Blocks wait until held packets drain, and one
 that then fails recovers from its own offset; an individual Block needing more
