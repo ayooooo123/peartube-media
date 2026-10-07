@@ -15,13 +15,13 @@
 // compute_pkt_fields), H.264 and HEVC units are numbered in the stream
 // time base.
 
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{Demuxer, Error, Packet, ReadSeek, Result, StreamInfo};
 
-use crate::parser::{Combine, Parser, Split, END_NOT_FOUND};
+use crate::h264_parse::H264Parse;
+use crate::parser::{Combine, Parser, Split, Unit, VideoCut, END_NOT_FOUND};
 use demux_seek_core::{read_on, Allowance, Index};
 
 /// ff_raw_demuxer_class raw_packet_size
@@ -97,7 +97,7 @@ impl<S: Split + Units + Send> RawVideoDemuxer<S> {
             self.pos += n as i64;
         }
         for unit in units {
-            let stamp = self.parser.split.unit(&unit.data, self.count);
+            let stamp = self.parser.split.unit(&unit, self.count);
             let mut packet = Packet::new(0, self.streams[0].time_base, unit.data);
             packet.pts = stamp.pts;
             packet.dts = stamp.dts;
@@ -218,7 +218,7 @@ impl<S: Split + Units + Send> Demuxer for RawVideoDemuxer<S> {
 pub(crate) trait Units {
     fn buffered_bytes(&self) -> usize;
     /// The `index`th unit of the stream, counting from 0.
-    fn unit(&mut self, unit: &[u8], index: i64) -> Stamp;
+    fn unit(&mut self, unit: &Unit, index: i64) -> Stamp;
     /// The 1024-byte read whose units were just stamped is over.
     fn read_done(&mut self) {}
     /// The splitter a seek leaves (ff_read_frame_flush makes a new parser;
@@ -656,8 +656,8 @@ impl Units for MpegVideo {
 
     /// Key when the first picture header before the first slice is I;
     /// timed as FFmpeg's demuxer layer times the unit.
-    fn unit(&mut self, unit: &[u8], _index: i64) -> Stamp {
-        let picture = self.extract_headers(unit);
+    fn unit(&mut self, unit: &Unit, _index: i64) -> Stamp {
+        let picture = self.extract_headers(&unit.data);
         let clock = &mut self.clock;
         if let (true, Discovery::NoPicture, Some(code)) = (picture, clock.discovery, clock.frame_rate_code) {
             clock.discovery = Discovery::Pending(clock.decoder_timing(code));
@@ -711,25 +711,32 @@ impl Units for MpegVideo {
 
 // ───────────────────────── H.264 ─────────────────────────
 
-/// h264_parser.c: an access unit, cut where FFmpeg's parser cuts it.
+/// h264_parser.c: an access unit, cut where FFmpeg's parser cuts it,
+/// with what parse_nal_units makes of it.
 pub(crate) struct H264 {
     pc: Combine,
     frame_start_found: bool,
     history: [u8; 6],
     history_count: usize,
     last_mb: u32,
-    /// SPS reference count and bit depth; PPS captures its SPS's count.
-    sps: [Option<(u32, u32)>; 32],
-    pps: [Option<(u32, u32)>; 256],
+    units: H264Parse,
 }
 
-impl Default for H264 {
-    fn default() -> Self {
-        Self {
-            pc: Combine::default(), frame_start_found: false,
-            history: [0; 6], history_count: 0, last_mb: 0,
-            sps: [None; 32], pps: [None; 256],
-        }
+impl H264 {
+    /// The parser for a stream in `time_base` (the codec context's
+    /// pkt_timebase).
+    pub fn new(time_base: (i64, i64)) -> Self {
+        Self::over(H264Parse::new(time_base))
+    }
+
+    /// The parser a seek leaves (ff_read_frame_flush): a new one, on the
+    /// codec context the old one set up.
+    pub fn fresh(&self) -> Self {
+        Self::over(self.units.fresh())
+    }
+
+    fn over(units: H264Parse) -> Self {
+        Self { pc: Combine::default(), frame_start_found: false, history: [0; 6], history_count: 0, last_mb: 0, units }
     }
 }
 
@@ -821,7 +828,14 @@ impl Split for H264 {
             overread[..len].copy_from_slice(bytes);
             self.find_frame_end(&overread[..len]);
         }
+        self.units.parse_nal_units(&unit);
         (next, Some(unit))
+    }
+
+    /// h264_parse's HRD timing, and what parse_nal_units set.
+    fn cut(&mut self, pts: Option<i64>, dts: Option<i64>) -> (Option<i64>, Option<i64>, Option<VideoCut>) {
+        let (pts, dts) = self.units.timestamps(pts, dts);
+        (pts, dts, Some(self.units.video()))
     }
 }
 
@@ -839,213 +853,13 @@ fn nal_starts(unit: &[u8]) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
-/// A NAL's payload after `header` bytes of header, emulation prevention
-/// removed, up to the next start code.
-fn rbsp(unit: &[u8], from: usize) -> Cow<'_, [u8]> {
-    let data = &unit[from.min(unit.len())..];
-    let mut zeros = 0;
-    let mut end = data.len();
-    let mut escaped = false;
-    for (i, &b) in data.iter().enumerate() {
-        if zeros >= 2 && b <= 2 {
-            end = i;
-            break;
-        }
-        if zeros >= 2 && b == 3 {
-            escaped = true;
-            zeros = 0;
-        } else {
-            zeros = if b == 0 { zeros + 1 } else { 0 };
-        }
-    }
-    let data = &data[..end];
-    if !escaped {
-        return Cow::Borrowed(data);
-    }
-    let mut out = Vec::with_capacity(data.len());
-    zeros = 0;
-    for &b in data {
-        if zeros >= 2 && b == 3 {
-            zeros = 0;
-            continue;
-        }
-        zeros = if b == 0 { zeros + 1 } else { 0 };
-        out.push(b);
-    }
-    Cow::Owned(out)
-}
-
-/// ff_h264_sei_decode as far as recovery points: whether a valid one is
-/// in the SEI payload `sei` before a message FFmpeg fails on. A payload
-/// type or size is a sum of bytes; one past 32 bits is no value FFmpeg
-/// holds, and ends the SEI before anything reads it.
-fn sei_recovery_point(sei: &[u8]) -> bool {
-    let mut p = 0;
-    while sei.len() - p > 2 && (sei[p] != 0 || sei[p + 1] != 0) {
-        let mut read = || -> Option<u32> {
-            let mut v = 0u32;
-            loop {
-                let b = *sei.get(p)?;
-                p += 1;
-                v = v.checked_add(u32::from(b))?;
-                if b != 255 {
-                    return Some(v);
-                }
-            }
-        };
-        let Some(kind) = read() else { return false };
-        let Some(size) = read() else { return false };
-        let size = size as usize;
-        if size > sei.len() - p {
-            return false;
-        }
-        let payload = &sei[p..p + size];
-        match kind {
-            // picture timing: FFmpeg keeps at most 40 bytes
-            1 if size > 40 => return false,
-            // recovery point: recovery_frame_cnt below 1 << 16
-            6 => return ue_golomb_long(payload).0 < 1 << 16,
-            // Messages unrelated to recovery do not set the key flag.
-            _ => {}
-        }
-        p += size;
-    }
-    false
-}
-
-/// Bounded header reader for the SPS/PPS fields the keyframe heuristic
-/// uses. Exhausted or overlong codes reject that header.
-struct Bits<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Bits<'a> {
-    fn new(bytes: &'a [u8]) -> Self { Self { bytes, pos: 0 } }
-
-    fn read(&mut self, n: usize) -> Option<u32> {
-        if n > 32 || self.pos.checked_add(n)? > self.bytes.len() * 8 {
-            return None;
-        }
-        let mut value = 0;
-        for _ in 0..n {
-            value = (value << 1) | u32::from((self.bytes[self.pos / 8] >> (7 - self.pos % 8)) & 1);
-            self.pos += 1;
-        }
-        Some(value)
-    }
-
-    fn ue(&mut self) -> Option<u32> {
-        let mut zeros = 0;
-        while self.read(1)? == 0 {
-            zeros += 1;
-            if zeros > 31 { return None; }
-        }
-        Some((1u32 << zeros) - 1 + self.read(zeros)?)
-    }
-
-    fn se(&mut self) -> Option<i64> {
-        let v = i64::from(self.ue()?);
-        Some(if v & 1 == 0 { -(v / 2) } else { (v + 1) / 2 })
-    }
-}
-
-impl H264 {
-    /// h264_ps.c through ref_frame_count; no picture decoding is needed.
-    fn sps_refs(&mut self, bytes: &[u8]) -> Option<()> {
-        let mut b = Bits::new(bytes);
-        let profile = b.read(8)?;
-        b.read(16)?;
-        let id = b.ue()? as usize;
-        if id >= self.sps.len() { return None; }
-        let mut depth = 8;
-        if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 144) {
-            let chroma = b.ue()?;
-            if chroma > 3 || (chroma == 3 && b.read(1)? != 0) { return None; }
-            let luma = b.ue()?;
-            if luma > 6 || b.ue()? != luma { return None; }
-            depth += luma;
-            b.read(1)?;
-            if b.read(1)? != 0 {
-                for i in 0..if chroma == 3 { 12 } else { 8 } {
-                    if b.read(1)? == 0 { continue; }
-                    let (mut last, mut next) = (8i64, 8i64);
-                    for _ in 0..if i < 6 { 16 } else { 64 } {
-                        if next != 0 { next = (last + b.se()?).rem_euclid(256); }
-                        if next != 0 { last = next; }
-                    }
-                }
-            }
-        }
-        if b.ue()? > 12 { return None; }
-        match b.ue()? {
-            0 => { if b.ue()? > 12 { return None; } }
-            1 => {
-                b.read(1)?;
-                b.se()?;
-                b.se()?;
-                let cycle = b.ue()?;
-                if cycle >= 256 { return None; }
-                for _ in 0..cycle { b.se()?; }
-            }
-            2 => {}
-            _ => return None,
-        }
-        let refs = b.ue()?;
-        if refs > 16 { return None; }
-        self.sps[id] = Some((refs, depth));
-        Some(())
-    }
-
-    fn pps_refs(&mut self, bytes: &[u8]) -> Option<()> {
-        let mut b = Bits::new(bytes);
-        let id = b.ue()? as usize;
-        if id >= self.pps.len() { return None; }
-        let (sps_refs, depth) = (*self.sps.get(b.ue()? as usize)?)?;
-        if depth == 11 || depth == 13 { return None; }
-        b.read(2)?;
-        if b.ue()? != 0 { return None; } // FFmpeg rejects FMO.
-        let refs_minus1 = b.ue()?;
-        if refs_minus1 >= 32 || b.ue()? >= 32 { return None; }
-        self.pps[id] = Some((sps_refs, refs_minus1 + 1));
-        Some(())
-    }
-
-    fn intra_key(&self, bytes: &[u8]) -> Option<bool> {
-        let mut b = Bits::new(bytes);
-        b.ue()?;
-        let slice_type = b.ue()?;
-        let (sps_refs, pps_refs) = (*self.pps.get(b.ue()? as usize)?)?;
-        Some(slice_type % 5 == 2 && sps_refs <= 1 && pps_refs <= 1)
-    }
-}
-
-impl H264 {
-    /// parse_nal_units: IDR, recovery point, or FFmpeg's single-reference
-    /// I-picture heuristic, using the active SPS/PPS.
-    fn key_frame(&mut self, unit: &[u8]) -> bool {
-        let mut recovery = false;
-        for h in nal_starts(unit) {
-            match unit[h] & 0x1F {
-                5 => return true,
-                1 | 2 => return recovery || self.intra_key(&rbsp(unit, h + 1)).unwrap_or(false),
-                6 => recovery |= sei_recovery_point(&rbsp(unit, h + 1)),
-                7 => { let _ = self.sps_refs(&rbsp(unit, h + 1)); }
-                8 => { let _ = self.pps_refs(&rbsp(unit, h + 1)); }
-                _ => {}
-            }
-        }
-        false
-    }
-}
-
 impl Units for H264 {
     fn buffered_bytes(&self) -> usize {
         self.pc.buffered_bytes()
     }
 
-    fn unit(&mut self, unit: &[u8], index: i64) -> Stamp {
-        Stamp::numbered(self.key_frame(unit), index)
+    fn unit(&mut self, unit: &Unit, index: i64) -> Stamp {
+        Stamp::numbered(unit.video.is_some_and(|v| v.key), index)
     }
 }
 
@@ -1110,7 +924,8 @@ impl Units for Hevc {
     }
 
     /// parse_nal_units: key when the first base-layer slice is IRAP.
-    fn unit(&mut self, unit: &[u8], index: i64) -> Stamp {
+    fn unit(&mut self, unit: &Unit, index: i64) -> Stamp {
+        let unit = &unit.data[..];
         let mut key = false;
         for h in nal_starts(unit) {
             let Some(&second) = unit.get(h + 1) else { break };

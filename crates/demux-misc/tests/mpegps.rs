@@ -10,12 +10,12 @@
 //! ffprobe's in order, type, codec and the parameters FFmpeg reports.
 //! FFmpeg's demuxer returns PES payloads that its parsers then re-frame.
 //! This demuxer re-frames what its decoders need whole, with FFmpeg's
-//! parsers: DVD subpictures (dvdsub), MPEG audio (mpegaudio) and AC-3 /
-//! E-AC-3 (ac3). Those streams compare with ffprobe's parsed packet
-//! table, timestamps FFmpeg fills in included; every other stream
-//! compares with the unparsed one (`-fflags +noparse+nofillin`). Every
-//! packet's payload MD5, size, pts and dts, and the interleaving of the
-//! unparsed streams.
+//! parsers: DVD subpictures (dvdsub), MPEG audio (mpegaudio), AC-3 /
+//! E-AC-3 (ac3) and H.264 (h264). Those streams compare with ffprobe's
+//! parsed packet table, timestamps FFmpeg fills in included; every other
+//! stream compares with the unparsed one (`-fflags +noparse+nofillin`).
+//! Every packet's payload MD5, size, pts and dts, and the interleaving
+//! of the unparsed streams.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -143,7 +143,7 @@ fn demux(path: &Path) -> (Vec<StreamInfo>, Vec<StreamInfo>, Vec<Pkt>) {
 
 /// The streams whose packets are parsed units.
 fn reframed(stream: &StreamInfo) -> bool {
-    matches!(stream.params.codec_id.as_str(), "dvd_subtitle" | "mp1" | "mp2" | "mp3" | "ac3" | "eac3")
+    matches!(stream.params.codec_id.as_str(), "dvd_subtitle" | "mp1" | "mp2" | "mp3" | "ac3" | "eac3" | "h264")
 }
 
 fn check(rel: &str) {
@@ -294,6 +294,191 @@ fn pcm_dvda_aob() {
 #[test]
 fn vobsub_sub() {
     check("sub/vobsub.sub");
+}
+
+// ─── H.264 ───
+
+/// 0.8 s of 720x480 testsrc at 25 fps (20 frames) through the libx264 of
+/// the ffmpeg on PATH, yuv444p as it encodes RGB input by default, with
+/// B-frames, and `args`, muxed by FFmpeg's VOB muxer: units of a few
+/// hundred bytes, several to a 2048-byte pack, the larger ones split
+/// across packs.
+fn libx264_vob(name: &str, args: &[&str]) -> std::path::PathBuf {
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("demux-misc-mpegps-{}-{name}", std::process::id()));
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=720x480:rate=25:duration=0.8"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv444p"])
+        .args(args)
+        .args(["-f", "vob"])
+        .arg(&path)
+        .output()
+        .expect("ffmpeg must be on PATH");
+    assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    path
+}
+
+/// ffprobe's parsed packets of `path` with their key flags.
+fn ffprobe_keyed(path: &Path) -> Vec<(Pkt, bool)> {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-f", "mpeg", "-show_data_hash", "md5", "-show_entries"])
+        .arg("packet=stream_index,pts,dts,size,flags,data_hash")
+        .args(["-of", "compact"])
+        .arg(path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("packet|"))
+        .map(|fields| {
+            let kv: HashMap<&str, &str> = fields.split('|').filter_map(|f| f.split_once('=')).collect();
+            let packet = Pkt {
+                stream: kv["stream_index"].parse().unwrap(),
+                size: kv["size"].parse().unwrap(),
+                md5: kv["data_hash"].trim_start_matches("MD5:").to_string(),
+                pts: num(kv.get("pts")),
+                dts: num(kv.get("dts")),
+            };
+            (packet, kv["flags"].starts_with('K'))
+        })
+        .collect()
+}
+
+/// Every packet of `path` with its key flag, through the player's
+/// registry.
+fn demux_keyed(path: &Path) -> Vec<(Pkt, bool)> {
+    let ctx = codecs::context();
+    let file = std::fs::File::open(path).unwrap();
+    let mut demuxer = ctx.containers.open_demuxer("mpeg", Box::new(file), &ctx.codecs).unwrap();
+    let mut packets = Vec::new();
+    loop {
+        match demuxer.next_packet() {
+            Ok(p) => packets.push((
+                Pkt { stream: p.stream_index, size: p.data.len(), md5: refcheck::md5_hex(&p.data), pts: p.pts, dts: p.dts },
+                p.flags.keyframe,
+            )),
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("{}: demux: {e}", path.display()),
+        }
+    }
+    packets
+}
+
+/// H.264 comes out as FFmpeg's h264 parser cuts it (mpeg.c gives every
+/// stream AVSTREAM_PARSE_FULL): whole access units, keyed as the parser
+/// keys them. A unit takes the timestamps of the PES it starts in when no
+/// unit before it started there (parser.c ff_fetch_timestamp); the others
+/// have none, unless buffering period and picture timing SEIs let the
+/// parser time every unit (h264_parser.c h264_parse).
+#[test]
+fn h264_units_are_ffmpeg_parser_units() {
+    let hrd = ["-x264-params", "nal-hrd=vbr", "-b:v", "1M", "-maxrate", "1M", "-bufsize", "2M"];
+    for (name, args, untimed) in [("h264.vob", &[][..], true), ("h264-hrd.vob", &hrd[..], false)] {
+        let path = libx264_vob(name, args);
+        let want = ffprobe_keyed(&path);
+        assert_eq!(want.len(), 20, "{name}: FFmpeg's units");
+        assert_eq!(want.iter().any(|(p, _)| p.pts.is_none()), untimed, "{name}: FFmpeg leaves units untimed");
+        let got = demux_keyed(&path);
+        assert_eq!(got.len(), want.len(), "{name}: packet count");
+        for (n, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g, w, "{name}: packet {n} (packet, key)");
+        }
+    }
+}
+
+/// The Player's video sink, hashing each frame the engine presents,
+/// packed at the 720x480 4:4:4 picture FFmpeg decodes (the container
+/// declares no picture size, which the headless sink packs at).
+mod hashed {
+    use std::sync::mpsc::Sender;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use oxideav_core::{CodecParameters, Packet, VideoFrame};
+    use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleSink, VideoSink};
+    use player::Headless;
+
+    pub struct Hashing {
+        pub headless: Arc<Headless>,
+        pub md5: Sender<String>,
+    }
+
+    impl Backend for Hashing {
+        fn audio(&self) -> Box<dyn AudioSink> {
+            self.headless.audio()
+        }
+        fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
+            Box::new(HashedVideo { sink: self.headless.video(clock), md5: self.md5.clone() })
+        }
+        fn subtitles(&self) -> Box<dyn SubtitleSink> {
+            self.headless.subtitles()
+        }
+    }
+
+    struct HashedVideo {
+        sink: Box<dyn VideoSink>,
+        md5: Sender<String>,
+    }
+
+    impl VideoSink for HashedVideo {
+        fn open_compressed(&mut self, params: &CodecParameters) -> bool {
+            self.sink.open_compressed(params)
+        }
+        fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+            self.sink.push_packet(packet, pts, random_access)
+        }
+        fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> {
+            self.sink.open_frames(params)
+        }
+        fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> {
+            let _ = self.md5.send(refcheck::md5_hex(&refcheck::pack(frame, &[(720, 480); 3])));
+            self.sink.push_frame(frame, pts)
+        }
+        fn frame_lead(&self) -> Duration {
+            self.sink.frame_lead()
+        }
+        fn finish(&mut self) -> Result<(), SinkError> {
+            self.sink.finish()
+        }
+        fn flush(&mut self) {
+            self.sink.flush()
+        }
+        fn set_playing(&mut self, playing: bool) {
+            self.sink.set_playing(playing)
+        }
+    }
+}
+
+/// The Player (headless backend, every codec of the app) presents every
+/// frame FFmpeg decodes from the VOB, as FFmpeg decodes it, none dropped.
+/// Played as fast as the pipeline goes: the engine presents a frame at
+/// its packet's pts, which FFmpeg leaves unset for most of these units.
+#[test]
+fn player_presents_every_ffmpeg_frame_of_an_h264_vob() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let path = libx264_vob("h264-player.vob", &[]);
+    let want = refcheck::ffmpeg_video_md5s(&path, 0, "yuv444p");
+    assert_eq!(want.len(), 20, "FFmpeg's frames");
+    let (md5, presented) = std::sync::mpsc::channel();
+    let backend = Arc::new(hashed::Hashing { headless: player::Headless::new(), md5 });
+    let options = player::PlayerOptions { realtime: false, ..player::PlayerOptions::default() };
+    let player = player::Player::open(path.to_str().unwrap(), backend, Arc::new(codecs::context()), options, |_| {});
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let state = loop {
+        let state = player.state();
+        assert!(state.error.is_none(), "{state:?}");
+        if state.ended {
+            break state;
+        }
+        assert!(Instant::now() < deadline, "playback did not end: {state:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    drop(player);
+    assert_eq!(state.dropped_frames, 0, "frames dropped");
+    assert_eq!(presented.try_iter().collect::<Vec<_>>(), want, "every presented frame");
 }
 
 // ─── private stream 1 substream routing ───

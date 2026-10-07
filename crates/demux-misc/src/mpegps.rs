@@ -16,20 +16,25 @@
 // Packets are the PES payloads FFmpeg's demuxer returns: private stream
 // 1 is split by substream id with FFmpeg's substream headers stripped,
 // the program stream map types elementary streams, DVD navigation
-// packets surface once DVD PCI/DSI structures are recognised. Three
+// packets surface once DVD PCI/DSI structures are recognised. Four
 // kinds of stream differ from FFmpeg's raw PES output:
 // - MPEG audio and AC-3 / E-AC-3 come out as frames, as FFmpeg's
 //   mpegaudio and ac3 parsers cut them, timed as FFmpeg's demuxer layer
 //   times them (a frame without a PES timestamp follows the one before);
 //   their decoders take one frame per packet.
+// - H.264 comes out as the access units FFmpeg's h264 parser cuts, keyed
+//   and timed as its parser and demuxer layer key and time them; its
+//   decoder takes one access unit per packet. A stream probed as H.264
+//   is parsed from its first packet, as FFmpeg holds the packets back
+//   until the probe ends.
 // - DVD subpictures (substreams 0x20-0x3f) are reassembled into whole
 //   units across PES packets by FFmpeg's dvdsub parser, each unit keeping
 //   the timestamps of its first PES.
 // - CVD (substreams 0x00-0x03) and SVCD OGT (0x70) subpictures, which
 //   FFmpeg skips, are carried as VLC carries them: the PES payload with
 //   its leading substream id.
-// Video stays in PES payloads: its decoders take the elementary stream
-// in pieces.
+// Other video stays in PES payloads: its decoders take the elementary
+// stream in pieces.
 
 use std::collections::VecDeque;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -40,7 +45,8 @@ use oxideav_core::{
     PROBE_SCORE_EXTENSION,
 };
 
-use crate::parser::{mpa_decode_header, returned, Ac3, AudioClock, DvdSub, MpegAudio, Parser, Unit};
+use crate::parser::{mpa_decode_header, returned, Ac3, AudioClock, DvdSub, H264Clock, MpegAudio, Parser, Unit};
+use crate::rawvideo::{Units, H264};
 use demux_seek_core::{gen_search, Allowance, Index};
 
 const PACK_START_CODE: u32 = 0x1BA;
@@ -170,6 +176,8 @@ enum Framing {
     Mpa(Parser<MpegAudio>, AudioClock),
     /// AC-3 / E-AC-3 frames from the ac3 parser.
     Ac3(Parser<Ac3>, AudioClock),
+    /// H.264 access units from the h264 parser.
+    H264(Parser<H264>, H264Clock),
 }
 
 struct Track {
@@ -192,6 +200,10 @@ struct Track {
     /// The dts of the stream's PES headers read (mpegps_read_pes_header
     /// indexes each), which bound a seek's search.
     index: Index,
+    /// While a video stream's codec is probed: where its PES payloads
+    /// queued so far start, for the parser that takes them once the
+    /// probe settles on H.264.
+    probing: Vec<i64>,
 }
 
 /// One PES header: its stream id after private-stream-1 / extension
@@ -623,6 +635,10 @@ impl MpegPsDemuxer {
                     *parser = Parser::new(parser.split.reset());
                     clock.seeked(ts);
                 }
+                Framing::H264(parser, clock) => {
+                    *parser = Parser::new(parser.split.fresh());
+                    clock.seeked(ts);
+                }
             }
         }
         Ok(())
@@ -729,6 +745,11 @@ impl MpegPsDemuxer {
             if buffered + data.len() > 8 * 1024 * 1024 {
                 return Err(Error::invalid("mpeg: audio access unit exceeds 8 MiB"));
             }
+            if let Framing::H264(parser, _) = &self.tracks[track].framing {
+                if parser.split.buffered_bytes() + data.len() > 32 * 1024 * 1024 {
+                    return Err(Error::invalid("mpeg: H.264 access unit exceeds 32 MiB"));
+                }
+            }
             self.deliver(track, data, pts, dts, pos);
             return Ok(Next::Found((track, dts.or(pts))));
         }
@@ -803,6 +824,10 @@ impl MpegPsDemuxer {
             Some("cvd_subtitle" | "ogt") => Framing::SubstreamId(startcode as u8),
             Some(codec @ ("mp2" | "mp3")) => Framing::Mpa(Parser::new(MpegAudio::new(codec)), AudioClock::new(1, 90_000, 33)),
             Some("ac3") => Framing::Ac3(Parser::new(Ac3::new("ac3")), AudioClock::new(1, 90_000, 33)),
+            Some("h264") => {
+                let (parser, clock) = h264_parsing();
+                Framing::H264(parser, clock)
+            }
             _ => Framing::Pes,
         };
         self.tracks.push(Track {
@@ -817,14 +842,15 @@ impl MpegPsDemuxer {
             start_time: None,
             framing,
             index: Index::default(),
+            probing: Vec::new(),
         });
         Ok(Some(self.tracks.len() - 1))
     }
 
     /// Queue what one PES payload of `track` yields.
     fn deliver(&mut self, track: usize, data: Vec<u8>, pts: Option<i64>, dts: Option<i64>, pos: i64) {
-        let t = &mut self.tracks[track];
         if self.discovering {
+            let t = &mut self.tracks[track];
             self.probed += data.len() as u64;
             if t.start_time.is_none() {
                 t.start_time = pts;
@@ -835,11 +861,19 @@ impl MpegPsDemuxer {
             }
             if !t.probe_done {
                 t.probe(false);
+                if t.probe_done {
+                    self.settle(track);
+                }
             }
+            let t = &mut self.tracks[track];
             if !t.ready {
                 t.ready = t.params_ready();
             }
+            if !t.probe_done {
+                t.probing.push(pos);
+            }
         }
+        let t = &mut self.tracks[track];
         let index = track as u32;
         match &mut t.framing {
             Framing::Pes => self.queue.push_back(packet(index, data, pts, dts)),
@@ -864,7 +898,37 @@ impl MpegPsDemuxer {
                 parser.push(&data, pts, dts, pos, &mut units);
                 stamp_all(units, clock, index, &mut self.queue);
             }
+            Framing::H264(parser, clock) => {
+                let mut units = Vec::new();
+                parser.push(&data, pts, dts, pos, &mut units);
+                stamp_h264(units, clock, index, &mut self.queue);
+            }
         }
+    }
+
+    /// The probe of `track` ended (probe_codec): FFmpeg holds every packet
+    /// from the probed stream's first on until then (ff_read_packet's
+    /// raw_packet_buffer), then parses them in order. A stream probed as
+    /// H.264 has its PES payloads queued so far cut into access units
+    /// where they wait.
+    fn settle(&mut self, track: usize) {
+        let t = &mut self.tracks[track];
+        let mut positions = std::mem::take(&mut t.probing).into_iter();
+        if t.codec != Some("h264") || !matches!(t.framing, Framing::Pes) {
+            return;
+        }
+        let (mut parser, mut clock) = h264_parsing();
+        let index = track as u32;
+        let mut units = Vec::new();
+        for packet in std::mem::take(&mut self.queue) {
+            if packet.stream_index != index {
+                self.queue.push_back(packet);
+                continue;
+            }
+            parser.push(&packet.data, packet.pts, packet.dts, positions.next().unwrap_or(-1), &mut units);
+            stamp_h264(std::mem::take(&mut units), &mut clock, index, &mut self.queue);
+        }
+        self.tracks[track].framing = Framing::H264(parser, clock);
     }
 
     /// The end of the input: parsers hand over what they still hold.
@@ -885,6 +949,10 @@ impl MpegPsDemuxer {
                 Framing::Ac3(parser, clock) => {
                     parser.flush(&mut units);
                     stamp_all(units, clock, index, &mut self.queue);
+                }
+                Framing::H264(parser, clock) => {
+                    parser.flush(&mut units);
+                    stamp_h264(units, clock, index, &mut self.queue);
                 }
                 Framing::Pes | Framing::SubstreamId(_) => {}
             }
@@ -910,6 +978,7 @@ impl MpegPsDemuxer {
             let (track, ts) = match self.read_packet()? {
                 Next::Found(read) => read,
                 Next::End => {
+                    self.finish_probes();
                     self.end_of_input();
                     break;
                 }
@@ -930,17 +999,32 @@ impl MpegPsDemuxer {
         }
         self.discovering = false;
         self.limit = None;
-        for t in &mut self.tracks {
-            if !t.probe_done {
-                t.probe(true);
-            }
-        }
+        self.finish_probes();
         self.streams = self.tracks.iter().enumerate().map(|(i, t)| t.stream_info(i as u32)).collect();
         for t in &mut self.tracks {
             t.head = Vec::new();
         }
         Ok(())
     }
+
+    /// avformat_find_stream_info ends every probe still running with what
+    /// it has (a forced probe_codec); a stream found to be H.264 is then
+    /// parsed from its first packet.
+    fn finish_probes(&mut self) {
+        for track in 0..self.tracks.len() {
+            if !self.tracks[track].probe_done {
+                self.tracks[track].probe(true);
+                self.tracks[track].probe_done = true;
+                self.settle(track);
+            }
+        }
+    }
+}
+
+/// The h264 parser and timing of an H.264 stream: time base (and
+/// pkt_timebase) 1/90000, 33-bit timestamps.
+fn h264_parsing() -> (Parser<H264>, H264Clock) {
+    (Parser::new(H264::new((1, 90_000))), H264Clock::new(33))
 }
 
 fn packet(index: u32, data: Vec<u8>, pts: Option<i64>, dts: Option<i64>) -> Packet {
@@ -960,6 +1044,14 @@ fn unit_packet(index: u32, unit: Unit) -> Packet {
 
 /// Parsed audio frames, timed by their stream's clock and queued.
 fn stamp_all(units: Vec<Unit>, clock: &mut AudioClock, index: u32, queue: &mut VecDeque<Packet>) {
+    for unit in units {
+        let packet = clock.stamp(unit, index, TIME_BASE, queue);
+        queue.push_back(packet);
+    }
+}
+
+/// Parsed H.264 units, timed and queued.
+fn stamp_h264(units: Vec<Unit>, clock: &mut H264Clock, index: u32, queue: &mut VecDeque<Packet>) {
     for unit in units {
         let packet = clock.stamp(unit, index, TIME_BASE, queue);
         queue.push_back(packet);

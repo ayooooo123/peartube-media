@@ -38,6 +38,14 @@ pub(crate) trait Split {
     fn fallback(&self) -> i64 {
         0
     }
+
+    /// What the parse callback left in the parser context for the unit
+    /// it just cut, given the timestamps fetched for it: the unit's
+    /// timestamps (h264_parse derives some from HRD SEIs) and, for video
+    /// parsers that set them, its key flag, picture type and duration.
+    fn cut(&mut self, pts: Option<i64>, dts: Option<i64>) -> (Option<i64>, Option<i64>, Option<VideoCut>) {
+        (pts, dts, None)
+    }
 }
 
 /// A parsed unit and the timestamps of the demuxed packet it inherits.
@@ -45,6 +53,8 @@ pub(crate) struct Unit {
     pub data: Vec<u8>,
     pub pts: Option<i64>,
     pub dts: Option<i64>,
+    /// What a video parser set for the unit.
+    pub video: Option<VideoCut>,
     /// The parser's duration in samples and the sample rate it knew when
     /// the unit came out (0 when it does not tell).
     pub samples: i64,
@@ -162,7 +172,8 @@ impl<S: Split> Parser<S> {
             ts.fetch_timestamp = true;
             let (samples, sample_rate) = self.split.audio();
             let fallback = self.split.fallback();
-            out.push(Unit { data, pts: ts.out_pts, dts: ts.out_dts, samples, sample_rate, fallback, pos: ts.frame_offset });
+            let (pts, dts, video) = self.split.cut(ts.out_pts, ts.out_dts);
+            out.push(Unit { data, pts, dts, video, samples, sample_rate, fallback, pos: ts.frame_offset });
         }
         let index = index.max(0) as usize;
         ts.cur_offset += index as i64;
@@ -721,84 +732,33 @@ fn add_stable(ts: i64, ts_tb: (i64, i64), inc_tb: (i64, i64)) -> i64 {
     rescale_q(old.saturating_add(1), inc_tb, ts_tb).saturating_add(ts.saturating_sub(old_ts))
 }
 
-/// compute_pkt_fields (demux.c) for a parsed audio stream (no decoder
-/// delay, one frame per packet), with the parse_packet duration of each
-/// unit.
-pub(crate) struct AudioClock {
-    /// The stream time base.
-    num: i64,
-    den: i64,
-    /// pts_wrap_bits
-    wrap_bits: u32,
+/// FFStream's timing state behind compute_pkt_fields (demux.c): the
+/// stream's cur_dts and first_dts, and the revisions of its waiting
+/// packets that its first timestamp and first duration make.
+struct Initial {
     cur_dts: i64,
     first_dts: Option<i64>,
     initial_durations_done: bool,
 }
 
-impl AudioClock {
-    pub fn new(num: i64, den: i64, wrap_bits: u32) -> Self {
-        Self { num, den, wrap_bits, cur_dts: RELATIVE_TS_BASE, first_dts: None, initial_durations_done: false }
+impl Initial {
+    fn new() -> Self {
+        Self { cur_dts: RELATIVE_TS_BASE, first_dts: None, initial_durations_done: false }
     }
 
-    /// ff_read_frame_flush then avpriv_update_cur_dts: after a seek the
-    /// clock runs on from the landing timestamp `ts`, which is absolute,
-    /// so no later packet revises those before it.
-    pub fn seeked(&mut self, ts: i64) {
-        self.cur_dts = ts;
-    }
-
-    /// The packet of `unit` on stream `index`, timed. `queue` holds the
-    /// packets not yet returned (FFmpeg's packet buffer): FFmpeg revises
-    /// this stream's ones when the unit brings its first timestamp or
-    /// duration.
-    pub fn stamp(&mut self, unit: Unit, index: u32, time_base: oxideav_core::TimeBase, queue: &mut VecDeque<Packet>) -> Packet {
-        let mut pts = unit.pts;
-        let mut dts = unit.dts;
-        // parse_packet's duration from the parser; without one,
-        // compute_frame_duration's from the codec context, which moves the
-        // clock by the exact fraction (av_add_stable).
-        let (samples, exact) = if unit.samples > 0 { (unit.samples, false) } else { (unit.fallback, true) };
-        let rate = i64::from(unit.sample_rate);
-        let duration = if rate > 0 && samples > 0 { rescale_down(samples, self.den, self.num * rate) } else { 0 };
-        if let (Some(p), Some(d)) = (pts, dts) {
-            let wrap = 1i64 << self.wrap_bits;
-            if self.wrap_bits < 63 && d > i64::MIN + wrap && d - (wrap >> 1) > p {
+    /// demux.c:1040-1047: a dts more than half the timestamp wrap past
+    /// its pts wrapped, or the pts did.
+    fn unwrap(&self, wrap_bits: u32, pts: &mut Option<i64>, dts: &mut Option<i64>) {
+        if let (Some(p), Some(d)) = (*pts, *dts) {
+            let wrap = 1i64 << wrap_bits;
+            if wrap_bits < 63 && d > i64::MIN + wrap && d - (wrap >> 1) > p {
                 if is_relative(self.cur_dts) || d - (wrap >> 1) > self.cur_dts {
-                    dts = Some(d - wrap);
+                    *dts = Some(d - wrap);
                 } else {
-                    pts = Some(p + wrap);
+                    *pts = Some(p + wrap);
                 }
             }
         }
-        if duration > 0 && !queue.is_empty() {
-            self.update_initial_durations(queue, index, duration);
-        }
-        if pts.is_some() || dts.is_some() || duration > 0 {
-            if pts.is_none() {
-                pts = dts;
-            }
-            if let Some(p) = pts {
-                self.update_initial_timestamps(p, queue, index);
-            }
-            let p = pts.unwrap_or(self.cur_dts);
-            pts = Some(p);
-            dts = Some(p);
-            self.cur_dts = if exact && duration > 0 {
-                add_stable(p, (self.num, self.den), (samples, rate))
-            } else {
-                // av_add_stable of a whole number of ticks
-                p.saturating_add(duration)
-            };
-        }
-        if let Some(d) = dts {
-            self.cur_dts = self.cur_dts.max(d);
-        }
-        let mut packet = Packet::new(index, time_base, unit.data);
-        packet.pts = pts;
-        packet.dts = dts;
-        packet.duration = (duration > 0).then_some(duration);
-        packet.flags.keyframe = true;
-        packet
     }
 
     /// update_initial_timestamps: the first timestamp of the stream turns
@@ -825,8 +785,9 @@ impl AudioClock {
     }
 
     /// update_initial_durations: waiting packets without a duration take
-    /// this one, and their timestamps follow from it.
-    fn update_initial_durations(&mut self, queue: &mut VecDeque<Packet>, index: u32, duration: i64) {
+    /// this one, and their dts follow from it, their pts too unless the
+    /// stream has B-frames.
+    fn update_initial_durations(&mut self, queue: &mut VecDeque<Packet>, index: u32, duration: i64, has_b_frames: bool) {
         let mut cur_dts = RELATIVE_TS_BASE;
         if let Some(first_dts) = self.first_dts {
             if self.initial_durations_done {
@@ -854,7 +815,9 @@ impl AudioClock {
             let dts_open = packet.dts.is_none() || packet.dts == self.first_dts || packet.dts == Some(RELATIVE_TS_BASE);
             if (packet.pts == packet.dts || packet.pts.is_none()) && dts_open && packet.duration.is_none() && cur_dts.checked_add(duration).is_some() {
                 packet.dts = Some(cur_dts);
-                packet.pts = Some(cur_dts);
+                if !has_b_frames {
+                    packet.pts = Some(cur_dts);
+                }
                 packet.duration = Some(duration);
             } else {
                 all = false;
@@ -865,6 +828,143 @@ impl AudioClock {
         if all {
             self.cur_dts = cur_dts;
         }
+    }
+}
+
+/// compute_pkt_fields (demux.c) for a parsed audio stream (no decoder
+/// delay, one frame per packet), with the parse_packet duration of each
+/// unit.
+pub(crate) struct AudioClock {
+    /// The stream time base.
+    num: i64,
+    den: i64,
+    /// pts_wrap_bits
+    wrap_bits: u32,
+    initial: Initial,
+}
+
+impl AudioClock {
+    pub fn new(num: i64, den: i64, wrap_bits: u32) -> Self {
+        Self { num, den, wrap_bits, initial: Initial::new() }
+    }
+
+    /// ff_read_frame_flush then avpriv_update_cur_dts: after a seek the
+    /// clock runs on from the landing timestamp `ts`, which is absolute,
+    /// so no later packet revises those before it.
+    pub fn seeked(&mut self, ts: i64) {
+        self.initial.cur_dts = ts;
+    }
+
+    /// The packet of `unit` on stream `index`, timed. `queue` holds the
+    /// packets not yet returned (FFmpeg's packet buffer): FFmpeg revises
+    /// this stream's ones when the unit brings its first timestamp or
+    /// duration.
+    pub fn stamp(&mut self, unit: Unit, index: u32, time_base: oxideav_core::TimeBase, queue: &mut VecDeque<Packet>) -> Packet {
+        let mut pts = unit.pts;
+        let mut dts = unit.dts;
+        // parse_packet's duration from the parser; without one,
+        // compute_frame_duration's from the codec context, which moves the
+        // clock by the exact fraction (av_add_stable).
+        let (samples, exact) = if unit.samples > 0 { (unit.samples, false) } else { (unit.fallback, true) };
+        let rate = i64::from(unit.sample_rate);
+        let duration = if rate > 0 && samples > 0 { rescale_down(samples, self.den, self.num * rate) } else { 0 };
+        self.initial.unwrap(self.wrap_bits, &mut pts, &mut dts);
+        if duration > 0 && !queue.is_empty() {
+            self.initial.update_initial_durations(queue, index, duration, false);
+        }
+        if pts.is_some() || dts.is_some() || duration > 0 {
+            if pts.is_none() {
+                pts = dts;
+            }
+            if let Some(p) = pts {
+                self.initial.update_initial_timestamps(p, queue, index);
+            }
+            let p = pts.unwrap_or(self.initial.cur_dts);
+            pts = Some(p);
+            dts = Some(p);
+            self.initial.cur_dts = if exact && duration > 0 {
+                add_stable(p, (self.num, self.den), (samples, rate))
+            } else {
+                // av_add_stable of a whole number of ticks
+                p.saturating_add(duration)
+            };
+        }
+        if let Some(d) = dts {
+            self.initial.cur_dts = self.initial.cur_dts.max(d);
+        }
+        let mut packet = Packet::new(index, time_base, unit.data);
+        packet.pts = pts;
+        packet.dts = dts;
+        packet.duration = (duration > 0).then_some(duration);
+        packet.flags.keyframe = true;
+        packet
+    }
+}
+
+/// What a video parser set for a unit it cut, beyond its timestamps.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct VideoCut {
+    /// key_frame (parse_packet's AV_PKT_FLAG_KEY)
+    pub key: bool,
+    /// pict_type is B
+    pub b_picture: bool,
+    /// compute_frame_duration from the frame rate and repeat_pict the
+    /// parser set, in the stream time base; 0 for none.
+    pub duration: i64,
+}
+
+/// compute_pkt_fields (demux.c:983-1170) for a parsed H.264 stream: the
+/// timestamps the parser gave, which FFmpeg does not interpolate for
+/// H.264 (1099-1101), with the timestamp wrap corrected (1040-1047); the
+/// parser's duration (1061-1071), which also times untimed first packets
+/// (update_initial_durations, 1073); and the first timestamp dating the
+/// waiting packets (update_initial_timestamps, 1159). has_b_frames is
+/// what compute_pkt_fields sets on a B picture (1025-1028); FFmpeg's
+/// decoder may raise it while avformat_find_stream_info runs, which is
+/// not modeled. Not ported, as they act on has_b_frames or the decoder's
+/// progress: a dts equal to its pts out of dts order dropped (1000-1020),
+/// a non-B picture's dts equal to its pts dropped under a one-frame delay
+/// (1053-1059), and a missing dts taken from the reordered pts
+/// (1148-1155). Without a frame rate in the SPS FFmpeg's duration comes
+/// from the one avformat_find_stream_info estimates; here there is none.
+pub(crate) struct H264Clock {
+    wrap_bits: u32,
+    initial: Initial,
+    has_b_frames: bool,
+}
+
+impl H264Clock {
+    pub fn new(wrap_bits: u32) -> Self {
+        Self { wrap_bits, initial: Initial::new(), has_b_frames: false }
+    }
+
+    /// ff_read_frame_flush then avpriv_update_cur_dts, as for audio; the
+    /// codec context keeps has_b_frames.
+    pub fn seeked(&mut self, ts: i64) {
+        self.initial.cur_dts = ts;
+    }
+
+    /// The packet of `unit` on stream `index`, as for [`AudioClock::stamp`].
+    pub fn stamp(&mut self, unit: Unit, index: u32, time_base: oxideav_core::TimeBase, queue: &mut VecDeque<Packet>) -> Packet {
+        let video = unit.video.unwrap_or_default();
+        let (mut pts, mut dts) = (unit.pts, unit.dts);
+        if video.b_picture {
+            self.has_b_frames = true;
+        }
+        self.initial.unwrap(self.wrap_bits, &mut pts, &mut dts);
+        if video.duration > 0 && !queue.is_empty() {
+            self.initial.update_initial_durations(queue, index, video.duration, self.has_b_frames);
+        }
+        if let Some(d) = dts {
+            self.initial.update_initial_timestamps(d, queue, index);
+            self.initial.cur_dts = self.initial.cur_dts.max(d);
+        }
+        let mut packet = Packet::new(index, time_base, unit.data);
+        packet.pts = pts;
+        packet.dts = dts;
+        packet.duration = (video.duration > 0).then_some(video.duration);
+        packet.flags.keyframe = video.key;
+        packet
     }
 }
 
