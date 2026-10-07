@@ -67,10 +67,15 @@ Top-Level element should start, before the first Cluster, is skipped by either
 open with a forward scan, as FFmpeg's matroska_resync does, one damage event per
 run; the scans read at most 1 MiB in total, and a strict open fails only when
 one ends without finding an element. Every element in a Tracks, Tags, Chapters,
-Cues or SeekHead tree must fit its parent. Only a Segment or Cluster may use the
-unknown size; any other Top-Level element doing so, or running past its
-Segment, is damage (the walk rescans for what follows; between Clusters,
-playback resumes at the next Cluster).
+Cues or SeekHead tree, and in the EBML header, must fit its parent, and the EBML
+header's strings and extension records keep at most 16 MiB together (FFmpeg's
+limit for one EBML string). Only a Segment or Cluster may use the unknown size;
+any other Top-Level element doing so, or running past its Segment, is damage
+(the walk rescans for what follows; between Clusters, playback resumes at the
+next Cluster), and so is an AttachedFile or FileData of unknown size. A master
+over its budget, in line or found through the SeekHead, is noted as damage too,
+and a Tags or SeekHead found through the SeekHead keeps its complete records. A
+Cluster may start with a Void.
 SegmentUUID, PrevUUID and NextUUID must be 16 octets. Text fields in Info,
 Chapters and Attachments hold at most 64 KiB, and each of these masters keeps
 at most 1 MiB. Past it, Chapters and Attachments keep the records that fit, in
@@ -80,15 +85,18 @@ reaching past its AttachedFile or the Segment is refused unread, and a source
 failure while it reads is returned as itself. Everything the open keeps from
 Tracks or Tags, including tag resolution, the per-stream views and room to
 parse or decompress a codec configuration, stays within the master's 32 MiB
-limit at its peak and after the open. The Cues index keeps at most 32 MiB:
+limit at its peak and after the open; a decoded CodecPrivate frees the stored
+one's room, and a Tags master replaced between Clusters frees its entries' room
+in one pass. The Cues index keeps at most 32 MiB:
 past that, or past damage, it keeps the CuePoints before it, and a seek past
 the last point kept for its track, or with no Cues, scans the Clusters from
 the first one (a known read cost on large remote files). Cluster
-records, their index, and the EncryptedBlocks and SilentTracks numbers they
-keep share one 32 MiB budget, lists included, and are recorded once even when
-a seek revisits them. A block past the budget is damage and the walk resumes
-at the next Cluster; a Cluster past it gets no record while playback and seeks
-go on. At most 4096 damage events are kept, and the rest are counted exactly.
+records, their index, the EncryptedBlocks and SilentTracks numbers they keep,
+and the CRC-32 statuses share one 32 MiB budget, lists included, and are
+recorded once even when a seek revisits them. A block past the budget is
+damage and the walk resumes at the next Cluster; a Cluster past it gets no
+record or status while playback and seeks go on. At most 4096 damage events
+are kept, and the rest are counted exactly.
 The 1024-packet cap counts
 virtual-track copies and the frames a lace actually holds (a one-frame EBML
 lace is InvalidData): compliant Blocks wait until held packets drain, and one
