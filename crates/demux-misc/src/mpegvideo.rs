@@ -9,7 +9,7 @@ use oxideav_core::{
     PROBE_SCORE_EXTENSION,
 };
 
-use crate::rawvideo::{MpegVideo, RawVideoDemuxer};
+use crate::rawvideo::{MpegVideo, RawVideoDemuxer, RAW_VIDEO_CLOCK};
 
 const SEQ_START_CODE: u32 = 0x000001B3;
 const PICTURE_START_CODE: u32 = 0x00000100;
@@ -18,18 +18,6 @@ const SLICE_START_CODE_MAX: u32 = 0x000001AF;
 const PACK_START_CODE: u32 = 0x000001BA;
 const VIDEO_ID: u32 = 0x000001E0;
 const AUDIO_ID: u32 = 0x000001C0;
-
-const FRAME_RATES: [(u32, u32); 9] = [
-    (0, 0),
-    (24000, 1001),
-    (24, 1),
-    (25, 1),
-    (30000, 1001),
-    (30, 1),
-    (50, 1),
-    (60000, 1001),
-    (60, 1),
-];
 
 pub fn probe_mpegvideo(probe: &ProbeData) -> ProbeScore {
     let p = probe.buf;
@@ -103,8 +91,9 @@ pub fn probe_mpegvideo(probe: &ProbeData) -> ProbeScore {
 
 /// ff_raw_video_read_header, with the stream parameters FFmpeg's parser
 /// reports: MPEG-2 once a sequence extension follows the first sequence
-/// header, its size and frame rate. Packets are numbered in frame
-/// periods of that rate.
+/// header, and its size. Time base 1/1200000, as FFmpeg's: packets are
+/// timed in it as FFmpeg times them (see rawvideo.rs), in fields, which
+/// a repeated field can make one and a half frames.
 pub fn open_mpegvideo(
     mut input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
@@ -120,19 +109,12 @@ pub fn open_mpegvideo(
     let mut is_mpeg2 = false;
     let mut width = 0;
     let mut height = 0;
-    let mut fps_num = 25;
-    let mut fps_den = 1;
 
     for i in 0..n.saturating_sub(7) {
         if head[i] == 0 && head[i + 1] == 0 && head[i + 2] == 1 && head[i + 3] == 0xB3 {
             seq_offset = Some(i);
             width = ((head[i + 4] as u32) << 4) | ((head[i + 5] as u32) >> 4);
             height = (((head[i + 5] as u32) & 0x0F) << 8) | (head[i + 6] as u32);
-            let fps_idx = (head[i + 7] & 0x0F) as usize;
-            if fps_idx > 0 && fps_idx < FRAME_RATES.len() {
-                fps_num = FRAME_RATES[fps_idx].0;
-                fps_den = FRAME_RATES[fps_idx].1;
-            }
             break;
         }
     }
@@ -165,7 +147,7 @@ pub fn open_mpegvideo(
     let stream = StreamInfo {
         index: 0,
         params,
-        time_base: TimeBase::new(fps_den as i64, fps_num as i64),
+        time_base: TimeBase::new(1, RAW_VIDEO_CLOCK),
         duration: None,
         start_time: Some(0),
     };

@@ -10,8 +10,10 @@
 //
 // Raw video elementary streams: the input is read in 1024-byte pieces and
 // cut into the access units FFmpeg's parser for the codec cuts, each
-// flagged key as FFmpeg flags it. The streams carry no timestamps; packets
-// are numbered in the stream time base.
+// flagged key as FFmpeg flags it. The streams carry no timestamps: MPEG-1/2
+// units are timed as FFmpeg's demuxer layer times them (demux.c
+// compute_pkt_fields), H.264 and HEVC units are numbered in the stream
+// time base.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -36,7 +38,7 @@ pub(crate) struct RawVideoDemuxer<S> {
     eof: bool,
 }
 
-impl<S: Split + KeyFrame> RawVideoDemuxer<S> {
+impl<S: Split + Units> RawVideoDemuxer<S> {
     pub fn new(format: &'static str, input: Box<dyn ReadSeek>, stream: StreamInfo, split: S) -> Self {
         Self { format, input, streams: vec![stream], parser: Parser::new(split), queue: VecDeque::new(), pos: 0, count: 0, eof: false }
     }
@@ -64,20 +66,21 @@ impl<S: Split + KeyFrame> RawVideoDemuxer<S> {
             self.pos += n as i64;
         }
         for unit in units {
-            let key = S::key_frame(&unit.data, &mut self.parser.split);
+            let stamp = self.parser.split.unit(&unit.data, self.count);
             let mut packet = Packet::new(0, self.streams[0].time_base, unit.data);
-            packet.pts = Some(self.count);
-            packet.dts = Some(self.count);
-            packet.duration = Some(1);
-            packet.flags.keyframe = key;
+            packet.pts = stamp.pts;
+            packet.dts = stamp.dts;
+            packet.duration = stamp.duration;
+            packet.flags.keyframe = stamp.key;
             self.count += 1;
             self.queue.push_back(packet);
         }
+        self.parser.split.read_done();
         Ok(())
     }
 }
 
-impl<S: Split + KeyFrame + Send> Demuxer for RawVideoDemuxer<S> {
+impl<S: Split + Units + Send> Demuxer for RawVideoDemuxer<S> {
     fn format_name(&self) -> &str {
         self.format
     }
@@ -99,11 +102,33 @@ impl<S: Split + KeyFrame + Send> Demuxer for RawVideoDemuxer<S> {
     }
 }
 
-/// How a codec's parser flags a unit key: AV_PKT_FLAG_KEY as parse_packet
-/// sets it from the parser's key_frame and pict_type.
-pub(crate) trait KeyFrame {
+/// What FFmpeg makes of a unit once its codec's parser cut it: the key
+/// flag parse_packet sets from the parser's key_frame and pict_type, and
+/// the timestamps its demuxer layer gives the packet.
+pub(crate) trait Units {
     fn buffered_bytes(&self) -> usize;
-    fn key_frame(unit: &[u8], split: &mut Self) -> bool;
+    /// The `index`th unit of the stream, counting from 0.
+    fn unit(&mut self, unit: &[u8], index: i64) -> Stamp;
+    /// The 1024-byte read whose units were just stamped is over.
+    fn read_done(&mut self) {}
+}
+
+/// A unit's key flag, and its pts, dts and duration in the stream time
+/// base.
+pub(crate) struct Stamp {
+    key: bool,
+    pts: Option<i64>,
+    dts: Option<i64>,
+    duration: Option<i64>,
+}
+
+impl Stamp {
+    /// Timed by its index: each unit lasts one tick of the stream time
+    /// base. Not what FFmpeg does for H.264 and HEVC (which leave raw
+    /// streams' timestamps to the decoder); kept as it was for them.
+    fn numbered(key: bool, index: i64) -> Self {
+        Self { key, pts: Some(index), dts: Some(index), duration: Some(1) }
+    }
 }
 
 /// avpriv_find_start_code over `buf[p..end]`, carrying `state` across
@@ -164,12 +189,160 @@ pub(crate) struct MpegVideo {
     frame_start_found: u8,
     /// AVCodecParserContext.pict_type: I until a picture header says.
     pict_type: u8,
+    clock: MpegClock,
 }
 
 impl Default for MpegVideo {
     fn default() -> Self {
-        Self { pc: Combine::default(), frame_start_found: 0, pict_type: 1 }
+        Self { pc: Combine::default(), frame_start_found: 0, pict_type: 1, clock: MpegClock::default() }
     }
+}
+
+/// ff_mpeg12_frame_rate_tab (mpeg12framerate.c).
+const FRAME_RATES: [(i64, i64); 16] = [
+    (0, 0), (24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1), (50, 1), (60000, 1001),
+    (60, 1), (15, 1), (5, 1), (10, 1), (12, 1), (15, 1), (0, 0), (0, 0),
+];
+
+/// AV_PICTURE_TYPE_B
+const PICTURE_TYPE_B: u8 = 3;
+
+/// ff_raw_video_read_header's time base: 1/1200000.
+pub(crate) const RAW_VIDEO_CLOCK: i64 = 1_200_000;
+
+/// How FFmpeg times raw MPEG-1/2 video, which carries no timestamps: what
+/// mpegvideo_extract_headers leaves in the parser and codec contexts, and
+/// compute_pkt_fields (demux.c) on each parsed unit, in 1/1200000.
+///
+/// With B-frame delay (has_b_frames), an I- or P-frame's pts is unknown
+/// and its dts is the current one, which then moves on by the duration of
+/// the I- or P-frame before it; a B-frame's pts and dts are the current
+/// dts, which moves on by its own duration. Without delay every frame is
+/// timed like a B-frame. A duration counts fields: 1/(2 x frame rate),
+/// times 1 + repeat_pict.
+struct MpegClock {
+    /// pc->frame_rate: the last sequence header's frame rate.
+    frame_rate: (i64, i64),
+    /// avctx->framerate: with its sequence extension's factors.
+    framerate: (i64, i64),
+    progressive_sequence: bool,
+    /// avctx->codec_id is MPEG-2: a sequence extension followed the last
+    /// sequence header. The raw demuxer starts out MPEG-1.
+    mpeg2: bool,
+    /// AVCodecParserContext.repeat_pict
+    repeat_pict: i64,
+    /// avctx->has_b_frames
+    has_b_frames: bool,
+    /// The last sequence extension's low_delay, which FFmpeg's decoder
+    /// turns into has_b_frames.
+    low_delay: bool,
+    /// A unit with a picture has been stamped, and FFmpeg's decoder, run
+    /// on the first one by avformat_find_stream_info before the next read,
+    /// has set has_b_frames from it.
+    picture_stamped: bool,
+    decoder_ran: bool,
+    /// sti->cur_dts and sti->last_IP_duration
+    cur_dts: i64,
+    last_ip_duration: i64,
+}
+
+impl Default for MpegClock {
+    fn default() -> Self {
+        Self {
+            frame_rate: (0, 0),
+            // avcodec_alloc_context3
+            framerate: (0, 1),
+            progressive_sequence: false,
+            mpeg2: false,
+            repeat_pict: 0,
+            has_b_frames: false,
+            low_delay: false,
+            picture_stamped: false,
+            decoder_ran: false,
+            cur_dts: 0,
+            last_ip_duration: 0,
+        }
+    }
+}
+
+impl MpegClock {
+    /// compute_frame_duration in seconds, (0, 0) when it gives none. A
+    /// stream without a known frame rate falls back to the raw demuxer's
+    /// framerate option, 25 (AVFMT_NOTIMESTAMPS), as FFmpeg does during
+    /// stream discovery; afterwards FFmpeg would use its r_frame_rate
+    /// estimate, which is not modelled. Both MPEG codecs have
+    /// AV_CODEC_PROP_FIELDS: a tick is a field.
+    fn frame_duration(&self) -> (i64, i64) {
+        let (num, den) = self.framerate;
+        if num == 0 {
+            return (1, 25);
+        }
+        if den.saturating_mul(1000) <= num {
+            return (0, 0);
+        }
+        let field = (den, num.saturating_mul(2));
+        if self.repeat_pict != 0 { (field.0.saturating_mul(1 + self.repeat_pict), field.1) } else { field }
+    }
+
+    /// compute_pkt_fields for a unit of picture type `pict_type`: its pts,
+    /// dts and duration.
+    fn stamp(&mut self, pict_type: u8) -> (Option<i64>, Option<i64>, Option<i64>) {
+        if pict_type == PICTURE_TYPE_B {
+            self.has_b_frames = true;
+        }
+        let (num, den) = self.frame_duration();
+        // av_rescale_rnd(1, num * tb.den, den * tb.num, AV_ROUND_DOWN)
+        let duration = if num > 0 && den > 0 {
+            i64::try_from(i128::from(num) * i128::from(RAW_VIDEO_CLOCK) / i128::from(den)).unwrap_or(i64::MAX)
+        } else {
+            0
+        };
+        let known = (duration > 0).then_some(duration);
+        if self.has_b_frames && pict_type != PICTURE_TYPE_B {
+            // Presentation delayed: the dts is the current one, and the
+            // next follows the I- or P-frame shown before this one.
+            let dts = self.cur_dts;
+            if self.last_ip_duration == 0 {
+                self.last_ip_duration = duration;
+            }
+            self.cur_dts = dts.saturating_add(self.last_ip_duration);
+            self.last_ip_duration = duration;
+            (None, Some(dts), known)
+        } else if duration > 0 {
+            let pts = self.cur_dts;
+            self.cur_dts = add_stable(pts, num, den);
+            (Some(pts), Some(pts), known)
+        } else {
+            (None, None, None)
+        }
+    }
+}
+
+/// av_rescale_q(a, b, c), rounding to nearest with ties away from zero.
+fn rescale(a: i64, b: (i64, i64), c: (i64, i64)) -> i64 {
+    let num = i128::from(a) * i128::from(b.0) * i128::from(c.1);
+    let den = i128::from(b.1) * i128::from(c.0);
+    if den == 0 {
+        return 0;
+    }
+    let q = (num.abs() + den / 2) / den;
+    i64::try_from(if num < 0 { -q } else { q }).unwrap_or(i64::MAX)
+}
+
+/// av_add_stable(1/1200000, ts, num/den, 1): `ts` moved on by num/den
+/// seconds without accumulating rounding errors.
+fn add_stable(ts: i64, num: i64, den: i64) -> i64 {
+    let clock = (1, RAW_VIDEO_CLOCK);
+    let (m, d) = (i128::from(num) * i128::from(RAW_VIDEO_CLOCK), i128::from(den));
+    if m % d == 0 {
+        return i64::try_from(i128::from(ts) + m / d).unwrap_or(i64::MAX);
+    }
+    if m < d {
+        return ts;
+    }
+    let old = rescale(ts, clock, (num, den));
+    let old_ts = rescale(old, (num, den), clock);
+    rescale(old.saturating_add(1), (num, den), clock).saturating_add(ts - old_ts)
 }
 
 impl MpegVideo {
@@ -234,28 +407,96 @@ impl Split for MpegVideo {
     }
 }
 
-impl KeyFrame for MpegVideo {
-    fn buffered_bytes(&self) -> usize {
-        self.pc.buffered_bytes()
-    }
-
-    /// mpegvideo_extract_headers: the picture coding type of the first
-    /// picture header before the first slice; key when it is I.
-    fn key_frame(unit: &[u8], split: &mut Self) -> bool {
+impl MpegVideo {
+    /// mpegvideo_extract_headers, up to a unit's first slice: its picture
+    /// type, and the frame rate, B-frame delay and repeated fields it
+    /// declares. True when it has a picture header.
+    fn extract_headers(&mut self, unit: &[u8]) -> bool {
+        let clock = &mut self.clock;
+        let mut picture = false;
+        // picture coding extensions: two make a field pair
+        let mut pic_ext = 0;
         let mut p = 0;
         while p < unit.len() {
             let mut code = u32::MAX;
             p = find_start_code(unit, p, unit.len(), &mut code);
-            let left = unit.len() - p;
-            if code == PICTURE_START_CODE {
-                if left >= 2 {
-                    split.pict_type = (unit[p + 1] >> 3) & 7;
+            let b = &unit[p..];
+            match code {
+                PICTURE_START_CODE => {
+                    if b.len() >= 2 {
+                        self.pict_type = (b[1] >> 3) & 7;
+                        picture = true;
+                    }
                 }
-            } else if (SLICE_MIN_START_CODE..=SLICE_MAX_START_CODE).contains(&code) || (code & 0xFFFF_FF00) != 0x100 {
-                break;
+                SEQ_START_CODE => {
+                    if b.len() >= 7 {
+                        clock.frame_rate = FRAME_RATES[usize::from(b[3] & 0x0F)];
+                        clock.framerate = clock.frame_rate;
+                        clock.mpeg2 = false;
+                    }
+                }
+                EXT_START_CODE if !b.is_empty() => match b[0] >> 4 {
+                    // sequence extension
+                    1 if b.len() >= 6 => {
+                        let (ext_n, ext_d) = (i64::from((b[5] >> 5) & 3), i64::from(b[5] & 0x1F));
+                        clock.progressive_sequence = b[1] & (1 << 3) != 0;
+                        clock.low_delay = b[5] >> 7 != 0;
+                        clock.has_b_frames = !clock.low_delay;
+                        clock.framerate = (clock.frame_rate.0 * (ext_n + 1), clock.frame_rate.1 * (ext_d + 1));
+                        clock.mpeg2 = true;
+                    }
+                    // picture coding extension
+                    8 if b.len() >= 5 => {
+                        let top_field_first = b[3] & (1 << 7) != 0;
+                        let repeat_first_field = b[3] & (1 << 1) != 0;
+                        let progressive_frame = b[4] & (1 << 7) != 0;
+                        clock.repeat_pict = 1;
+                        if repeat_first_field {
+                            if clock.progressive_sequence {
+                                clock.repeat_pict = if top_field_first { 5 } else { 3 };
+                            } else if progressive_frame {
+                                clock.repeat_pict = 2;
+                            }
+                        }
+                        pic_ext += 1;
+                    }
+                    _ => {}
+                },
+                c if (SLICE_MIN_START_CODE..=SLICE_MAX_START_CODE).contains(&c) || (c & 0xFFFF_FF00) != 0x100 => break,
+                _ => {}
             }
         }
-        split.pict_type == 1
+        if !clock.mpeg2 || pic_ext > 1 {
+            clock.repeat_pict = 1;
+        }
+        picture
+    }
+}
+
+impl Units for MpegVideo {
+    fn buffered_bytes(&self) -> usize {
+        self.pc.buffered_bytes()
+    }
+
+    /// Key when the first picture header before the first slice is I;
+    /// timed as FFmpeg's demuxer layer times the unit.
+    fn unit(&mut self, unit: &[u8], _index: i64) -> Stamp {
+        let picture = self.extract_headers(unit);
+        let (pts, dts, duration) = self.clock.stamp(self.pict_type);
+        self.clock.picture_stamped |= picture;
+        Stamp { key: self.pict_type == 1, pts, dts, duration }
+    }
+
+    /// avformat_find_stream_info decodes the first picture once the read
+    /// that ended it has been parsed, and FFmpeg's MPEG-1/2 decoder sets
+    /// has_b_frames to !low_delay: an MPEG-1 stream is delayed from the
+    /// next read on, B-frames seen or not.
+    fn read_done(&mut self) {
+        let clock = &mut self.clock;
+        if clock.picture_stamped && !clock.decoder_ran {
+            clock.decoder_ran = true;
+            clock.has_b_frames = !clock.low_delay;
+        }
     }
 }
 
@@ -570,26 +811,32 @@ impl H264 {
     }
 }
 
-impl KeyFrame for H264 {
-    fn buffered_bytes(&self) -> usize {
-        self.pc.buffered_bytes()
-    }
-
+impl H264 {
     /// parse_nal_units: IDR, recovery point, or FFmpeg's single-reference
     /// I-picture heuristic, using the active SPS/PPS.
-    fn key_frame(unit: &[u8], split: &mut Self) -> bool {
+    fn key_frame(&mut self, unit: &[u8]) -> bool {
         let mut recovery = false;
         for h in nal_starts(unit) {
             match unit[h] & 0x1F {
                 5 => return true,
-                1 | 2 => return recovery || split.intra_key(&rbsp(unit, h + 1)).unwrap_or(false),
+                1 | 2 => return recovery || self.intra_key(&rbsp(unit, h + 1)).unwrap_or(false),
                 6 => recovery |= sei_recovery_point(&rbsp(unit, h + 1)),
-                7 => { let _ = split.sps_refs(&rbsp(unit, h + 1)); }
-                8 => { let _ = split.pps_refs(&rbsp(unit, h + 1)); }
+                7 => { let _ = self.sps_refs(&rbsp(unit, h + 1)); }
+                8 => { let _ = self.pps_refs(&rbsp(unit, h + 1)); }
                 _ => {}
             }
         }
         false
+    }
+}
+
+impl Units for H264 {
+    fn buffered_bytes(&self) -> usize {
+        self.pc.buffered_bytes()
+    }
+
+    fn unit(&mut self, unit: &[u8], index: i64) -> Stamp {
+        Stamp::numbered(self.key_frame(unit), index)
     }
 }
 
@@ -648,13 +895,14 @@ impl Split for Hevc {
     }
 }
 
-impl KeyFrame for Hevc {
+impl Units for Hevc {
     fn buffered_bytes(&self) -> usize {
         self.pc.buffered_bytes()
     }
 
     /// parse_nal_units: key when the first base-layer slice is IRAP.
-    fn key_frame(unit: &[u8], _: &mut Self) -> bool {
+    fn unit(&mut self, unit: &[u8], index: i64) -> Stamp {
+        let mut key = false;
         for h in nal_starts(unit) {
             let Some(&second) = unit.get(h + 1) else { break };
             let nut = (unit[h] >> 1) & 0x3F;
@@ -663,9 +911,10 @@ impl KeyFrame for Hevc {
                 continue;
             }
             if nut <= 9 || (16..=21).contains(&nut) {
-                return (16..=23).contains(&nut);
+                key = (16..=23).contains(&nut);
+                break;
             }
         }
-        false
+        Stamp::numbered(key, index)
     }
 }

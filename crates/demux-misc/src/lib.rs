@@ -12,10 +12,11 @@
 //! leaves later ADPCM timestamps unknown when no duration is available.
 //!
 //! Reference tests require FATE_SUITE, FFmpeg/ffprobe on PATH, and the
-//! FFmpeg source and built binary at FFMPEG_SRC (revision 2da55bf).
-//! The inventory expands tests/fate/*.mak and rejects missing inputs.
-//! Raw video compares complete access units and key flags, not FFmpeg's
-//! decoder-derived timestamps; raw AVC/HEVC rate inference is unchanged.
+//! FFmpeg source with its built ffmpeg and ffprobe at FFMPEG_SRC
+//! (revision 2da55bf). The inventory expands tests/fate/*.mak and rejects
+//! missing inputs. Raw video compares complete access units and key flags;
+//! raw MPEG-1/2 also FFmpeg's timestamps and durations. Raw AVC/HEVC
+//! timing is unchanged: units are numbered, not timed as FFmpeg does.
 #![forbid(unsafe_code)]
 
 mod ac3;

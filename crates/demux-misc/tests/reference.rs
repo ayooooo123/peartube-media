@@ -19,9 +19,10 @@
 //! - raw video elementary streams (MPEG-1/2, H.264, HEVC): the access
 //!   units and key flags FFmpeg's parsers produce. Key flags use the
 //!   port's FFmpeg revision (`FFMPEG_SRC/ffmpeg -dump`): 9.0.2 predates
-//!   its H.264 data-partition key detection. Their timestamps are not
-//!   compared: the streams carry none, and FFmpeg derives them from
-//!   decoder state such as has_b_frames and ticks_per_frame.
+//!   its H.264 data-partition key detection. Raw MPEG-1/2 also compares
+//!   pts, dts (a missing one included) and duration with that revision's
+//!   packet table (`FFMPEG_SRC/ffprobe`). H.264 and HEVC timestamps are
+//!   not compared: FFmpeg leaves them to its decoder.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -265,19 +266,37 @@ struct Pkt {
     md5: String,
     pts: Option<i64>,
     dts: Option<i64>,
+    duration: Option<i64>,
     key: bool,
 }
 
-/// `ffprobe -f format` on `path`: streams, then packets.
-fn ffprobe(path: &Path, format: &str, unparsed: bool) -> (Vec<FfStream>, Vec<Pkt>) {
-    let mut cmd = std::process::Command::new("ffprobe");
+/// The ffprobe of the port's FFmpeg revision (`FFMPEG_SRC/ffprobe`,
+/// 2da55bf), checked once to be that revision.
+fn port_ffprobe() -> &'static Path {
+    static PORT: LazyLock<PathBuf> = LazyLock::new(|| {
+        let bin = ffmpeg_src().join("ffprobe");
+        let out = std::process::Command::new(&bin)
+            .arg("-version")
+            .output()
+            .expect("build ffprobe in FFMPEG_SRC (the port's revision): make ffprobe");
+        let version = String::from_utf8_lossy(&out.stdout);
+        assert!(version.contains("2da55bf"), "packet-table oracle must be FFmpeg 2da55bf: {version}");
+        bin
+    });
+    &PORT
+}
+
+/// `ffprobe -f format` on `path`: streams, then packets. `port` takes the
+/// table from the port's FFmpeg revision instead of the installed one.
+fn ffprobe(path: &Path, format: &str, unparsed: bool, port: bool) -> (Vec<FfStream>, Vec<Pkt>) {
+    let mut cmd = std::process::Command::new(if port { port_ffprobe() } else { Path::new("ffprobe") });
     cmd.args(["-v", "quiet", "-f", format]);
     if unparsed {
         cmd.args(["-fflags", "+noparse+nofillin"]);
     }
     let out = cmd
         .args(["-show_data_hash", "md5", "-show_entries"])
-        .arg("stream=index,codec_type,codec_name,time_base:packet=stream_index,pts,dts,size,flags,data_hash")
+        .arg("stream=index,codec_type,codec_name,time_base:packet=stream_index,pts,dts,duration,size,flags,data_hash")
         .args(["-of", "compact"])
         .arg(path)
         .output()
@@ -296,6 +315,7 @@ fn ffprobe(path: &Path, format: &str, unparsed: bool) -> (Vec<FfStream>, Vec<Pkt
                 md5: kv["data_hash"].trim_start_matches("MD5:").to_string(),
                 pts: num(kv.get("pts")),
                 dts: num(kv.get("dts")),
+                duration: num(kv.get("duration")),
                 key: kv["flags"].starts_with('K'),
             }),
             "stream" => {
@@ -377,12 +397,20 @@ struct Mode {
     unparsed: bool,
     /// Compare rescaled timestamps.
     times: bool,
+    /// Compare rescaled durations too.
+    durations: bool,
     /// Compare key flags.
     keys: bool,
+    /// Take the packet table from the port's FFmpeg revision.
+    port: bool,
 }
 
-const CONTAINER: Mode = Mode { unparsed: false, times: true, keys: false };
-const RAW_VIDEO: Mode = Mode { unparsed: false, times: false, keys: true };
+const CONTAINER: Mode = Mode { unparsed: false, times: true, durations: false, keys: false, port: false };
+const RAW_VIDEO: Mode = Mode { unparsed: false, times: false, durations: false, keys: true, port: false };
+/// Raw MPEG-1/2 video: access units, key flags, and the pts, dts (a
+/// missing one included) and duration FFmpeg 2da55bf's demuxer layer
+/// gives each.
+const RAW_MPEG: Mode = Mode { unparsed: false, times: true, durations: true, keys: true, port: true };
 
 /// `rel` through the player's registry against ffprobe's table for
 /// `format`; the first difference, if any.
@@ -402,7 +430,7 @@ fn compare(path: &Path, rel: &str, format: &str, mode: Mode) -> Result<(), Strin
     let mut ours = Vec::new();
     loop {
         match demuxer.next_packet() {
-            Ok(p) => ours.push((p.stream_index, p.time_base, p.data.len(), refcheck::md5_hex(&p.data), p.pts, p.dts, p.flags.keyframe)),
+            Ok(p) => ours.push((p.stream_index, p.time_base, p.data.len(), refcheck::md5_hex(&p.data), p.pts, p.dts, p.duration, p.flags.keyframe)),
             Err(oxideav_core::Error::Eof) => break,
             Err(e) => return Err(format!("{rel}: demux after {} packets: {e}", ours.len())),
         }
@@ -412,7 +440,7 @@ fn compare(path: &Path, rel: &str, format: &str, mode: Mode) -> Result<(), Strin
         return Err(format!("{rel}: streams at open {at_open:?}, after demuxing {at_end:?}"));
     }
 
-    let (ff_streams, mut ff_packets) = ffprobe(path, format, mode.unparsed);
+    let (ff_streams, mut ff_packets) = ffprobe(path, format, mode.unparsed, mode.port);
     if mode.keys {
         let flags = raw_video_flags(path, format);
         assert_eq!(flags.len(), ff_packets.len(), "{rel}: FFmpeg revisions disagree on packet count");
@@ -428,7 +456,7 @@ fn compare(path: &Path, rel: &str, format: &str, mode: Mode) -> Result<(), Strin
     if ours.len() != ff_packets.len() {
         return Err(format!("{rel}: {} packets, ffprobe {}", ours.len(), ff_packets.len()));
     }
-    for (n, (&(stream, tb, size, ref md5, pts, dts, key), want)) in ours.iter().zip(&ff_packets).enumerate() {
+    for (n, (&(stream, tb, size, ref md5, pts, dts, duration, key), want)) in ours.iter().zip(&ff_packets).enumerate() {
         let to = ff_streams[want.stream as usize].time_base;
         let tb = if tb.den() == 0 { time_bases[stream as usize] } else { tb };
         let got = Pkt {
@@ -437,10 +465,12 @@ fn compare(path: &Path, rel: &str, format: &str, mode: Mode) -> Result<(), Strin
             md5: md5.clone(),
             pts: pts.map(|t| rescale(t, tb, to)),
             dts: dts.map(|t| rescale(t, tb, to)),
+            duration: duration.map(|t| rescale(t, tb, to)),
             key,
         };
         if got.stream != want.stream || got.size != want.size || got.md5 != want.md5
             || (mode.times && (got.pts != want.pts || got.dts != want.dts))
+            || (mode.durations && got.duration != want.duration)
             || (mode.keys && got.key != want.key)
         {
             return Err(format!("{rel}: packet {n}: ours {got:?}, ffprobe {want:?}"));
@@ -478,10 +508,56 @@ fn eac3() {
     check_inventory("eac3", &["eac3", "ec3"], CONTAINER);
 }
 
-/// Raw MPEG-1/2 video: the frames FFmpeg's mpegvideo parser cuts.
+/// Raw MPEG-1/2 video: the frames FFmpeg's mpegvideo parser cuts, timed
+/// as FFmpeg 2da55bf's demuxer layer times them. Without B-frame delay a
+/// frame's pts is its dts; with it, I- and P-frames have no pts and B-frames
+/// pts = dts, dts following the previous I/P frame's duration. MPEG-2
+/// declares the delay in its sequence extension; for MPEG-1 FFmpeg learns
+/// it from its decoder once the first picture is read, or from the first
+/// B-frame. Durations count fields, repeated ones included.
+///
+/// The FATE inventory is MPEG-2 only, so FFmpeg also encodes MPEG-1 with
+/// and without B-frames, MPEG-1 small enough that the 1024-byte read that
+/// ends the first picture ends the next one too (stamped before FFmpeg's
+/// decoder has seen a picture), and MPEG-2 without B-frames, with and
+/// without the low-delay flag.
 #[test]
 fn mpegvideo() {
-    check_inventory("mpegvideo", &["m1v", "m2v", "mpv", "bs", "bits", "mpg", "mpeg"], RAW_VIDEO);
+    let inputs = inventory("mpegvideo", &["m1v", "m2v", "mpv", "bs", "bits", "mpg", "mpeg"]);
+    println!("mpegvideo: {} required FATE inputs: {}", inputs.len(), inputs.join(", "));
+    let mut failures: Vec<String> =
+        inputs.iter().filter_map(|rel| compare(&suite_path(rel), rel, "mpegvideo", RAW_MPEG).err()).collect();
+    let dir = std::env::temp_dir().join(format!("demux-misc-mpegvideo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let generated = [
+        ("mpeg1-bframes.m1v", "mpeg1video", "176x144", &["-bf", "2"][..]),
+        ("mpeg1-ippp.m1v", "mpeg1video", "176x144", &["-bf", "0"][..]),
+        ("mpeg1-small.m1v", "mpeg1video", "32x32", &["-bf", "2"][..]),
+        ("mpeg2-ippp.m2v", "mpeg2video", "176x144", &["-bf", "0"][..]),
+        ("mpeg2-low-delay.m2v", "mpeg2video", "176x144", &["-bf", "0", "-flags", "+low_delay"][..]),
+    ];
+    for (name, codec, size, args) in generated {
+        let path = dir.join(name);
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(format!("testsrc=duration=0.6:size={size}:rate=25"))
+            .args(["-c:v", codec])
+            .args(args)
+            .args(["-f", codec])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg must be on PATH");
+        assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        failures.extend(compare(&path, &format!("generated {name}"), "mpegvideo", RAW_MPEG).err());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        failures.is_empty(),
+        "mpegvideo: {} of {} inputs differ from FFmpeg:\n{}",
+        failures.len(),
+        inputs.len() + generated.len(),
+        failures.join("\n")
+    );
 }
 
 /// h264.mak (the conformance suite) and every other raw H.264 input:
