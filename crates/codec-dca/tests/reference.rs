@@ -1,5 +1,8 @@
-//! Reference tests: decode every FATE DTS sample through this crate's
-//! decoder and the `dtshd` / `dts` demuxers, and compare against FFmpeg.
+//! Reference tests: decode every FATE DTS sample of FFmpeg's dca.mak and
+//! compare against FFmpeg. The DTS-HD suite and the raw master go
+//! through this crate's decoder and its `dtshd` / `dts` demuxers;
+//! fate-dca-core (dts/dts.ts) and fate-dts_es (dts/dts_es.dts) go
+//! through the player's whole registry, container probe included.
 //!
 //! The XLL (DTS-HD MA) path is an integer port, so the lossless samples
 //! compare bit-exact: the interleaved PCM stream MD5 must equal FFmpeg's
@@ -13,7 +16,7 @@ use oxideav_core::{Frame, MediaType};
 use refcheck::{decode, fate};
 
 fn registrars() -> Vec<refcheck::Registrar> {
-    vec![codec_dca::register, oxideav_mpegts::register]
+    vec![codec_dca::register]
 }
 
 /// Interleaved PCM bytes of every decoded audio frame (one `data[0]`
@@ -277,66 +280,239 @@ fn lossy_xxch_71_24_48_2046() {
     lossy_suite_sample("xxch_71_24_48_2046");
 }
 
-// fate-dca-core (dts.ts via MPEG-TS): the TS carries DTS as stream type
-// 0x06 (private data) with no registration descriptor, which
-// oxideav-mpegts drops. Queued as an oxideav-mpegts fix; the dts.ts
-// sample is intentionally not tested in this crate until that lands.
+// ─────────────── fate-dca-core and fate-dts_es, through the player ───────────────
+//
+// dts/dts.ts carries DTS as MPEG-TS stream type 0x06 (private PES) with no
+// ES_info descriptor at all; the TS demuxer identifies it from the payload
+// the way FFmpeg probes such streams. dts/dts_es.dts is raw core + XCh.
+// Both open with the production registry: the probe picks the container,
+// the registry resolves the decoder, and every decoded sample is compared
+// with FFmpeg's decode of the same file.
+
+/// The channel count FFmpeg's decoder reports for stream `0:a:0` (MPEG-TS
+/// input prints the stream once more inside its program).
+fn ffprobe_channels(path: &std::path::Path) -> usize {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    assert!(out.status.success(), "ffprobe {} failed", path.display());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().find(|l| !l.trim().is_empty()).expect("ffprobe reported no audio stream");
+    first.trim().parse().expect("ffprobe channel count")
+}
+
+fn production_decode_matches_ffmpeg(rel: &str, container: &str) {
+    let path = fate(rel);
+    let ctx = codecs::context();
+    assert_eq!(refcheck::probe_container(&ctx, &path).as_deref(), Ok(container), "{rel}: container");
+    let decoded = decode(&path, &[codecs::register_all], MediaType::Audio, 0);
+    assert_eq!(decoded.params.codec_id.as_str(), "dts", "{rel}: codec");
+    let ours = refcheck::interleaved_f32(&decoded);
+    let reference = refcheck::ffmpeg_audio_f32(&path, 0);
+    let channels = decoded.audio_format.map(|f| usize::from(f.channels));
+    assert_eq!(
+        (ours.len(), channels),
+        (reference.len(), Some(ffprobe_channels(&path))),
+        "{rel}: decoded samples and channels vs FFmpeg"
+    );
+    let snr = refcheck::snr_db(&reference, &ours, 0);
+    assert!(snr >= 90.0, "{rel}: SNR {snr:.2} dB < 90 dB vs FFmpeg");
+}
+
+/// dca.mak fate-dca-core: `pcm -i dts/dts.ts`.
+#[test]
+fn dca_core_mpegts() {
+    production_decode_matches_ffmpeg("dts/dts.ts", "mpegts");
+}
+
+/// dca.mak fate-dts_es: `pcm -i dts/dts_es.dts`.
+#[test]
+fn dts_es_raw() {
+    production_decode_matches_ffmpeg("dts/dts_es.dts", "dts");
+}
 
 // ───────────────────────── demuxer packet layout ─────────────────────────
 
-/// The `dtshd` demuxer must cut the same frames ffprobe reports
-/// (`ffprobe -show_packets` on xll_51_24_48_768.dtshd: 2 packets of 768
-/// samples at 48 kHz). Packet count and total sample coverage must match.
-#[test]
-fn dtshd_demuxer_packet_metadata() {
-    use oxideav_core::{ProbeData, RuntimeContext};
-    use std::fs::File;
-    use std::io::Read;
+/// One `ffprobe -show_packets` row.
+struct FfPacket {
+    stream: u32,
+    pts: Option<i64>,
+    dts: Option<i64>,
+    duration: Option<i64>,
+    size: usize,
+    md5: String,
+}
 
-    for (rel, rate) in [
-        ("dts/dcadec-suite/xll_51_24_48_768.dtshd", 48_000u32),
-        ("dts/dcadec-suite/xll_51_16_192_768_0.dtshd", 192_000),
-        ("dts/dcadec-suite/core_51_24_48_768_0.dtshd", 48_000),
-    ] {
-        let path = fate(rel);
+/// One `ffprobe -show_streams` row.
+struct FfStream {
+    codec_name: String,
+    time_base: (i64, i64),
+    start_pts: Option<i64>,
+    duration_ts: Option<i64>,
+}
+
+/// FFmpeg's demuxed-and-parsed packet table for `path`, as `ffprobe
+/// -show_packets -show_streams` prints it. Fails unless ffprobe succeeds
+/// and reports at least one stream and one packet.
+fn ffprobe_table(path: &std::path::Path) -> (Vec<FfStream>, Vec<FfPacket>) {
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-show_data_hash", "md5", "-show_entries"])
+        .arg(
+            "stream=codec_name,time_base,start_pts,duration_ts:\
+             packet=stream_index,pts,dts,duration,size,data_hash",
+        )
+        .args(["-of", "compact"])
+        .arg(path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    assert!(
+        out.status.success(),
+        "ffprobe {} failed: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ts = |v: &str| if v == "N/A" { None } else { Some(v.parse::<i64>().unwrap()) };
+    let (mut streams, mut packets) = (Vec::new(), Vec::new());
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut fields = line.split('|');
+        let section = fields.next().unwrap_or("");
+        let kv: std::collections::HashMap<&str, &str> =
+            fields.filter_map(|f| f.split_once('=')).collect();
+        match section {
+            "packet" => packets.push(FfPacket {
+                stream: kv["stream_index"].parse().unwrap(),
+                pts: ts(kv["pts"]),
+                dts: ts(kv["dts"]),
+                duration: ts(kv["duration"]),
+                size: kv["size"].parse().unwrap(),
+                md5: kv["data_hash"].trim_start_matches("MD5:").to_string(),
+            }),
+            "stream" => {
+                let (num, den) = kv["time_base"].split_once('/').unwrap();
+                streams.push(FfStream {
+                    codec_name: kv["codec_name"].to_string(),
+                    time_base: (num.parse().unwrap(), den.parse().unwrap()),
+                    start_pts: ts(kv["start_pts"]),
+                    duration_ts: ts(kv["duration_ts"]),
+                });
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        !streams.is_empty() && !packets.is_empty(),
+        "ffprobe {}: empty oracle ({} streams, {} packets)",
+        path.display(),
+        streams.len(),
+        packets.len()
+    );
+    (streams, packets)
+}
+
+/// `a` ticks of time base `ta` and `b` ticks of `tb` name the same instant.
+fn same_time(a: Option<i64>, ta: (i64, i64), b: Option<i64>, tb: (i64, i64)) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            i128::from(a) * i128::from(ta.0) * i128::from(tb.1)
+                == i128::from(b) * i128::from(tb.0) * i128::from(ta.1)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Every DTS-HD input of FFmpeg's dca.mak (DCADEC_SUITE_LOSSLESS_16,
+/// DCADEC_SUITE_LOSSLESS_24 and DCADEC_SUITE_LOSSY).
+const DTSHD_SUITE: [&str; 19] = [
+    "xll_51_16_192_768_0",
+    "xll_51_16_192_768_1",
+    "xll_51_24_48_768",
+    "xll_51_24_48_none",
+    "xll_71_24_48_768_0",
+    "xll_71_24_48_768_1",
+    "xll_71_24_96_768",
+    "xll_x96_51_24_96_1509",
+    "xll_xch_61_24_48_768",
+    "core_51_24_48_768_0",
+    "core_51_24_48_768_1",
+    "x96_51_24_96_1509",
+    "x96_xch_61_24_96_3840",
+    "x96_xxch_71_24_96_3840",
+    "xbr_51_24_48_3840",
+    "xbr_xch_61_24_48_3840",
+    "xbr_xxch_71_24_48_3840",
+    "xch_61_24_48_768",
+    "xxch_71_24_48_2046",
+];
+
+/// The `dtshd` demuxer cuts the frames FFmpeg's dca parser cuts and times
+/// them as libavformat does (FATE's dca-xll tests check the same
+/// `packet=pts,duration` table): for every DTS-HD sample, the stream's
+/// codec, time base, start time and duration match `ffprobe`, and each
+/// packet's size, payload MD5, pts, dts and duration match, rescaled
+/// through both time bases. The packet durations cover the stream's whole
+/// duration.
+#[test]
+fn dtshd_demuxer_packet_tables_match_ffprobe() {
+    use oxideav_core::{RuntimeContext, TimeBase};
+
+    for name in DTSHD_SUITE {
+        let path = fate(&format!("dts/dcadec-suite/{name}.dtshd"));
+        let (ff_streams, ff_packets) = ffprobe_table(&path);
+
         let mut ctx = RuntimeContext::new();
         codec_dca::register(&mut ctx);
-        let mut head = vec![0u8; 256 * 1024];
-        let n = File::open(&path)
-            .and_then(|mut f| f.read(&mut head))
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let probe = ProbeData {
-            buf: &head[..n],
-            ext: Some("dtshd"),
-        };
-        let candidates = ctx.containers.probe_candidates(&probe);
-        let format = match candidates.first() {
-            Some(c) if c.score >= oxideav_core::PROBE_SCORE_EXTENSION => c.name.to_string(),
-            _ => "dtshd".to_string(),
-        };
-        let file = File::open(&path).unwrap();
+        let format = refcheck::probe_container(&ctx, &path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(format, "dtshd", "{name}: container");
+        let file = std::fs::File::open(&path).unwrap();
         let mut demuxer = ctx
             .containers
             .open_demuxer(&format, Box::new(file), &ctx.codecs)
-            .unwrap_or_else(|e| panic!("open {format}: {e}"));
-        assert_eq!(demuxer.streams()[0].time_base.den(), i64::from(rate), "{rel}: time base");
+            .unwrap_or_else(|e| panic!("{name}: open: {e}"));
 
-        let mut count = 0usize;
-        let mut samples = 0u64;
-        while let Ok(packet) = demuxer.next_packet() {
-            samples += packet.data.len() as u64;
-            count += 1;
+        assert_eq!(demuxer.streams().len(), ff_streams.len(), "{name}: stream count");
+        let stream = demuxer.streams()[0].clone();
+        let ff = &ff_streams[0];
+        let tb = |t: TimeBase| (t.num(), t.den());
+        assert_eq!(stream.params.codec_id.as_str(), ff.codec_name, "{name}: codec");
+        assert_eq!(tb(stream.time_base), ff.time_base, "{name}: time base");
+        assert!(
+            same_time(stream.start_time, tb(stream.time_base), ff.start_pts, ff.time_base),
+            "{name}: start time {:?} vs ffprobe {:?}",
+            stream.start_time,
+            ff.start_pts
+        );
+        assert!(
+            same_time(stream.duration, tb(stream.time_base), ff.duration_ts, ff.time_base),
+            "{name}: duration {:?} vs ffprobe {:?}",
+            stream.duration,
+            ff.duration_ts
+        );
+
+        let mut ours = Vec::new();
+        loop {
+            match demuxer.next_packet() {
+                Ok(p) => ours.push(p),
+                Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("{name}: demux: {e}"),
+            }
         }
-        // ffprobe: STRMDATA extent read as 1024-byte packets.
-        let expect_packets = {
-            let out = std::process::Command::new("ffprobe")
-                .args(["-v", "error", "-show_packets", "-of", "csv"])
-                .arg(&path)
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).lines().count()
-        };
-        assert_eq!(count, expect_packets, "{rel}: packet count vs ffprobe");
-        assert!(samples > 0, "{rel}: no data demuxed");
+        assert_eq!(ours.len(), ff_packets.len(), "{name}: packet count");
+        for (i, (p, f)) in ours.iter().zip(&ff_packets).enumerate() {
+            let ptb = tb(p.time_base);
+            assert_eq!(p.stream_index, f.stream, "{name}: packet {i} stream");
+            assert_eq!(p.data.len(), f.size, "{name}: packet {i} size");
+            assert_eq!(refcheck::md5_hex(&p.data), f.md5, "{name}: packet {i} payload");
+            for (what, a, b) in [("pts", p.pts, f.pts), ("dts", p.dts, f.dts), ("duration", p.duration, f.duration)] {
+                assert!(
+                    same_time(a, ptb, b, ff.time_base),
+                    "{name}: packet {i} {what} {a:?} vs ffprobe {b:?}"
+                );
+            }
+        }
+        let covered: i64 = ff_packets.iter().map(|f| f.duration.unwrap_or(0)).sum();
+        assert_eq!(Some(covered), ff.duration_ts, "{name}: packet durations vs stream duration");
     }
 }

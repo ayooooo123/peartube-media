@@ -1,12 +1,15 @@
-// Ported from FFmpeg libavformat/mpegvideodec.c (commit 2da55bf)
+// Ported from FFmpeg libavformat/mpegvideodec.c (commit 2da55bf); packets
+// are the frames of FFmpeg's mpegvideo parser (see rawvideo.rs).
 // License: LGPL-2.1-or-later
 
 use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
-    Packet, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo, TimeBase,
+    ProbeData, ProbeScore, ReadSeek, Result, StreamInfo, TimeBase,
     PROBE_SCORE_EXTENSION,
 };
+
+use crate::rawvideo::{MpegVideo, RawVideoDemuxer, RAW_VIDEO_CLOCK};
 
 const SEQ_START_CODE: u32 = 0x000001B3;
 const PICTURE_START_CODE: u32 = 0x00000100;
@@ -15,18 +18,6 @@ const SLICE_START_CODE_MAX: u32 = 0x000001AF;
 const PACK_START_CODE: u32 = 0x000001BA;
 const VIDEO_ID: u32 = 0x000001E0;
 const AUDIO_ID: u32 = 0x000001C0;
-
-const FRAME_RATES: [(u32, u32); 9] = [
-    (0, 0),
-    (24000, 1001),
-    (24, 1),
-    (25, 1),
-    (30000, 1001),
-    (30, 1),
-    (50, 1),
-    (60000, 1001),
-    (60, 1),
-];
 
 pub fn probe_mpegvideo(probe: &ProbeData) -> ProbeScore {
     let p = probe.buf;
@@ -98,16 +89,11 @@ pub fn probe_mpegvideo(probe: &ProbeData) -> ProbeScore {
     }
 }
 
-pub struct MpegVideoDemuxer {
-    input: Box<dyn ReadSeek>,
-    streams: Vec<StreamInfo>,
-    buffer: Vec<u8>,
-    pts: i64,
-    eof_reached: bool,
-    /// Whether the first picture (with any leading sequence header) shipped.
-    first_picture_emitted: bool,
-}
-
+/// ff_raw_video_read_header, with the stream parameters FFmpeg's parser
+/// reports: MPEG-2 once a sequence extension follows the first sequence
+/// header, and its size. Time base 1/1200000, as FFmpeg's: packets are
+/// timed in it as FFmpeg times them (see rawvideo.rs), in fields, which
+/// a repeated field can make one and a half frames.
 pub fn open_mpegvideo(
     mut input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
@@ -123,19 +109,12 @@ pub fn open_mpegvideo(
     let mut is_mpeg2 = false;
     let mut width = 0;
     let mut height = 0;
-    let mut fps_num = 25;
-    let mut fps_den = 1;
 
     for i in 0..n.saturating_sub(7) {
         if head[i] == 0 && head[i + 1] == 0 && head[i + 2] == 1 && head[i + 3] == 0xB3 {
             seq_offset = Some(i);
             width = ((head[i + 4] as u32) << 4) | ((head[i + 5] as u32) >> 4);
             height = (((head[i + 5] as u32) & 0x0F) << 8) | (head[i + 6] as u32);
-            let fps_idx = (head[i + 7] & 0x0F) as usize;
-            if fps_idx > 0 && fps_idx < FRAME_RATES.len() {
-                fps_num = FRAME_RATES[fps_idx].0;
-                fps_den = FRAME_RATES[fps_idx].1;
-            }
             break;
         }
     }
@@ -153,7 +132,7 @@ pub fn open_mpegvideo(
         }
     }
 
-    input.seek(SeekFrom::Start(seq_pos as u64))?;
+    input.seek(SeekFrom::Start(0))?;
 
     let codec_id = if is_mpeg2 {
         CodecId::new("mpeg2video")
@@ -168,125 +147,11 @@ pub fn open_mpegvideo(
     let stream = StreamInfo {
         index: 0,
         params,
-        time_base: TimeBase::new(fps_den as i64, fps_num as i64),
+        time_base: TimeBase::new(1, RAW_VIDEO_CLOCK),
         duration: None,
         start_time: Some(0),
     };
-
-    Ok(Box::new(MpegVideoDemuxer {
-        input,
-        streams: vec![stream],
-        buffer: Vec::with_capacity(64 * 1024),
-        pts: 0,
-        eof_reached: false,
-        first_picture_emitted: false,
-    }))
-}
-
-impl Demuxer for MpegVideoDemuxer {
-    fn format_name(&self) -> &str {
-        "mpegvideo"
-    }
-
-    fn streams(&self) -> &[StreamInfo] {
-        &self.streams
-    }
-
-    fn next_packet(&mut self) -> Result<Packet> {
-        let mut chunk = [0u8; 16 * 1024];
-
-        // We want to return one picture per packet.
-        // A picture packet starts at picture_start_code (or sequence_start_code on the first frame)
-        // and ends before the NEXT picture_start_code or EOF.
-        loop {
-            // Check if we have a full picture in buffer
-            if self.buffer.len() >= 4 {
-                // Find where the first picture start code is
-                let first_pic = self.find_picture_start(0);
-                if let Some(first_pos) = first_pic {
-                    // Look for the NEXT picture start code after first_pos + 4
-                    if let Some(second_pos) = self.find_picture_start(first_pos + 4) {
-                        // Any leading sequence/GOP header before the first
-                        // picture groups with the first picture's packet (the
-                        // way FFmpeg's parser groups it): when nothing has been
-                        // emitted yet the packet starts at 0 and must reach the
-                        // picture AFTER the headers, i.e. end at the second
-                        // picture start.
-                        let (start, end) = if !self.first_picture_emitted {
-                            let end = self
-                                .find_picture_start(second_pos + 4)
-                                .unwrap_or(self.buffer.len());
-                            (0, end)
-                        } else {
-                            (first_pos, second_pos)
-                        };
-                        self.first_picture_emitted = true;
-                        let packet_data = self.buffer[start..end.max(start + 1)].to_vec();
-                        self.buffer.drain(..end.max(start + 1));
-                        let mut pkt = Packet {
-                            stream_index: 0,
-                            time_base: self.streams[0].time_base,
-                            pts: Some(self.pts),
-                            dts: Some(self.pts),
-                            duration: Some(1),
-                            flags: Default::default(),
-                            data: packet_data,
-                        };
-                        pkt.flags.keyframe = true;
-                        self.pts += 1;
-                        return Ok(pkt);
-                    }
-                }
-            }
-
-            if self.eof_reached {
-                // Flush the remainder as the final packet only when it holds
-                // actual picture data; trailing header/end codes (sequence
-                // end, padding) attach to nothing and are dropped.
-                let has_picture = self.find_picture_start(0).is_some();
-                if !self.buffer.is_empty() && has_picture {
-                    let packet_data = std::mem::take(&mut self.buffer);
-                    let mut pkt = Packet {
-                        stream_index: 0,
-                        time_base: self.streams[0].time_base,
-                        pts: Some(self.pts),
-                        dts: Some(self.pts),
-                        duration: Some(1),
-                        flags: Default::default(),
-                        data: packet_data,
-                    };
-                    pkt.flags.keyframe = true;
-                    self.pts += 1;
-                    return Ok(pkt);
-                }
-                return Err(Error::Eof);
-            }
-
-            let n = self.input.read(&mut chunk)?;
-            if n == 0 {
-                self.eof_reached = true;
-            } else {
-                if self.buffer.len() + n > 16 * 1024 * 1024 {
-                    return Err(Error::invalid("mpegvideo: frame size exceeded maximum"));
-                }
-                self.buffer.extend_from_slice(&chunk[..n]);
-            }
-        }
-    }
-}
-
-impl MpegVideoDemuxer {
-    fn find_picture_start(&self, from: usize) -> Option<usize> {
-        if self.buffer.len() < from + 4 {
-            return None;
-        }
-        (from..self.buffer.len() - 3).find(|&i| {
-            self.buffer[i] == 0
-                && self.buffer[i + 1] == 0
-                && self.buffer[i + 2] == 1
-                && (self.buffer[i + 3] == 0x00 || (from == 0 && self.buffer[i + 3] == 0xB3))
-        })
-    }
+    Ok(Box::new(RawVideoDemuxer::new("mpegvideo", input, stream, MpegVideo::default())))
 }
 
 pub fn register(reg: &mut ContainerRegistry) {
