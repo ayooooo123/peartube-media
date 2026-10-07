@@ -93,6 +93,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-decoders"
+version = "0.1.0"
+dependencies = [
+ "demux-misc",
+ "oxideav-ac3",
+ "oxideav-core",
+ "oxideav-h264",
+ "oxideav-mp2",
+ "refcheck",
+]
+
+[[package]]
 name = "check-mkv"
 version = "0.1.0"
 dependencies = [
@@ -1029,7 +1041,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h264"
 version = "0.1.8"
-source = "git+https://github.com/OxideAV/oxideav-h264?rev=9392f7330f2bccafdc3cd175e16f568abbed9430#9392f7330f2bccafdc3cd175e16f568abbed9430"
+source = "git+https://github.com/ayooooo123/oxideav-h264?rev=103743224259f2b8663dc882fa60a18cd95c134a#103743224259f2b8663dc882fa60a18cd95c134a"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",
@@ -1140,7 +1152,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mp2"
 version = "0.0.10"
-source = "git+https://github.com/OxideAV/oxideav-mp2?rev=701c9e6b7b3bce9c72e56453633b53429c387180#701c9e6b7b3bce9c72e56453633b53429c387180"
+source = "git+https://github.com/ayooooo123/oxideav-mp2?rev=1f335d02e92ecee338945777e8f5f9b483bef22a#1f335d02e92ecee338945777e8f5f9b483bef22a"
 dependencies = [
  "oxideav-core",
 ]
