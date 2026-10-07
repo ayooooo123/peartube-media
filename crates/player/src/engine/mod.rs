@@ -1977,12 +1977,26 @@ fn run_video_thread(
         }
         need_keyframe = false;
 
-        if compressed {
-            // A packet without a timestamp follows the previous one.
-            let pts = match packet.pts.or(packet.dts) {
-                Some(ticks) => Duration::from_secs_f64(stream.time_base.seconds_of(ticks.max(0)).max(0.0)),
-                None => last_end,
+        if compressed && packet.pts.is_none() {
+            // A platform decoder presents each picture at its input's
+            // timestamp. Raw elementary streams leave reference pictures
+            // untimed (only their decode order is known), so only the
+            // software decoder can time them: switch before pushing.
+            sink.flush();
+            compressed = false;
+            sw_decoder = match software_fallback(&shared, &stream, &mut *sink) {
+                Some(d) => Some(d),
+                None => return,
             };
+            if !random_access {
+                need_keyframe = true;
+                continue;
+            }
+        }
+
+        if compressed {
+            let ticks = packet.pts.unwrap_or(0).max(0);
+            let pts = Duration::from_secs_f64(stream.time_base.seconds_of(ticks).max(0.0));
             if primed != Some(seen_seek) {
                 primed = Some(seen_seek);
                 shared.pipe_primed(Pipe::Video, seen_seek);
@@ -2011,21 +2025,10 @@ fn run_video_thread(
                     // next keyframe.
                     compressed = false;
                     need_keyframe = true;
-                    match make_decoder(&shared.ctx, &stream.params) {
-                        Ok(d) => {
-                            let _ = sink.open_frames(&stream.params);
-                            sw_decoder = Some(d);
-                        }
-                        Err(e) => {
-                            let mut st = shared.state.lock();
-                            let _ = st
-                                .error
-                                .get_or_insert_with(|| format!("video fallback failed: {e}"));
-                            drop(st);
-                            notify_changed(&shared);
-                            return;
-                        }
-                    }
+                    sw_decoder = match software_fallback(&shared, &stream, &mut *sink) {
+                        Some(d) => Some(d),
+                        None => return,
+                    };
                 }
                 Err(SinkError::Fatal(f)) => {
                     set_error(&shared, format!("video fatal error: {f}"));
@@ -2208,4 +2211,27 @@ fn present_frame(
     sync_video_sink(sink, shared, sink_running);
     let _ = sink.push_frame(frame, pts);
     true
+}
+
+/// The software decoder for `stream` after its platform decoder gave up,
+/// with the sink switched to frames. `None` (error recorded) when there is
+/// no software decoder.
+fn software_fallback(
+    shared: &SharedState,
+    stream: &StreamInfo,
+    sink: &mut dyn VideoSink,
+) -> Option<Box<dyn oxideav_core::Decoder>> {
+    match make_decoder(&shared.ctx, &stream.params) {
+        Ok(d) => {
+            let _ = sink.open_frames(&stream.params);
+            Some(d)
+        }
+        Err(e) => {
+            let mut st = shared.state.lock();
+            let _ = st.error.get_or_insert_with(|| format!("video fallback failed: {e}"));
+            drop(st);
+            notify_changed(shared);
+            None
+        }
+    }
 }
