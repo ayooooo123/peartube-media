@@ -42,6 +42,9 @@ pub(crate) struct Unit {
     /// the unit came out (0 when it does not tell).
     pub samples: i64,
     pub sample_rate: u32,
+    /// Where the unit starts in the input (the parser's frame_offset,
+    /// which raw demuxers make the packet position and index).
+    pub pos: i64,
 }
 
 /// AV_PARSER_PTS_NB: demuxed packets whose timestamps are remembered.
@@ -149,7 +152,7 @@ impl<S: Split> Parser<S> {
             ts.next_frame_offset = ts.cur_offset + index as i64;
             ts.fetch_timestamp = true;
             let (samples, sample_rate) = self.split.audio();
-            out.push(Unit { data, pts: ts.out_pts, dts: ts.out_dts, samples, sample_rate });
+            out.push(Unit { data, pts: ts.out_pts, dts: ts.out_dts, samples, sample_rate, pos: ts.frame_offset });
         }
         let index = index.max(0) as usize;
         ts.cur_offset += index as i64;
@@ -664,6 +667,13 @@ pub(crate) struct AudioClock {
 impl AudioClock {
     pub fn new(num: i64, den: i64, wrap_bits: u32) -> Self {
         Self { num, den, wrap_bits, cur_dts: RELATIVE_TS_BASE, first_dts: None, initial_durations_done: false }
+    }
+
+    /// ff_read_frame_flush then avpriv_update_cur_dts: after a seek the
+    /// clock runs on from the landing timestamp `ts`, which is absolute,
+    /// so no later packet revises those before it.
+    pub fn seeked(&mut self, ts: i64) {
+        self.cur_dts = ts;
     }
 
     /// The packet of `unit` on stream `index`, timed. `queue` holds the
