@@ -55,9 +55,10 @@ fn dtshd_frames(name: &str) -> Vec<Packet> {
     demux_all("dtshd", Box::new(std::fs::File::open(path).unwrap()))
 }
 
-/// A file in this test run's scratch directory.
+/// A file in this test run's scratch directory, under the directory Cargo
+/// gives integration tests; each test removes its files after use.
 fn scratch(name: &str, bytes: &[u8]) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("codec-dca-streaming-{}", std::process::id()));
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("codec-dca-streaming-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     std::fs::write(&path, bytes).unwrap();
@@ -548,10 +549,11 @@ fn dtshd_decoded_frames_carry_ffmpegs_trimmed_timestamps() {
         let theirs = ffmpeg_frames(path);
         if ours.frames != theirs {
             failures.push(format!("{name}: ours {:?}\n  FFmpeg {:?}", ours.frames, theirs));
-            continue;
+        } else if *compare_pcm {
+            assert_pcm_matches(name, path, &ours);
         }
         if *compare_pcm {
-            assert_pcm_matches(name, path, &ours);
+            let _ = std::fs::remove_file(path);
         }
     }
     assert!(failures.is_empty(), "{} of {} inputs differ from FFmpeg's decoded frames:\n{}", failures.len(), cases.len(), failures.join("\n"));
