@@ -133,9 +133,11 @@ text and timing work, but exposing side data alone is not end-to-end support.
 
 `cargo test -p check-mkv -p player --no-fail-fast` compares packet fields
 directly with FFmpeg 9, checks incremental reads and malformed input, and
-exercises player subtitle dispatch. Known-wrong packet digests are not accepted:
-outstanding CodecDelay timestamp differences remain failing assertions until
-the separate AudioTrim work supplies the missing behavior.
+exercises player subtitle dispatch. Known-wrong packet digests are not accepted;
+every packet field of the 69 samples equals FFmpeg's, CodecDelay-shifted
+timestamps included. The MKV demuxer exposes CodecDelay, DiscardPadding and
+SeekPreRoll as `PacketMetadata::audio_trim` for the AudioTrim consumer, which
+lives on another branch.
 
 
 ## Licenses
