@@ -7,10 +7,9 @@
 //! The per-sample diagnostics distinguish that dependency from regressions
 //! in packet counts, payload reconstruction, lacing and video timestamps.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use check_mkv::{Pkt, corpus_samples, ffprobe_packets, our_packets, FATE_SAMPLES};
+use check_mkv::{corpus_samples, differences, ffprobe_packets, our_packets, FATE_SAMPLES};
 
 /// Coverage inventory, not expected packet values. Missing samples fail too.
 const EXPECTED_SAMPLES: &[&str] = &[
@@ -93,45 +92,6 @@ fn samples() -> Vec<(String, PathBuf)> {
         out.push((format!("gen:{name}"), path));
     }
     out
-}
-
-/// Compare every contracted field directly with the oracle, retaining all
-/// failures so a timestamp dependency cannot hide a payload/count regression.
-fn differences(ours: &[Pkt], theirs: &[Pkt], error: &Option<String>) -> String {
-    let mut parts = Vec::new();
-    if let Some(e) = error {
-        parts.push(format!("error: {e}"));
-    }
-    let streams: BTreeSet<u32> = ours.iter().chain(theirs).map(|p| p.stream).collect();
-    for s in streams {
-        let a: Vec<&Pkt> = ours.iter().filter(|p| p.stream == s).collect();
-        let b: Vec<&Pkt> = theirs.iter().filter(|p| p.stream == s).collect();
-        let mut diffs = Vec::new();
-        if a.len() != b.len() {
-            diffs.push(format!("count {}/{}", a.len(), b.len()));
-        }
-        let n = a.len().min(b.len());
-        let fields: [(&str, fn(&Pkt, &Pkt) -> bool); 5] = [
-            ("pts", |x, y| x.pts == y.pts),
-            ("dts", |x, y| x.dts == y.dts),
-            ("size", |x, y| x.size == y.size),
-            ("key", |x, y| x.keyframe == y.keyframe),
-            ("md5", |x, y| x.md5 == y.md5),
-        ];
-        for (name, same) in fields {
-            let k = (0..n).filter(|&i| !same(a[i], b[i])).count();
-            if k > 0 {
-                diffs.push(format!("{name} {k}/{n}"));
-            }
-        }
-        if !diffs.is_empty() {
-            parts.push(format!("s{s}: {}", diffs.join(", ")));
-        }
-    }
-    if ours.iter().map(|p| p.stream).ne(theirs.iter().map(|p| p.stream)) {
-        parts.push("order".into());
-    }
-    parts.join("; ")
 }
 
 #[test]

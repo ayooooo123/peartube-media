@@ -952,7 +952,7 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.1.37"
-source = "git+https://github.com/ayooooo123/oxideav-core?rev=80948860b817c416ca405430e890a8f8cda9d6a3#80948860b817c416ca405430e890a8f8cda9d6a3"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=a6ccbf96af9e8aad594becbfd5a9ae08435ecd35#a6ccbf96af9e8aad594becbfd5a9ae08435ecd35"
 dependencies = [
  "bytemuck",
  "serde_json",
@@ -1105,7 +1105,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=dfd6e930b001c67a720ac87cd2e1dc0592272682#dfd6e930b001c67a720ac87cd2e1dc0592272682"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=f85c19af42696a4dab5c1a4074b2ab6108df1239#f85c19af42696a4dab5c1a4074b2ab6108df1239"
 dependencies = [
  "compcol",
  "oxideav-core",

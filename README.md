@@ -48,25 +48,36 @@ The MKV fork follows at most two SeekHeads (one target per other master),
 recovers complete packets from damaged Cluster tails, reconstructs ProRes/WavPack
 payloads, and derives lace timing, TrackTimestampScale and H.264/HEVC decode
 timestamps. Untrusted input is bounded: 256 tracks, 4 MiB per CodecPrivate and
-16 MiB in total, 32 MiB retained per Block (laces, header stripping, copies and
-side data), and H.264 startup analysis holds at most 1024 packets / 512 KiB
-plus the current Block. Transport errors are returned rather than treated as
-end of stream.
+16 MiB in total, and 32 MiB retained per Block (payload capacity, laces,
+header stripping, copies, side data and packet slots). The 1024-packet cap
+counts virtual-track copies: compliant Blocks wait until held packets drain;
+an individual Block needing more than 1024 packets is InvalidData and queues
+nothing. Startup analysis also stops at a 512 KiB retained-byte threshold,
+plus the bounded current Block. Source errors propagate, including ordinary
+InvalidInput reads and source-generated UnexpectedEof; physical truncation
+remains recoverable.
 
-Two playback gaps remain at this boundary. Packets keep FFmpeg's parser keyframe
-flags, so a non-IDR I-frame that the container marks as a random-access point
-(no recovery-point SEI, several reference frames) is not a key packet. The
-engine's post-seek keyframe gate needs the Block's own keyframe signal through
-the shared packet-metadata integration. Separately, later laces of AAC, MP3,
-AC-3 and DTS Blocks without DefaultDuration still lack the PTS that FFmpeg
-derives from codec frame durations.
+Packets keep FFmpeg's parser keyframe flags. The shared
+`Demuxer::packet_metadata()` snapshot separately carries the container's
+random-access signal on lace 0. The producer test checks all four Cues
+points, including parser-keyframe=false/container-keyframe=true at 4 s.
+The actual Player regression compares every one of FFmpeg's 100 post-seek
+frame MD5s. **The engine/native-gate consumer integration is separate and
+not included on this branch**; the unchanged engine still fails this test.
+
+Duration-less AAC/HE-AAC, MP3 (including MPEG-2), AC-3/E-AC-3 and DTS core
+laces now match strict FFprobe packet comparisons on nine generated/real
+fixtures, including millisecond time bases. AAC 960-sample/LD/ELD/USAC and
+14-bit/substream-only DTS frame timing are not inferred.
 
 Matroska/WebM WebVTT packets carry raw cue text to the registered subtitle
-adapter, which uses the packet timestamps rather than requiring an in-band
-WebVTT timing line. The typed `MkvDemuxer::webvtt_metadata()` accessor preserves
-each cue's identifier/settings across lacing and seeks. **The generic
-`Demuxer`/`Packet` path does not transport these settings**, so player cue text
-and timing work but WebVTT settings/layout are not yet end-to-end compatible.
+adapter, which uses packet timestamps rather than an in-band timing line.
+`Demuxer::packet_metadata().webvtt` replaces the typed-only accessor and
+preserves each cue's identifier/settings through lacing and seeks. The
+accessor clears before the next read/seek, including errors and EOF;
+previously captured owned snapshots remain valid.
+**WebVTT settings/layout still need consumer rendering integration**; cue
+text and timing work, but exposing side data alone is not end-to-end support.
 
 `cargo test -p check-mkv -p player --no-fail-fast` compares packet fields
 directly with FFmpeg 9, checks incremental reads and malformed input, and
