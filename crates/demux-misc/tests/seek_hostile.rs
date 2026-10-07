@@ -238,6 +238,7 @@ fn voc_landings_past_the_index_cap_stay_ffmpegs() {
         let target = format!("{}", ts as f64 / 8000.0);
         let want: Vec<Pkt> =
             ffprobe_packets(&path, &["-read_intervals", &format!("%+#{all},{target}%+#3")]).split_off(all);
+        assert_eq!(want.len(), 3, "FFmpeg's 3 packets after the seek to {ts}");
         let mut demuxer = open_bytes("voc", data.clone());
         for _ in 0..all {
             demuxer.next_packet().unwrap();
@@ -265,6 +266,7 @@ fn nut_index_over_4096_bytes_gives_ffmpegs_landings() {
     let data = std::fs::read(&path).unwrap();
     for target in ["3.33", "10.01", "33.3"] {
         let want = ffprobe_packets(&path, &["-fflags", "+noparse+nofillin", "-read_intervals", &format!("{target}%+#6")]);
+        assert_eq!(want.len(), 6, "FFmpeg's 6 packets after the seek to {target}");
         let mut demuxer = open_bytes("nut", data.clone());
         // ffprobe seeks the default stream, the video.
         let video = demuxer.streams().iter().position(|s| s.params.media_type == oxideav_core::MediaType::Video).unwrap();
@@ -321,6 +323,7 @@ fn av1_units_cbs_rejects_are_not_key() {
     }
     let path = scratch("av1-rejected-units.ivf", &data);
     let want: Vec<bool> = ffprobe_packets(&path, &[]).iter().map(|p| p.key).collect();
+    assert_eq!(want.len(), 4, "FFmpeg's 4 units");
     let mut demuxer = open_bytes("ivf", data);
     let got: Vec<bool> = std::iter::from_fn(|| demuxer.next_packet().ok()).map(|p| p.flags.keyframe).collect();
     assert_eq!(got, want, "key flags of: a valid key unit, a profile-7 header, a cut key frame, the valid unit");
