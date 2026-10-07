@@ -62,10 +62,15 @@ known network cost: their declared size has no limit). Optional metadata never
 stops playback: damage in Chapters, Attachments, Tags, Cues, a SeekHead or any
 other Top-Level master but Info and Tracks drops it, or cuts it to the records
 before the damage, with one damage event, in strict opens too; damage in the
-EBML header, the Segment, Info or Tracks still fails a strict open. Every
-element in a Tracks, Tags, Chapters, Cues or SeekHead tree must fit its parent.
-Only a Segment or Cluster may use the unknown size; any other Top-Level element
-doing so is damage (between Clusters, playback resumes at the next Cluster).
+EBML header, the Segment, Info or Tracks still fails a strict open. Junk where a
+Top-Level element should start, before the first Cluster, is skipped by either
+open with a forward scan, as FFmpeg's matroska_resync does, one damage event per
+run; the scans read at most 1 MiB in total, and a strict open fails only when
+one ends without finding an element. Every element in a Tracks, Tags, Chapters,
+Cues or SeekHead tree must fit its parent. Only a Segment or Cluster may use the
+unknown size; any other Top-Level element doing so, or running past its
+Segment, is damage (the walk rescans for what follows; between Clusters,
+playback resumes at the next Cluster).
 SegmentUUID, PrevUUID and NextUUID must be 16 octets. Text fields in Info,
 Chapters and Attachments hold at most 64 KiB, and each of these masters keeps
 at most 1 MiB. Past it, Chapters and Attachments keep the records that fit, in
