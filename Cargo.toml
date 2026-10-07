@@ -111,7 +111,7 @@ oxideav-flv = { git = "https://github.com/OxideAV/oxideav-flv", rev = "02e9158a2
 oxideav-g711 = { git = "https://github.com/OxideAV/oxideav-g711", rev = "72af018b7c04e8c3aacc6c0b7628cd6e43cde37a" }
 oxideav-h261 = { git = "https://github.com/OxideAV/oxideav-h261", rev = "bba9abb79f6e54cefa189ea92997a91dd46e1e56" }
 oxideav-h263 = { git = "https://github.com/OxideAV/oxideav-h263", rev = "25bf0a12102969034d57ab96f29e686d8d61ddc3" }
-oxideav-h264 = { git = "https://github.com/OxideAV/oxideav-h264", rev = "9392f7330f2bccafdc3cd175e16f568abbed9430" }
+oxideav-h264 = { git = "https://github.com/ayooooo123/oxideav-h264", rev = "103743224259f2b8663dc882fa60a18cd95c134a" }
 oxideav-h265 = { git = "https://github.com/ayooooo123/oxideav-h265", rev = "29cf54638f58ee3393474a172831c9c32582b7ad" }
 oxideav-http = { git = "https://github.com/OxideAV/oxideav-http", rev = "f54f106e1e131300387d1df1a71d2686690ccdca" }
 oxideav-id3 = { git = "https://github.com/OxideAV/oxideav-id3", rev = "d1b462e3da204f2010844648cf1a6bbc65f10dd0" }
@@ -124,7 +124,7 @@ oxideav-mkv = { git = "https://github.com/ayooooo123/oxideav-mkv", rev = "5f9ac5
 oxideav-mod = { git = "https://github.com/OxideAV/oxideav-mod", rev = "f509819bc977ac4d499fb95f1156bc536a9a964f" }
 oxideav-mov = { git = "https://github.com/OxideAV/oxideav-mov", rev = "deccbd8c6c728d9ab2bda6c70ffec22967884dc8" }
 oxideav-mp1 = { git = "https://github.com/OxideAV/oxideav-mp1", rev = "e01e2d0dfa651f39d5ba05ee3129b7144282dceb" }
-oxideav-mp2 = { git = "https://github.com/OxideAV/oxideav-mp2", rev = "701c9e6b7b3bce9c72e56453633b53429c387180" }
+oxideav-mp2 = { git = "https://github.com/ayooooo123/oxideav-mp2", rev = "1f335d02e92ecee338945777e8f5f9b483bef22a" }
 oxideav-mp3 = { git = "https://github.com/ayooooo123/oxideav-mp3", rev = "ba94ce70a7e6ddb37f02713b3ca34ed5b39f7cf0" }
 oxideav-mp4 = { git = "https://github.com/ayooooo123/oxideav-mp4", rev = "4fd2bca2f78a6f67238f9503d89f553588a59de3" }
 oxideav-mpeg12video = { git = "https://github.com/ayooooo123/oxideav-mpeg12video", rev = "9c4c24c2d336ffde2e23f29d55812e75c40d780a" }
