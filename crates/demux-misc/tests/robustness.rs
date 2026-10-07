@@ -151,6 +151,46 @@ fn smf_truncated_and_bit_flipped_never_panic() {
     }
 }
 
+/// Every probe this crate registers scores any input without panicking:
+/// the first 32 KiB of each sample above and of FATE's SSA subtitle file,
+/// cut to every length up to 512 bytes and to every 61st past it; the
+/// same with its bytes swapped in pairs (AC-3 in some captures comes
+/// so); and 300 copies with bits flipped, whole and cut to an odd length.
+#[test]
+fn probes_take_short_and_damaged_input() {
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    demux_misc::register(&mut ctx);
+    let probe = |name: &str, buf: &[u8], ext: Option<&str>| {
+        let data = oxideav_core::ProbeData { buf, ext };
+        let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.containers.probe_candidates(&data).len()));
+        assert!(probed.is_ok(), "{name}: a probe panicked on {} bytes (extension {ext:?})", buf.len());
+    };
+    let mut rng = Rng(0x5EED_CAFE_F00D_0002);
+    for sample in CASES.iter().map(|&(sample, _)| sample).chain(["sub/a9-misc.ssa"]) {
+        let data = std::fs::read(fate(sample)).unwrap();
+        let head = &data[..data.len().min(32 * 1024)];
+        let ext = std::path::Path::new(sample).extension().and_then(|e| e.to_str());
+        let swapped: Vec<u8> = head.chunks(2).flat_map(|pair| pair.iter().rev().copied()).collect();
+        for (variant, bytes) in [("", head), (" swapped", &swapped[..])] {
+            let name = format!("{sample}{variant}");
+            for len in (0..=bytes.len().min(512)).chain((513..bytes.len()).step_by(61)) {
+                probe(&name, &bytes[..len], ext);
+                probe(&name, &bytes[..len], None);
+            }
+            for _ in 0..300 {
+                let mut mutated = bytes.to_vec();
+                for _ in 0..1 + rng.next() % 8 {
+                    let pos = (rng.next() as usize) % mutated.len();
+                    mutated[pos] ^= (rng.next() & 0xFF) as u8 | 1;
+                }
+                probe(&name, &mutated, None);
+                let odd = ((rng.next() as usize) % mutated.len()) | 1;
+                probe(&name, &mutated[..odd.min(mutated.len())], ext);
+            }
+        }
+    }
+}
+
 /// Open `data` as `format` through the player's registry, then seek it
 /// the way the player does (its video stream, else audio, else stream 0)
 /// to a few targets, reading a little after each: errors are fine, panics

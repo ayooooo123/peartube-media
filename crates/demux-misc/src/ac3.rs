@@ -175,17 +175,17 @@ pub fn parse_ac3_header(buf: &[u8]) -> Option<Ac3Header> {
     }
 }
 
-/// Parse `buf` assuming the byte-swapped (0x770B) byte order.
+/// Parse `buf` assuming the byte-swapped (0x770B) byte order: its first 8
+/// bytes swapped in pairs, as ac3_eac3_probe does (ac3dec.c:58-64), bytes
+/// past its end read as the zero padding of FFmpeg's probe buffer.
 fn parse_ac3_header_swapped(buf: &[u8]) -> Option<Ac3Header> {
-    let len = buf.len().min(64);
-    let mut tmp = [0u8; 64];
-    for i in (0..len).step_by(2) {
-        tmp[i] = buf[i + 1];
-        if i + 1 < len {
-            tmp[i + 1] = buf[i];
-        }
+    let byte = |i: usize| buf.get(i).copied().unwrap_or(0);
+    let mut tmp = [0u8; 8];
+    for i in (0..8).step_by(2) {
+        tmp[i] = byte(i + 1);
+        tmp[i + 1] = byte(i);
     }
-    parse_ac3_header(&tmp[..len])
+    parse_ac3_header(&tmp)
 }
 
 /// Mirror of ac3_eac3_probe (ac3dec.c): chase syncframes from every
