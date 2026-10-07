@@ -17,6 +17,8 @@ use oxideav_core::{
     StreamInfo, TimeBase, CodecTag, MAX_PROBE_SCORE,
 };
 
+use crate::seek::{gen_search, Bounds, Index};
+
 const MAIN_STARTCODE: u64 = 0x4E4D7A561F5F04AD; // 'N''M' | 0x7A561F5F04AD
 const STREAM_STARTCODE: u64 = 0x4E5311405BF2F9DB; // 'N''S'
 const SYNCPOINT_STARTCODE: u64 = 0x4E4BE4ADEECA4569; // 'N''K'
@@ -43,6 +45,10 @@ const FLAG_INVALID: i64 = 8192;
 /// Caps for untrusted input.
 const MAX_HEADER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FRAME_SIZE: i64 = 64 * 1024 * 1024;
+/// The index read from the end of the file.
+const MAX_INDEX_BYTES: i64 = 64 * 1024 * 1024;
+/// Syncpoints remembered for seeking a file without an index.
+const MAX_SYNCPOINTS: usize = 1 << 20;
 
 /// ff_crc04C11DB7 / AV_CRC_32_IEEE, bit-at-a-time (poly 0x04C11DB7,
 /// non-reflected, init/final 0).
@@ -80,6 +86,16 @@ struct NutStream {
     last_flags: i64,
 }
 
+/// A syncpoint FFmpeg's syncpoint tree keeps: where it starts, where
+/// decoding every stream can start from (back_ptr), its time in
+/// microseconds.
+#[derive(Clone, Copy)]
+struct Syncpoint {
+    pos: i64,
+    back_ptr: i64,
+    ts: i64,
+}
+
 struct NutDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
@@ -91,6 +107,15 @@ struct NutDemuxer {
     /// Bytes consumed while headers were being read, so frame decoding
     /// starts exactly at the first syncpoint.
     header_end: u64,
+    /// Where the first syncpoint starts (FFmpeg's data_offset).
+    data_offset: i64,
+    /// Per stream: the key frames of the index at the end of the file.
+    index: Vec<Index>,
+    /// Every syncpoint read, by position (FFmpeg's syncpoint tree).
+    syncpoints: Vec<Syncpoint>,
+    /// Per stream: frames are dropped after a seek until a key frame
+    /// (skip_until_key_frame).
+    skip_until_key: Vec<bool>,
 }
 
 /// ffio_read_varlen: little-endian base-128 with continuation MSB,
@@ -520,15 +545,23 @@ impl NutDemuxer {
         Ok(true)
     }
 
-    /// decode_syncpoint: returns the global PTS value in the syncpoint's
-    /// time base, rescaled into each stream's time base (ff_nut_reset_ts).
-    fn decode_syncpoint(&mut self) -> Result<i64> {
+    /// decode_syncpoint, its start code just read: the global PTS in the
+    /// syncpoint's time base resets every stream's (ff_nut_reset_ts), and
+    /// the syncpoint, with its back pointer and its time in microseconds,
+    /// joins the syncpoint tree (ff_nut_add_sp).
+    fn decode_syncpoint(&mut self) -> Result<Syncpoint> {
+        let pos = self.input.stream_position()? as i64 - 8;
         let (size, _ck) = read_packet_header(&mut self.input, SYNCPOINT_STARTCODE)?;
         let end = self.input.stream_position()? + size as u64;
 
         let tmp = read_varlen(&mut self.input)?;
-        read_varlen(&mut self.input)?; // back_ptr divisor
-        let sp_tb = &self.time_bases[(tmp % self.time_bases.len() as u64) as usize];
+        let back_ptr = read_varlen(&mut self.input)?
+            .checked_mul(16)
+            .and_then(|b| i64::try_from(b).ok())
+            .and_then(|b| pos.checked_sub(b))
+            .filter(|&b| b >= 0)
+            .ok_or_else(|| Error::invalid("nut: syncpoint back pointer before the file"))?;
+        let sp_tb = self.time_bases[(tmp % self.time_bases.len() as u64) as usize];
         let sp_val = (tmp / self.time_bases.len() as u64) as i64;
         for st in &mut self.states {
             // av_rescale_rnd(val, sp.num * st.den, sp.den * st.num, DOWN)
@@ -544,7 +577,153 @@ impl NutDemuxer {
             return Err(Error::invalid("nut: syncpoint overlong"));
         }
         self.input.seek(std::io::SeekFrom::Start(end))?;
-        Ok(sp_val)
+        // tmp / time_base_count * av_q2d(time_base) * AV_TIME_BASE, in
+        // double precision as FFmpeg computes it.
+        let ts = (sp_val as f64 * (sp_tb.0.num as f64 / sp_tb.0.den as f64) * 1_000_000f64) as i64;
+        let sp = Syncpoint { pos, back_ptr, ts };
+        if let Err(at) = self.syncpoints.binary_search_by_key(&pos, |s| s.pos) {
+            if self.syncpoints.len() < MAX_SYNCPOINTS {
+                self.syncpoints.insert(at, sp);
+            }
+        }
+        Ok(sp)
+    }
+
+    /// find_startcode: the position of the next `code` from `from` on.
+    fn find_startcode(&mut self, code: u64, from: i64) -> Result<Option<i64>> {
+        self.input.seek(std::io::SeekFrom::Start(from.max(0) as u64))?;
+        loop {
+            match find_any_startcode(&mut self.input)? {
+                Some((found, at)) if found == code => return Ok(Some(at as i64)),
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// nut_read_timestamp for stream -1: the time of the first syncpoint
+    /// that decodes from `*pos` on, `*pos` moved to it.
+    fn read_timestamp(&mut self, pos: &mut i64) -> Result<Option<i64>> {
+        let mut from = *pos;
+        loop {
+            let Some(at) = self.find_startcode(SYNCPOINT_STARTCODE, from)? else { return Ok(None) };
+            from = at + 1;
+            if let Ok(sp) = self.decode_syncpoint() {
+                *pos = at;
+                return Ok(Some(sp.ts));
+            }
+        }
+    }
+
+    /// find_and_decode_index: the index FFmpeg's muxer writes at the end,
+    /// its key frames into each stream's index at the position of the
+    /// syncpoint before them. Like FFmpeg, entries read before an error
+    /// stay, and a bad checksum is only an error.
+    fn find_and_decode_index(&mut self) -> Result<()> {
+        let file_size = self.input.seek(std::io::SeekFrom::End(0))? as i64;
+        if file_size < 12 {
+            return Ok(());
+        }
+        self.input.seek(std::io::SeekFrom::Start((file_size - 12) as u64))?;
+        let mut ptr = [0u8; 8];
+        self.input.read_exact(&mut ptr)?;
+        let Some(at) = file_size.checked_sub(i64::from_be_bytes(ptr)).filter(|&at| at >= 0) else { return Ok(()) };
+        self.input.seek(std::io::SeekFrom::Start(at as u64))?;
+        let mut code = [0u8; 8];
+        self.input.read_exact(&mut code)?;
+        if u64::from_be_bytes(code) != INDEX_STARTCODE {
+            return Ok(());
+        }
+        let (size, _) = read_packet_header(&mut self.input, INDEX_STARTCODE)?;
+        if !(4..=MAX_INDEX_BYTES).contains(&size) {
+            return Err(Error::invalid("nut: index size out of range"));
+        }
+        let mut data = vec![0u8; size as usize];
+        self.input.read_exact(&mut data)?;
+        let mut p = 0;
+        // ffio_read_varlen: zeros past the end
+        let mut v = || -> u64 {
+            let mut val = 0u64;
+            loop {
+                let b = data.get(p).copied().unwrap_or(0);
+                p += 1;
+                val = (val << 7).wrapping_add(u64::from(b & 127));
+                if b & 128 == 0 {
+                    return val;
+                }
+            }
+        };
+        v(); // max_pts
+        let count = v();
+        if count == 0 || count >= i32::MAX as u64 / 8 || count > size as u64 {
+            return Err(Error::invalid("nut: index syncpoint count"));
+        }
+        let count = count as usize;
+        let mut syncpoints = vec![0i64; count];
+        for i in 0..count {
+            let pos = i64::try_from(v()).ok().filter(|&pos| pos > 0);
+            let Some(pos) = pos.and_then(|pos| if i > 0 { pos.checked_add(syncpoints[i - 1]) } else { Some(pos) }) else {
+                return Err(Error::invalid("nut: index syncpoint position"));
+            };
+            syncpoints[i] = pos;
+        }
+        let mut has_keyframe = vec![false; count + 1];
+        for stream in 0..self.streams.len() {
+            let mut last_pts: i64 = -1;
+            let mut j = 0;
+            while j < count {
+                let mut x = v();
+                let mut n = j;
+                let run = x & 1 != 0;
+                x >>= 1;
+                if run {
+                    let flag = x & 1 != 0;
+                    x >>= 1;
+                    if x.checked_add(n as u64).is_none_or(|end| end >= count as u64 + 1) {
+                        return Err(Error::invalid("nut: index overflow"));
+                    }
+                    for _ in 0..x {
+                        has_keyframe[n] = flag;
+                        n += 1;
+                    }
+                    has_keyframe[n] = !flag;
+                    n += 1;
+                } else {
+                    if x <= 1 {
+                        return Err(Error::invalid("nut: index keyframe bits"));
+                    }
+                    while x != 1 {
+                        if n >= count + 1 {
+                            return Err(Error::invalid("nut: index overflow"));
+                        }
+                        has_keyframe[n] = x & 1 != 0;
+                        n += 1;
+                        x >>= 1;
+                    }
+                }
+                if has_keyframe[0] {
+                    return Err(Error::invalid("nut: keyframe before the first syncpoint in the index"));
+                }
+                while j < n && j < count {
+                    if has_keyframe[j] {
+                        let mut a = v();
+                        let b = if a == 0 {
+                            a = v();
+                            v()
+                        } else {
+                            0
+                        };
+                        let pts = last_pts.wrapping_add(a as i64);
+                        if let Some(pos) = j.checked_sub(1).and_then(|k| syncpoints[k].checked_mul(16)) {
+                            self.index[stream].add(pos, pts, 0, 0, true);
+                        }
+                        last_pts = pts.wrapping_add(b as i64);
+                    }
+                    j += 1;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// decode_frame_header + decode_frame: one packet or None when the
@@ -688,6 +867,10 @@ fn open_nut(
         header: Vec::new(),
         max_distance: 0,
         header_end: 0,
+        data_offset: 0,
+        index: Vec::new(),
+        syncpoints: Vec::new(),
+        skip_until_key: Vec::new(),
     };
 
     // main header: FFmpeg loops find+decode until decode succeeds; errors
@@ -747,7 +930,8 @@ fn open_nut(
     let mut sync = false;
     loop {
         match find_any_startcode(&mut nut.input)? {
-            Some((code, _)) if code == SYNCPOINT_STARTCODE => {
+            Some((code, at)) if code == SYNCPOINT_STARTCODE => {
+                nut.data_offset = at as i64;
                 sync = true;
                 break;
             }
@@ -766,6 +950,13 @@ fn open_nut(
     nut.decode_syncpoint()?;
     nut.header_end = nut.input.stream_position()?;
 
+    // nut_read_header on a seekable input: the index at the end, if any;
+    // a broken one only ends early.
+    nut.index = (0..nut.streams.len()).map(|_| Index::default()).collect();
+    nut.skip_until_key = vec![false; nut.streams.len()];
+    let _ = nut.find_and_decode_index();
+    nut.input.seek(std::io::SeekFrom::Start(nut.header_end))?;
+
     Ok(Box::new(nut))
 }
 
@@ -776,6 +967,16 @@ impl NutDemuxer {
         let end = self.input.stream_position()? + size as u64;
         self.input.seek(std::io::SeekFrom::Start(end))?;
         Ok(())
+    }
+
+    /// nut_read_packet's skip_until_key_frame: after a seek a stream's
+    /// frames are dropped until its first key frame.
+    fn kept(&mut self, packet: Packet) -> Option<Packet> {
+        let skip = self.skip_until_key.get_mut(packet.stream_index as usize)?;
+        if packet.flags.keyframe {
+            *skip = false;
+        }
+        (!*skip).then_some(packet)
     }
 }
 
@@ -819,25 +1020,77 @@ impl Demuxer for NutDemuxer {
                         // frame_code byte follows
                         let mut fb = [0u8; 1];
                         self.input.read_exact(&mut fb)?;
-                        if let Some(pkt) = self.decode_frame(fb[0])? {
+                        if let Some(pkt) = self.decode_frame(fb[0])?.and_then(|p| self.kept(p)) {
                             return Ok(pkt);
                         }
                     }
                     _ => {
                         // not a startcode: re-interpret as a frame code
-                        if let Some(pkt) = self.decode_frame(b'N')? {
+                        if let Some(pkt) = self.decode_frame(b'N')?.and_then(|p| self.kept(p)) {
                             return Ok(pkt);
                         }
                     }
                 }
-            } else if let Some(pkt) = self.decode_frame(b[0])? {
+            } else if let Some(pkt) = self.decode_frame(b[0])?.and_then(|p| self.kept(p)) {
                 return Ok(pkt);
             }
         }
     }
 
-    fn seek_to(&mut self, _stream_index: u32, _pts: i64) -> Result<i64> {
-        Err(Error::unsupported("nut: seeking not supported"))
+    /// nutdec.c read_seek with AVSEEK_FLAG_BACKWARD. With the index FFmpeg's
+    /// muxer writes: the stream's last key frame at or before the target
+    /// (else the first after it), from the syncpoint before it. Without
+    /// one: ff_gen_search over the syncpoint times (nut_read_timestamp),
+    /// within the syncpoints read so far, then the landing syncpoint's
+    /// back pointer. Reading resumes at a syncpoint and drops each
+    /// stream's frames until its first key frame.
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        let stream = stream_index as usize;
+        let Some(info) = self.streams.get(stream) else {
+            return Err(Error::invalid("nut: no such stream to seek"));
+        };
+        let tb = info.time_base;
+        let resume = self.input.stream_position()?;
+        let (pos2, landed) = if !self.index[stream].entries().is_empty() {
+            let index = &self.index[stream];
+            let Some(i) = index.search(pts, true).or_else(|| index.search(pts, false)) else {
+                return Err(Error::invalid("nut: no key frame to seek to"));
+            };
+            let e = index.entries()[i];
+            (e.pos, e.timestamp)
+        } else {
+            // pts * av_q2d(time_base) * AV_TIME_BASE
+            let target = (pts as f64 * (tb.0.num as f64 / tb.0.den as f64) * 1_000_000f64) as i64;
+            let before = self.syncpoints.iter().rev().find(|s| s.ts < target).copied();
+            let after = self.syncpoints.iter().find(|s| s.ts > target).copied();
+            let bounds = Bounds {
+                pos_min: before.map_or(0, |s| s.pos),
+                pos_max: after.map_or(0, |s| s.pos),
+                pos_limit: after.map_or(0, |s| s.pos),
+                ts_min: before.map(|s| s.ts),
+                ts_max: after.map(|s| s.ts),
+            };
+            let file_size = self.input.seek(std::io::SeekFrom::End(0))? as i64;
+            let data_offset = self.data_offset;
+            let found = gen_search(target, bounds, data_offset, file_size, &mut |pos, _| self.read_timestamp(pos));
+            let Ok(Some((pos, ts))) = found else {
+                self.input.seek(std::io::SeekFrom::Start(resume))?;
+                return Err(found.err().unwrap_or_else(|| Error::invalid("nut: no syncpoint to seek to")));
+            };
+            let Ok(at) = self.syncpoints.binary_search_by_key(&pos, |s| s.pos) else {
+                self.input.seek(std::io::SeekFrom::Start(resume))?;
+                return Err(Error::invalid("nut: the search landed off the syncpoints"));
+            };
+            let landed = (ts as f64 / (tb.0.num as f64 / tb.0.den as f64) / 1_000_000f64) as i64;
+            (self.syncpoints[at].back_ptr - 15, landed)
+        };
+        let Some(pos) = self.find_startcode(SYNCPOINT_STARTCODE, pos2)? else {
+            self.input.seek(std::io::SeekFrom::Start(resume))?;
+            return Err(Error::invalid("nut: no syncpoint at the seek position"));
+        };
+        self.input.seek(std::io::SeekFrom::Start(pos as u64))?;
+        self.skip_until_key.iter_mut().for_each(|skip| *skip = true);
+        Ok(landed)
     }
 }
 

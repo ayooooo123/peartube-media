@@ -311,18 +311,22 @@ fn mpegvideo() {
 
 /// NUT read_seek: the index of key frames FFmpeg's muxer writes, from the
 /// syncpoint before the key frame on, packets before each stream's first
-/// key frame skipped.
+/// key frame skipped. Without an index (`-write_index 0`), ff_gen_search
+/// over the syncpoint times, bounded by the syncpoints read so far: what
+/// avformat_find_stream_info read ahead, so FFmpeg runs without it.
 #[test]
 fn nut() {
-    let path = generated(
-        "av.nut",
-        &[
+    let args = |index: &'static str| {
+        [
             "-f", "lavfi", "-i", "sine=frequency=1000:duration=4", "-f", "lavfi", "-i",
             "testsrc=duration=4:size=64x64:rate=10", "-c:a", "mp2", "-c:v", "mpeg2video", "-g", "8", "-bf", "0",
-            "-shortest",
-        ],
-    );
-    check(&path, "generated NUT", "nut", &["1.0", "2.35"], 8, Mode { unparsed: true, keys: true, ..CONTAINER });
+            "-shortest", "-write_index", index,
+        ]
+    };
+    let mode = Mode { unparsed: true, keys: true, ..CONTAINER };
+    check(&generated("av.nut", &args("1")), "generated NUT", "nut", &["1.0", "2.35"], 8, mode);
+    let unindexed = generated("unindexed.nut", &args("0"));
+    check(&unindexed, "NUT without index", "nut", &["1.0", "2.35", "3.2"], 8, Mode { no_read_ahead: true, ..mode });
 }
 
 /// PVA bisects the PES timestamps (pva_read_timestamp, which looks at
