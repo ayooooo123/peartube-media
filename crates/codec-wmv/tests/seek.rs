@@ -42,7 +42,7 @@ fn ffprobe_after(path: &Path, format: &str, target: &str, n: usize) -> Vec<Pkt> 
         .expect("port ffprobe");
     assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
-    String::from_utf8_lossy(&out.stdout)
+    let packets: Vec<Pkt> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| line.strip_prefix("packet|"))
         .map(|line| {
@@ -55,7 +55,9 @@ fn ffprobe_after(path: &Path, format: &str, target: &str, n: usize) -> Vec<Pkt> 
                 dts: num(kv.get("dts")),
             }
         })
-        .collect()
+        .collect();
+    assert!(!packets.is_empty(), "ffprobe {} @ {target}: no packets", path.display());
+    packets
 }
 
 /// av_rescale(us, tb.den, 1000000 * tb.num), to nearest.
@@ -131,4 +133,40 @@ fn vc1test_lands_on_ffmpegs_key_frame() {
     let path = scratch("twice.rcv", &twice);
     check(&path, "SMM0015 twice", "vc1test", &["0.5", "1.1", "1.5", "1.9"], 4);
     let _ = std::fs::remove_file(&path);
+}
+
+/// An RCV of one key frame then 1.1 M non-key empty frames, at a
+/// millisecond time base: seeking past the end reads on for a frame
+/// after the target, and stops on the seek's allowance (1 M packets,
+/// 256 MiB) with ResourceExhausted, reading resuming where it was. (The
+/// 1000-non-key cut-off counts frames after the target only, so a run of
+/// frames before it is bounded by the allowance alone.)
+#[test]
+fn vc1test_frames_before_the_target_exhaust_the_seek_allowance() {
+    let rcv = std::fs::read(refcheck::fate("vc1/SMM0015.rcv")).unwrap();
+    let header = 8 + u32::from_le_bytes(rcv[4..8].try_into().unwrap()) as usize + 24;
+    let mut data = [0xFF, 0xFF, 0xFF].to_vec();
+    data.extend_from_slice(&rcv[3..header - 4]);
+    data.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fps: millisecond pts in each frame
+    let first_size = u32::from_le_bytes([rcv[header], rcv[header + 1], rcv[header + 2], 0]) as usize;
+    data.extend_from_slice(&rcv[header..header + 8 + first_size]);
+    for n in 1..1_100_000u32 {
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        data.extend_from_slice(&n.min(10).to_le_bytes());
+    }
+    let open = |data: Vec<u8>| {
+        let mut ctx = RuntimeContext::new();
+        codec_wmv::register(&mut ctx);
+        ctx.containers.open_demuxer("vc1test", Box::new(std::io::Cursor::new(data)), &ctx.codecs).unwrap()
+    };
+    let first = open(data.clone()).next_packet().map(|p| (p.dts, refcheck::md5_hex(&p.data))).ok();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut demuxer = open(data);
+        let result = demuxer.seek_to(0, 1_000_000);
+        let _ = tx.send((result, demuxer.next_packet().map(|p| (p.dts, refcheck::md5_hex(&p.data))).ok()));
+    });
+    let (result, after) = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the seek ends");
+    assert!(matches!(result, Err(Error::ResourceExhausted(_))), "the seek ends on its allowance: {result:?}");
+    assert_eq!(after, first, "reading resumes where it was");
 }

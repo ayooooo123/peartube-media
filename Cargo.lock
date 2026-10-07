@@ -180,6 +180,7 @@ name = "codec-wmv"
 version = "0.1.0"
 dependencies = [
  "demux-asf",
+ "demux-seek-core",
  "oxideav-avi",
  "oxideav-core",
  "oxideav-mov",
