@@ -112,13 +112,13 @@ dependencies = [
 name = "check-decoders"
 version = "0.1.0"
 dependencies = [
+ "codec-mp2",
  "codecs",
  "demux-misc",
  "oxideav-ac3",
  "oxideav-core",
  "oxideav-h264",
  "oxideav-mkv",
- "oxideav-mp2",
  "oxideav-mp3",
  "oxideav-mpegts",
  "oxideav-ogg",
@@ -285,6 +285,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-mp2"
+version = "0.1.0"
+dependencies = [
+ "mpegaudiodsp",
+ "oxideav-core",
+ "oxideav-mp2",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-musepack"
 version = "0.1.0"
 dependencies = [
@@ -446,6 +456,7 @@ dependencies = [
  "codec-lpcm",
  "codec-mlp",
  "codec-mp1",
+ "codec-mp2",
  "codec-musepack",
  "codec-ra",
  "codec-rv",
@@ -492,7 +503,6 @@ dependencies = [
  "oxideav-mkv",
  "oxideav-mod",
  "oxideav-mov",
- "oxideav-mp2",
  "oxideav-mp3",
  "oxideav-mp4",
  "oxideav-mpeg12video",
@@ -1424,7 +1434,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mp2"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-mp2?rev=1f335d02e92ecee338945777e8f5f9b483bef22a#1f335d02e92ecee338945777e8f5f9b483bef22a"
+source = "git+https://github.com/ayooooo123/oxideav-mp2?rev=503367c83790c2e6d9d41cc545bee26ea70d21b0#503367c83790c2e6d9d41cc545bee26ea70d21b0"
 dependencies = [
  "oxideav-core",
 ]
@@ -1452,7 +1462,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg12video"
 version = "0.0.13"
-source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=51af52c9c46f4878d001eaa2a7db89baabdc633a#51af52c9c46f4878d001eaa2a7db89baabdc633a"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=02de487a4b604640633b142d21fb6c5308b27b04#02de487a4b604640633b142d21fb6c5308b27b04"
 dependencies = [
  "oxideav-core",
 ]

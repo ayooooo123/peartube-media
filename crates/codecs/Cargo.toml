@@ -47,7 +47,7 @@ oxideav-flac.workspace = true
 oxideav-g711.workspace = true
 oxideav-midi.workspace = true
 oxideav-mod.workspace = true
-oxideav-mp2.workspace = true
+codec-mp2 = { path = "../codec-mp2" }
 oxideav-mp3.workspace = true
 oxideav-opus.workspace = true
 oxideav-s3m.workspace = true

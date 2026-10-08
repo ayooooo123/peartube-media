@@ -54,7 +54,7 @@ fn mp2_survives_truncated_and_flipped_packets() {
     params.channels = Some(2);
     params.sample_format = Some(SampleFormat::S16);
     for mutant in mutants(&packets, 2_000, 0x6d70_3221) {
-        let _ = decode_packets(&[oxideav_mp2::register], &params, &mutant);
+        let _ = decode_packets(&[codec_mp2::register], &params, &mutant);
     }
 }
 

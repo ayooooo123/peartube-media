@@ -1,5 +1,5 @@
-//! oxideav-mp2 against FFmpeg's mp2 decoder, fed the packets FFmpeg's
-//! demuxer and mpegaudio parser give its own decoder.
+//! The player's fixed-point MP2 path against FFmpeg 2da55bf, fed the
+//! packets FFmpeg's demuxer and MPEG-audio parser give its decoder.
 
 use check_decoders::{decode_packets, ffmpeg_packets, tool};
 use oxideav_core::{CodecId, CodecParameters, Frame, SampleFormat};
@@ -9,10 +9,8 @@ use oxideav_core::{CodecId, CodecParameters, Frame, SampleFormat};
 /// FFmpeg only clamps a buffer longer than the frame and decodes a
 /// shorter one over the zero padding (mpegaudiodec_template.c:1599-1604),
 /// so each track ends with that frame: 49,536 and 50,688 samples, the
-/// last frame included. The complete frames are PCM-identical to
-/// FFmpeg's; in the cut frame's zero-decoded tail, where samples sit at
-/// ±0.5 LSB, FFmpeg's fixed-point synthesis rounds some ties the other
-/// way (78 samples on track 0), so that frame is held to 1 LSB.
+/// last frame included. Every sample, including the zero-decoded cut tail,
+/// must match FFmpeg's fixed-point synthesis exactly.
 #[test]
 fn a_frame_cut_by_the_end_of_file_decodes_like_ffmpeg() {
     let path = refcheck::fate("h264/h264_intra_first-small.ts");
@@ -26,7 +24,7 @@ fn a_frame_cut_by_the_end_of_file_decodes_like_ffmpeg() {
         params.sample_rate = Some(48_000);
         params.channels = Some(2);
         params.sample_format = Some(SampleFormat::S16);
-        let (decoded, refused) = decode_packets(&[oxideav_mp2::register], &params, &packets);
+        let (decoded, refused) = decode_packets(&[codec_mp2::register], &params, &packets);
         let ours: Vec<u8> = decoded
             .frames
             .iter()
@@ -46,16 +44,7 @@ fn a_frame_cut_by_the_end_of_file_decodes_like_ffmpeg() {
             theirs.len() / 4
         );
         assert_eq!(theirs.len() / 4, samples, "track {track}: FFmpeg's sample count changed");
-        let cut = (samples - 1152) * 4;
-        let first = ours[..cut].chunks(2).zip(theirs[..cut].chunks(2)).position(|(a, b)| a != b);
-        assert!(first.is_none(), "track {track}: complete frames differ from FFmpeg's from interleaved sample {first:?}");
-        let worst = ours[cut..]
-            .chunks(2)
-            .zip(theirs[cut..].chunks(2))
-            .map(|(a, b)| (i16::from_le_bytes([a[0], a[1]]) as i32 - i16::from_le_bytes([b[0], b[1]]) as i32).abs())
-            .max()
-            .unwrap_or(0);
-        assert!(worst <= 1, "track {track}: the cut frame is {worst} LSB from FFmpeg's");
+        assert_pcm_exact(&format!("truncated-track-{track}"), &ours, &theirs, 2);
     }
 }
 
@@ -68,4 +57,18 @@ fn interleave_s16(planes: &[Vec<u8>], samples: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+fn assert_pcm_exact(label: &str, ours: &[u8], theirs: &[u8], channels: usize) {
+    assert_eq!(ours.len(), theirs.len(), "{label}: PCM byte count");
+    let samples = |bytes: &[u8]| -> Vec<f32> {
+        bytes.chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0).collect()
+    };
+    let ours_pcm = samples(ours);
+    let reference = samples(theirs);
+    let differences = ours_pcm.iter().zip(&reference).filter(|(a, b)| a != b).count();
+    let snr = refcheck::snr_db(&reference, &ours_pcm, 0);
+    eprintln!("{label}: samples/channel={}; differences={differences}; SNR={snr} dB; md5={}; reference={}",
+        ours_pcm.len() / channels, refcheck::md5_hex(ours), refcheck::md5_hex(theirs));
+    assert_eq!(differences, 0, "{label}: exact PCM required, SNR={snr}");
 }
