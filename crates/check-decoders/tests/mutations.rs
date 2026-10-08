@@ -70,3 +70,22 @@ fn h264_recovery_survives_truncated_and_flipped_packets() {
         let _ = decode_packets(&[oxideav_h264::register], &params, &mutant);
     }
 }
+
+#[test]
+fn opus_surround_survives_truncated_and_flipped_packets() {
+    // FATE's 7.1 Opus: five streams per packet, the first hybrid (SILK,
+    // its resampler and the CELT delay buffer), the others CELT, so a
+    // mutant reaches the multistream split, both layers and the channel
+    // map. The OpusHead is the one FFmpeg's MPEG-TS demuxer builds for it.
+    let path = refcheck::fate("opus/test-8-7.1.opus-small.ts");
+    let packets: Vec<Packet> = ffmpeg_packets(&path, "a:0", None).into_iter().take(16).collect();
+    let mut params = CodecParameters::audio(CodecId::new("opus"));
+    params.extradata = vec![
+        0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 0x01, 0x08, 0x00, 0x00, 0x80, 0xbb, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x05, 0x03, 0x00, 0x06, 0x01, 0x02, 0x03, 0x04, 0x05, 0x07,
+    ];
+    params.channels = Some(8);
+    for mutant in mutants(&packets, 2_000, 0x6f70_7573) {
+        let _ = decode_packets(&[oxideav_opus::register], &params, &mutant);
+    }
+}
