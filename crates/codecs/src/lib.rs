@@ -112,9 +112,7 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     ] {
         register(ctx);
     }
-    // MIDI registers its synth only; its decoder plays with the built-in
-    // tone instruments.
-    oxideav_midi::register_codecs(&mut ctx.codecs);
+    codec_midi::register(ctx);
     // MPEG-TS and MPEG-PS name MPEG-4 Part 2 video `mpeg4` (FFmpeg's id);
     // its decoder registers as `mpeg4video`. 3ivx Delta 4's `3IV2` is
     // MPEG-4 Part 2 in QuickTime and AVI (FFmpeg's isom_tags.c and riff.c).

@@ -1,0 +1,15 @@
+[package]
+name = "codec-midi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LGPL-2.1-or-later"
+description = "General MIDI player: Standard MIDI Files rendered with a SoundFont by a port of FluidSynth 2.6.1"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+sha2 = "0.10"
+player = { path = "../player" }
+demux-misc = { path = "../demux-misc" }

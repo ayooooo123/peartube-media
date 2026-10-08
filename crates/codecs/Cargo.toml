@@ -45,7 +45,7 @@ oxideav-cook.workspace = true
 oxideav-dts.workspace = true
 oxideav-flac.workspace = true
 oxideav-g711.workspace = true
-oxideav-midi.workspace = true
+codec-midi = { path = "../codec-midi" }
 oxideav-mod.workspace = true
 oxideav-mp1.workspace = true
 oxideav-mp2.workspace = true

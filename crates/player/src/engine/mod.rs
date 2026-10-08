@@ -1,4 +1,5 @@
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
@@ -46,6 +47,9 @@ pub struct PlayerOptions {
     pub video: Option<u32>,
     pub subtitle: Option<u32>,
     pub realtime: bool,
+    /// Local user-selected SF2 bank for MIDI. `None` makes MIDI report
+    /// "needs a SoundFont". No bank is bundled or downloaded.
+    pub soundfont: Option<PathBuf>,
 }
 
 impl Default for PlayerOptions {
@@ -55,6 +59,7 @@ impl Default for PlayerOptions {
             video: None,
             subtitle: None,
             realtime: true,
+            soundfont: None,
         }
     }
 }
@@ -411,6 +416,7 @@ struct SharedState {
     /// pipelines pause or resume their sinks.
     lanes: Mutex<Vec<Arc<Lane>>>,
     ctx: Arc<RuntimeContext>,
+    soundfont: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -497,6 +503,7 @@ impl Player {
             running: AtomicBool::new(false),
             lanes: Mutex::new(Vec::new()),
             ctx,
+            soundfont: options.soundfont.clone(),
         });
 
         let url_owned = url.to_string();
@@ -1499,13 +1506,27 @@ fn run_audio_thread(
     retired: Arc<AtomicBool>,
 ) {
     let mut decoder_params = stream.params.clone();
+    if decoder_params.codec_id.as_str() == "midi" {
+        if let Some(path) = &shared.soundfont {
+            let Some(path) = path.to_str() else {
+                audio_failed(&shared, "MIDI SoundFont path is not valid UTF-8".into());
+                return;
+            };
+            decoder_params.options.insert("soundfont", path);
+        }
+    }
     let decoder_delay = audio_trim::take_decoder_delay(&mut decoder_params);
     let mut decoder = match make_decoder(&shared.ctx, &decoder_params) {
         Ok(d) => d,
         Err(e) => {
             // No decoder: the track is skipped (still listed in `tracks`)
             // and the rest plays on.
-            audio_failed(&shared, format!("no audio decoder found: {e}"));
+            let message = if decoder_params.codec_id.as_str() == "midi" {
+                format!("MIDI playback failed: {e}")
+            } else {
+                format!("no audio decoder found: {e}")
+            };
+            audio_failed(&shared, message);
             return;
         }
     };

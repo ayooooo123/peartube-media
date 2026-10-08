@@ -241,6 +241,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-midi"
+version = "0.1.0"
+dependencies = [
+ "demux-misc",
+ "oxideav-core",
+ "player",
+ "sha2",
+]
+
+[[package]]
 name = "codec-mlp"
 version = "0.1.0"
 dependencies = [
@@ -386,6 +396,7 @@ dependencies = [
  "codec-dca",
  "codec-dv",
  "codec-lpcm",
+ "codec-midi",
  "codec-mlp",
  "codec-musepack",
  "codec-ra",
@@ -425,7 +436,6 @@ dependencies = [
  "oxideav-h265",
  "oxideav-iff",
  "oxideav-indeo",
- "oxideav-midi",
  "oxideav-mjpeg",
  "oxideav-mkv",
  "oxideav-mod",
@@ -1311,14 +1321,6 @@ dependencies = [
 name = "oxideav-indeo"
 version = "0.0.1"
 source = "git+https://github.com/ayooooo123/oxideav-indeo?rev=fafc8fa7bb089f743b841cb0d1229c0763612d93#fafc8fa7bb089f743b841cb0d1229c0763612d93"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
-name = "oxideav-midi"
-version = "0.0.5"
-source = "git+https://github.com/OxideAV/oxideav-midi?rev=cf1b26b7b44b3427e78378c2b74e80e695c12e58#cf1b26b7b44b3427e78378c2b74e80e695c12e58"
 dependencies = [
  "oxideav-core",
 ]
@@ -2227,3 +2229,8 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "oxideav-midi"
+version = "0.0.5"
+source = "git+https://github.com/OxideAV/oxideav-midi?rev=cf1b26b7b44b3427e78378c2b74e80e695c12e58#cf1b26b7b44b3427e78378c2b74e80e695c12e58"
