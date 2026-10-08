@@ -107,7 +107,11 @@ dependencies = [
  "oxideav-ac3",
  "oxideav-core",
  "oxideav-h264",
+ "oxideav-mkv",
  "oxideav-mp2",
+ "oxideav-mpegts",
+ "oxideav-ogg",
+ "oxideav-opus",
  "refcheck",
 ]
 
@@ -220,6 +224,8 @@ dependencies = [
  "md5",
  "oxideav-core",
  "oxideav-mkv",
+ "oxideav-mp4",
+ "oxideav-mpegts",
  "refcheck",
 ]
 
@@ -1370,7 +1376,7 @@ dependencies = [
 [[package]]
 name = "oxideav-opus"
 version = "0.0.14"
-source = "git+https://github.com/OxideAV/oxideav-opus?rev=fd97e6110860d21a69c76ba4d051984486fea9fb#fd97e6110860d21a69c76ba4d051984486fea9fb"
+source = "git+https://github.com/ayooooo123/oxideav-opus?rev=5573fa9ac3136c62e68199e877bff754432c89f9#5573fa9ac3136c62e68199e877bff754432c89f9"
 dependencies = [
  "oxideav-core",
 ]
