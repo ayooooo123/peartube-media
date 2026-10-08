@@ -60,6 +60,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_tak::register_codecs,
         codec_als::register_codecs,
         codec_mp1::register_codecs,
+        // libopenmpt tracker player, ported to Rust.
+        codec_tracker::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -104,11 +106,9 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_dts::__oxideav_entry,
         oxideav_flac::__oxideav_entry,
         oxideav_g711::__oxideav_entry,
-        oxideav_mod::__oxideav_entry,
         codec_mp2::register,
         oxideav_mp3::__oxideav_entry,
         oxideav_opus::__oxideav_entry,
-        oxideav_s3m::__oxideav_entry,
         oxideav_speex::__oxideav_entry,
         oxideav_vorbis::__oxideav_entry,
         oxideav_wma::__oxideav_entry,
@@ -149,6 +149,7 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_tta::register_containers,
         codec_shorten::register_containers,
         codec_tak::register_containers,
+        codec_tracker::register_containers,
     ] {
         register(&mut ctx.containers);
     }

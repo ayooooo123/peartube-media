@@ -390,6 +390,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-tracker"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "sha2",
+]
+
+[[package]]
 name = "codec-tta"
 version = "0.1.0"
 dependencies = [
@@ -477,6 +485,7 @@ dependencies = [
  "codec-svq1",
  "codec-svq3",
  "codec-tak",
+ "codec-tracker",
  "codec-tta",
  "codec-vp3",
  "codec-vp56",
@@ -511,7 +520,6 @@ dependencies = [
  "oxideav-indeo",
  "oxideav-mjpeg",
  "oxideav-mkv",
- "oxideav-mod",
  "oxideav-mov",
  "oxideav-mp3",
  "oxideav-mp4",
@@ -521,7 +529,6 @@ dependencies = [
  "oxideav-msmpeg4",
  "oxideav-ogg",
  "oxideav-opus",
- "oxideav-s3m",
  "oxideav-speex",
  "oxideav-sub-image",
  "oxideav-subtitle",
@@ -1417,14 +1424,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-mod"
-version = "0.0.10"
-source = "git+https://github.com/OxideAV/oxideav-mod?rev=f509819bc977ac4d499fb95f1156bc536a9a964f#f509819bc977ac4d499fb95f1156bc536a9a964f"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
 name = "oxideav-mov"
 version = "0.0.6"
 source = "git+https://github.com/ayooooo123/oxideav-mov?rev=d6af48d7db0428583b60ae52b0f2bbc0901d4318#d6af48d7db0428583b60ae52b0f2bbc0901d4318"
@@ -1542,14 +1541,6 @@ source = "git+https://github.com/OxideAV/oxideav-raster?rev=e601465cb38e4ac77b38
 dependencies = [
  "oxideav-core",
  "oxideav-pixfmt",
-]
-
-[[package]]
-name = "oxideav-s3m"
-version = "0.0.9"
-source = "git+https://github.com/OxideAV/oxideav-s3m?rev=6da2027ae868a37a2aab6aa3fcc57143f01113c8#6da2027ae868a37a2aab6aa3fcc57143f01113c8"
-dependencies = [
- "oxideav-core",
 ]
 
 [[package]]

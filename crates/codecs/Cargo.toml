@@ -46,11 +46,9 @@ oxideav-dts.workspace = true
 oxideav-flac.workspace = true
 oxideav-g711.workspace = true
 codec-midi = { path = "../codec-midi" }
-oxideav-mod.workspace = true
 codec-mp2 = { path = "../codec-mp2" }
 oxideav-mp3.workspace = true
 oxideav-opus.workspace = true
-oxideav-s3m.workspace = true
 oxideav-speex.workspace = true
 oxideav-vorbis.workspace = true
 oxideav-wma.workspace = true
@@ -89,6 +87,7 @@ codec-shorten = { path = "../codec-shorten" }
 codec-tak = { path = "../codec-tak" }
 codec-als = { path = "../codec-als" }
 codec-mp1 = { path = "../codec-mp1" }
+codec-tracker = { path = "../codec-tracker" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

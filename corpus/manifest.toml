@@ -385,7 +385,7 @@ compare = ["audio:md5"]
 
 [[entry]]
 path = "gen:audio_mod.mod"
-rows = ["audio:mod", "container:midi"]
+rows = ["audio:mod"]
 compare = ["audio:decodes"]
 
 [[entry]]
