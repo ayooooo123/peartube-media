@@ -390,6 +390,10 @@ const RAW_VIDEO: Mode = Mode { unparsed: false, times: true, durations: true, ke
 /// missing one included) and duration FFmpeg 2da55bf's demuxer layer
 /// gives each.
 const RAW_MPEG: Mode = Mode { unparsed: false, times: true, durations: true, keys: true };
+/// Raw Dirac: units and key flags. FFmpeg reads its parser's picture
+/// numbers as 1/1200000 s; the port counts them in frames, so times are
+/// checked apart (`dirac_picture_numbers_count_frames`).
+const RAW_DIRAC: Mode = Mode { unparsed: false, times: false, durations: false, keys: true };
 
 /// `rel` through the player's registry against ffprobe's table for
 /// `format`; the first difference, if any.
@@ -541,6 +545,48 @@ fn picture_headers(bytes: &[u8]) -> Vec<usize> {
 #[test]
 fn m4v() {
     check_inventory("m4v", &["m4v", "h263"], RAW_MPEG);
+}
+
+/// Raw Dirac / VC-2 (FFmpeg's dirac, found by its probe alone): the units
+/// FFmpeg's dirac parser cuts, a picture with the parse units before it and
+/// the end of the sequence on its own, and their key flags: only the units
+/// before the first B picture are key, as the parser never resets its
+/// picture type.
+#[test]
+fn dirac() {
+    check_inventory("dirac", &["drc"], RAW_DIRAC);
+}
+
+/// The pts and dts of each picture unit are FFmpeg's picture numbers in
+/// frames of the sequence's 30 fps (40000 ticks of 1/1200000); the end of
+/// the sequence comes a frame after the last picture's dts.
+#[test]
+fn dirac_picture_numbers_count_frames() {
+    for rel in inventory("dirac", &["drc"]) {
+        let path = suite_path(&rel);
+        let ctx = codecs::context();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut demuxer = ctx.containers.open_demuxer("dirac", Box::new(file), &ctx.codecs).unwrap();
+        assert_eq!(demuxer.streams()[0].time_base, TimeBase::new(1, 1_200_000), "{rel}");
+        let mut ours = Vec::new();
+        loop {
+            match demuxer.next_packet() {
+                Ok(p) => ours.push((p.pts, p.dts, p.duration)),
+                Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("{rel}: {e}"),
+            }
+        }
+        let (_, theirs) = ffprobe(&path, "dirac", false);
+        assert_eq!(ours.len(), theirs.len(), "{rel}: packets");
+        let (end, pictures) = theirs.split_last().unwrap();
+        assert_eq!(end.size, 13, "{rel}: the end of the sequence");
+        for (n, (got, want)) in ours.iter().zip(pictures).enumerate() {
+            let frames = |t: Option<i64>| t.map(|t| t * 40_000);
+            assert_eq!(*got, (frames(want.pts), frames(want.dts), Some(40_000)), "{rel}: packet {n}");
+        }
+        let last_dts = ours[ours.len() - 2].1.unwrap();
+        assert_eq!(ours[ours.len() - 1], (Some(last_dts + 40_000), Some(last_dts + 40_000), Some(40_000)), "{rel}: end");
+    }
 }
 
 /// Raw MPEG-1/2 video: the frames FFmpeg's mpegvideo parser cuts, timed

@@ -18,8 +18,11 @@ codecs = { path = "../codecs" }
 oxideav-h264.workspace = true
 oxideav-mp2.workspace = true
 oxideav-ac3.workspace = true
+oxideav-mp3.workspace = true
 oxideav-opus.workspace = true
 # Containers the Opus tests read through, as the player does.
 oxideav-mkv.workspace = true
 oxideav-mpegts.workspace = true
 oxideav-ogg.workspace = true
+# The video tests pack frames as the player's headless sink does.
+player = { path = "../player" }

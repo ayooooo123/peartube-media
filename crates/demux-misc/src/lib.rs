@@ -1,6 +1,6 @@
 //! Miscellaneous container demuxers for PearTube media: raw AC-3/E-AC-3,
-//! raw MPEG video, raw MPEG-4 Part 2 video (m4v), raw H.264 and HEVC
-//! Annex B, MPEG-1/2 program streams,
+//! raw MPEG video, raw MPEG-4 Part 2 video (m4v), raw Dirac / VC-2 video,
+//! raw H.264 and HEVC Annex B, MPEG-1/2 program streams,
 //! TechnoTrend PVA, NUT, Creative VOC, Core Audio Format (CAF), On2 IVF
 //! and Standard MIDI Files. Ported from FFmpeg's libavformat (commit
 //! 2da55bf), with the libavcodec parsers that cut its packets, except
@@ -18,11 +18,14 @@
 //! (revision 2da55bf). The inventory expands tests/fate/*.mak and rejects
 //! missing inputs. Raw video compares complete access units and key flags;
 //! raw MPEG-1/2, MPEG-4 Part 2, H.264 and HEVC also FFmpeg's timestamps
-//! and durations (H.264 and HEVC are untimed, as FFmpeg leaves them).
+//! and durations (H.264 and HEVC are untimed, as FFmpeg leaves them). Raw
+//! Dirac counts FFmpeg's picture numbers in frames, where FFmpeg reads them
+//! as 1/1200000 s.
 #![forbid(unsafe_code)]
 
 mod ac3;
 mod av1_cbs;
+mod dirac;
 mod h264;
 mod h264_parse;
 mod hevc;
@@ -43,6 +46,7 @@ use oxideav_core::RuntimeContext;
 
 pub fn register(ctx: &mut RuntimeContext) {
     ac3::register(&mut ctx.containers);
+    dirac::register(&mut ctx.containers);
     h264::register(&mut ctx.containers);
     hevc::register(&mut ctx.containers);
     ivf::register(&mut ctx.containers);

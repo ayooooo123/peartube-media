@@ -166,6 +166,38 @@ timestamps included. The MKV demuxer exposes CodecDelay, DiscardPadding and
 SeekPreRoll as `PacketMetadata::audio_trim` for the AudioTrim consumer, which
 lives on another branch.
 
+### Dirac and legacy video decoding
+
+`demux-misc` opens raw Dirac and VC-2 (`.drc`) by content probe. Its LGPL
+port of FFmpeg 2da55bf's Dirac parser preserves packet bytes and key flags.
+Timing differs on purpose: FFmpeg treats the parser's picture numbers as
+ticks of 1/1200000 s; the port scales them by the sequence frame duration,
+so a 30-picture, 30 fps stream plays for one second. The stream time base
+stays 1/1200000. The first sequence header supplies the frame rate, with
+25 fps as the fallback.
+
+The Dirac fork honors reference retirement, keeps up to eight reference
+pictures and returns pictures in display order through FFmpeg's delay
+buffer. Flushing emits the pictures still waiting; a seek reset drops
+them and clears the reference and output state. A new sequence drains the
+old sequence and restarts its picture count, unlike FFmpeg.
+
+Known seek limit (deferred): a raw Dirac seek can reset away the sequence
+header and land on a picture-only packet. Pictures may then be dropped
+until another sequence header arrives. The sequential playback checks
+below do not cover this recovery path.
+
+`cargo test -p check-decoders --test video` compares every decoded frame
+with pinned FFmpeg: Dirac main/low-delay, MJPEG including interlaced and
+4:2:2 files, 24-bit Cinepak, H.261 and Indeo 3. Indeo 3 emits native
+`yuv410p`, supported by the core and pixel-conversion forks. Palettized
+Cinepak remains outside this coverage; its palette mode cannot yet be
+selected through the stream parameters.
+
+`cargo test -p demux-misc --test reference dirac` checks packet bytes, key
+flags and frame-unit timing. `cargo run -j 2 -p e2e --release -- --filter
+dirac` plays both raw profiles through the headless Player from disk and
+HTTP; each has 30 frame MD5s equal to pinned FFmpeg.
 
 ## Licenses
 
