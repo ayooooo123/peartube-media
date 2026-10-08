@@ -356,9 +356,9 @@ const FATE_SAMPLES: &[&str] = &[
 /// Samples whose output differs from FFmpeg's for reasons other than
 /// recovery handling, all already different before it (pixels from the
 /// first differing frame on: MBAFF/PAFF inter, PCM, 4:2:2 intra, data
-/// partitioning, lossless; counts: frame_num gaps FFmpeg conceals, a
-/// flush error). They are still decoded (a panic fails the test) and
-/// reported; one that starts to match is reported too.
+/// partitioning, lossless; counts: a flush error). They are still decoded
+/// (a panic fails the test) and reported; one that starts to match is
+/// reported too.
 const KNOWN_DIVERGENT: &[&str] = &[
     "h264-conformance/CAMA1_TOSHIBA_B.264",
     "h264-conformance/CAMACI3_Sony_C.jsv",
@@ -404,9 +404,7 @@ const KNOWN_DIVERGENT: &[&str] = &[
     "h264/extradata-reload-multi-stsd.mov",
     "h264/h264refframeregression.mp4",
     "h264/interlaced_crop.mp4",
-    "h264/intra_refresh.h264",
     "h264/lossless.h264",
-    "h264/nondeterministic_cut.h264",
 ];
 
 /// Frame counts (ours, FFmpeg's) and how many leading frames are equal,
