@@ -7,7 +7,9 @@
 //! - H.264 SEI payload type and size codes sum as FFmpeg sums them, in
 //!   32 bits (h264_sei.c: an int type and an unsigned size): a sum past
 //!   2^32 wraps, so its access unit is key exactly where FFmpeg's parser
-//!   reads a recovery point out of it.
+//!   reads a recovery point out of it;
+//! - a CAF header that claims more frames than an i64 holds opens without
+//!   a frame count, as FFmpeg's cafdec.c leaves `nb_frames` unset.
 
 use oxideav_core::{Demuxer, Error, Packet};
 use refcheck::fate;
@@ -135,4 +137,30 @@ fn sei_type_and_size_sums_wrap_as_ffmpegs() {
     ] {
         assert_eq!(key_flags(name, &message), (key, key), "{name}: (ours, FFmpeg's) key flags");
     }
+}
+
+// ───────────────────────── CAF ─────────────────────────
+
+/// 68 bytes: a CAF header of MACE 6:1 (constant 1-byte packets of 6
+/// frames) and a data chunk declaring 2^62 bytes, with nothing after it.
+/// 2^62 packets of 6 frames overflow i64; cafdec.c checks
+/// `data_size / bytes_per_packet < INT64_MAX / frames_per_packet` and
+/// leaves the count unset. The file opens with no duration and ends.
+#[test]
+fn a_caf_frame_count_past_i64_is_left_unset() {
+    let mut caf = b"caff\0\x01\0\0desc".to_vec();
+    caf.extend_from_slice(&32i64.to_be_bytes());
+    caf.extend_from_slice(&8000f64.to_be_bytes());
+    caf.extend_from_slice(b"MAC6");
+    for field in [0u32, 1, 6, 1, 0] {
+        // flags, bytes per packet, frames per packet, channels, bits
+        caf.extend_from_slice(&field.to_be_bytes());
+    }
+    caf.extend_from_slice(b"data");
+    caf.extend_from_slice(&(1i64 << 62).to_be_bytes());
+    caf.extend_from_slice(&[0; 4]); // edit count
+    assert_eq!(caf.len(), 68);
+    let (demuxer, packets) = demux("caf", caf);
+    assert_eq!(demuxer.streams()[0].duration, None);
+    assert!(packets.is_empty());
 }

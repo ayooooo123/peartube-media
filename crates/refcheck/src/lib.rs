@@ -493,13 +493,12 @@ fn pinned_tool(name: &str) -> PathBuf {
     path
 }
 
-/// The `ffmpeg` on PATH (Homebrew 9.0.2), built with external libraries
-/// the pinned build lacks. Use it only for what needs them: test inputs
-/// made with encoders such as libx264, libx265, libvpx, libaom,
-/// libmp3lame, libopus, libvorbis or libtheora, and the two references
-/// FFmpeg's own code cannot give: AV1 pictures ([`dav1d_video_md5s`]) and
-/// ASS rendering (libass). Every other reference comes from
-/// [`pinned_ffmpeg`].
+/// The `ffmpeg` on PATH (Homebrew 9.0.2), with external libraries the
+/// pinned build lacks. It makes the test inputs (encoders such as libx264,
+/// libx265, libvpx, libaom, libmp3lame, libopus, libvorbis and libtheora
+/// are only here), and it gives the two references FFmpeg's own code
+/// cannot: AV1 pictures ([`dav1d_video_md5s`]) and ASS rendering
+/// (libass). Every other reference comes from [`pinned_ffmpeg`].
 pub fn system_ffmpeg() -> PathBuf {
     PathBuf::from("ffmpeg")
 }

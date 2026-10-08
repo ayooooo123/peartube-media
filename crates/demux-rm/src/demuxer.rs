@@ -103,10 +103,10 @@ pub struct RmDemuxer {
 }
 
 
-/// FFmpeg's readfull(): read exactly `n` bytes into `dst`; on a short read
-/// zero-fill the rest and report `false` (the caller keeps the data —
-/// truncated trailing packets are surfaced with the corrupt flag).
-fn read_full(io: &mut Box<dyn ReadSeek>, dst: &mut [u8]) -> bool {
+/// FFmpeg's readfull(): read `dst.len()` bytes; on a short read zero-fill
+/// the rest. Returns the bytes read (the deinterleaving callers keep the
+/// zero-filled block and flag it corrupt).
+fn read_full(io: &mut Box<dyn ReadSeek>, dst: &mut [u8]) -> usize {
     // Count what arrives: read_exact would consume a partial tail and then
     // leave its contents unspecified.
     let mut n = 0;
@@ -119,7 +119,7 @@ fn read_full(io: &mut Box<dyn ReadSeek>, dst: &mut [u8]) -> bool {
         }
     }
     dst[n..].fill(0);
-    n == dst.len()
+    n
 }
 
 fn get_num<R: Read + ?Sized>(reader: &mut R, len: &mut usize) -> Result<usize> {
@@ -1176,8 +1176,8 @@ impl RmDemuxer {
                     for x in 0..steps {
                         let offset = x * 2 * w + y * cfs;
                         if offset + cfs <= ast.audio_buf.len() {
-                            let ok = read_full(&mut self.io, &mut ast.audio_buf[offset..offset + cfs]);
-                            ast.partial |= !ok;
+                            let n = read_full(&mut self.io, &mut ast.audio_buf[offset..offset + cfs]);
+                            ast.partial |= n < cfs;
                         }
                     }
                 }
@@ -1186,16 +1186,16 @@ impl RmDemuxer {
                     for x in 0..steps {
                         let offset = sps * (h * x + ((h + 1) / 2) * (y & 1) + (y >> 1));
                         if offset + sps <= ast.audio_buf.len() {
-                            let ok = read_full(&mut self.io, &mut ast.audio_buf[offset..offset + sps]);
-                            ast.partial |= !ok;
+                            let n = read_full(&mut self.io, &mut ast.audio_buf[offset..offset + sps]);
+                            ast.partial |= n < sps;
                         }
                     }
                 }
                 DEINT_ID_SIPR => {
                     let offset = y * w;
                     if offset + w <= ast.audio_buf.len() {
-                        let ok = read_full(&mut self.io, &mut ast.audio_buf[offset..offset + w]);
-                        ast.partial |= !ok;
+                        let n = read_full(&mut self.io, &mut ast.audio_buf[offset..offset + w]);
+                        ast.partial |= n < w;
                     }
                 }
                 _ => {}
@@ -1340,21 +1340,33 @@ impl RmDemuxer {
                 Ok(None)
             }
         } else {
-            // DEINT_ID_INT0 or unknown: direct packet
+            // DEINT_ID_INT0 or unknown: direct packet, read as av_get_packet
+            // does: a cut final packet is handed over short and flagged
+            // corrupt, and nothing left to read ends the stream.
             if len > MAX_BUFFER_SIZE {
                 return Err(Error::invalid("audio packet too large"));
             }
             let mut buf = vec![0u8; len];
-            let whole = read_full(&mut self.io, &mut buf);
+            let n = read_full(&mut self.io, &mut buf);
+            if n == 0 && len > 0 {
+                return Err(Error::Eof);
+            }
+            buf.truncate(n);
             if self.streams[stream_idx].params.codec_id.as_str() == "ac3" {
-                for chunk in buf.chunks_exact_mut(2) {
-                    chunk.swap(0, 1);
+                // rm_ac3_swap_bytes: an odd last byte swaps with the zeroed
+                // padding past the packet.
+                for pair in buf.chunks_mut(2) {
+                    match pair {
+                        [a, b] => std::mem::swap(a, b),
+                        [last] => *last = 0,
+                        _ => {}
+                    }
                 }
             }
             let mut pkt = Packet::new(stream_idx as u32, time_base, buf);
             pkt = pkt.with_pts(timestamp);
             pkt = pkt.with_keyframe(true);
-            pkt = pkt.with_corrupt(!whole);
+            pkt = pkt.with_corrupt(n < len);
             Ok(Some(pkt))
         }
     }

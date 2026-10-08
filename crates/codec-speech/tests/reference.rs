@@ -63,13 +63,11 @@ fn amr_nb_fate() {
     }
 }
 
-/// amrwb.mak: every 3GP file, remuxed by FFmpeg to the raw `#!AMR-WB`
-/// storage format (`amr` demuxer); see `support::raw_amr_wb` for why not
-/// through the MP4 demuxer.
+/// amrwb.mak: every 3GP file, through the MP4 demuxer.
 #[test]
 fn amr_wb_fate() {
     for name in AMRWB {
-        assert_snr(&raw_amr_wb(name), SampleFormat::F32P, 16_000, 320);
+        assert_snr(&fate(&format!("amrwb/{name}.awb")), SampleFormat::F32P, 16_000, 320);
     }
 }
 

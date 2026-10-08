@@ -38,10 +38,8 @@ pub fn remux(name: &str, input: &Path, output_args: &[&str]) -> PathBuf {
 }
 
 /// FATE's `amrwb/<name>.awb` (3GP) remuxed by FFmpeg to the raw
-/// `#!AMR-WB` storage format. Read from the 3GP files the stream says 2
-/// channels: 3GPP fixes the sample entry's channel count at 2, and
-/// oxideav-mp4 passes it on where FFmpeg's MOV demuxer forces mono for
-/// AMR, so the decoder (as FFmpeg's would) expects two frames a packet.
+/// `#!AMR-WB` storage format: the `amr` demuxer's AMR-WB input, as FATE
+/// has no raw AMR-WB file.
 pub fn raw_amr_wb(name: &str) -> PathBuf {
     let source = refcheck::fate(&format!("amrwb/{name}.awb"));
     remux(&format!("{name}.amr"), &source, &["-c", "copy", "-f", "amr"])

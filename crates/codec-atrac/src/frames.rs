@@ -23,18 +23,28 @@ pub(crate) trait FrameCodec: Send {
 /// Builds a codec from the stream parameters (FFmpeg's `init`).
 pub(crate) type MakeCodec = fn(&CodecParameters) -> Result<Box<dyn FrameCodec>>;
 
-/// A [`Decoder`] around a [`FrameCodec`]. Each packet is decoded as
-/// FFmpeg's decode loop does: every call consumes what the codec reports
-/// and the rest is fed again without the packet's timestamp; an error ends
-/// the packet and is returned after the frames decoded before it.
+/// A [`Decoder`] around a [`FrameCodec`], decoding as FFmpeg's decode loop
+/// does: on demand, one frame per `receive_frame`. Each call consumes what
+/// the codec reports, and the rest of the packet is fed again without the
+/// packet's timestamp; an error drops the rest of the packet. A packet of
+/// many small frames therefore costs one frame of memory at a time, not
+/// all its frames at once.
 pub(crate) struct AudioDecoder {
     codec_id: CodecId,
     params: CodecParameters,
     make: MakeCodec,
     codec: Box<dyn FrameCodec>,
     format: AudioFormat,
-    queue: VecDeque<Result<AudioFrame>>,
+    pending: VecDeque<Pending>,
     eof: bool,
+}
+
+/// A packet not yet fully decoded: its bytes from `pos` on, and the
+/// timestamp of its first frame until that frame is decoded.
+struct Pending {
+    data: Vec<u8>,
+    pos: usize,
+    pts: Option<i64>,
 }
 
 /// The codec option FFmpeg's `AVCodecContext::block_align` travels in.
@@ -76,7 +86,7 @@ impl AudioDecoder {
                 sample_rate,
                 channels,
             },
-            queue: VecDeque::new(),
+            pending: VecDeque::new(),
             eof: false,
         }))
     }
@@ -87,42 +97,45 @@ impl Decoder for AudioDecoder {
         &self.codec_id
     }
 
+    /// Holds the packet; `receive_frame` decodes it.
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let mut data: &[u8] = &packet.data;
-        let mut pts = packet.pts;
-        while !data.is_empty() {
-            match self.codec.decode(data) {
-                Ok((consumed, planes)) => {
-                    if let Some(planes) = planes {
-                        let samples = planes.first().map_or(0, Vec::len) as u32;
-                        let data = planes
-                            .iter()
-                            .map(|p| p.iter().flat_map(|s| s.to_le_bytes()).collect())
-                            .collect();
-                        self.queue.push_back(Ok(AudioFrame { samples, pts, data }));
-                    }
-                    pts = None;
-                    if consumed == 0 || consumed >= data.len() {
-                        break;
-                    }
-                    data = &data[consumed..];
-                }
-                Err(e) => {
-                    self.queue.push_back(Err(e));
-                    break;
-                }
-            }
+        if !packet.data.is_empty() {
+            self.pending.push_back(Pending {
+                data: packet.data.clone(),
+                pos: 0,
+                pts: packet.pts,
+            });
         }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.queue.pop_front() {
-            Some(Ok(frame)) => Ok(Frame::Audio(frame)),
-            Some(Err(e)) => Err(e),
-            None if self.eof => Err(Error::Eof),
-            None => Err(Error::NeedMore),
+        while let Some(packet) = self.pending.front_mut() {
+            let rest = &packet.data[packet.pos..];
+            let left = rest.len();
+            let pts = packet.pts.take();
+            match self.codec.decode(rest) {
+                Ok((consumed, planes)) => {
+                    if consumed == 0 || consumed >= left {
+                        self.pending.pop_front();
+                    } else {
+                        packet.pos += consumed;
+                    }
+                    if let Some(planes) = planes {
+                        return Ok(Frame::Audio(audio_frame(&planes, pts)));
+                    }
+                }
+                Err(e) => {
+                    self.pending.pop_front();
+                    return Err(e);
+                }
+            }
         }
+        Err(if self.eof {
+            Error::Eof
+        } else {
+            Error::NeedMore
+        })
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -134,7 +147,7 @@ impl Decoder for AudioDecoder {
     /// `flush`; a seek reopens them).
     fn reset(&mut self) -> Result<()> {
         self.codec = (self.make)(&self.params)?;
-        self.queue.clear();
+        self.pending.clear();
         self.eof = false;
         Ok(())
     }
@@ -144,4 +157,14 @@ impl Decoder for AudioDecoder {
     fn output_audio_format(&self) -> Option<AudioFormat> {
         Some(self.format)
     }
+}
+
+/// The codec's planes as an [`AudioFrame`]: little-endian `f32` per plane.
+fn audio_frame(planes: &Planes, pts: Option<i64>) -> AudioFrame {
+    let samples = planes.first().map_or(0, Vec::len) as u32;
+    let data = planes
+        .iter()
+        .map(|p| p.iter().flat_map(|s| s.to_le_bytes()).collect())
+        .collect();
+    AudioFrame { samples, pts, data }
 }

@@ -88,6 +88,14 @@ fn opus_in_container(ext: &str) {
     exact_length(&output.0, 11208);
 }
 
+/// FATE's chained Ogg Opus: a second link (its own serial, pre-skip and end
+/// padding) after the first. FFmpeg goes on with it as the same stream
+/// (`ogg_replace_stream`): 4800 samples from each link.
+#[test]
+fn chained_ogg_opus_plays_both_links() {
+    exact_length(&refcheck::fate("ogg-opus/chained-meta.ogg"), 9600);
+}
+
 /// FFmpeg 2da55bf's decode of `path` from `at` on. `-ss` before `-i`
 /// seeks, decodes from where it lands and drops what precedes `at`;
 /// `-seek_timestamp 1` makes `at` a media time, as `Player::seek` takes

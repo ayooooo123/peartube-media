@@ -429,7 +429,8 @@ fn source_io<T>(state: &mut MutexGuard<'_, RingState>, call: impl FnOnce() -> T)
     out
 }
 
-/// Opens a URL (http(s) or file) with read-ahead ring buffering.
+/// Opens a URL (http, https with the `https` feature, or file) with
+/// read-ahead ring buffering.
 pub fn open_source(url: &str) -> std::io::Result<ReadAheadSource> {
     if url.starts_with("http://") || url.starts_with("https://") {
         let cfg = oxideav_http::HttpConfig::builder()
