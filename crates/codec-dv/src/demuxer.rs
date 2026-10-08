@@ -151,6 +151,30 @@ fn extract_audio(frame: &[u8], ppcm: &[Option<usize>; 5], bufs: &mut [Vec<u8>; 4
     Some(size)
 }
 
+/// The PCM avpriv_dv_produce_packet makes of the DIF frame `frame` for its
+/// first audio stream, for DV audio carried in whole frames (QuickTime's
+/// `dvca`/`vdva` tracks, type-1 DV AVI): the sample rate, and the bytes of
+/// 16-bit stereo left at the start of `pcm`, which persists from frame to
+/// frame as FFmpeg's audio buffer does. `sys` is the last frame's profile.
+/// None when `frame` is not a DIF frame or carries no audio in that pair.
+pub(crate) fn first_pair_audio(frame: &[u8], sys: &mut Option<&'static DvProfile>, pcm: &mut Vec<u8>) -> Option<(u32, usize)> {
+    *sys = frame_profile(*sys, frame, frame.len(), false);
+    let profile = (*sys).filter(|s| frame.len() >= s.frame_size)?;
+    // dv_extract_audio_info: no pairs for an unknown rate or stereo mode
+    let as_pack = extract_pack(frame, DV_AUDIO_SOURCE)?;
+    let sample_rate = *DV_AUDIO_FREQUENCY.get(usize::from(frame[as_pack + 4] >> 3 & 0x07))?;
+    let pairs = [1, 0, 2, 4].get(usize::from(frame[as_pack + 3] & 0x1f)).copied().unwrap_or(0);
+    // a 720p frame's first half carries pairs 2 and 3
+    if pairs == 0 || (profile.height == 720 && frame[1] & 0x0C == 0) {
+        return None;
+    }
+    pcm.resize(AUDIO_BUF, 0);
+    let mut bufs = [std::mem::take(pcm), Vec::new(), Vec::new(), Vec::new()];
+    let size = extract_audio(frame, &[Some(0), None, None, None, None], &mut bufs, profile);
+    *pcm = std::mem::take(&mut bufs[0]);
+    Some((sample_rate, size?))
+}
+
 /// DVPacket: an audio packet waiting to be returned.
 #[derive(Clone, Copy, Default)]
 struct AudioPkt {

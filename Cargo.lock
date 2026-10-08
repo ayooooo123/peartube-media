@@ -1053,7 +1053,7 @@ dependencies = [
 [[package]]
 name = "oxideav-avi"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-avi?rev=b919db191b3bc6f5da0fe250e660b37c231d1c26#b919db191b3bc6f5da0fe250e660b37c231d1c26"
+source = "git+https://github.com/ayooooo123/oxideav-avi?rev=498b1097cee7002a235ff9a527e6a7009050cfb9#498b1097cee7002a235ff9a527e6a7009050cfb9"
 dependencies = [
  "oxideav-core",
 ]
@@ -1061,7 +1061,7 @@ dependencies = [
 [[package]]
 name = "oxideav-basic"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-basic?rev=33120ba15b5cf1aa91061662dbf43826153a3fd3#33120ba15b5cf1aa91061662dbf43826153a3fd3"
+source = "git+https://github.com/ayooooo123/oxideav-basic?rev=b7329a9198fab533fabe6d8d9b5a408eeb77cec4#b7329a9198fab533fabe6d8d9b5a408eeb77cec4"
 dependencies = [
  "oxideav-core",
 ]
@@ -1197,7 +1197,7 @@ dependencies = [
 [[package]]
 name = "oxideav-iff"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-iff?rev=c054ff2d42a347be36b2c2ba4b0d9490932c210f#c054ff2d42a347be36b2c2ba4b0d9490932c210f"
+source = "git+https://github.com/ayooooo123/oxideav-iff?rev=50e0fc05c1c13303df6c9d212e7046f5eb2a3ea5#50e0fc05c1c13303df6c9d212e7046f5eb2a3ea5"
 dependencies = [
  "oxideav-core",
 ]
@@ -1255,7 +1255,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mov"
 version = "0.0.6"
-source = "git+https://github.com/ayooooo123/oxideav-mov?rev=c1e7719a39e436bf9690c0b1f5cffc93f421ea54#c1e7719a39e436bf9690c0b1f5cffc93f421ea54"
+source = "git+https://github.com/ayooooo123/oxideav-mov?rev=3cb57f8548867149753f340f3470c281bec36010#3cb57f8548867149753f340f3470c281bec36010"
 dependencies = [
  "compcol",
  "oxideav-core",
