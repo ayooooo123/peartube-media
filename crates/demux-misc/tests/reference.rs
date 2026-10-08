@@ -765,14 +765,94 @@ fn voc() {
     check_inventory("voc", &["voc"], CONTAINER);
 }
 
-/// caf.mak's PCM input and the previously covered AAC/Opus fixtures:
-/// complete packet-table framing and timing, not only the first 3 PTS.
+/// caf.mak's PCM input; FATE's AAC and Opus files, a packet table before
+/// the data; and files FFmpeg's muxer writes, the table after the data:
+/// ALAC (packet sizes in the table) and QDM2 (constant sizes, the count
+/// taken from the data size). Packets, timestamps and durations equal
+/// FFmpeg 2da55bf's, and so do the priming and remainder trims, its
+/// skip-samples side data, on every packet.
 #[test]
 fn caf() {
     check_inventory("caf", &["caf"], CONTAINER);
-    for rel in ["caf/aac.caf", "caf/opus.caf"] {
-        compare(&suite_path(rel), rel, "caf", CONTAINER).unwrap();
+    let dir = scratch_dir("caf");
+    let remux = |name: &str, source: &str| {
+        let path = dir.join(name);
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(suite_path(source))
+            .args(["-map", "0:a", "-c", "copy", "-f", "caf"])
+            .arg(&path)
+            .output()
+            .expect("ffmpeg must be on PATH");
+        assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        let chunks = caf_chunks(&path);
+        let at = |tag: &[u8; 4]| chunks.iter().position(|c| c == tag);
+        assert!(at(b"pakt") > at(b"data"), "{name}: FFmpeg wrote the packet table after the data: {chunks:?}");
+        path
+    };
+    let inputs = [
+        ("caf/aac.caf", suite_path("caf/aac.caf")),
+        ("caf/opus.caf", suite_path("caf/opus.caf")),
+        ("inside.caf (ALAC)", remux("inside.caf", "lossless-audio/inside.m4a")),
+        ("surge-2-16-B-QDM2.caf", remux("surge-2-16-B-QDM2.caf", "qt-surge-suite/surge-2-16-B-QDM2.mov")),
+    ];
+    let timed = Mode { durations: true, port: true, ..CONTAINER };
+    for (rel, path) in &inputs {
+        compare(path, rel, "caf", timed).unwrap();
+        assert_eq!(caf_trims(path), ffprobe_trims(path), "{rel}: priming and remainder trims per packet");
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The chunk tags of a CAF file, in file order.
+fn caf_chunks(path: &Path) -> Vec<[u8; 4]> {
+    let bytes = std::fs::read(path).unwrap();
+    let mut tags = Vec::new();
+    let mut pos = 8;
+    while pos + 12 <= bytes.len() {
+        tags.push(bytes[pos..pos + 4].try_into().unwrap());
+        let size = i64::from_be_bytes(bytes[pos + 4..pos + 12].try_into().unwrap());
+        if size < 0 {
+            break;
+        }
+        pos += 12 + size as usize;
+    }
+    tags
+}
+
+/// Each packet's (skip, discard) trim from the CAF demuxer.
+fn caf_trims(path: &Path) -> Vec<Option<(u32, u32)>> {
+    let ctx = codecs::context();
+    let file = std::fs::File::open(path).unwrap();
+    let mut demuxer = ctx.containers.open_demuxer("caf", Box::new(file), &ctx.codecs).unwrap();
+    let mut trims = Vec::new();
+    loop {
+        match demuxer.next_packet() {
+            Ok(_) => trims.push(demuxer.packet_metadata().audio_trim.map(|t| (t.skip_samples, t.discard_padding))),
+            Err(oxideav_core::Error::Eof) => return trims,
+            Err(e) => panic!("{}: {e}", path.display()),
+        }
+    }
+}
+
+/// Each packet's skip-samples side data (skip, discard) from FFmpeg
+/// 2da55bf's ffprobe.
+fn ffprobe_trims(path: &Path) -> Vec<Option<(u32, u32)>> {
+    let out = std::process::Command::new(port_ffprobe())
+        .args(["-v", "quiet", "-show_entries", "packet=pts:packet_side_data=skip_samples,discard_padding", "-of", "compact"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.starts_with("packet|"))
+        .map(|line| {
+            let kv: HashMap<&str, &str> = line.split('|').filter_map(|f| f.split_once('=')).collect();
+            let field = |key: &str| kv.get(key).map(|v| v.parse::<u32>().unwrap());
+            Some((field("side_datum/skip_samples:skip_samples")?, field("side_datum/skip_samples:discard_padding")?))
+        })
+        .collect()
 }
 
 /// cbs.mak, av1.mak, vpx.mak: frame headers carry size and pts; key
