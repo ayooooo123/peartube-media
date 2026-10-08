@@ -654,9 +654,9 @@ pub fn parse_stream_header(data: &[u8]) -> Result<StreamHeader> {
 }
 
 /// The `shorten` decoder. FFmpeg's decoder buffers the stream itself and
-/// decodes a block once it holds `max_framesize` bytes, so a packet gives
-/// any number of blocks and the last ones come out on `flush`. Blocks carry
-/// their pts in samples from the start.
+/// decodes a block once it holds `max_framesize` bytes. Receives resume at
+/// that block's bit position; after `flush` they drain the smaller tail.
+/// Blocks carry their pts in samples from the start.
 pub struct ShortenDecoder {
     codec_id: CodecId,
     has_extradata: bool,
@@ -665,8 +665,16 @@ pub struct ShortenDecoder {
     /// rate also for a stream whose header the container carries.
     params_format: Option<AudioFormat>,
     state: State,
+    draining: bool,
     drained: bool,
-    ready: VecDeque<Frame>,
+    drain_errors: u32,
+    pending: VecDeque<Pending>,
+}
+
+/// Compressed bytes not yet taken by `State::call`, never expanded PCM.
+struct Pending {
+    data: Vec<u8>,
+    pos: usize,
 }
 
 impl ShortenDecoder {
@@ -683,8 +691,10 @@ impl ShortenDecoder {
             has_extradata,
             params_format,
             state: State::new(has_extradata),
+            draining: false,
             drained: false,
-            ready: VecDeque::new(),
+            drain_errors: 0,
+            pending: VecDeque::new(),
         })
     }
 }
@@ -707,72 +717,73 @@ impl Decoder for ShortenDecoder {
         Some(AudioFormat { sample_format: s.sample_format(), sample_rate, channels: s.channels as u16 })
     }
 
-    /// decode.c's loop: calls until the packet is taken, a block per call.
-    /// After an error the rest of the packet is dropped; the blocks decoded
-    /// before it stay queued.
+    /// Retain compressed input; receives run decode.c's loop one output
+    /// block at a time. The internal byte buffer and bit index survive.
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if packet.data.is_empty() {
-            return Ok(());
+        if !packet.data.is_empty() {
+            self.draining = false;
+            self.drained = false;
+            self.drain_errors = 0;
+            self.pending.push_back(Pending { data: packet.data.clone(), pos: 0 });
         }
-        self.drained = false;
-        let mut data: &[u8] = &packet.data;
-        loop {
-            let before = (self.state.bitstream_index, self.state.bitstream_size, self.state.bitindex);
-            match self.state.call(Some(data)) {
-                Call::Done(consumed, frame) => {
-                    let decoded = frame.is_some();
-                    if let Some(f) = frame {
-                        self.ready.push_back(f);
-                    }
-                    if consumed >= data.len() {
-                        return Ok(());
-                    }
-                    // A call that neither takes input nor moves through
-                    // the buffer would repeat forever.
-                    let after = (self.state.bitstream_index, self.state.bitstream_size, self.state.bitindex);
-                    if consumed == 0 && !decoded && before == after {
-                        return Ok(());
-                    }
-                    data = &data[consumed..];
-                }
-                Call::Failed(e) => return Err(e),
-            }
-        }
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        self.ready.pop_front().ok_or(Error::NeedMore)
-    }
-
-    /// Draining: calls without input until one decodes no block. A call
-    /// that fails loses its block and draining goes on, as decode.c does
-    /// (giving up after its error limit).
-    fn flush(&mut self) -> Result<()> {
-        if self.drained {
-            return Ok(());
+        while let Some(mut packet) = self.pending.pop_front() {
+            let data = &packet.data[packet.pos..];
+            let before = (self.state.bitstream_index, self.state.bitstream_size, self.state.bitindex);
+            match self.state.call(Some(data)) {
+                Call::Done(consumed, frame) => {
+                    let after = (self.state.bitstream_index, self.state.bitstream_size, self.state.bitindex);
+                    // As in decode.c, drop an input that made no progress.
+                    // Consuming bits but no whole bytes is still progress.
+                    if consumed < data.len() && (consumed != 0 || frame.is_some() || before != after) {
+                        packet.pos += consumed;
+                        self.pending.push_front(packet);
+                    }
+                    if let Some(frame) = frame {
+                        return Ok(frame);
+                    }
+                }
+                // The rest of this packet is lost, not earlier output.
+                Call::Failed(e) => return Err(e),
+            }
         }
-        self.drained = true;
-        let mut errors = 0;
-        loop {
+        while self.draining && !self.drained {
             match self.state.call(None) {
-                Call::Done(_, Some(f)) => self.ready.push_back(f),
-                Call::Done(_, None) => return Ok(()),
+                Call::Done(_, Some(frame)) => return Ok(frame),
+                Call::Done(_, None) => self.drained = true,
                 Call::Failed(_) => {
-                    errors += 1;
-                    if errors >= MAX_DRAIN_ERRORS {
-                        return Ok(());
+                    self.drain_errors += 1;
+                    if self.drain_errors >= MAX_DRAIN_ERRORS {
+                        self.drained = true;
                     }
                 }
             }
         }
+        Err(Error::NeedMore)
+    }
+
+    /// Signal EOF without expanding the buffered tail. Receives finish
+    /// pending packets first, then drain blocks using the same read state.
+    fn flush(&mut self) -> Result<()> {
+        self.draining = true;
+        Ok(())
     }
 
     /// Back to the start of a stream: the demuxer only rewinds to the first
     /// byte, where the stream header is.
     fn reset(&mut self) -> Result<()> {
         self.state = State::new(self.has_extradata);
+        self.draining = false;
         self.drained = false;
-        self.ready.clear();
+        self.drain_errors = 0;
+        self.pending.clear();
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/memory/mod.rs"]
+mod memory;

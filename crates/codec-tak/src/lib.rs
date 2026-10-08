@@ -2,6 +2,11 @@
 //! 24 bits, mono to 6 channels) and the `.tak` demuxer with FFmpeg's TAK
 //! parser framing.
 //!
+//! The demuxer drops scanned junk while retaining partial headers. Frame
+//! growth is bounded by sample/channel counts: 16 bytes per sample plus
+//! 4 KiB per channel and header/CRC space, including header lookahead.
+//! A missing next sync cannot make one packet absorb the rest of the file.
+//!
 //! Ported from FFmpeg (commit 2da55bf): libavcodec/takdec.c, tak.c, tak.h,
 //! takdsp.c, tak_parser.c, the C scalarproduct_int16 of audiodsp.c, the
 //! cached little-endian reader of bitstream_template.h, libavutil/crc.c's

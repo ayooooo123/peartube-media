@@ -2,6 +2,12 @@
 //! up to 16 channels, password-encrypted streams with the `password`
 //! option) and the `.tta` demuxer.
 //!
+//! Before reading payload, the demuxer validates every seek-table size
+//! against a 256 MiB budget less the table and a full frame's i32 working
+//! samples and output. Rice coding can exceed PCM size; PCM size alone is
+//! not a compressed-frame cap. Packet/table growth stays within the
+//! validated sizes, and a short last packet still reaches the decoder.
+//!
 //! Ported from FFmpeg (commit 2da55bf): libavcodec/tta.c, ttadsp.c,
 //! ttadata.c, ttadata.h and libavformat/tta.c. Licensed under
 //! LGPL-2.1-or-later (see LICENSE).

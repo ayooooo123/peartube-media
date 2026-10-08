@@ -41,7 +41,7 @@ const NEEDED_AT_END: usize = 8;
 /// How much of the stream a header check reads at most: every header the
 /// decoder accepts (at most 6 channels) fits in the parser's 37 bytes.
 const HEADER_WINDOW: usize = 64;
-const READ_CHUNK: u64 = 64 * 1024;
+const READ_CHUNK: u64 = 32 * 1024;
 
 /// `tak_probe`: FFmpeg's extension-level score for the magic.
 pub fn probe(p: &ProbeData) -> u8 {
@@ -144,7 +144,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
         stream,
         data_start,
         data_end: last_frame_end.map(|e| e + data_start),
-        splitter: Splitter::new(data_start),
+        splitter: Splitter { ti: info, ..Splitter::new(data_start) },
         pts: 0,
         index: Vec::new(),
     }))
@@ -194,6 +194,25 @@ impl Splitter {
             key: false,
         }
     }
+
+    /// A residue takes at most 73 bits (26 + 1 + 9 + 3 + 5 + 29).
+    /// Allow 128 bits/sample, plus 4 KiB/channel for up to eight predictor
+    /// and window headers and decorrelation parameters. TAK allows at most
+    /// 16384 samples and 16 channels: this stays below 4.1 MiB even for
+    /// layouts the decoder does not support yet.
+    fn frame_limit(&self) -> usize {
+        let samples = self.ti.frame_samples.max(self.ti.last_frame_samples);
+        let samples = if samples > 0 { samples.min(16384) as usize } else { 16384 };
+        let channels = if self.ti.channels > 0 { self.ti.channels.min(16) } else { 16 };
+        (samples * 16 + 4096) * channels + HEADER_WINDOW + 3
+    }
+
+    /// Keep unexamined bytes, including a possible partial sync/header.
+    fn discard_prefix(&mut self, n: usize) {
+        self.buf.drain(..n);
+        self.pos += n as u64;
+        self.scan = self.scan.saturating_sub(n);
+    }
 }
 
 /// One frame: its bytes, file offset, duration and whether it is a key
@@ -220,14 +239,21 @@ struct TakDemuxer {
 impl TakDemuxer {
     /// More of the data into the splitter; false at its end.
     fn fill(&mut self) -> Result<bool> {
-        let at = self.splitter.pos + self.splitter.buf.len() as u64;
-        let limit = match self.data_end {
-            Some(end) => end.saturating_sub(at).min(READ_CHUNK),
-            None => READ_CHUNK,
+        let s = &mut self.splitter;
+        let at = s.pos + s.buf.len() as u64;
+        // A frame needs only one header's lookahead beyond its budget.
+        let room = if s.start_found {
+            (s.frame_limit() + NEEDED).saturating_sub(s.buf.len()) as u64
+        } else {
+            READ_CHUNK
         };
-        let before = self.splitter.buf.len();
-        (&mut self.input).take(limit).read_to_end(&mut self.splitter.buf)?;
-        Ok(self.splitter.buf.len() > before)
+        let limit = self.data_end.map_or(READ_CHUNK, |end| end.saturating_sub(at).min(READ_CHUNK)).min(room);
+        let mut chunk = [0u8; READ_CHUNK as usize];
+        let n = self.input.read(&mut chunk[..limit as usize])?;
+        // read_to_end's geometric growth can exceed the frame budget.
+        s.buf.reserve_exact(n);
+        s.buf.extend_from_slice(&chunk[..n]);
+        Ok(n != 0)
     }
 
     /// `tak_parse`: the next frame, or `None` at the end of the data.
@@ -237,8 +263,12 @@ impl TakDemuxer {
             let needed = if s.eof { NEEDED_AT_END } else { NEEDED };
             while s.scan + needed <= s.buf.len() {
                 let p = s.scan;
+                if s.start_found && p > s.frame_limit() {
+                    break;
+                }
                 if !s.start_found {
                     if frame_starts(&s.buf[p..], &mut s.ti) {
+                        s.discard_prefix(p);
                         s.start_found = true;
                         s.duration = i64::from(if s.ti.last_frame_samples != 0 {
                             s.ti.last_frame_samples
@@ -260,8 +290,20 @@ impl TakDemuxer {
                 }
                 s.scan += 1;
             }
+            if s.start_found && (s.scan > s.frame_limit() || (s.eof && s.buf.len() > s.frame_limit())) {
+                let scanned = s.scan;
+                s.discard_prefix(scanned);
+                s.start_found = false;
+                return Err(Error::invalid("tak: frame exceeds its sample/channel budget"));
+            }
+            if !s.start_found {
+                let scanned = s.scan;
+                s.discard_prefix(scanned);
+            }
             if s.eof {
-                if s.buf.is_empty() {
+                if !s.start_found || s.buf.is_empty() {
+                    let remaining = s.buf.len();
+                    s.discard_prefix(remaining);
                     return Ok(None);
                 }
                 let data = std::mem::take(&mut s.buf);
@@ -290,7 +332,7 @@ impl TakDemuxer {
 
     fn restart_at(&mut self, pts: i64, pos: u64) -> Result<()> {
         self.input.seek(SeekFrom::Start(pos))?;
-        self.splitter = Splitter::new(pos);
+        self.splitter = Splitter { ti: self.splitter.ti, ..Splitter::new(pos) };
         self.pts = pts;
         Ok(())
     }
@@ -341,3 +383,7 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("tak", "tak");
     reg.register_probe("tak", probe);
 }
+
+#[cfg(test)]
+#[path = "../tests/memory/mod.rs"]
+mod memory;

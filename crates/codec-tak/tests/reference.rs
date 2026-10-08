@@ -594,6 +594,8 @@ fn written_streams_match_ffmpeg() {
         Spec { name: "s24-4ch-multichannel", bps: 24, channels: 4, rate: 44100, frame_type: 8, frames: 14, multichannel: true, seed: 6 },
         Spec { name: "s16-3ch-small-frames", bps: 16, channels: 3, rate: 22050, frame_type: 7, frames: 20, multichannel: true, seed: 7 },
         Spec { name: "s16-stereo-11k", bps: 16, channels: 2, rate: 11025, frame_type: 9, frames: 10, multichannel: false, seed: 8 },
+        // The format's largest supported frame, well beyond a read chunk.
+        Spec { name: "s24-6ch-max-frame", bps: 24, channels: 6, rate: 96000, frame_type: 6, frames: 3, multichannel: true, seed: 9 },
     ];
     for spec in &specs {
         let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("codec-tak-{}.tak", spec.name));
