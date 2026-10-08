@@ -40,7 +40,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_speech::register_codecs,
         // Speex, ahead of oxideav-speex.
         codec_speex::register_codecs,
-        // SVQ3, ahead of oxideav-svq.
+        // SVQ1 and SVQ3, ahead of oxideav-svq.
+        codec_svq1::register_codecs,
         codec_svq3::register_codecs,
         // Monkey's Audio (every version from 3.80), Musepack SV7 and SV8,
         // and WavPack (lossless, hybrid, float, DSD): FFmpeg's decoders,

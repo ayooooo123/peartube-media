@@ -319,6 +319,7 @@ pub fn ffmpeg_pix_fmt_name(format: PixelFormat) -> Option<&'static str> {
         PixelFormat::Yuv444P => "yuv444p",
         PixelFormat::Yuv440P => "yuv440p",
         PixelFormat::Yuv411P => "yuv411p",
+        PixelFormat::Yuv410P => "yuv410p",
         PixelFormat::YuvJ420P => "yuvj420p",
         PixelFormat::YuvJ422P => "yuvj422p",
         PixelFormat::YuvJ444P => "yuvj444p",
