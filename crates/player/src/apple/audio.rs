@@ -36,8 +36,8 @@ pub struct AppleAudioSink {
     format_desc: Option<CFRetained<CMAudioFormatDescription>>,
     ready: ReadyFlag,
     requesting: std::cell::Cell<bool>,
-    /// Set once the timebase has been anchored (first `write` after open
-    /// or flush); `play`/`pause` before that only record the intent.
+    /// Set by the first `write`, or the first one after an explicit flush.
+    /// Format reopens preserve it; unanchored `play`/`pause` record intent.
     anchored: bool,
     playing: bool,
     playback: super::PlaybackSlot,
