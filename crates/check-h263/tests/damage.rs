@@ -181,14 +181,9 @@ fn h263_survives_damage() {
     survive(mov, &archive(mov), 0x2634);
 }
 
-/// From FFmpeg's video-only remux: oxideav-avi refuses the archive files'
-/// MP3 audio header (see `reference.rs`).
 #[test]
 fn intel_h263_survives_damage() {
     for (file, seed) in [("V-codecs/I263/i263.avi", 0x1263), ("V-codecs/I263/i263_2.avi", 0x1264)] {
-        let original = archive(file);
-        let name = original.file_stem().unwrap().to_str().unwrap();
-        let video = remux(&format!("{name}-video.avi"), &original, &["-map", "0:v:0", "-c", "copy", "-f", "avi"]);
-        survive(file, &video, seed);
+        survive(file, &archive(file), seed);
     }
 }

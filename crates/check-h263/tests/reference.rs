@@ -50,21 +50,15 @@ fn raw_h263_streams_in_pieces() {
     }
 }
 
-/// oxideav-avi refuses both archive files over their MP3 audio header
-/// (`strh.dwSampleSize` 1 on a VBR codec), so the video is read from
-/// FFmpeg's video-only remux, which FFmpeg decodes exactly as it does
-/// the original.
+/// The archive's Intel H.263 captures, video only (`tests/player.rs`
+/// plays them with their audio).
 #[test]
 fn intel_h263_archive_files() {
     for file in ["V-codecs/I263/i263.avi", "V-codecs/I263/i263_2.avi"] {
-        let original = archive(file);
-        let name = original.file_stem().unwrap().to_str().unwrap();
-        let video = remux(&format!("{name}-video.avi"), &original, &["-map", "0:v:0", "-c", "copy", "-f", "avi"]);
-        let theirs = ffmpeg_md5s(&video, &[]);
-        assert_eq!(theirs, ffmpeg_md5s(&original, &[]), "{file}: FFmpeg decodes the remux differently");
-        let decoded = decode(&video);
+        let path = archive(file);
+        let decoded = decode(&path);
         assert_eq!(decoded.params.codec_id.as_str(), "h263i", "{file}");
-        assert_frames_equal(file, &frame_md5s(&decoded, file), &theirs);
+        assert_frames_equal(file, &frame_md5s(&decoded, file), &ffmpeg_md5s(&path, &[]));
     }
 }
 

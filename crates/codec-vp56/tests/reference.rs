@@ -152,22 +152,11 @@ fn check(path: &Path, registrars: &[Registrar], input_args: &[&str]) {
     assert_eq!(got.len(), want.len(), "{name}: frames");
 }
 
-/// fate-vp5. OxideAV's AVI demuxer stops one chunk short of FFmpeg on
-/// this cut-off file (246 of 247 packets), so FFmpeg first copies its
-/// video into a complete AVI: all 247 packets reach the decoder.
+/// fate-vp5: the file is cut inside its last frame; FFmpeg's AVI demuxer
+/// returns the frame's present bytes and decodes all 247 frames.
 #[test]
 fn vp5_in_avi() {
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("codec-vp56-{}-potter.avi", std::process::id()));
-    let out = Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error", "-y", "-i"])
-        .arg(fate("vp5/potter512-400-partial.avi"))
-        .args(["-map", "0:v", "-c", "copy"])
-        .arg(&path)
-        .output()
-        .expect("ffmpeg on PATH");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    check(&path, &[codec_vp56::register, avi], &[]);
-    let _ = std::fs::remove_file(&path);
+    check(&fate("vp5/potter512-400-partial.avi"), &[codec_vp56::register, avi], &[]);
 }
 
 /// fate-vp60-interlace1.
