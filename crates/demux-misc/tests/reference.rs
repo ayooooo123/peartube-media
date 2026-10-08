@@ -560,6 +560,17 @@ fn picture_headers(bytes: &[u8]) -> Vec<usize> {
     (0..bytes.len().saturating_sub(4)).filter(|&i| bytes[i..i + 4] == [0, 0, 1, 0]).collect()
 }
 
+/// Raw MPEG-4 Part 2 video (m4v; FATE names some `.h263`): the VOPs
+/// FFmpeg's mpeg4video parser cuts with the headers before them, key for
+/// I-VOPs, timed by their VOP times as FFmpeg 2da55bf's demuxer layer
+/// times them: B-frame delay (the Xvid stream), plain (the resolution
+/// changes), FFmpeg's guessed time_increment_bits (demo.m4v) and the
+/// studio profile's untimed VOP.
+#[test]
+fn m4v() {
+    check_inventory("m4v", &["m4v", "h263"], RAW_MPEG);
+}
+
 /// Raw MPEG-1/2 video: the frames FFmpeg's mpegvideo parser cuts, timed
 /// as FFmpeg 2da55bf's demuxer layer times them. Without B-frame delay a
 /// frame's pts is its dts; with it, I- and P-frames have no pts and B-frames

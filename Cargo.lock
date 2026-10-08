@@ -272,6 +272,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-svq1"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "oxideav-mov",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-svq3"
 version = "0.1.0"
 dependencies = [
@@ -339,6 +348,7 @@ dependencies = [
  "codec-rv",
  "codec-speech",
  "codec-speex",
+ "codec-svq1",
  "codec-svq3",
  "codec-vp3",
  "codec-vp56",
@@ -1124,7 +1134,7 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.1.37"
-source = "git+https://github.com/ayooooo123/oxideav-core?rev=57e5fa9cbf9eda25e4b992391c121a306f78cac4#57e5fa9cbf9eda25e4b992391c121a306f78cac4"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=9a314bf862480d019dc1133847ff6262d14ba628#9a314bf862480d019dc1133847ff6262d14ba628"
 dependencies = [
  "bytemuck",
  "serde_json",
@@ -1339,7 +1349,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg12video"
 version = "0.0.13"
-source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=9c4c24c2d336ffde2e23f29d55812e75c40d780a#9c4c24c2d336ffde2e23f29d55812e75c40d780a"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=51af52c9c46f4878d001eaa2a7db89baabdc633a#51af52c9c46f4878d001eaa2a7db89baabdc633a"
 dependencies = [
  "oxideav-core",
 ]
@@ -1404,7 +1414,7 @@ dependencies = [
 [[package]]
 name = "oxideav-pixfmt"
 version = "0.1.9"
-source = "git+https://github.com/OxideAV/oxideav-pixfmt?rev=82b63ba210c097fc62bea63d98412ed88823fd77#82b63ba210c097fc62bea63d98412ed88823fd77"
+source = "git+https://github.com/ayooooo123/oxideav-pixfmt?rev=77d0d3731fb9d8e9a10893a28ddf86b19219188b#77d0d3731fb9d8e9a10893a28ddf86b19219188b"
 dependencies = [
  "oxideav-core",
 ]
