@@ -175,6 +175,8 @@ dependencies = [
  "md5",
  "oxideav-core",
  "oxideav-mkv",
+ "oxideav-mp4",
+ "oxideav-mpegts",
  "refcheck",
 ]
 

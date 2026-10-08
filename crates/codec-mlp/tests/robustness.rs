@@ -1,10 +1,12 @@
 //! Untrusted-input robustness: the decoder and demuxers must never panic on
 //! truncated or bit-flipped copies of the reference samples (every stream
 //! byte comes from untrusted peers). Deterministic: fixed seed, 2000+
-//! mutations per sample, no panic — errors are fine.
+//! mutations per sample, no panic — errors are fine. Every frame that does
+//! come out must match the layout the decoder reports for it, since
+//! consumers read the PCM in that layout.
 
 use refcheck::fate;
-use oxideav_core::{Frame, ProbeData, RuntimeContext};
+use oxideav_core::{Frame, ProbeData, RuntimeContext, SampleFormat};
 use std::fs::File;
 use std::io::Read;
 
@@ -25,7 +27,8 @@ impl Rng {
 const MUTATIONS_PER_SAMPLE: usize = 2400;
 
 /// Decode `data` with the raw demuxer + decoder, swallowing every error —
-/// only a panic (or hang) fails the test.
+/// a panic (or hang) fails the test, and so does a frame whose bytes do not
+/// fill exactly the layout `output_audio_format` reports for it.
 fn feed_through(data: &[u8], ext: &str, fallback_format: &str) {
     let mut ctx = RuntimeContext::new();
     codec_mlp::register(&mut ctx);
@@ -62,9 +65,23 @@ fn feed_through(data: &[u8], ext: &str, fallback_format: &str) {
                         guard += 1;
                         match decoder.receive_frame() {
                             Ok(Frame::Audio(a)) => {
-                                // Touch the data so a bad length panics here
-                                // instead of downstream.
-                                let _ = a.data.iter().map(|p| p.len()).sum::<usize>();
+                                let format = decoder
+                                    .output_audio_format()
+                                    .expect("a decoded frame without a reported layout");
+                                let width = match format.sample_format {
+                                    SampleFormat::S16 => 2,
+                                    SampleFormat::S32 => 4,
+                                    other => panic!("unexpected sample format {other:?}"),
+                                };
+                                let channels = usize::from(format.channels);
+                                assert!((1..=8).contains(&channels), "{format:?}");
+                                assert!(format.sample_rate > 0, "{format:?}");
+                                assert_eq!(
+                                    a.data.iter().map(Vec::len).collect::<Vec<_>>(),
+                                    [a.samples as usize * channels * width],
+                                    "frame of {} samples vs the reported {format:?}",
+                                    a.samples
+                                );
                             }
                             Ok(_) => {}
                             Err(_) => break,
