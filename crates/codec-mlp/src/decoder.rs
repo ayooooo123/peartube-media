@@ -14,7 +14,7 @@ use crate::dsp::{mlp_filter_channel, mlp_rematrix_channel, msb_mask, pack_output
 use crate::parse::{read_major_sync, MlpHeaderInfo};
 use crate::tables::{HUFF_LUTS, NOISE_TABLE, THD_CHANNEL_ORDER};
 
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Decoder, Error as CoreError, Frame, Packet};
+use oxideav_core::{AudioFormat, AudioFrame, CodecId, CodecParameters, Decoder, Error as CoreError, Frame, Packet, SampleFormat};
 
 /// Number of bits used for the VLC lookup — longest Huffman code is 9.
 const VLC_BITS: u32 = 9;
@@ -95,8 +95,11 @@ pub struct MlpDecoder {
     codec_is_mlp: bool,
     /// The codec id the decoder was created for (`mlp` or `truehd`).
     codec_id: CodecId,
-    /// Buffered output frame between `send_packet` and `receive_frame`.
-    pending: Option<AudioFrame>,
+    /// Buffered output frame between `send_packet` and `receive_frame`,
+    /// with the layout it was packed in.
+    pending: Option<(AudioFrame, AudioFormat)>,
+    /// Layout of the last frame `receive_frame` returned.
+    format: Option<AudioFormat>,
 
     is_major_sync_unit: bool,
     major_sync_header_size: usize,
@@ -138,6 +141,7 @@ impl MlpDecoder {
             codec_is_mlp,
             codec_id: params.codec_id.clone(),
             pending: None,
+            format: None,
             is_major_sync_unit: false,
             major_sync_header_size: 0,
             params_valid: false,
@@ -1066,8 +1070,9 @@ impl MlpDecoder {
         Ok((vec![data], blockpos, lc as i64))
     }
 
-    /// `read_access_unit`.
-    pub fn decode_access_unit(&mut self, pkt: &Packet) -> oxideav_core::Result<Option<(AudioFrame, usize)>> {
+    /// `read_access_unit`: the decoded frame, if the unit yields one, and
+    /// the layout its samples are packed in.
+    pub fn decode_access_unit(&mut self, pkt: &Packet) -> oxideav_core::Result<Option<(AudioFrame, AudioFormat)>> {
         let buf = &pkt.data[..];
         let buf_size = buf.len();
         if buf_size < 4 {
@@ -1312,6 +1317,13 @@ impl MlpDecoder {
         }
 
         let (data, samples, _lc) = self.output_data(self.max_decoded_substream)?;
+        // FFmpeg sets the frame's format in read_major_sync (sample_fmt)
+        // and read_restart_header (ch_layout); output_data packs with them.
+        let format = AudioFormat {
+            sample_format: if self.is32 { SampleFormat::S32 } else { SampleFormat::S16 },
+            sample_rate: self.out_sample_rate,
+            channels: self.out_channels,
+        };
 
         // End-of-stream handling after successful output.
         for substr in 0..=self.max_decoded_substream {
@@ -1328,7 +1340,7 @@ impl MlpDecoder {
             pts: pkt.pts,
             data,
         };
-        Ok(Some((frame, length)))
+        Ok(Some((frame, format)))
     }
 }
 
@@ -1386,21 +1398,29 @@ impl Decoder for MlpDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> oxideav_core::Result<()> {
-        match self.decode_access_unit(packet) {
-            Ok(Some((frame, _consumed))) => {
-                self.pending = Some(frame);
-                Ok(())
-            }
-            Ok(None) => Ok(()),
-            Err(e) => Err(e),
+        if let Some(decoded) = self.decode_access_unit(packet)? {
+            self.pending = Some(decoded);
         }
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> oxideav_core::Result<Frame> {
         match self.pending.take() {
-            Some(frame) => Ok(Frame::Audio(frame)),
+            Some((frame, format)) => {
+                self.format = Some(format);
+                Ok(Frame::Audio(frame))
+            }
             None => Err(CoreError::NeedMore),
         }
+    }
+
+    /// The layout of the frame waiting in `receive_frame`, else of the last
+    /// frame it returned: interleaved S32 (`sample << 8`) when the major
+    /// sync states more than 16 bits, else S16, at the major sync's rate,
+    /// with the channels of the decoded presentation. Containers rarely
+    /// state it (MPEG-TS and Matroska carry no sample format for TrueHD).
+    fn output_audio_format(&self) -> Option<AudioFormat> {
+        self.pending.as_ref().map(|(_, format)| *format).or(self.format)
     }
 
     /// `mlp_decode_flush`: drop stream parameters; the next major sync

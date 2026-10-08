@@ -15,7 +15,10 @@ publish = false
 [workspace.dependencies]
 oxideav-core = "*"
 oxideav-pixfmt = "*"
-oxideav-http = "*"
+# Plain http only: the app reads every stream from its worklet's server on
+# 127.0.0.1. https (rustls + ring, about 0.6 MB) is the fork's `tls`
+# feature; the player's `https` feature turns it on.
+oxideav-http = { version = "*", default-features = false }
 # Containers
 oxideav-avi = "*"
 oxideav-basic = "*"
@@ -198,7 +201,7 @@ oxideav-h261 = { git = "https://github.com/ayooooo123/oxideav-h261", rev = "0803
 oxideav-h263 = { git = "https://github.com/ayooooo123/oxideav-h263", rev = "88189ab8c65491d366345bdb1ab3124b9589e784" }
 oxideav-h264 = { git = "https://github.com/ayooooo123/oxideav-h264", rev = "103743224259f2b8663dc882fa60a18cd95c134a" }
 oxideav-h265 = { git = "https://github.com/ayooooo123/oxideav-h265", rev = "279ecc3f27dc6f4145c5478a0f2388180661e1d1" }
-oxideav-http = { git = "https://github.com/OxideAV/oxideav-http", rev = "f54f106e1e131300387d1df1a71d2686690ccdca" }
+oxideav-http = { git = "https://github.com/ayooooo123/oxideav-http", rev = "ebbc1911048ee0288c5e76bbc0603d5df989dd3f" }
 oxideav-id3 = { git = "https://github.com/OxideAV/oxideav-id3", rev = "d1b462e3da204f2010844648cf1a6bbc65f10dd0" }
 oxideav-iff = { git = "https://github.com/ayooooo123/oxideav-iff", rev = "c054ff2d42a347be36b2c2ba4b0d9490932c210f" }
 oxideav-image-filter = { git = "https://github.com/OxideAV/oxideav-image-filter", rev = "601f4fe832e31fdd9dc3f2bf171389cc09f0dd68" }
@@ -218,7 +221,7 @@ oxideav-mpegts = { git = "https://github.com/ayooooo123/oxideav-mpegts", rev = "
 oxideav-msmpeg4 = { git = "https://github.com/ayooooo123/oxideav-msmpeg4", rev = "def8962c09aa5d339dada2d2308c61186a67e074" }
 oxideav-musepack = { git = "https://github.com/OxideAV/oxideav-musepack", rev = "c60b07708683e0e25c6e0007bffbb887e03876f7" }
 oxideav-ogg = { git = "https://github.com/ayooooo123/oxideav-ogg", rev = "0f651ce5b48fef181dfb5100495aef978d42ac3f" }
-oxideav-opus = { git = "https://github.com/OxideAV/oxideav-opus", rev = "fd97e6110860d21a69c76ba4d051984486fea9fb" }
+oxideav-opus = { git = "https://github.com/ayooooo123/oxideav-opus", rev = "5573fa9ac3136c62e68199e877bff754432c89f9" }
 oxideav-otf = { git = "https://github.com/OxideAV/oxideav-otf", rev = "554299a740ce7236bf2c5e751bb7df5befd52dd0" }
 oxideav-pixfmt = { git = "https://github.com/OxideAV/oxideav-pixfmt", rev = "82b63ba210c097fc62bea63d98412ed88823fd77" }
 oxideav-png = { git = "https://github.com/OxideAV/oxideav-png", rev = "39bdba2cfd11545056934f12482afd56be3b7628" }
