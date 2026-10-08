@@ -15,7 +15,10 @@ publish = false
 [workspace.dependencies]
 oxideav-core = "*"
 oxideav-pixfmt = "*"
-oxideav-http = "*"
+# Plain http only: the app reads every stream from its worklet's server on
+# 127.0.0.1. https (rustls + ring, about 0.6 MB) is the fork's `tls`
+# feature; the player's `https` feature turns it on.
+oxideav-http = { version = "*", default-features = false }
 # Containers
 oxideav-avi = "*"
 oxideav-basic = "*"
@@ -182,7 +185,7 @@ oxideav-h261 = { git = "https://github.com/ayooooo123/oxideav-h261", rev = "0803
 oxideav-h263 = { git = "https://github.com/ayooooo123/oxideav-h263", rev = "88189ab8c65491d366345bdb1ab3124b9589e784" }
 oxideav-h264 = { git = "https://github.com/ayooooo123/oxideav-h264", rev = "103743224259f2b8663dc882fa60a18cd95c134a" }
 oxideav-h265 = { git = "https://github.com/ayooooo123/oxideav-h265", rev = "279ecc3f27dc6f4145c5478a0f2388180661e1d1" }
-oxideav-http = { git = "https://github.com/OxideAV/oxideav-http", rev = "f54f106e1e131300387d1df1a71d2686690ccdca" }
+oxideav-http = { git = "https://github.com/ayooooo123/oxideav-http", rev = "ebbc1911048ee0288c5e76bbc0603d5df989dd3f" }
 oxideav-id3 = { git = "https://github.com/OxideAV/oxideav-id3", rev = "d1b462e3da204f2010844648cf1a6bbc65f10dd0" }
 oxideav-iff = { git = "https://github.com/ayooooo123/oxideav-iff", rev = "c054ff2d42a347be36b2c2ba4b0d9490932c210f" }
 oxideav-image-filter = { git = "https://github.com/OxideAV/oxideav-image-filter", rev = "601f4fe832e31fdd9dc3f2bf171389cc09f0dd68" }
