@@ -127,6 +127,11 @@ rows = ["video:dirac"]
 compare = ["video:md5"]
 
 [[entry]]
+path = "fate:dirac/vts.profile-vc2-low-delay.drc"
+rows = ["video:dirac"]
+compare = ["video:md5"]
+
+[[entry]]
 path = "gen:video_mjpeg.avi"
 rows = ["video:mjpeg", "container:avi"]
 compare = ["video:md5"]

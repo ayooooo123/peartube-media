@@ -142,3 +142,14 @@ fn indeo3_frames_equal_ffmpegs() {
         ("iv32/cubes.mov".into(), refcheck::fate("iv32/cubes.mov")),
     ]);
 }
+
+/// FATE's raw Dirac samples (dirac/), opened as the player opens them: the
+/// main profile with inter pictures in FFmpeg's output order, and VC-2 low
+/// delay.
+#[test]
+fn dirac_frames_equal_ffmpegs() {
+    run(vec![
+        ("dirac/vts.profile-main.drc".into(), refcheck::fate("dirac/vts.profile-main.drc")),
+        ("dirac/vts.profile-vc2-low-delay.drc".into(), refcheck::fate("dirac/vts.profile-vc2-low-delay.drc")),
+    ]);
+}

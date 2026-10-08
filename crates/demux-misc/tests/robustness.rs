@@ -46,6 +46,8 @@ const CASES: &[(&str, &str)] = &[
     ("mpeg4/xvid_vlc_trac7411.h263", "m4v"),
     ("mpeg4/demo.m4v", "m4v"),
     ("mpeg4/mpeg4_sstp_dpcm.m4v", "m4v"),
+    ("dirac/vts.profile-main.drc", "dirac"),
+    ("dirac/vts.profile-vc2-low-delay.drc", "dirac"),
     ("h264/lossless.h264", "h264"),
     ("hevc-conformance/WPP_A_ericsson_MAIN_2.bit", "hevc"),
     ("cavs/cavs.mpg", "mpeg"),
@@ -243,6 +245,7 @@ fn seeking_truncated_and_bit_flipped_files_never_panics_or_hangs() {
     let mut cases: Vec<(String, &str, Vec<u8>)> = [
         ("ac3/monsters_inc_5.1_448_small.ac3", "ac3"),
         ("eac3/csi_miami_5.1_256_spx_small.eac3", "eac3"),
+        ("dirac/vts.profile-main.drc", "dirac"),
         ("mpeg2/sony-ct3.bs", "mpegvideo"),
         ("mpegps/pcm_aud.mpg", "mpeg"),
         ("mpeg2/dvd_single_frame.vob", "mpeg"),

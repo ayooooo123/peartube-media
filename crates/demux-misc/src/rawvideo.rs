@@ -332,7 +332,7 @@ impl Default for MpegVideo {
 }
 
 /// ff_mpeg12_frame_rate_tab (mpeg12framerate.c).
-const FRAME_RATES: [(i64, i64); 16] = [
+pub(crate) const FRAME_RATES: [(i64, i64); 16] = [
     (0, 0), (24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1), (50, 1), (60000, 1001),
     (60, 1), (15, 1), (5, 1), (10, 1), (12, 1), (15, 1), (0, 0), (0, 0),
 ];
