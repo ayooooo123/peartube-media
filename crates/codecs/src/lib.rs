@@ -51,6 +51,15 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_wavpack::register_codecs,
         // DVD-Video and Blu-ray LPCM.
         codec_lpcm::register_codecs,
+        // GSM 06.10 and Microsoft GSM (MSN Audio rates too), TTA, Shorten,
+        // TAK, MPEG-4 ALS (MP4 object type 0x40 with ALS's config; ahead of
+        // the AAC decoders that claim that tag too), and MPEG audio Layer I.
+        codec_gsm::register_codecs,
+        codec_tta::register_codecs,
+        codec_shorten::register_codecs,
+        codec_tak::register_codecs,
+        codec_als::register_codecs,
+        codec_mp1::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -96,13 +105,11 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_flac::__oxideav_entry,
         oxideav_g711::__oxideav_entry,
         oxideav_mod::__oxideav_entry,
-        oxideav_mp1::__oxideav_entry,
         oxideav_mp2::__oxideav_entry,
         oxideav_mp3::__oxideav_entry,
         oxideav_opus::__oxideav_entry,
         oxideav_s3m::__oxideav_entry,
         oxideav_speex::__oxideav_entry,
-        oxideav_tta::__oxideav_entry,
         oxideav_vorbis::__oxideav_entry,
         oxideav_wma::__oxideav_entry,
         // Subtitles
@@ -139,6 +146,11 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_ape::register_containers,
         codec_musepack::register_containers,
         codec_wavpack::register_containers,
+        // Raw GSM (.gsm), TTA (.tta), raw Shorten (.shn) and TAK (.tak).
+        codec_gsm::register_containers,
+        codec_tta::register_containers,
+        codec_shorten::register_containers,
+        codec_tak::register_containers,
     ] {
         register(&mut ctx.containers);
     }

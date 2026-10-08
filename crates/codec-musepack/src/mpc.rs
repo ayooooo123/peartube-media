@@ -3,7 +3,7 @@
 // Copyright (c) 2006 Konstantin Shishkov; Copyright (c) 2008 Michael Niedermayer.
 
 use crate::mpc_data::{MPC_CC, MPC_SCF};
-use crate::synth::MpaSynth;
+use mpegaudiodsp::MpaSynth;
 
 pub const BANDS: usize = 32;
 pub const SAMPLES_PER_BAND: usize = 36;

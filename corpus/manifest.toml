@@ -234,6 +234,11 @@ compare = ["video:md5", "audio:snr:90"]
 # ---------------- Audio ----------------
 
 [[entry]]
+path = "gen:audio_mp1.mpa"
+rows = ["audio:mp1", "container:mp3"]
+compare = ["audio:md5"]
+
+[[entry]]
 path = "samples:A-codecs/mp1-sample.mp1"
 rows = ["audio:mp1", "container:mp3"]
 compare = ["audio:md5"]
@@ -445,7 +450,34 @@ compare = ["audio:snr:90", "diag:audio:snr:80"]
 
 [[entry]]
 path = "fate:lossless-audio/als_00_2ch48k16b.mp4"
-rows = ["audio:mp3", "container:mp4"]
+rows = ["audio:als", "container:mp4"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/als_05_2ch48k16b.mp4"
+rows = ["audio:als", "container:mp4"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:gsm/sample-gsm-8000.mov"
+rows = ["audio:gsm"]
+# Stream 1 is a QuickTime text track FFmpeg cannot decode ("unknown"), so
+# the file verifies the GSM audio, not the container.
+compare = ["audio:md5", "sub:decodes"]
+
+[[entry]]
+path = "fate:gsm/ciao.wav"
+rows = ["audio:gsm_ms", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/luckynight-partial.shn"
+rows = ["audio:shorten"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/luckynight-partial.tak"
+rows = ["audio:tak"]
 compare = ["audio:md5"]
 
 [[entry]]

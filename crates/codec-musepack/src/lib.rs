@@ -34,7 +34,6 @@ mod mpc8_data;
 mod mpc8_dec;
 mod mpc8_huff;
 mod mpc_data;
-mod synth;
 mod vlc;
 
 pub use containers::{mpc8_probe, mpc_probe, open_mpc, open_mpc8};

@@ -1,0 +1,11 @@
+[package]
+name = "mpegaudiodsp"
+description = "FFmpeg's fixed-point MPEG audio synthesis filter (dct32 and windowing), shared by the MPEG audio and Musepack decoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# A port of FFmpeg's LGPL files (see the src/ header); not the workspace's MIT.
+license = "LGPL-2.1-or-later"
+publish.workspace = true
+
+[dependencies]

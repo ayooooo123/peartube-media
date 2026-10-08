@@ -17,7 +17,7 @@ use crate::mpc8_huff::{
     MPC8_Q2_LEN_COUNTS, MPC8_Q34_LEN_COUNTS, MPC8_Q5_8_LEN_COUNTS, MPC8_Q9UP_LEN_COUNTS, MPC8_Q_SYMS,
     MPC8_RES_LEN_COUNTS, MPC8_RES_SYMS, MPC8_SCFI_LEN_COUNTS, MPC8_SCFI_SYMS,
 };
-use crate::synth::MpaSynth;
+use mpegaudiodsp::MpaSynth;
 use crate::vlc::Vlc;
 
 struct Mpc8Tables {
