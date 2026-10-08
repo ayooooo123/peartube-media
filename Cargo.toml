@@ -162,7 +162,7 @@ opt-level = 3
 # BEGIN pin-oxideav
 [patch.crates-io]
 oxideav-aac = { git = "https://github.com/ayooooo123/oxideav-aac", rev = "d9f6d8eb2a62b19518e957868702d57eb0123124" }
-oxideav-ac3 = { git = "https://github.com/ayooooo123/oxideav-ac3", rev = "239a59825b733a522cf4818c93e7cb3c35e5ce3a" }
+oxideav-ac3 = { git = "https://github.com/ayooooo123/oxideav-ac3", rev = "65384d52a21eddd59ab72409278f497f045f9a7f" }
 oxideav-adpcm = { git = "https://github.com/OxideAV/oxideav-adpcm", rev = "0802fb34c6c57bfa8913670fe78882547416fd16" }
 oxideav-ape = { git = "https://github.com/OxideAV/oxideav-ape", rev = "ea6e8ca2848b18716a49ca6de0fe4d8d26d4893a" }
 oxideav-ass = { git = "https://github.com/OxideAV/oxideav-ass", rev = "e89607612ef19285c60b84f51ce5d34c72a493b1" }
@@ -176,7 +176,7 @@ oxideav-dirac = { git = "https://github.com/ayooooo123/oxideav-dirac", rev = "05
 oxideav-dts = { git = "https://github.com/OxideAV/oxideav-dts", rev = "9a7c128366aa4914331825e3b5d40a3d3304c090" }
 oxideav-dvd = { git = "https://github.com/OxideAV/oxideav-dvd", rev = "f237f8c05fb3a70d0d9c7e7c99c56110c570d849" }
 oxideav-flac = { git = "https://github.com/OxideAV/oxideav-flac", rev = "cfcc7c4359d1f97d39c228dfd95ed46e9246b458" }
-oxideav-flv = { git = "https://github.com/OxideAV/oxideav-flv", rev = "02e9158a20786a214a707da2f4ae7650146f3b3e" }
+oxideav-flv = { git = "https://github.com/ayooooo123/oxideav-flv", rev = "5b1b6656065c3bea804bc3de3b95970d3286ad3c" }
 oxideav-g711 = { git = "https://github.com/OxideAV/oxideav-g711", rev = "72af018b7c04e8c3aacc6c0b7628cd6e43cde37a" }
 oxideav-h261 = { git = "https://github.com/ayooooo123/oxideav-h261", rev = "0803bf4eb603c9766c01ba89f150259c84c3af7b" }
 oxideav-h263 = { git = "https://github.com/ayooooo123/oxideav-h263", rev = "88189ab8c65491d366345bdb1ab3124b9589e784" }

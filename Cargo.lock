@@ -1030,7 +1030,7 @@ dependencies = [
 [[package]]
 name = "oxideav-ac3"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-ac3?rev=239a59825b733a522cf4818c93e7cb3c35e5ce3a#239a59825b733a522cf4818c93e7cb3c35e5ce3a"
+source = "git+https://github.com/ayooooo123/oxideav-ac3?rev=65384d52a21eddd59ab72409278f497f045f9a7f#65384d52a21eddd59ab72409278f497f045f9a7f"
 dependencies = [
  "oxideav-core",
 ]
@@ -1149,7 +1149,7 @@ dependencies = [
 [[package]]
 name = "oxideav-flv"
 version = "0.0.5"
-source = "git+https://github.com/OxideAV/oxideav-flv?rev=02e9158a20786a214a707da2f4ae7650146f3b3e#02e9158a20786a214a707da2f4ae7650146f3b3e"
+source = "git+https://github.com/ayooooo123/oxideav-flv?rev=5b1b6656065c3bea804bc3de3b95970d3286ad3c#5b1b6656065c3bea804bc3de3b95970d3286ad3c"
 dependencies = [
  "oxideav-core",
 ]
