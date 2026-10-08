@@ -48,9 +48,11 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_ape::register_codecs,
         codec_musepack::register_codecs,
         codec_wavpack::register_codecs,
-        // GSM 06.10 and Microsoft GSM (MSN Audio rates too), and TTA.
+        // GSM 06.10 and Microsoft GSM (MSN Audio rates too), TTA and
+        // Shorten.
         codec_gsm::register_codecs,
         codec_tta::register_codecs,
+        codec_shorten::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -136,9 +138,10 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_ape::register_containers,
         codec_musepack::register_containers,
         codec_wavpack::register_containers,
-        // Raw GSM (.gsm) and TTA (.tta).
+        // Raw GSM (.gsm), TTA (.tta) and raw Shorten (.shn).
         codec_gsm::register_containers,
         codec_tta::register_containers,
+        codec_shorten::register_containers,
     ] {
         register(&mut ctx.containers);
     }

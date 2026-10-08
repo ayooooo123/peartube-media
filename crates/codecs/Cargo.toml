@@ -84,6 +84,7 @@ codec-wavpack = { path = "../codec-wavpack" }
 codec-musepack = { path = "../codec-musepack" }
 codec-gsm = { path = "../codec-gsm" }
 codec-tta = { path = "../codec-tta" }
+codec-shorten = { path = "../codec-shorten" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

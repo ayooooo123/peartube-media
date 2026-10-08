@@ -276,6 +276,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-shorten"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-speech"
 version = "0.1.0"
 dependencies = [
@@ -384,6 +392,7 @@ dependencies = [
  "codec-musepack",
  "codec-ra",
  "codec-rv",
+ "codec-shorten",
  "codec-speech",
  "codec-speex",
  "codec-svq3",

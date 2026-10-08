@@ -137,6 +137,8 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.codec-rv]
 opt-level = "s"
+[profile.release.package.codec-shorten]
+opt-level = "s"
 [profile.release.package.codec-tta]
 opt-level = "s"
 [profile.release.package.codec-wavpack]
