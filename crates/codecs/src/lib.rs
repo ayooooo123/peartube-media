@@ -38,6 +38,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_vp56::register_codecs,
         // AMR-NB, AMR-WB and QCELP.
         codec_speech::register_codecs,
+        // Speex, ahead of oxideav-speex.
+        codec_speex::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }

@@ -245,6 +245,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-speex"
+version = "0.1.0"
+dependencies = [
+ "oxideav-avi",
+ "oxideav-core",
+ "oxideav-flv",
+ "oxideav-ogg",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-vp3"
 version = "0.1.0"
 dependencies = [
@@ -301,6 +312,7 @@ dependencies = [
  "codec-ra",
  "codec-rv",
  "codec-speech",
+ "codec-speex",
  "codec-vp3",
  "codec-vp56",
  "codec-wma",
