@@ -270,7 +270,15 @@ pub struct AlsDecoder {
     channel_size: usize,
     luts: Luts,
     float: Option<FloatState>,
-    ready: VecDeque<Frame>,
+    pending: VecDeque<Pending>,
+}
+
+/// Compressed input only. A packet may contain the entire ALS stream;
+/// keeping its PCM here would expand tiny constant blocks without a bound.
+struct Pending {
+    data: Vec<u8>,
+    pos: usize,
+    pts: Option<i64>,
 }
 
 impl AlsDecoder {
@@ -325,7 +333,7 @@ impl AlsDecoder {
             channel_size,
             luts: Luts::new(),
             float,
-            ready: VecDeque::new(),
+            pending: VecDeque::new(),
             c,
         })
     }
@@ -1157,24 +1165,26 @@ impl Decoder for AlsDecoder {
         })
     }
 
-    /// decode.c's loop: frames until the packet's bytes are taken. An error
-    /// drops the rest of the packet.
+    /// Retains compressed input; decode.c's loop resumes on each receive.
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let mut data: &[u8] = &packet.data;
-        let mut pts = packet.pts;
-        while !data.is_empty() {
-            let (samples, bytes, consumed) = self.decode_frame(data)?;
-            self.ready.push_back(Frame::Audio(AudioFrame { samples: samples as u32, pts: pts.take(), data: vec![bytes] }));
-            if consumed == 0 || consumed >= data.len() {
-                break;
-            }
-            data = &data[consumed..];
+        if !packet.data.is_empty() {
+            self.pending.push_back(Pending { data: packet.data.clone(), pos: 0, pts: packet.pts });
         }
         Ok(())
     }
 
+    /// One frame at a time, including when one packet holds many frames.
+    /// A decode error drops the rest of that packet, not earlier output.
     fn receive_frame(&mut self) -> Result<Frame> {
-        self.ready.pop_front().ok_or(Error::NeedMore)
+        let mut packet = self.pending.pop_front().ok_or(Error::NeedMore)?;
+        let data = &packet.data[packet.pos..];
+        let (samples, bytes, consumed) = self.decode_frame(data)?;
+        let pts = packet.pts.take();
+        if consumed != 0 && consumed < data.len() {
+            packet.pos += consumed;
+            self.pending.push_front(packet);
+        }
+        Ok(Frame::Audio(AudioFrame { samples: samples as u32, pts, data: vec![bytes] }))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -1185,7 +1195,11 @@ impl Decoder for AlsDecoder {
     /// buffers stay).
     fn reset(&mut self) -> Result<()> {
         self.frame_id = 0;
-        self.ready.clear();
+        self.pending.clear();
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/memory/mod.rs"]
+mod memory;

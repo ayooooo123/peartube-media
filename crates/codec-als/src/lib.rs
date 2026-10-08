@@ -2,6 +2,11 @@
 //! 32-bit float, Rice and BGMC entropy coding, long-term prediction, joint
 //! stereo, multichannel coding, channel sorting).
 //!
+//! `send_packet` retains compressed bytes, never a packet's expanded PCM.
+//! Each `receive_frame` decodes one ALS frame, without limiting how many
+//! frames a packet may hold. Only its first output carries the packet pts;
+//! `reset` discards pending input and resets the frame counter.
+//!
 //! Ported from FFmpeg (commit 2da55bf): libavcodec/alsdec.c, bgmc.c,
 //! bgmc.h, mlz.c, mlz.h, the ALS part of mpeg4audio.c, and
 //! libavutil/softfloat_ieee754.h, with get_bits.h's reader. Licensed under
