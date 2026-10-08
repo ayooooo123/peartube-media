@@ -227,7 +227,7 @@ pub struct APERice {
 #[inline]
 pub fn update_rice(rice: &mut APERice, x: u32) {
     let lim = if rice.k != 0 { 1 << (rice.k + 4) } else { 0 };
-    rice.ksum = rice.ksum.wrapping_add((x + 1) / 2).wrapping_sub((rice.ksum + 16) >> 5);
+    rice.ksum = rice.ksum.wrapping_add(x.wrapping_add(1) / 2).wrapping_sub(rice.ksum.wrapping_add(16) >> 5);
 
     if rice.ksum < lim {
         rice.k = rice.k.saturating_sub(1);
@@ -269,8 +269,8 @@ pub fn decode_array_0000(
     }
     if blockstodecode <= 5 {
         for i in 0..blockstodecode {
-            let val = out[i] as u32;
-            out[i] = (((val >> 1) ^ ((val & 1).wrapping_sub(1))) as i32).wrapping_add(1);
+            let v = out[i];
+            out[i] = ((v >> 1) ^ ((v & 1).wrapping_sub(1))).wrapping_add(1);
         }
         return;
     }
@@ -290,8 +290,8 @@ pub fn decode_array_0000(
     }
     if blockstodecode <= 64 {
         for i in 0..blockstodecode {
-            let val = out[i] as u32;
-            out[i] = (((val >> 1) ^ ((val & 1).wrapping_sub(1))) as i32).wrapping_add(1);
+            let v = out[i];
+            out[i] = ((v >> 1) ^ ((v & 1).wrapping_sub(1))).wrapping_add(1);
         }
         return;
     }
@@ -322,8 +322,8 @@ pub fn decode_array_0000(
     }
 
     for i in 0..blockstodecode {
-        let val = out[i] as u32;
-        out[i] = (((val >> 1) ^ ((val & 1).wrapping_sub(1))) as i32).wrapping_add(1);
+        let v = out[i];
+        out[i] = ((v >> 1) ^ ((v & 1).wrapping_sub(1))).wrapping_add(1);
     }
 }
 
@@ -342,13 +342,13 @@ pub fn ape_decode_value_3860(
     }
     let x: u32 = if rice.k == 0 {
         overflow
-    } else if rice.k <= 24 {
+    } else if rice.k <= 25 {
         (overflow << rice.k) + gb.get_bits(rice.k as usize)
     } else {
         *error = true;
         return 0;
     };
-    rice.ksum = rice.ksum.wrapping_add(x).wrapping_sub((rice.ksum + 8) >> 4);
+    rice.ksum = rice.ksum.wrapping_add(x).wrapping_sub(rice.ksum.wrapping_add(8) >> 4);
     if rice.ksum < (if rice.k != 0 { 1 << (rice.k + 4) } else { 0 }) {
         rice.k = rice.k.saturating_sub(1);
     } else if rice.ksum >= (1 << (rice.k + 5)) && rice.k < 24 {
@@ -377,8 +377,7 @@ pub fn ape_decode_value_3900(
     let mut x: u32;
     if tmpk <= 16 || fileversion < 3910 {
         if tmpk > 23 {
-            *error = true;
-            return 0;
+            return -1094995529; // AVERROR_INVALIDDATA without setting error
         }
         x = rc.decode_bits(tmpk, ptr, data, error);
     } else if tmpk <= 31 {
@@ -386,8 +385,7 @@ pub fn ape_decode_value_3900(
         let hi = rc.decode_bits(tmpk - 16, ptr, data, error);
         x |= hi << 16;
     } else {
-        *error = true;
-        return 0;
+        return -1094995529; // AVERROR_INVALIDDATA without setting error
     }
     x = x.wrapping_add(overflow << tmpk);
     update_rice(rice, x);

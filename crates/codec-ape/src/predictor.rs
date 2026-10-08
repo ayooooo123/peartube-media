@@ -30,11 +30,6 @@ pub fn ape_sign(x: i32) -> i32 {
     (x < 0) as i32 - (x > 0) as i32
 }
 
-/// 64-bit inverse sign of integer.
-#[inline(always)]
-pub fn ape_sign64(x: i64) -> i64 {
-    (x < 0) as i64 - (x > 0) as i64
-}
 
 #[derive(Clone)]
 #[allow(non_snake_case)]
@@ -485,10 +480,10 @@ pub fn predictor_update_filter(
     let buf_adapt_b = p.buf_offset + adapt_b;
 
     p.historybuffer[buf_a] = p.lastA[filter];
-    p.historybuffer[buf_adapt_a] = ape_sign64(p.historybuffer[buf_a]);
+    p.historybuffer[buf_adapt_a] = ape_sign(p.historybuffer[buf_a] as i32) as i64;
     p.historybuffer[buf_a - 1] = (p.historybuffer[buf_a] as u64)
         .wrapping_sub(p.historybuffer[buf_a - 1] as u64) as i64;
-    p.historybuffer[buf_adapt_a - 1] = ape_sign64(p.historybuffer[buf_a - 1]);
+    p.historybuffer[buf_adapt_a - 1] = ape_sign(p.historybuffer[buf_a - 1] as i32) as i64;
 
     let pred_a = (p.historybuffer[buf_a] as u64).wrapping_mul(p.coeffsA[filter][0] as u64)
         .wrapping_add((p.historybuffer[buf_a - 1] as u64).wrapping_mul(p.coeffsA[filter][1] as u64))
@@ -498,10 +493,10 @@ pub fn predictor_update_filter(
     let other = filter ^ 1;
     let scaled_fb = ((p.filterB[filter] as u64).wrapping_mul(31) as i64) >> 5;
     p.historybuffer[buf_b] = p.filterA[other].wrapping_sub(scaled_fb);
-    p.historybuffer[buf_adapt_b] = ape_sign64(p.historybuffer[buf_b]);
+    p.historybuffer[buf_adapt_b] = ape_sign(p.historybuffer[buf_b] as i32) as i64;
     p.historybuffer[buf_b - 1] = (p.historybuffer[buf_b] as u64)
         .wrapping_sub(p.historybuffer[buf_b - 1] as u64) as i64;
-    p.historybuffer[buf_adapt_b - 1] = ape_sign64(p.historybuffer[buf_b - 1]);
+    p.historybuffer[buf_adapt_b - 1] = ape_sign(p.historybuffer[buf_b - 1] as i32) as i64;
     p.filterB[filter] = p.filterA[other];
 
     let pred_b = (p.historybuffer[buf_b] as u64).wrapping_mul(p.coeffsB[filter][0] as u64)
@@ -637,11 +632,12 @@ pub fn predictor_decode_mono_3950(
             .wrapping_add((p.historybuffer[buf_y - 2] as u64).wrapping_mul(p.coeffsA[0][2] as u64))
             .wrapping_add((p.historybuffer[buf_y - 3] as u64).wrapping_mul(p.coeffsA[0][3] as u64)) as i64;
 
-        current_a = (a as i64).wrapping_add(pred_a >> 10);
+        let pred_a32 = pred_a as i32;
+        current_a = ((a as u32).wrapping_add((pred_a32 >> 10) as u32) as i32) as i64;
 
         let buf_adapt = p.buf_offset + YADAPTCOEFFSA;
-        p.historybuffer[buf_adapt] = ape_sign64(p.historybuffer[buf_y]);
-        p.historybuffer[buf_adapt - 1] = ape_sign64(p.historybuffer[buf_y - 1]);
+        p.historybuffer[buf_adapt] = ape_sign(p.historybuffer[buf_y] as i32) as i64;
+        p.historybuffer[buf_adapt - 1] = ape_sign(p.historybuffer[buf_y - 1] as i32) as i64;
 
         let sign = ape_sign(a) as i64;
         p.coeffsA[0][0] = p.coeffsA[0][0].wrapping_add(p.historybuffer[buf_adapt].wrapping_mul(sign));

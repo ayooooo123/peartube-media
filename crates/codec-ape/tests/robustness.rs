@@ -85,81 +85,102 @@ fn mutate(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
     d
 }
 
+const SAMPLES: &[&str] = &[
+    "lossless-audio/luckynight-mac380-c2000.ape",
+    "lossless-audio/luckynight-mac388-c2000.ape",
+    "lossless-audio/luckynight-mac389b1-c2000.ape",
+    "lossless-audio/luckynight-mac391b1-c2000.ape",
+    "lossless-audio/luckynight-mac392b2-c2000.ape",
+    "lossless-audio/luckynight-mac394b1-c2000.ape",
+    "lossless-audio/luckynight-partial.ape",
+    "lossless-audio/NoLegacy-cut.ape",
+];
+
 #[test]
 fn decoder_packet_mutants() {
     let ctx = context();
-    let path = fate("lossless-audio/luckynight-partial.ape");
-    let file = std::fs::File::open(&path).expect("open sample");
-    let mut demuxer = codec_ape::open_ape(Box::new(file), &ctx.codecs).expect("open demuxer");
-
-    let stream = demuxer.streams()[0].clone();
-    let mut clean_packets = Vec::new();
-    while let Ok(pkt) = demuxer.next_packet() {
-        clean_packets.push(pkt);
-    }
-    assert!(!clean_packets.is_empty());
-
     let mut rng = Rng::new(0xDEAD_BEEF_CAFE_BABE);
-    let mut decoder = ctx.codecs.first_decoder(&stream.params).expect("make decoder");
+    let mut total_mutants = 0;
 
-    for i in 0..2500 {
-        if i % 100 == 0 {
-            decoder.reset().unwrap_or(());
+    for sample in SAMPLES {
+        let path = fate(sample);
+        let file = std::fs::File::open(&path).expect("open sample");
+        let mut demuxer = codec_ape::open_ape(Box::new(file), &ctx.codecs).expect("open demuxer");
+
+        let stream = demuxer.streams()[0].clone();
+        let mut clean_packets = Vec::new();
+        while let Ok(pkt) = demuxer.next_packet() {
+            clean_packets.push(pkt);
         }
+        assert!(!clean_packets.is_empty(), "{sample}: no packets");
 
-        let base_pkt = &clean_packets[rng.below(clean_packets.len())];
-        let mutated_data = mutate(&mut rng, &base_pkt.data);
-        let mut pkt = Packet::new(0, stream.time_base, mutated_data);
-        pkt.pts = base_pkt.pts;
-        pkt.duration = base_pkt.duration;
+        let mut decoder = ctx.codecs.first_decoder(&stream.params).expect("make decoder");
 
-        let _ = decoder.send_packet(&pkt);
+        for i in 0..300 {
+            total_mutants += 1;
+            if i % 50 == 0 {
+                decoder.reset().unwrap_or(());
+            }
 
-        while let Ok(frame) = decoder.receive_frame() {
-            let Frame::Audio(audio) = frame else { continue };
-            let format = decoder.output_audio_format().expect("layout reported");
-            assert_eq!(
-                audio.data.len(),
-                format.channels as usize,
-                "frame channels mismatch"
-            );
-            let expected_plane_len =
-                audio.samples as usize * format.sample_format.bytes_per_sample();
-            for plane in &audio.data {
+            let base_pkt = &clean_packets[rng.below(clean_packets.len())];
+            let mutated_data = mutate(&mut rng, &base_pkt.data);
+            let mut pkt = Packet::new(0, stream.time_base, mutated_data);
+            pkt.pts = base_pkt.pts;
+            pkt.duration = base_pkt.duration;
+
+            let _ = decoder.send_packet(&pkt);
+
+            while let Ok(frame) = decoder.receive_frame() {
+                let Frame::Audio(audio) = frame else { continue };
+                let format = decoder.output_audio_format().expect("layout reported");
                 assert_eq!(
-                    plane.len(),
-                    expected_plane_len,
-                    "plane byte length must match layout"
+                    audio.data.len(),
+                    format.channels as usize,
+                    "frame channels mismatch"
                 );
+                let expected_plane_len =
+                    audio.samples as usize * format.sample_format.bytes_per_sample();
+                for plane in &audio.data {
+                    assert_eq!(
+                        plane.len(),
+                        expected_plane_len,
+                        "plane byte length must match layout"
+                    );
+                }
             }
         }
     }
+    assert!(total_mutants >= 2000, "total packet mutants: {total_mutants}");
 }
 
 #[test]
 fn demuxer_file_mutants() {
     let ctx = context();
-    let path = fate("lossless-audio/luckynight-partial.ape");
-    let file_bytes = std::fs::read(&path).expect("read sample");
-
     let mut rng = Rng::new(0x1234_5678_9ABC_DEF0);
+    let mut total_mutants = 0;
 
-    for _ in 0..2500 {
-        let mutated = mutate(&mut rng, &file_bytes);
-        let cursor = Box::new(Cursor::new(mutated));
+    for sample in SAMPLES {
+        let path = fate(sample);
+        let file_bytes = std::fs::read(&path).expect("read sample");
 
-        if let Ok(mut demuxer) = codec_ape::open_ape(cursor, &ctx.codecs) {
-            let mut guard = 0;
-            while let Ok(_pkt) = demuxer.next_packet() {
-                guard += 1;
-                if guard > 200 {
-                    break;
+        for _ in 0..300 {
+            total_mutants += 1;
+            let mutated = mutate(&mut rng, &file_bytes);
+            let cursor = Box::new(Cursor::new(mutated));
+
+            if let Ok(mut demuxer) = codec_ape::open_ape(cursor, &ctx.codecs) {
+                let mut guard = 0;
+                while let Ok(_pkt) = demuxer.next_packet() {
+                    guard += 1;
+                    if guard > 200 {
+                        break;
+                    }
                 }
             }
         }
     }
+    assert!(total_mutants >= 2000, "total file mutants: {total_mutants}");
 }
-
 #[test]
 fn corrupted_extradata_never_panics() {
     let mut rng = Rng::new(0x5555_AAAA_3333_CCCC);

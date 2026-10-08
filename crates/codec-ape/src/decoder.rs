@@ -78,16 +78,8 @@ impl ApeDecoder {
             buf_size += 2;
         }
 
-        // 32-bit word byte swapping as done by bswap_buf in apedec.c
-        let n_words = (data.len() & !3) / 4;
-        let mut swapped: Vec<u8> = vec![0; buf_size + 8];
-        for i in 0..n_words {
-            let chunk: [u8; 4] = data[i * 4..i * 4 + 4].try_into().unwrap();
-            swapped[i * 4] = chunk[3];
-            swapped[i * 4 + 1] = chunk[2];
-            swapped[i * 4 + 2] = chunk[1];
-            swapped[i * 4 + 3] = chunk[0];
-        }
+        let mut swapped = vec![0u8; buf_size];
+        crate::dsp::bswap_buf(&mut swapped, data);
 
         let mut ptr = 0usize;
         let nblocks = u32::from_be_bytes(swapped[ptr..ptr + 4].try_into().unwrap());
@@ -99,7 +91,9 @@ impl ApeDecoder {
             return;
         }
 
-        if nblocks == 0 || nblocks > 0x3fff_ffff {
+        const FFMPEG_MAX_BLOCKS: u32 = 268_435_447; // INT_MAX / 2 / 4 - 8
+        const FORMAT_MAX_BLOCKS: u32 = 73728 * 16;   // format-level cap
+        if nblocks == 0 || nblocks > FFMPEG_MAX_BLOCKS || nblocks > FORMAT_MAX_BLOCKS {
             return;
         }
 

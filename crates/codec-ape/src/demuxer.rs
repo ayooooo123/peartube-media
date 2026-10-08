@@ -100,9 +100,13 @@ impl Demuxer for ApeDemuxer {
         self.input.seek(SeekFrom::Start(frame.pos))?;
 
         let extra_size = 8usize;
-        let read_size = frame.size.max(0) as usize;
-        let mut payload = vec![0u8; read_size + extra_size];
-
+        if frame.size <= 0 || frame.size > (i32::MAX - extra_size as i32) as i64 {
+            self.currentframe += 1;
+            return Err(Error::invalid("ape: invalid packet size"));
+        }
+        let read_size = frame.size as usize;
+        let available = (self.file_size.saturating_sub(frame.pos) as usize).min(read_size);
+        let mut payload = vec![0u8; available + extra_size];
         payload[0..4].copy_from_slice(&nblocks.to_le_bytes());
         payload[4..8].copy_from_slice(&frame.skip.to_le_bytes());
 
@@ -370,9 +374,6 @@ pub fn open_ape(
         channels = read_u16_le(&mut *input)?;
         samplerate = read_u32_le(&mut *input)?;
 
-        if headerlength > 24 {
-            input.seek(SeekFrom::Current((headerlength - 24) as i64))?;
-        }
     } else {
         descriptorlength = 0;
         headerlength = 32;
@@ -453,7 +454,7 @@ pub fn open_ape(
         frames[i].pos = entry as u64 + junklength;
         frames[i].nblocks = blocksperframe;
         frames[i - 1].size = (frames[i].pos as i64) - (frames[i - 1].pos as i64);
-        frames[i].skip = ((frames[i].pos - frames[0].pos) & 3) as u32;
+        frames[i].skip = (frames[i].pos.wrapping_sub(frames[0].pos) & 3) as u32;
     }
 
     let remaining_seek = (seektablelength / 4).saturating_sub(totalframes);
@@ -464,7 +465,9 @@ pub fn open_ape(
     let last_idx = totalframes as usize - 1;
     frames[last_idx].nblocks = finalframeblocks;
 
+    let current_pos = input.stream_position()?;
     let file_size = input.seek(SeekFrom::End(0))?;
+    input.seek(SeekFrom::Start(current_pos))?;
     let mut final_size = (file_size as i64)
         .saturating_sub(frames[last_idx].pos as i64)
         .saturating_sub(wavtaillength as i64);
@@ -479,14 +482,13 @@ pub fn open_ape(
             frame.pos = frame.pos.saturating_sub(frame.skip as u64);
             frame.size = frame.size.saturating_add(frame.skip as i64);
         }
-        if frame.size < 0 || frame.size > (i32::MAX - 3) as i64 {
+        if frame.size > (i32::MAX - 3) as i64 {
             return Err(Error::invalid("ape: invalid frame size"));
         }
         frame.size = (frame.size + 3) & !3;
     }
 
     if fileversion < 3810 {
-        input.seek(SeekFrom::Start(firstframe - totalframes as u64))?;
         for i in 0..totalframes as usize {
             let bits = read_u8(&mut *input)?;
             if i > 0 && bits != 0 {

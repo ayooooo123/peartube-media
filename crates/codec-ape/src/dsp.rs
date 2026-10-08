@@ -26,41 +26,16 @@ pub fn scalarproduct_and_madd_int16(
     res as i32
 }
 
-/// Vector scalar product and multiply-add for 32-bit integers.
-///
-/// Ported from `scalarproduct_and_madd_int32_c` in `lossless_audiodsp.c`.
-#[inline]
-pub fn scalarproduct_and_madd_int32(
-    v1: &mut [i16],
-    v2: &[i32],
-    v3: &[i16],
-    order: usize,
-    mul: i32,
-) -> i32 {
-    let mut res: u32 = 0;
-    for i in 0..order {
-        res = res.wrapping_add((v1[i] as i32).wrapping_mul(v2[i]) as u32);
-        v1[i] = (v1[i] as i32).wrapping_add(mul.wrapping_mul(v3[i] as i32)) as i16;
-    }
-    res as i32
-}
-
 /// Swaps 32-bit words in place or into a destination buffer.
 ///
 /// Ported from `bswap_buf` in `bswapdsp.c`.
 #[inline]
-pub fn bswap_buf(dst: &mut [u32], src: &[u32]) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d = s.swap_bytes();
-    }
-}
-
-/// Swaps 16-bit words.
-///
-/// Ported from `bswap16_buf` in `bswapdsp.c`.
-#[inline]
-pub fn bswap16_buf(dst: &mut [u16], src: &[u16]) {
-    for (d, s) in dst.iter_mut().zip(src.iter()) {
-        *d = s.swap_bytes();
+pub fn bswap_buf(dst: &mut [u8], src: &[u8]) {
+    let n_words = (src.len() & !3) / 4;
+    for i in 0..n_words {
+        dst[i * 4] = src[i * 4 + 3];
+        dst[i * 4 + 1] = src[i * 4 + 2];
+        dst[i * 4 + 2] = src[i * 4 + 1];
+        dst[i * 4 + 3] = src[i * 4];
     }
 }
