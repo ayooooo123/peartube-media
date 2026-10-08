@@ -85,14 +85,24 @@ impl<'a> GetBits<'a> {
 }
 
 pub struct GetBitsLe<'a> {
+    /// The bytes from the reader's start: what FFmpeg's reader sees in
+    /// memory, which can run past its size (zeros past them).
     data: &'a [u8],
-    /// Bits read (`index`), at most `len * 8 + 8` (`size_in_bits_plus8`).
+    /// `size_in_bits`
+    size_bits: usize,
+    /// Bits read (`index`), at most `size_bits + 8` (`size_in_bits_plus8`).
     index: usize,
 }
 
 impl<'a> GetBitsLe<'a> {
     pub fn new(data: &'a [u8]) -> Self {
-        Self { data, index: 0 }
+        Self { data, size_bits: data.len() * 8, index: 0 }
+    }
+
+    /// `init_get_bits8(data, size)` where the memory after `size` bytes is
+    /// `data[size..]`: reads past the size see those bytes, as FFmpeg's do.
+    pub fn with_size(data: &'a [u8], size: usize) -> Self {
+        Self { data, size_bits: size * 8, index: 0 }
     }
 
     /// The bytes being read (FFmpeg's `gb->buffer`).
@@ -101,7 +111,7 @@ impl<'a> GetBitsLe<'a> {
     }
 
     fn size_in_bits(&self) -> usize {
-        self.data.len() * 8
+        self.size_bits
     }
 
     /// `get_bits_left`

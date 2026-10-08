@@ -81,6 +81,59 @@ impl Fft {
     }
 }
 
+/// The inverse real FFT (`AV_TX_FLOAT_RDFT`, inverse: the `rdft_c2r`
+/// codelet over an inverse FFT of half the length).
+pub struct RdftC2r {
+    len: usize,
+    /// `s->exp`: the eight factors, then the cosine and sine tables.
+    fact: [f32; 8],
+    tcos: Vec<f32>,
+    tsin: Vec<f32>,
+    fft: Fft,
+}
+
+impl RdftC2r {
+    /// `av_tx_init(AV_TX_FLOAT_RDFT, inv = 1, len, scale)`
+    pub fn new(len: usize, scale: f32) -> Self {
+        let scale_d = f64::from(scale);
+        let len4 = len.div_ceil(4);
+        let f = 2.0 * std::f64::consts::PI / len as f64;
+        let m = 2.0 * scale_d;
+        let fact = [0.5 * m, 0.5 * m, m, -m, (0.5 - 0.0) * m, (0.0 - 0.5) * m, (0.5 - 1.0) * m, -(0.5 - 1.0) * m]
+            .map(|v| v as f32);
+        let tcos = (0..len4).map(|i| (i as f64 * f).cos() as f32).collect();
+        let tsin = (0..len4).map(|i| ((len as f64 - (i * 4) as f64) / 4.0 * f).cos() as f32).collect();
+        Self { len, fact, tcos, tsin, fft: Fft::new(len / 2, true) }
+    }
+
+    /// `ff_tx_rdft_c2r`: the `len / 2 + 1` bins of `data` (which it
+    /// overwrites, as FFmpeg does) to `len` real samples, as `len / 2`
+    /// complex pairs in `out`.
+    pub fn run(&self, out: &mut [Complex], data: &mut [Complex]) {
+        let (len2, len4) = (self.len >> 1, self.len >> 2);
+        let fact = &self.fact;
+        data[0].im = data[len2].re;
+        let t0re = data[0].re;
+        data[0].re = t0re + data[0].im;
+        data[0].im = t0re - data[0].im;
+        data[0].re *= fact[0];
+        data[0].im *= fact[1];
+        data[len4].re *= fact[2];
+        data[len4].im *= fact[3];
+        for i in 1..len4 {
+            let (a, b) = (data[i], data[len2 - i]);
+            let t0re = fact[4] * (a.re + b.re);
+            let t0im = fact[5] * (a.im - b.im);
+            let t1re = fact[6] * (a.im + b.im);
+            let t1im = fact[7] * (a.re - b.re);
+            let (t2re, t2im) = cmul(t1re, t1im, self.tcos[i], self.tsin[i]);
+            data[i] = Complex { re: t0re + t2re, im: t2im - t0im };
+            data[len2 - i] = Complex { re: t0re - t2re, im: t2im + t0im };
+        }
+        self.fft.run(out, &data[..len2]);
+    }
+}
+
 /// `BF(x, y, a, b)`: (a - b, a + b).
 fn bf(a: f32, b: f32) -> (f32, f32) {
     (a - b, a + b)

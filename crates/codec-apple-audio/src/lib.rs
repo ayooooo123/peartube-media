@@ -3,20 +3,25 @@
 //!
 //! | Codec id | Ported from | Output | MP4/MOV sample entry | Matroska | CAF |
 //! |---|---|---|---|---|---|
-//! | `alac` | `alac.c`, `alacdsp.c`, `alac_data.c` | S16P / S32P, bit-exact | `alac` | `A_ALAC` | `alac` |
-//! | `qdm2` | `qdm2.c`, `qdm2_tablegen.h`, `qdm2data.h`, mpegaudio synthesis, RDFT | float | `QDM2` | | `QDM2` |
-//! | `qdmc` | `qdmc.c` | float | `QDMC` | | `QDMC` |
-//! | `mace3` | `mace.c` | S16P, bit-exact | `MAC3` | | `MAC3` |
-//! | `mace6` | `mace.c` | S16P, bit-exact | `MAC6` | | `MAC6` |
+//! | `alac` | `alac.c`, `alacdsp.c`, `alac_data.c` | S16P / S32P | `alac` | `A_ALAC` | `alac` |
+//! | `qdm2` | `qdm2.c`, `qdm2data.h`, `qdm2_tablegen.h`; `mpegaudiodsp_template.c`, `mpegaudiodsp_data.c`, `dct32_template.c`; `tx.c`, `tx_template.c` | S16 | `QDM2` | | `QDM2` |
+//! | `qdmc` | `qdmc.c`; `tx.c`, `tx_template.c` | S16 | `QDMC` | | `QDMC` |
+//! | `mace3` | `mace.c` | S16P | `MAC3` | | `MAC3` |
+//! | `mace6` | `mace.c` | S16P | `MAC6` | | `MAC6` |
+//!
+//! The bit readers come from `get_bits.h`, the VLC tables from `vlc.c`.
+//! ALAC and MACE are integer codecs and match FFmpeg bit for bit. QDM2 and
+//! QDMC compute in float; their arithmetic follows FFmpeg's C path
+//! (`-cpuflags 0`) step by step, including the multiply-adds clang fuses
+//! on arm64, so on arm64 they match it bit for bit too.
 //!
 //! Codec ids are FFmpeg's decoder names; CAF, AIFF-C and the QuickTime
 //! demuxers name these codecs the same way. Every byte comes from
 //! untrusted peers: reads are bounds-checked, allocations are capped, and
-//! malformed packets give `Error::InvalidData`, never a panic.
+//! malformed input gives an error, never a panic.
 #![forbid(unsafe_code)]
 
 mod alac;
-mod bits;
 mod getbits;
 mod mace;
 mod qdm2;
