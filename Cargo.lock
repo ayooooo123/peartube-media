@@ -1376,7 +1376,7 @@ dependencies = [
 [[package]]
 name = "oxideav-opus"
 version = "0.0.14"
-source = "git+https://github.com/ayooooo123/oxideav-opus?rev=5573fa9ac3136c62e68199e877bff754432c89f9#5573fa9ac3136c62e68199e877bff754432c89f9"
+source = "git+https://github.com/ayooooo123/oxideav-opus?rev=6a27d5bd7ec3081eadc527cb610336b7d6d2f32e#6a27d5bd7ec3081eadc527cb610336b7d6d2f32e"
 dependencies = [
  "oxideav-core",
 ]

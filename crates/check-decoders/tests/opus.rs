@@ -1,12 +1,13 @@
 //! oxideav-opus against FFmpeg 2da55bf, read through the containers the
 //! player reads Opus from (`refcheck::decode`: the registered decoder, the
 //! container's trims). The fork registers FFmpeg's Opus decoder, ported:
-//! planar float, FFmpeg's channel order, FFmpeg's samples. Before it,
-//! mapping-family-1 streams came out in the `OpusHead`'s Vorbis channel
-//! order (7.1: -2.3 dB against FFmpeg), and every stream as the RFC 6716
-//! decoder's 16-bit PCM: CELT files at the 16-bit limit of FFmpeg's own
-//! output (testvector01: 79.8 dB), SILK and hybrid files at 9.6 to 36 dB
-//! (FFmpeg decodes SILK in float and resamples it with libswresample).
+//! planar float, FFmpeg's channel order, and FFmpeg's samples bit for bit
+//! against its C code (`ffmpeg_c_path`). Before it, mapping-family-1
+//! streams came out in the `OpusHead`'s Vorbis channel order (7.1: -2.3 dB
+//! against FFmpeg), and every stream as the RFC 6716 decoder's 16-bit PCM:
+//! CELT files at the 16-bit limit of FFmpeg's own output (testvector01:
+//! 79.8 dB), SILK and hybrid files at 9.6 to 36 dB (FFmpeg decodes SILK in
+//! float and resamples it with libswresample).
 
 use oxideav_core::{AudioFormat, CodecId, CodecParameters, MediaType, SampleFormat};
 use refcheck::Registrar;
@@ -14,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Decodes the first audio stream of `path` and compares it with FFmpeg's
-/// decode: the decoder's reported layout, the exact sample count, and the
-/// SNR (contract floor for float decoders: 90 dB).
+/// decode through its C code (`ffmpeg_c_path`): the decoder's reported
+/// layout, the exact sample count, and the samples bit for bit.
 fn assert_matches_ffmpeg(path: &Path, registrars: &[Registrar], channels: u16) {
     let name = path.display();
     let decoded = refcheck::decode(path, registrars, MediaType::Audio, 0);
@@ -26,11 +27,16 @@ fn assert_matches_ffmpeg(path: &Path, registrars: &[Registrar], channels: u16) {
     );
     assert!(decoded.trim_fallbacks.is_empty(), "{name}: trims not applied: {:?}", decoded.trim_fallbacks);
     let ours = refcheck::interleaved_f32(&decoded);
-    let theirs = refcheck::ffmpeg_src_audio_f32(path, 0);
+    let theirs = ffmpeg_c_path(path, false);
     assert_eq!(ours.len(), theirs.len(), "{name}: interleaved samples vs FFmpeg's");
-    let snr = refcheck::snr_db(&theirs, &ours, 0);
-    eprintln!("{name}: {} samples/channel, {snr:.2} dB against FFmpeg", ours.len() / usize::from(channels));
-    assert!(snr >= 90.0, "{name}: {snr:.1} dB against FFmpeg");
+    let differ = differing(&theirs, &ours);
+    eprintln!("{name}: {} samples/channel, {differ} differ from FFmpeg's", ours.len() / usize::from(channels));
+    assert_eq!(differ, 0, "{name}: {differ} samples differ ({:.1} dB)", refcheck::snr_db(&theirs, &ours, 0));
+}
+
+/// How many samples differ in their bits.
+fn differing(theirs: &[f32], ours: &[f32]) -> usize {
+    theirs.iter().zip(ours).filter(|(t, o)| t.to_bits() != o.to_bits()).count()
 }
 
 /// Every FATE file with Opus audio, mono to 7.1, SILK, hybrid and CELT.
@@ -73,24 +79,25 @@ fn ffmpeg_extradata(path: &Path) -> Vec<u8> {
     bytes
 }
 
-/// FFmpeg 2da55bf's decode of stream `0:a:0` with nothing trimmed
-/// (`-flags2 +skip_manual`), interleaved f32.
-fn ffmpeg_untrimmed(path: &Path) -> Vec<f32> {
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    let out = check_decoders::tool(
-        src.join("ffmpeg").to_str().unwrap(),
-        &["-v", "error", "-nostdin", "-flags2", "+skip_manual", "-i", path.to_str().unwrap(), "-map", "0:a:0", "-f", "f32le", "-"],
-    );
+/// FFmpeg 2da55bf's decode of stream `0:a:0`, interleaved f32, through its
+/// C code paths (`-cpuflags 0`: contract.md's reference for float decoders
+/// whose C code calls SIMD-selected DSP, here av_tx and swresample), with
+/// the container's trims or, `untrimmed`, nothing trimmed
+/// (`-flags2 +skip_manual`).
+fn ffmpeg_c_path(path: &Path, untrimmed: bool) -> Vec<f32> {
+    let mut args = vec!["-v", "error", "-nostdin", "-cpuflags", "0"];
+    if untrimmed {
+        args.extend(["-flags2", "+skip_manual"]);
+    }
+    args.extend(["-i", path.to_str().unwrap(), "-map", "0:a:0", "-f", "f32le", "-c:a", "pcm_f32le", "-"]);
+    let out = check_decoders::tool(refcheck::pinned_ffmpeg().to_str().unwrap(), &args);
     out.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 /// The decoder on its own: FFmpeg's packets and `OpusHead` of every FATE
 /// Opus file (its pre-skip cleared, so the decoder trims nothing) give
-/// FFmpeg's untrimmed output, with its exact sample count (the samples the
-/// resampler holds back included, drained at the end) and at least 90 dB.
-/// No container or trimmer is involved.
+/// FFmpeg's untrimmed output bit for bit, the samples the resampler holds
+/// back included (drained at the end). No container or trimmer is involved.
 #[test]
 fn every_fate_opus_file_decodes_to_ffmpegs_samples() {
     let mut failures = Vec::new();
@@ -104,27 +111,26 @@ fn every_fate_opus_file_decodes_to_ffmpegs_samples() {
         params.extradata[10..12].fill(0);
         let (decoded, errors) = check_decoders::decode_packets(&[oxideav_opus::register], &params, &packets);
         let ours = refcheck::interleaved_f32(&decoded);
-        let theirs = ffmpeg_untrimmed(&path);
+        let theirs = ffmpeg_c_path(&path, true);
         let channels = decoded.audio_format.map_or(1, |f| usize::from(f.channels));
-        let result = refcheck::try_snr_db(&theirs, &ours, 0);
-        eprintln!("{rel}: {} vs FFmpeg {} samples/channel, {result:?} dB", ours.len() / channels, theirs.len() / channels);
-        match result {
-            Ok(snr) if snr >= 90.0 && errors.is_empty() => {}
-            other => failures.push(format!("{rel}: {other:?}, errors {errors:?}")),
+        let differ = differing(&theirs, &ours);
+        eprintln!("{rel}: {} vs FFmpeg {} samples/channel, {differ} differ", ours.len() / channels, theirs.len() / channels);
+        if ours.len() != theirs.len() || differ != 0 || !errors.is_empty() {
+            failures.push(format!("{rel}: {} vs {} samples, {differ} differ, errors {errors:?}", ours.len(), theirs.len()));
         }
     }
     assert!(failures.is_empty(), "{} of {} files:\n{}", failures.len(), files.len(), failures.join("\n"));
 }
 
 /// The player's path: every FATE Opus file through the demuxer the player
-/// opens it with and the container's trims, against FFmpeg's decode: its
-/// exact sample count and at least 90 dB. `opus/silk-lbrr-mono.mka` ends
-/// with a packet that discards 570 samples of padding, after which the
-/// decoder drains 24 delayed SILK samples: FFmpeg cuts the padding from
-/// that packet's frame and keeps the drained ones (`libavcodec/decode.c`
-/// trims each frame by the last packet's side data, the padding only where
-/// it fits in the frame). `caf/opus.caf` plays through the `OpusHead` the
-/// CAF reader builds (`caf_opus_header_is_ffmpegs`).
+/// opens it with and the container's trims gives FFmpeg's decode bit for
+/// bit. `opus/silk-lbrr-mono.mka` ends with a packet that discards 570
+/// samples of padding, after which the decoder drains 24 delayed SILK
+/// samples: FFmpeg cuts the padding from that packet's frame and keeps the
+/// drained ones (`libavcodec/decode.c` trims each frame by the last
+/// packet's side data, the padding only where it fits in the frame).
+/// `caf/opus.caf` plays through the `OpusHead` the CAF reader builds
+/// (`caf_opus_header_is_ffmpegs`).
 #[test]
 fn every_fate_opus_file_plays_ffmpegs_samples() {
     let registrars: &[Registrar] = &[
@@ -140,13 +146,12 @@ fn every_fate_opus_file_plays_ffmpegs_samples() {
         let path = refcheck::fate(rel);
         let decoded = refcheck::decode(&path, registrars, MediaType::Audio, 0);
         let ours = refcheck::interleaved_f32(&decoded);
-        let theirs = refcheck::ffmpeg_src_audio_f32(&path, 0);
+        let theirs = ffmpeg_c_path(&path, false);
         let channels = decoded.audio_format.map_or(1, |f| usize::from(f.channels));
-        let result = refcheck::try_snr_db(&theirs, &ours, 0);
-        eprintln!("{rel}: {channels} ch, {} vs FFmpeg {} samples/channel, {result:?} dB", ours.len() / channels, theirs.len() / channels);
-        match result {
-            Ok(snr) if snr >= 90.0 && decoded.trim_fallbacks.is_empty() => {}
-            other => failures.push(format!("{rel}: {other:?}, trims {:?}", decoded.trim_fallbacks)),
+        let differ = differing(&theirs, &ours);
+        eprintln!("{rel}: {channels} ch, {} vs FFmpeg {} samples/channel, {differ} differ", ours.len() / channels, theirs.len() / channels);
+        if ours.len() != theirs.len() || differ != 0 || !decoded.trim_fallbacks.is_empty() {
+            failures.push(format!("{rel}: {} vs {} samples, {differ} differ, trims {:?}", ours.len(), theirs.len(), decoded.trim_fallbacks));
         }
     }
     assert!(failures.is_empty(), "{} of {} files:\n{}", failures.len(), files.len(), failures.join("\n"));
@@ -167,22 +172,19 @@ fn caf_opus_header_is_ffmpegs() {
     assert_eq!(demuxer.streams()[0].params.extradata, ffmpeg_extradata(&path));
 }
 
-/// FATE's chained Ogg Opus (two mono links, 4800 samples each after the
-/// pre-skip): whatever the Ogg demuxer plays, at least the first link, is
-/// FFmpeg's samples at 90 dB or more. The pinned oxideav-ogg stops after
-/// the first link; the `mov-fixes` Ogg fork plays both, as FFmpeg does.
+/// FATE's chained Ogg Opus: two mono links, 4800 samples each after the
+/// pre-skip. Both play, one after the other as FFmpeg plays them, and are
+/// FFmpeg's samples bit for bit.
 #[test]
 fn chained_ogg_matches_ffmpeg() {
     let path = refcheck::fate("ogg-opus/chained-meta.ogg");
     let registrars: &[Registrar] = &[oxideav_opus::__oxideav_entry, oxideav_ogg::__oxideav_entry];
     let decoded = refcheck::decode(&path, registrars, MediaType::Audio, 0);
     let ours = refcheck::interleaved_f32(&decoded);
-    let theirs = refcheck::ffmpeg_src_audio_f32(&path, 0);
-    eprintln!("chained-meta.ogg: {} of FFmpeg's {} samples", ours.len(), theirs.len());
-    assert!(ours.len() >= 4800 && ours.len() <= theirs.len(), "{} samples, FFmpeg {}", ours.len(), theirs.len());
-    let snr = refcheck::snr_db(&theirs[..ours.len()], &ours, 0);
-    eprintln!("chained-meta.ogg: {snr:.1} dB");
-    assert!(snr >= 90.0, "{snr:.1} dB against FFmpeg");
+    let theirs = ffmpeg_c_path(&path, false);
+    assert_eq!(ours.len(), theirs.len(), "chained-meta.ogg samples");
+    assert_eq!(ours.len(), 9600, "two links of 4800");
+    assert_eq!(differing(&theirs, &ours), 0, "chained-meta.ogg differs from FFmpeg's samples");
 }
 
 /// A 7.1 Opus file made by FFmpeg's libopus encoder (mapping family 1:
