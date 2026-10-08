@@ -389,10 +389,12 @@ pub fn open_caf(
     }
     let constant = bytes_per_packet > 0 && frames_per_packet > 0;
     // FFmpeg's st->duration from the packet table; without one, constant
-    // packets give nb_frames.
+    // packets give nb_frames, when that fits an i64 (cafdec.c's check).
     let duration = match &pakt {
         Some(table) => Some(table.duration),
-        None if constant && data_size > 0 => Some((data_size / bytes_per_packet) * frames_per_packet),
+        None if constant && data_size > 0 && data_size / bytes_per_packet < i64::MAX / frames_per_packet => {
+            Some((data_size / bytes_per_packet) * frames_per_packet)
+        }
         None => None,
     };
     let pakt = pakt.unwrap_or_default();
@@ -503,7 +505,10 @@ impl CafDemuxer {
         pkt.flags.keyframe = true;
 
         self.packet_cnt += 1;
-        self.frame_cnt += pkt_frames;
+        // Hostile frame counts can sum past i64 over a long stream; C's
+        // signed overflow has no defined result, and a timestamp is all
+        // this feeds.
+        self.frame_cnt = self.frame_cnt.wrapping_add(pkt_frames);
         Ok(pkt)
     }
 }
