@@ -20,7 +20,7 @@
 //! stdout.
 
 use oxideav_core::{MediaType, Packet, RuntimeContext, TimeBase};
-use player::backend::{Backend, Clock, SinkError, VideoSink};
+use player::backend::{Backend, Clock, PictureReady, SinkError, VideoSink};
 use player::AndroidBackend;
 use std::fs::File;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -207,7 +207,7 @@ fn reopen_mode(
     match mode {
         Mode::Compressed => {
             sink.prefer_software_decoder(true);
-            if !sink.open_compressed(params) {
+            if !sink.open_compressed(params, PictureReady::new(|_| {})) {
                 return Err(SinkError::Fatal("re-open declined".into()));
             }
         }
@@ -285,7 +285,7 @@ fn run_stream(
         Mode::Compressed => {
             let mut sink = sink_video.lock();
             sink.prefer_software_decoder(true);
-            if !sink.open_compressed(params) {
+            if !sink.open_compressed(params, PictureReady::new(|_| {})) {
                 return Err(SinkError::Fatal("open_compressed declined".into()));
             }
         }
@@ -606,7 +606,7 @@ fn sw_first_probe() -> i32 {
         // wedges, and this probe isolates the software decode + ImageReader
         // pipeline from that.
         sink.prefer_software_decoder(true);
-        if !sink.open_compressed(&params) {
+        if !sink.open_compressed(&params, PictureReady::new(|_| {})) {
             println!("[sw] FAIL: open declined");
             return 1;
         }

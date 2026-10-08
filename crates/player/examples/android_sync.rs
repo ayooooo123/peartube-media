@@ -26,7 +26,8 @@ impl Backend for Probe {
 }
 struct Software(Box<dyn VideoSink>);
 impl VideoSink for Software {
-    fn open_compressed(&mut self, _: &CodecParameters) -> bool { false }
+    fn open_compressed(&mut self, _: &CodecParameters, _: player::backend::PictureReady) -> bool { false }
+    fn present_from(&mut self, start: Duration) { self.0.present_from(start); }
     fn push_packet(&mut self, p: &Packet, t: Duration, random_access: bool) -> Result<(), SinkError> { self.0.push_packet(p, t, random_access) }
     fn open_frames(&mut self, p: &CodecParameters) -> Result<(), SinkError> { self.0.open_frames(p) }
     fn push_frame(&mut self, f: &VideoFrame, t: Duration) -> Result<(), SinkError> { self.0.push_frame(f, t) }

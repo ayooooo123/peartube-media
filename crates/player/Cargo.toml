@@ -36,6 +36,8 @@ subs-text = { path = "../subs-text" }
 ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-29"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+oxideav-h264.workspace = true
+oxideav-h265.workspace = true
 objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = "0.3"
 objc2-av-foundation = { version = "0.3", features = ["objc2-core-media", "block2"] }

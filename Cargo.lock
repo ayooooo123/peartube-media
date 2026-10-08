@@ -1257,7 +1257,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h264"
 version = "0.1.8"
-source = "git+https://github.com/ayooooo123/oxideav-h264?rev=103743224259f2b8663dc882fa60a18cd95c134a#103743224259f2b8663dc882fa60a18cd95c134a"
+source = "git+https://github.com/ayooooo123/oxideav-h264?rev=6063d322c798b560ac1891fa1109901d30abd6a6#6063d322c798b560ac1891fa1109901d30abd6a6"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",
@@ -1666,6 +1666,7 @@ dependencies = [
  "oxideav-ass",
  "oxideav-core",
  "oxideav-h264",
+ "oxideav-h265",
  "oxideav-http",
  "oxideav-mp4",
  "oxideav-ogg",

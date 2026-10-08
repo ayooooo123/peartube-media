@@ -18,7 +18,7 @@ mod entry;
 
 pub use captions::{CAPTIONS_608, CAPTIONS_708};
 
-use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
+use crate::backend::{AudioSink, Backend, Clock, PictureReady, SinkError, VideoSink};
 use crate::clock::MasterClock;
 use crate::headless::find_headless;
 use crate::source::{open_source, ReadAheadSource, SourceMonitor};
@@ -110,6 +110,10 @@ const QUEUE_MAX_SECS: f64 = 2.0;
 const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
+
+/// A broken platform decoder must fail visibly, not let audio run ahead
+/// without a decoded picture.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Side data travels with its packet, including across equal-PTS laces.
 pub(crate) struct QueuedPacket {
@@ -420,6 +424,10 @@ struct Seek {
     generation: u64,
     /// Target in seconds.
     target: f64,
+    /// Where the video shows from, in seconds: the target, or later when the
+    /// seek starts at a recovery point that recovers after it
+    /// (`enter_video`).
+    show_from: f64,
 }
 
 /// The audio track asked for: the playback's default, or one the caller
@@ -441,8 +449,6 @@ impl SharedState {
     /// Moves playback to `to`: the demux loop applies the newest request,
     /// and each pipeline starts over when it sees the generation change.
     fn request_seek(&self, to: Duration) {
-        *self.seek_target.lock() = Some(to);
-        self.seek_gen.fetch_add(1, Ordering::SeqCst);
         self.seek_clock(to);
         self.state.lock().position = to;
         notify_changed(self);
@@ -1227,6 +1233,27 @@ fn run_demux_loop(run: &mut Run<'_>) {
     let mut full = false;
     let mut captions = captions::Captions::new(run);
 
+    // Resolve a start inside an intra-refresh cycle before any packet
+    // reaches a decoder. B-pyramid decode order can put a
+    // displayable picture before the picture completing recovery.
+    let streams = run.streams;
+    if shared.seek_target.lock().is_none() {
+        if let Some(stream) = streams.iter().find(|s| Some(s.index) == run.current_video) {
+            if entry::checked(&stream.params)
+                && matches!(read_to_random_access(run, stream.index, &stream.params),
+                    Some((_, entry::Entry::Recovery { .. })))
+            {
+                if let Some(pts) = read_to_recovery(run, stream.index, &stream.params) {
+                    *shared.active_seek.lock() = Some(Seek {
+                        generation: 0,
+                        target: 0.0,
+                        show_from: stream.time_base.seconds_of(pts),
+                    });
+                }
+            }
+        }
+    }
+
     while !shared.stopped.load(Ordering::SeqCst) {
         // Selection switch: replace the changed pipelines.
         let gen_now = shared.select_gen.load(Ordering::SeqCst);
@@ -1241,8 +1268,10 @@ fn run_demux_loop(run: &mut Run<'_>) {
 
         // Seek: apply each new request; a request already applied for this
         // generation is skipped so a slow seek_to doesn't re-run.
-        let latest = shared.seek_gen.load(Ordering::SeqCst);
-        let pending = *shared.seek_target.lock();
+        let (latest, pending) = {
+            let target = shared.seek_target.lock();
+            (shared.seek_gen.load(Ordering::SeqCst), *target)
+        };
         if let Some(target) = pending {
             let applied = (*shared.active_seek.lock()).map(|sk| sk.generation) == Some(latest);
             if !applied {
@@ -1371,6 +1400,7 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
     *shared.active_seek.lock() = Some(Seek {
         generation,
         target: target.as_secs_f64(),
+        show_from: target.as_secs_f64(),
     });
     run.video_lane.clear_for_seek(generation);
     run.audio_lane.clear_for_seek(generation);
@@ -1380,7 +1410,11 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
     shared.demux_seeked(generation);
 
     if seek(run, seek_stream, ticks) && Some(seek_stream) == run.current_video {
-        enter_video(run, seek_stream, target.as_secs_f64(), ticks);
+        if let Some(recovered) = enter_video(run, seek_stream, target.as_secs_f64(), ticks) {
+            if let Some(seek) = shared.active_seek.lock().as_mut().filter(|s| s.generation == generation) {
+                seek.show_from = tb.seconds_of(recovered);
+            }
+        }
     }
 }
 
@@ -1399,42 +1433,58 @@ fn seek(run: &mut Run<'_>, stream: u32, ticks: i64) -> bool {
 
 /// After the demuxer landed for a seek to `target` (seconds; `ticks` in the
 /// video stream's time base): when the video's first random-access picture
-/// there depends on earlier pictures (`entry`), seeks to the random-access
-/// point before it, until one a decoder can start from or `LOOKBACK_SECS`
-/// before the target. The reads go to `Run::replay`; the video pipeline
-/// drops the pictures before the target as after any seek.
-fn enter_video(run: &mut Run<'_>, video: u32, target: f64, ticks: i64) {
+/// there depends on earlier pictures, or is a recovery point that recovers
+/// after the target (`entry`), seeks to the random-access point before it,
+/// until one a decoder can start from or `LOOKBACK_SECS` before the target.
+/// The reads go to `Run::replay`; the video pipeline drops the pictures
+/// before the target as after any seek. Returns where the video shows from
+/// when that is past the target: the seek could not go back past a
+/// recovery point that recovers later, and its pictures before then are
+/// never shown, as FFmpeg's decoder outputs none of them.
+fn enter_video(run: &mut Run<'_>, video: u32, target: f64, ticks: i64) -> Option<i64> {
     let streams = run.streams;
-    let Some(stream) = streams.iter().find(|s| s.index == video) else { return };
+    let stream = streams.iter().find(|s| s.index == video)?;
     if !entry::checked(&stream.params) {
-        return;
+        return None;
     }
     let (params, tb) = (&stream.params, stream.time_base);
-    let mut entered: Option<i64> = None;
+    let late = |recovered: Option<i64>| recovered.filter(|&r| r > ticks);
+    // When the first landing recovers, and the landing before this one.
+    let mut first: Option<Option<i64>> = None;
+    let mut previous: Option<i64> = None;
     loop {
-        let Some((pts, kind)) = read_to_random_access(run, video, params) else { return };
-        let Some(pts) = pts else { return };
-        if kind == entry::Entry::Refresh || tb.seconds_of(pts) <= target - entry::LOOKBACK_SECS {
-            return;
+        let (pts, kind) = read_to_random_access(run, video, params)?;
+        let pts = pts?;
+        let recovers = match kind {
+            entry::Entry::Refresh => return None,
+            entry::Entry::Recovery { .. } => match read_to_recovery(run, video, params) {
+                Some(recovered) if recovered <= ticks => return None,
+                recovered => recovered,
+            },
+            entry::Entry::Dependent => None,
+        };
+        let first_recovers = *first.get_or_insert(recovers);
+        if tb.seconds_of(pts) <= target - entry::LOOKBACK_SECS {
+            return late(recovers);
         }
-        match entered {
+        match previous {
             // As far back as the demuxer goes.
-            Some(e) if pts == e => return,
+            Some(e) if pts == e => return late(recovers),
             // The demuxer went forward instead: back where the seek landed
             // first.
             Some(e) if pts > e => {
                 run.replay.clear();
                 seek(run, video, ticks);
-                return;
+                return late(first_recovers);
             }
             _ => {}
         }
-        entered = Some(pts);
+        previous = Some(pts);
         run.replay.clear();
         if !seek(run, video, pts - 1) {
             run.replay.clear();
             seek(run, video, ticks);
-            return;
+            return late(first_recovers);
         }
     }
 }
@@ -1468,6 +1518,41 @@ fn read_to_random_access(run: &mut Run<'_>, video: u32, params: &CodecParameters
         run.replay.push_back(read);
         if found.is_some() || bytes > VIDEO_MAX_BYTES {
             return found;
+        }
+    }
+    None
+}
+
+/// Reads on, into `Run::replay`, from a recovery point (the latest read) to
+/// the picture where it recovers (`entry::Recovery`): that picture's pts.
+/// `None` when the reads ended or reached `ENTRY_READ_LIMIT` packets or
+/// `VIDEO_MAX_BYTES` first.
+fn read_to_recovery(run: &mut Run<'_>, video: u32, params: &CodecParameters) -> Option<i64> {
+    let mut recovery = entry::Recovery::new();
+    match run.replay.back() {
+        Some(Ok(Ok(q))) if recovery.recovered(params, &q.packet.data) => return q.packet.pts,
+        Some(Ok(Ok(_))) => {}
+        _ => return None,
+    }
+    let mut bytes = 0usize;
+    for _ in 0..ENTRY_READ_LIMIT {
+        let read = read_packet(run.demuxer);
+        let found = match &read {
+            Ok(Ok(q)) => {
+                bytes += q.packet.data.len();
+                (q.packet.stream_index == video && recovery.recovered(params, &q.packet.data)).then_some(q.packet.pts)
+            }
+            _ => {
+                run.replay.push_back(read);
+                return None;
+            }
+        };
+        run.replay.push_back(read);
+        if let Some(pts) = found {
+            return pts;
+        }
+        if bytes > VIDEO_MAX_BYTES {
+            return None;
         }
     }
     None
@@ -2132,7 +2217,21 @@ fn run_video_thread(
     realtime: bool,
     retired: Arc<AtomicBool>,
 ) {
-    let mut compressed = sink.open_compressed(&stream.params);
+    let first = FirstPicture::new(&shared);
+    let ready = PictureReady::new({
+        let first = Arc::clone(&first);
+        move |_| first.report()
+    });
+    let mut compressed = sink.open_compressed(&stream.params, ready);
+    // The compressed path's generation `present_from` was set for, the one
+    // whose first random-access packet was looked at, what the sink shows
+    // from, a start's recovery point still recovering, and when the clock
+    // stops waiting for the decoder's first picture.
+    let mut presenting_for: Option<u64> = None;
+    let mut entered: Option<u64> = None;
+    let mut presenting = Duration::ZERO;
+    let mut recovering: Option<entry::Recovery> = None;
+    let mut ready_by = Instant::now();
     let mut sw_decoder: Option<Box<dyn Decoder>> = None;
     // What the frame sink was last opened with (see `sync_frame_format`).
     let mut frame_format: Option<CodecParameters> = None;
@@ -2146,7 +2245,7 @@ fn run_video_thread(
     let mut primed: Option<u64> = None;
     let mut last_end = Duration::ZERO;
     let mut frame_clock = FrameClock::default();
-    let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
+    let quit = || shared.stopped.load(Ordering::SeqCst) || shared.failed.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
     if !compressed {
         match make_decoder(&shared.ctx, &stream.params) {
@@ -2169,6 +2268,9 @@ fn run_video_thread(
                 return;
             }
         }
+    }
+    if compressed {
+        first.arm(seen_seek);
     }
 
     while !quit() {
@@ -2244,7 +2346,20 @@ fn run_video_thread(
                     while !quit() && shared.seek_gen.load(Ordering::SeqCst) == seen_seek {
                         sync_video_sink(&mut *sink, &shared, &mut sink_running);
                         if !matches!(sink.finish(), Err(SinkError::WouldBlock)) { break; }
+                        if !first.reported(seen_seek) && last_end > presenting && Instant::now() >= ready_by {
+                            set_error(&shared, "platform video decoder stalled while draining".into());
+                            return;
+                        }
                         shared.wait_retry();
+                    }
+                    // A seek beyond the final picture has nothing to show.
+                    // Otherwise draining must produce a decoded picture
+                    // before the clock can run.
+                    if presenting_for == Some(seen_seek) && last_end > presenting
+                        && !first.wait(&shared, seen_seek, ready_by, &retired)
+                    {
+                        if quit() { return; }
+                        continue;
                     }
                 }
                 if realtime {
@@ -2294,22 +2409,62 @@ fn run_video_thread(
         if compressed {
             let ticks = packet.pts.unwrap_or(0).max(0);
             let pts = Duration::from_secs_f64(stream.time_base.seconds_of(ticks).max(0.0));
-            if primed != Some(seen_seek) {
-                primed = Some(seen_seek);
-                shared.pipe_primed(Pipe::Video, seen_seek);
+            if presenting_for != Some(seen_seek) {
+                // The first packet since the decoder started or a seek
+                // flushed it: the clock holds until its first picture to
+                // show is out (`FirstPicture`).
+                presenting_for = Some(seen_seek);
+                recovering = None;
+                presenting = show_from(&shared, seen_seek).unwrap_or(pts);
+                sink.present_from(presenting);
+                first.arm(seen_seek);
+                ready_by = Instant::now() + READY_TIMEOUT;
             }
-            // While the clock stands still the platform decoder cannot
-            // present anything: feed it only up to `PREROLL` past the clock,
-            // so its input queue never fills and blocks `push_packet`.
-            if realtime && !preroll_video(&mut *sink, &shared, pts, &mut sink_running, seen_seek, &retired) {
-                continue;
+            if entered != Some(seen_seek) && random_access {
+                entered = Some(seen_seek);
+                // A start (no seek) at a recovery point that recovers later
+                // shows nothing until it has, as FFmpeg's decoder outputs
+                // nothing; a seek's landing is settled by `enter_video`.
+                if show_from(&shared, seen_seek).is_none()
+                    && matches!(entry::entry(&stream.params, &packet.data), entry::Entry::Recovery { .. })
+                {
+                    recovering = Some(entry::Recovery::new());
+                    presenting = Duration::MAX;
+                    sink.present_from(presenting);
+                }
+            }
+            if let Some(recovery) = recovering.as_mut() {
+                if recovery.recovered(&stream.params, &packet.data) {
+                    recovering = None;
+                    presenting = pts;
+                    sink.present_from(presenting);
+                }
+            }
+            let waiting = !first.reported(seen_seek);
+            if waiting && Instant::now() >= ready_by {
+                set_error(&shared, "platform video decoder produced no presentable picture before the seek deadline".into());
+                return;
+            }
+            // Feed until decoded output exists; a wall-clock/PTS bound
+            // cannot cover the reorder depth of a low-frame-rate stream.
+            // The sink's input bound and the deadline above limit this
+            // hold. Once ready, feed against the live playback clock.
+            if realtime && !waiting {
+                if !preroll_video(&mut *sink, &shared, pts, &mut sink_running, seen_seek, &retired) {
+                    continue;
+                }
             }
             sync_video_sink(&mut *sink, &shared, &mut sink_running);
             let result = loop {
                 if quit() || shared.seek_gen.load(Ordering::SeqCst) != seen_seek { break Ok(()); }
                 sync_video_sink(&mut *sink, &shared, &mut sink_running);
                 match sink.push_packet(&packet, pts, random_access) {
-                    Err(SinkError::WouldBlock) => shared.wait_retry(),
+                    Err(SinkError::WouldBlock) => {
+                        if !first.reported(seen_seek) && Instant::now() >= ready_by {
+                            break Err(SinkError::Fatal("platform video decoder stalled before its first presentable picture".into()));
+                        }
+                        shared.wait_retry();
+                    }
                     result => break result,
                 }
             };
@@ -2320,6 +2475,7 @@ fn run_video_thread(
                 Err(SinkError::Fallback(_)) => {
                     // Platform decoder cannot continue: software from the
                     // next keyframe.
+                    sink.flush();
                     compressed = false;
                     need_keyframe = true;
                     sw_decoder = match software_fallback(&shared, &stream, &mut *sink) {
@@ -2428,6 +2584,70 @@ fn run_video_thread(
     }
 }
 
+/// The first picture to show that a platform decoder output since the
+/// video pipeline started it or a seek flushed it, as the sink reports it
+/// (`PictureReady`). Until it is out the clock holds, so after a seek the
+/// video starts with the audio instead of behind it.
+struct FirstPicture {
+    shared: Weak<SharedState>,
+    /// The seek generation whose first picture is awaited, plus one (0:
+    /// none).
+    armed: AtomicU64,
+    /// The generation whose first picture is ready, plus one.
+    released: AtomicU64,
+}
+
+impl FirstPicture {
+    fn new(shared: &Arc<SharedState>) -> Arc<FirstPicture> {
+        Arc::new(FirstPicture {
+            shared: Arc::downgrade(shared),
+            armed: AtomicU64::new(0),
+            released: AtomicU64::new(0),
+        })
+    }
+
+    /// Awaits `generation`'s first picture from now on.
+    fn arm(&self, generation: u64) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.pipe_pending(Pipe::Video, generation);
+        }
+        self.armed.store(generation + 1, Ordering::SeqCst);
+    }
+
+    fn reported(&self, generation: u64) -> bool {
+        self.released.load(Ordering::SeqCst) == generation + 1
+    }
+
+    /// The sink's report: the armed generation's first picture is out,
+    /// unless a newer seek superseded that generation.
+    fn report(&self) {
+        let armed = self.armed.load(Ordering::SeqCst);
+        let Some(shared) = self.shared.upgrade() else { return };
+        if armed != 0 && shared.seek_gen.load(Ordering::SeqCst) == armed - 1 {
+            self.release(&shared, armed - 1);
+        }
+    }
+
+    /// Lets the clock go for `generation`, as when its first picture is
+    /// out.
+    fn release(&self, shared: &SharedState, generation: u64) {
+        if self.released.fetch_max(generation + 1, Ordering::SeqCst) < generation + 1 {
+            shared.pipe_primed(Pipe::Video, generation);
+        }
+    }
+
+    fn wait(&self, shared: &SharedState, generation: u64, until: Instant, retired: &AtomicBool) -> bool {
+        if !shared.wait_primed(Pipe::Video, generation, until, retired) {
+            return false;
+        }
+        if !self.reported(generation) {
+            set_error(shared, "platform video decoder produced no presentable picture before the seek deadline".into());
+            return false;
+        }
+        true
+    }
+}
+
 /// Timestamps for decoded pictures that carry none. FFmpeg leaves many
 /// pictures untimed (raw and MPEG-PS H.264 time only some access units);
 /// its consumers continue the timeline from the previous picture's time
@@ -2457,15 +2677,16 @@ impl FrameClock {
     }
 }
 
-/// Whether a frame at `pts_secs` precedes the target of the latest seek
-/// while this pipeline has shown nothing since it (`shown_seek` is the
-/// newest seek generation it has shown a frame for). Such frames are
-/// dropped; the first frame at or after the target closes the window.
+/// Whether a frame at `pts_secs` precedes where the video of the latest
+/// seek shows from (its target, or a later recovery) while this pipeline
+/// has shown nothing since it (`shown_seek` is the newest seek generation
+/// it has shown a frame for). Such frames are dropped; the first frame at
+/// or after that point closes the window.
 fn before_seek_target(shared: &SharedState, pts_secs: f64, seen_seek: u64, shown_seek: &mut u64) -> bool {
     let Some(seek) = *shared.active_seek.lock() else {
         return false;
     };
-    if seek.generation > *shown_seek && pts_secs < seek.target {
+    if seek.generation > *shown_seek && pts_secs < seek.show_from {
         return true;
     }
     *shown_seek = seen_seek;
@@ -2480,8 +2701,15 @@ fn skips_before_target(shared: &SharedState, stream: &StreamInfo, packet: &Packe
     let Some(pts) = packet.pts else { return false };
     let Some(seek) = *shared.active_seek.lock() else { return false };
     seek.generation > shown_seek
-        && stream.time_base.seconds_of(pts) < seek.target
+        && stream.time_base.seconds_of(pts) < seek.show_from
         && entry::non_reference(&stream.params, &packet.data)
+}
+
+/// Where the video of seek generation `generation` shows from: the latest
+/// seek's `show_from` when that is the generation, else the start.
+fn show_from(shared: &SharedState, generation: u64) -> Option<Duration> {
+    let seek = (*shared.active_seek.lock())?;
+    (seek.generation == generation).then(|| Duration::from_secs_f64(seek.show_from.max(0.0)))
 }
 
 /// Applies the clock's run state to a video sink when it changed.
@@ -2546,7 +2774,7 @@ fn preroll_video(
     let _timing = crate::clock::timing::Guard::enter();
     loop {
         sync_video_sink(sink, shared, applied);
-        match shared.preroll(pts, *applied, Some(Duration::from_millis(500)), seen_seek, retired) {
+        match shared.preroll(pts, *applied, None, seen_seek, retired) {
             Preroll::Go => return true,
             Preroll::Resync => {}
             Preroll::Abort => return false,

@@ -417,9 +417,10 @@ mod hashed {
     }
 
     impl VideoSink for HashedVideo {
-        fn open_compressed(&mut self, params: &CodecParameters) -> bool {
-            self.sink.open_compressed(params)
+        fn open_compressed(&mut self, params: &CodecParameters, ready: player::backend::PictureReady) -> bool {
+            self.sink.open_compressed(params, ready)
         }
+        fn present_from(&mut self, start: Duration) { self.sink.present_from(start); }
         fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
             self.sink.push_packet(packet, pts, random_access)
         }

@@ -60,6 +60,8 @@ struct PipeState {
     starved: bool,
     /// Seek generation for which the pipeline has had output ready.
     primed: Option<u64>,
+    /// Once this pipeline takes compressed input, each seek needs a picture.
+    requires_picture: bool,
     /// End (seconds) of the newest packet demuxed for the pipeline since the
     /// demuxer last seeked.
     horizon: Option<f64>,
@@ -166,6 +168,7 @@ impl Drop for Live {
             p.live = p.live.saturating_sub(1);
             if p.live == 0 {
                 p.starved = false;
+                p.requires_picture = false;
             }
         });
     }
@@ -247,10 +250,12 @@ impl SharedState {
         let generation = t.seek_gen;
         let ready = |p: &&PipeState| p.primed == Some(generation);
         if t.demux_full {
-            // The demuxer cannot queue more until the clock moves: go once
-            // every pipeline has output, except those waiting on an empty
-            // lane (they cannot get any before the demuxer moves on).
-            if t.pipes.iter().filter(live).all(|p| ready(&p) || p.starved) {
+            // Empty lanes can let other tracks move. Once compressed input
+            // arrived in this generation, only a decoded picture is ready:
+            // keep that rule across seeks, before the worker reads a packet.
+            if t.pipes.iter().filter(live).all(|p| ready(&p)
+                || (p.starved && !(p.requires_picture && p.horizon.is_some())))
+            {
                 t.buffering = false;
             }
             return;
@@ -277,7 +282,8 @@ impl SharedState {
     /// the audio plays from `to`.
     pub(super) fn seek_clock(&self, to: Duration) {
         self.update(|t| {
-            t.seek_gen = self.seek_gen.load(Ordering::SeqCst);
+            let mut target = self.seek_target.lock();
+            t.seek_gen = t.seek_gen.wrapping_add(1);
             self.master.seek(to, t.seek_gen);
             for p in &mut t.pipes {
                 p.horizon = None;
@@ -287,6 +293,10 @@ impl SharedState {
             t.tail_limit = None;
             t.demux_full = false;
             t.buffering = true;
+            // Publish the target and generation only after the clock holds.
+            // The demuxer reads the pair under the same target lock.
+            *target = Some(to);
+            self.seek_gen.store(t.seek_gen, Ordering::SeqCst);
         });
     }
 
@@ -322,10 +332,45 @@ impl SharedState {
         self.update(|t| t.pipe(pipe).starved = starved);
     }
 
+    pub(super) fn pipe_pending(&self, pipe: Pipe, generation: u64) {
+        self.update(|t| {
+            if t.seek_gen == generation {
+                let p = t.pipe(pipe);
+                p.requires_picture = true;
+                if p.primed != Some(generation) {
+                    t.buffering = true;
+                }
+            }
+        });
+    }
+
     /// The pipeline has output ready (decoded and past the seek target) for
-    /// seek generation `generation`.
+    /// seek generation `generation`. Wakes `wait_primed` even when the hold
+    /// stays.
     pub(super) fn pipe_primed(&self, pipe: Pipe, generation: u64) {
-        self.update(|t| t.pipe(pipe).primed = Some(generation));
+        self.update(|t| {
+            if t.seek_gen == generation {
+                t.pipe(pipe).primed = Some(generation);
+            }
+        });
+        self.wake_clock_waiters();
+    }
+
+    /// Waits until `pipe` has output ready for seek generation `generation`
+    /// (`pipe_primed`) or `until` passes. False when the player stopped, the
+    /// pipeline was retired or a newer seek superseded the wait.
+    pub(super) fn wait_primed(&self, pipe: Pipe, generation: u64, until: Instant, retired: &AtomicBool) -> bool {
+        let mut t = self.transport.lock();
+        loop {
+            if t.done || self.superseded(generation, retired) {
+                return false;
+            }
+            let now = Instant::now();
+            if t.pipe(pipe).primed == Some(generation) || now >= until {
+                return true;
+            }
+            self.transport_cv.wait_for(&mut t, until - now);
+        }
     }
 
     pub(super) fn source_starved(&self, starved: bool) {

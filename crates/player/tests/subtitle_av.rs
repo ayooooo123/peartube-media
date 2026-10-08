@@ -79,7 +79,8 @@ impl AudioSink for WatchedAudio {
 struct WatchedVideo(Box<dyn VideoSink>, Arc<Watch>);
 
 impl VideoSink for WatchedVideo {
-    fn open_compressed(&mut self, params: &CodecParameters) -> bool { self.0.open_compressed(params) }
+    fn open_compressed(&mut self, params: &CodecParameters, ready: player::backend::PictureReady) -> bool { self.0.open_compressed(params, ready) }
+    fn present_from(&mut self, start: Duration) { self.0.present_from(start); }
     fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
         self.0.push_packet(packet, pts, random_access)
     }

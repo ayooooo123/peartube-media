@@ -35,13 +35,14 @@ impl Backend for Measured {
 }
 struct MeasuredVideo(Box<dyn VideoSink>, bool);
 impl VideoSink for MeasuredVideo {
-    fn open_compressed(&mut self, p: &CodecParameters) -> bool {
-        let accepted = !self.1 && self.0.open_compressed(p);
+    fn open_compressed(&mut self, p: &CodecParameters, ready: player::backend::PictureReady) -> bool {
+        let accepted = !self.1 && self.0.open_compressed(p, ready);
         eprintln!("APPLE_VIDEO compressed={accepted}");
         accepted
     }
+    fn present_from(&mut self, start: Duration) { self.0.present_from(start); }
     fn push_packet(&mut self, p: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
-        self.0.push_packet(p, pts, random_access).inspect_err(|error| eprintln!("APPLE_PACKET {error:?}"))
+        self.0.push_packet(p, pts, random_access)
     }
     fn open_frames(&mut self, p: &CodecParameters) -> Result<(), SinkError> {
         eprintln!("APPLE_VIDEO software_frames");
@@ -65,12 +66,21 @@ fn main() {
     let mtm = MainThreadMarker::new().unwrap();
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-    app.activate();
+    app.finishLaunching();
     let frame = CGRect { origin: CGPoint { x: 40.0, y: 40.0 }, size: CGSize { width: 320.0, height: 192.0 } };
     let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(
         NSWindow::alloc(mtm), frame, NSWindowStyleMask::Titled, NSBackingStoreType::Buffered, false) };
     window.setTitle(&objc2_foundation::NSString::from_str("EngineSync timing"));
+    // An occluded layer can retain a stale readback. Keep this short
+    // display probe visible while other applications have focus.
+    window.setLevel(objc2_app_kit::NSFloatingWindowLevel);
+    window.setCollectionBehavior(objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+        | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary);
     window.makeKeyAndOrderFront(None);
+    // This standalone readback probe needs its window presented; the
+    // cooperative activate() request can leave a CLI-launched app inactive.
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
     let view = window.contentView().unwrap();
     let native = AppleBackend::new();
     native.set_muted(true);
@@ -99,13 +109,18 @@ fn measure(path: String, backend: Arc<Measured>, transport: bool) {
     let mut swapped = false;
     println!("mono_ns,audio_s,engine_s,frames,dropped,delay_sum_ms,delta_frames,delta_delay_ms");
     loop {
+        // Bracket the engine read so a descheduled probe cannot count
+        // elapsed wall time between two snapshots as clock skew.
+        let audio_before = backend.audio_clock.lock().as_ref().and_then(|c| c.now()).unwrap_or_default();
         let state = player.state();
         assert!(state.error.is_none(), "{state:?}");
         assert!(Instant::now() < deadline, "timing smoke timed out: {state:?}");
         let audio = backend.audio_clock.lock().as_ref().and_then(|c| c.now()).unwrap_or_default();
         if state.playing && !state.buffering && state.audio.is_some()
             && audio > Duration::from_secs(1) && state.duration.is_some_and(|end| state.position < end) {
-            assert!(audio.abs_diff(state.position) < Duration::from_millis(40), "engine not on audio: {audio:?}, {state:?}");
+            let margin = Duration::from_millis(40);
+            assert!(state.position >= audio_before.saturating_sub(margin) && state.position <= audio + margin,
+                "engine not on audio: {audio_before:?}..{audio:?}, {state:?}");
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let b = backend.clone();
@@ -236,17 +251,17 @@ fn displayed_frame(backend: Arc<Measured>) -> Option<u32> {
         use objc2_core_video::*;
         use objc2_av_foundation::AVQueuedSampleBufferRendering;
         let renderer = backend.native.video_layer().sampleBufferRenderer();
+        let timebase = renderer.timebase();
+        eprintln!("APPLE_READBACK ready={} status={:?} renderer_rate={} renderer_time={:?}",
+            backend.native.video_layer().isReadyForDisplay(), renderer.status(), timebase.rate(), timebase.time());
+        let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+        for window in app.windows().iter() {
+            eprintln!("APPLE_WINDOW active={} visible={} occlusion={:?} layer_frame={:?}",
+                app.isActive(), window.isVisible(), window.occlusionState(), backend.native.video_layer().frame());
+        }
         let pixel: Option<objc2::rc::Retained<CVPixelBuffer>> =
             objc2::msg_send![&*renderer, copyDisplayedPixelBuffer];
         let Some(pixel) = pixel else {
-            let timebase = renderer.timebase();
-            eprintln!("APPLE_READBACK unavailable ready={} status={:?} renderer_rate={} renderer_time={:?}",
-                backend.native.video_layer().isReadyForDisplay(), renderer.status(), timebase.rate(), timebase.time());
-            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
-            for window in app.windows().iter() {
-                eprintln!("APPLE_WINDOW active={} visible={} occlusion={:?} layer_frame={:?}",
-                    app.isActive(), window.isVisible(), window.occlusionState(), backend.native.video_layer().frame());
-            }
             return None;
         };
         let format = CVPixelBufferGetPixelFormatType(&pixel);

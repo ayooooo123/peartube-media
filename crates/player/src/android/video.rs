@@ -1,6 +1,6 @@
 use super::backend::BackendShared;
 use crate::clock::current_monotonic_ns;
-use crate::backend::{Clock, SinkError, VideoSink};
+use crate::backend::{Clock, PictureReady, SinkError, VideoSink};
 use ndk::hardware_buffer_format::HardwareBufferFormat;
 use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
@@ -11,7 +11,7 @@ use oxideav_core::{CodecParameters, Packet, PixelFormat, VideoFrame};
 use crate::annexb::convert_packet_to_annex_b;
 use oxideav_pixfmt::FrameInfo;
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -54,6 +54,13 @@ pub struct AndroidVideoSink {
     /// The type-derived decoder for this stream proved unusable (stalled);
     /// later re-opens (new window, resume) go straight to the software one.
     prefer_software: bool,
+    /// Where the engine reports the pictures the decoder outputs to show.
+    ready: Option<PictureReady>,
+    /// `VideoSink::present_from` in microseconds: earlier pictures are
+    /// released unshown. Read by the output thread.
+    present_from: Arc<AtomicU64>,
+    /// Serializes readiness reports with teardown, including wedged threads.
+    reports: Arc<Mutex<u64>>,
 }
 
 impl AndroidVideoSink {
@@ -75,10 +82,14 @@ impl AndroidVideoSink {
             is_compressed: false,
             awaiting_keyframe: false,
             prefer_software: false,
+            ready: None,
+            present_from: Arc::new(AtomicU64::new(0)),
+            reports: Arc::new(Mutex::new(0)),
         }
     }
 
     pub fn teardown_codec(&mut self) {
+        *self.reports.lock() += 1;
         // Stop every live output-thread generation. Reopens push a fresh
         // flag per generation and never reset an old one, so a thread that
         // unblocks after teardown always sees `true` and exits instead of
@@ -154,7 +165,7 @@ impl AndroidVideoSink {
             && !self.backend.is_suspended.load(Ordering::SeqCst)
         {
             if let Some(params) = self.last_compressed_params.clone() {
-                self.open_compressed(&params);
+                self.open_compressed_inner(&params, self.prefer_software);
             }
         }
     }
@@ -162,7 +173,7 @@ impl AndroidVideoSink {
     pub fn resume(&mut self) {
         if self.is_compressed {
             if let Some(params) = self.last_compressed_params.clone() {
-                self.open_compressed(&params);
+                self.open_compressed_inner(&params, self.prefer_software);
             }
         }
     }
@@ -321,24 +332,41 @@ impl AndroidVideoSink {
         let thread_err = self.midstream_error.clone();
         let thread_playing = self.is_playing.clone();
         let thread_wake = self.output_wake.clone();
+        let thread_ready = self.ready.clone();
+        let thread_from = self.present_from.clone();
+        let thread_reports = Arc::clone(&self.reports);
+        let report_generation = *thread_reports.lock();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         self.output_done = Some(done_rx);
 
         let handle = std::thread::spawn(move || {
             let _done = DoneSignal(done_tx);
+            // Output is taken while the clock stands still too: pictures
+            // before `present_from` are released unshown at once and the
+            // first one to show is reported (`PictureReady`), so a seek's
+            // pre-roll decodes while the engine holds the clock for it.
             while !thread_stop.load(Ordering::Relaxed) {
-                if !thread_playing.load(Ordering::Relaxed) {
-                    thread_wake.1.wait_for(&mut thread_wake.0.lock(), Duration::from_millis(10));
-                    continue;
-                }
-
                 match thread_codec
                     .0
                     .dequeue_output_buffer(Duration::from_millis(50))
                 {
                     Ok(DequeuedOutputBufferInfoResult::Buffer(out_buf)) => {
-                        let pts_us = out_buf.info().presentation_time_us();
-                        let pts = Duration::from_micros(pts_us.max(0) as u64);
+                        let pts_us = out_buf.info().presentation_time_us().max(0) as u64;
+                        let pts = Duration::from_micros(pts_us);
+                        if pts_us < thread_from.load(Ordering::SeqCst) {
+                            let _ = thread_codec.0.release_output_buffer(out_buf, false);
+                            continue;
+                        }
+                        {
+                            let generation = thread_reports.lock();
+                            if *generation != report_generation || thread_stop.load(Ordering::SeqCst) {
+                                let _ = thread_codec.0.release_output_buffer(out_buf, false);
+                                break;
+                            }
+                            if let Some(ready) = &thread_ready {
+                                ready.ready(pts);
+                            }
+                        }
                         // Keep ownership until near presentation, re-reading
                         // the audio mapping after every wake. Scheduling far
                         // ahead would make a later hold/seek uncancellable.
@@ -522,8 +550,14 @@ fn parse_hvcc_to_annex_b(data: &[u8]) -> Option<(Vec<u8>, usize)> {
 }
 
 impl VideoSink for AndroidVideoSink {
-    fn open_compressed(&mut self, params: &CodecParameters) -> bool {
+    fn open_compressed(&mut self, params: &CodecParameters, ready: PictureReady) -> bool {
+        self.ready = Some(ready);
         self.open_compressed_inner(params, self.prefer_software)
+    }
+
+    fn present_from(&mut self, start: Duration) {
+        let micros = u64::try_from(start.as_micros()).unwrap_or(u64::MAX);
+        self.present_from.store(micros, Ordering::SeqCst);
     }
 
     fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
@@ -718,7 +752,7 @@ impl VideoSink for AndroidVideoSink {
         if self.is_compressed {
             self.teardown_codec();
             if let Some(params) = self.last_compressed_params.clone() {
-                self.open_compressed(&params);
+                self.open_compressed_inner(&params, self.prefer_software);
             }
         }
     }
