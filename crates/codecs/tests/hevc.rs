@@ -76,7 +76,7 @@ fn main_and_main10_complete_production_output() {
 #[test]
 fn larger_picture_complete_production_output() {
     let path = evidence_dir().join("hevc_2160p30_main10.mkv");
-    let output = Command::new("ffmpeg").args([
+    let output = Command::new(refcheck::system_ffmpeg()).args([
         "-v", "error", "-nostdin", "-y", "-filter_threads", "1", "-f", "lavfi", "-i",
         "testsrc2=size=3840x2160:rate=30:duration=2", "-an", "-c:v", "libx265", "-preset", "medium",
         "-pix_fmt", "yuv420p10le", "-x265-params",

@@ -41,11 +41,11 @@ struct Pkt {
     dts: Option<i64>,
 }
 
-/// `ffprobe -f mpeg` on `path`: streams, then packets (`parsed` false adds
-/// `-fflags +noparse+nofillin`). Fails unless ffprobe succeeds with at
-/// least one stream and one packet.
+/// The pinned `ffprobe -f mpeg` on `path`: streams, then packets (`parsed`
+/// false adds `-fflags +noparse+nofillin`). Fails unless ffprobe succeeds
+/// with at least one stream and one packet.
 fn ffprobe(path: &Path, parsed: bool) -> (Vec<FfStream>, Vec<Pkt>) {
-    let mut cmd = std::process::Command::new("ffprobe");
+    let mut cmd = std::process::Command::new(refcheck::pinned_ffprobe());
     cmd.args(["-v", "error", "-f", "mpeg"]);
     if !parsed {
         cmd.args(["-fflags", "+noparse+nofillin"]);
@@ -59,7 +59,7 @@ fn ffprobe(path: &Path, parsed: bool) -> (Vec<FfStream>, Vec<Pkt>) {
         .args(["-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
     let (mut streams, mut packets) = (Vec::new(), Vec::new());
@@ -230,19 +230,14 @@ fn pcm_dvd_vob() {
 /// pcm.mak fate-pcm_dvda: DVD-Audio LPCM in an AOB. PCM_DVDA exists in
 /// FFmpeg's source tree (2da55bf), whose mpeg.c this demuxer ports, but
 /// not in the installed release, which reads the stream as MLP. The
-/// oracle is that tree's own ffmpeg: its stream line, and the unparsed
+/// oracle is that tree's own ffmpeg (`refcheck::pinned_ffmpeg`): its stream line, and the unparsed
 /// packets through `-c copy -copyts -f framemd5`.
 #[test]
 fn pcm_dvda_aob() {
     let rel = "pcm-dvda/pcm_dvda-96k24bit.aob";
     let path = fate(rel);
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    let ffmpeg = src.join("ffmpeg");
-    assert!(ffmpeg.is_file(), "build ffmpeg in FFmpeg's source tree {} (commit 2da55bf)", src.display());
     let run = |args: &[&str]| {
-        let out = std::process::Command::new(&ffmpeg)
+        let out = std::process::Command::new(refcheck::pinned_ffmpeg())
             .args(["-hide_banner", "-f", "mpeg", "-fflags", "+noparse", "-i"])
             .arg(&path)
             .args(args)
@@ -299,33 +294,33 @@ fn vobsub_sub() {
 // ─── H.264 ───
 
 /// 0.8 s of 720x480 testsrc at 25 fps (20 frames) through the libx264 of
-/// the ffmpeg on PATH, yuv444p as it encodes RGB input by default, with
+/// `refcheck::system_ffmpeg`, yuv444p as it encodes RGB input by default, with
 /// B-frames, and `args`, muxed by FFmpeg's VOB muxer: units of a few
 /// hundred bytes, several to a 2048-byte pack, the larger ones split
 /// across packs.
 fn libx264_vob(name: &str, args: &[&str]) -> std::path::PathBuf {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("demux-misc-mpegps-{}-{name}", std::process::id()));
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=720x480:rate=25:duration=0.8"])
         .args(["-c:v", "libx264", "-pix_fmt", "yuv444p"])
         .args(args)
         .args(["-f", "vob"])
         .arg(&path)
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
     path
 }
 
-/// ffprobe's parsed packets of `path` with their key flags.
+/// The pinned ffprobe's parsed packets of `path` with their key flags.
 fn ffprobe_keyed(path: &Path) -> Vec<(Pkt, bool)> {
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-f", "mpeg", "-show_data_hash", "md5", "-show_entries"])
         .arg("packet=stream_index,pts,dts,size,flags,data_hash")
         .args(["-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
     String::from_utf8_lossy(&out.stdout)

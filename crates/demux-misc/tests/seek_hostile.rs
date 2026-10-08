@@ -4,8 +4,8 @@
 //! search restores the parser state it touched; landings FFmpeg keeps
 //! past avformat's index cap stay FFmpeg's; NUT reads an index over 4096
 //! bytes (its header checksum covers the size field); an AV1 unit CBS
-//! rejects is never key. The oracle is the port's ffprobe (FFMPEG_SRC,
-//! 2da55bf).
+//! rejects is never key. The oracle is the port's ffprobe
+//! (`refcheck::pinned_ffprobe`, 2da55bf).
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -16,16 +16,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use oxideav_core::{Demuxer, Error, Packet, ReadSeek};
-
-fn port_ffprobe() -> PathBuf {
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    let bin = src.join("ffprobe");
-    let out = Command::new(&bin).arg("-version").output().expect("build ffprobe in FFMPEG_SRC");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("2da55bf"), "seek oracle must be FFmpeg 2da55bf");
-    bin
-}
 
 /// The scratch directory Cargo gives integration tests.
 fn scratch_dir() -> PathBuf {
@@ -43,17 +33,17 @@ fn scratch(name: &str, data: &[u8]) -> PathBuf {
     path
 }
 
-/// `name` made by the `ffmpeg` on PATH from `args`, once.
+/// `name` made by `refcheck::system_ffmpeg` from `args`, once.
 fn generated(name: &str, args: &[&str]) -> PathBuf {
     let path = scratch_dir().join(name);
     if !path.exists() {
         let tmp = scratch_dir().join(format!("{}.{}.tmp", std::process::id(), name));
-        let out = Command::new("ffmpeg")
+        let out = Command::new(refcheck::system_ffmpeg())
             .args(["-nostdin", "-v", "error", "-y"])
             .args(args)
             .arg(&tmp)
             .output()
-            .expect("ffmpeg must be on PATH");
+            .expect("the fixture FFmpeg runs");
         assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
         std::fs::rename(&tmp, &path).unwrap();
     }
@@ -83,7 +73,7 @@ fn pkt(p: &Packet) -> Pkt {
 
 /// Every packet the port's ffprobe prints for `args` (before the path).
 fn ffprobe_packets(path: &Path, args: &[&str]) -> Vec<Pkt> {
-    let out = Command::new(port_ffprobe())
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error"])
         .args(args)
         .args(["-show_data_hash", "md5", "-show_entries", "packet=stream_index,pts,dts,size,flags,data_hash", "-of", "compact"])

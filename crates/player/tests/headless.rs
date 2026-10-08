@@ -25,6 +25,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,17 +50,17 @@ fn test_context() -> Arc<oxideav_core::RuntimeContext> {
     Arc::new(codecs::context())
 }
 
-/// Runs `ffmpeg <args> <file>` and returns the file's bytes; the output
-/// format follows `ext`. A seekable file, unlike a pipe, gets its index
-/// (Matroska Cues), so seeks land on keyframes.
+/// Runs `refcheck::system_ffmpeg <args> <file>` and returns the file's
+/// bytes; the output format follows `ext`. A seekable file, unlike a pipe,
+/// gets its index (Matroska Cues), so seeks land on keyframes.
 fn ffmpeg_file(ext: &str, args: &[&str]) -> Vec<u8> {
     let path = tempfile(ext);
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args(["-v", "error", "-nostdin", "-y"])
         .args(args)
         .arg(&path)
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg generate: {}",
@@ -75,7 +76,7 @@ fn make_ref_mkv() -> Vec<u8> {
     // default (framemd5) decode, which the md5 assertions compare against.
     // (mpeg4 would require the codec-mpeg4 fork's integer IDCT — a separate
     // task; the engine-level assertions are codec-independent.)
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args([
             "-v", "error", "-nostdin",
             "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25",
@@ -85,7 +86,7 @@ fn make_ref_mkv() -> Vec<u8> {
             "-f", "matroska", "-",
         ])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg generate: {}",
@@ -94,8 +95,8 @@ fn make_ref_mkv() -> Vec<u8> {
     out.stdout
 }
 
-/// FFmpeg's decode of video stream 0 of `bytes`: each frame's pts and md5,
-/// in output order (`-f framemd5`).
+/// The pinned FFmpeg's decode of video stream 0 of `bytes`: each frame's
+/// pts and md5, in output order (`-f framemd5`).
 fn ffmpeg_video_frames(bytes: &[u8]) -> Vec<(Duration, String)> {
     ffmpeg_video_frames_with(bytes, &[])
 }
@@ -104,7 +105,7 @@ fn ffmpeg_video_frames(bytes: &[u8]) -> Vec<(Duration, String)> {
 fn ffmpeg_video_frames_with(bytes: &[u8], input_args: &[&str]) -> Vec<(Duration, String)> {
     let tmp = tempfile("bin");
     std::fs::write(&tmp, bytes).unwrap();
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-apply_cropping", "codec"])
         .args(input_args)
         .args([
@@ -115,7 +116,7 @@ fn ffmpeg_video_frames_with(bytes: &[u8], input_args: &[&str]) -> Vec<(Duration,
             "-f", "framemd5", "-",
         ])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg framemd5: {}",
@@ -153,12 +154,12 @@ fn ffmpeg_audio_f32(bytes: &[u8]) -> Vec<f32> {
     ffmpeg_audio_f32_nth(bytes, 0)
 }
 
-/// FFmpeg's decode of audio stream `nth` of `bytes`, interleaved f32.
+/// The pinned FFmpeg's decode of audio stream `nth` of `bytes`, interleaved f32.
 fn ffmpeg_audio_f32_nth(bytes: &[u8], nth: usize) -> Vec<f32> {
     let tmp = tempfile("bin");
     std::fs::write(&tmp, bytes).unwrap();
     let map = format!("0:a:{nth}");
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args([
             "-v", "error", "-nostdin",
             "-i", tmp.to_str().unwrap(),
@@ -166,7 +167,7 @@ fn ffmpeg_audio_f32_nth(bytes: &[u8], nth: usize) -> Vec<f32> {
             "-f", "f32le", "-c:a", "pcm_f32le", "-",
         ])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg f32le: {}",
@@ -179,12 +180,12 @@ fn ffmpeg_audio_f32_nth(bytes: &[u8], nth: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Each packet of video stream 0 of `bytes` (ffprobe): its pts and where its
-/// bytes end in the file.
+/// Each packet of video stream 0 of `bytes` (the pinned ffprobe): its pts
+/// and where its bytes end in the file.
 fn ffprobe_video_packets(bytes: &[u8]) -> Vec<(Duration, u64)> {
     let tmp = tempfile("bin");
     std::fs::write(&tmp, bytes).unwrap();
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args([
             "-v", "error",
             "-select_streams", "v:0",
@@ -193,7 +194,7 @@ fn ffprobe_video_packets(bytes: &[u8]) -> Vec<(Duration, u64)> {
             tmp.to_str().unwrap(),
         ])
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe: {}", String::from_utf8_lossy(&out.stderr));
     std::fs::remove_file(&tmp).ok();
     String::from_utf8(out.stdout)
@@ -717,7 +718,7 @@ fn realtime_tracks_the_clock() {
     let path = tempfile("mkv");
     std::fs::write(&path, &bytes).unwrap();
     let short = tempfile("mkv");
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args([
             "-v", "error", "-nostdin", "-y",
             "-i", path.to_str().unwrap(),
@@ -727,18 +728,18 @@ fn realtime_tracks_the_clock() {
             short.to_str().unwrap(),
         ])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "ffmpeg trim: {}", String::from_utf8_lossy(&out.stderr));
 
     // Realtime pacing relies on the audio sink; assert the trim kept audio.
-    let probe = std::process::Command::new("ffprobe")
+    let probe = std::process::Command::new(refcheck::pinned_ffprobe())
         .args([
             "-v", "error",
             "-show_entries", "stream=codec_type",
             "-of", "csv", short.to_str().unwrap(),
         ])
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     let streams = String::from_utf8_lossy(&probe.stdout);
     assert!(streams.contains("video"), "trim lost video: {streams}");
     assert!(streams.contains("audio"), "trim lost audio: {streams}");
@@ -854,7 +855,7 @@ fn realtime_tracks_the_clock() {
 /// default 5 s clusters is the whole file.)
 fn make_streaming_mkv() -> Vec<u8> {
     let path = tempfile("mkv");
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args([
             "-v", "error", "-nostdin", "-y",
             "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25",
@@ -867,7 +868,7 @@ fn make_streaming_mkv() -> Vec<u8> {
         ])
         .arg(&path)
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg generate: {}",
@@ -1469,11 +1470,11 @@ fn pal8_frames_hash_with_their_palette() {
         "-frames:v", "1", "-pix_fmt", "pal8",
     ];
     let ffmpeg = |format: &[&str]| {
-        let out = std::process::Command::new("ffmpeg")
+        let out = std::process::Command::new(refcheck::pinned_ffmpeg())
             .args(source)
             .args(format)
             .output()
-            .expect("ffmpeg must be on PATH");
+            .expect("the pinned FFmpeg runs");
         assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
         out.stdout
     };
@@ -1885,11 +1886,11 @@ fn untimed_raw_mpeg_switches_to_software_decoding() {
     let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &["-idct", "simple"]);
     assert_eq!(expected.len(), 50);
     assert_eq!(video.frame_md5, expected, "pictures differ from FFmpeg");
-    let probe = std::process::Command::new("ffprobe")
+    let probe = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0"])
         .arg(&path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     std::fs::remove_file(&path).unwrap();
     // FFmpeg leaves a picture untimed when it cannot derive a time (N/A);
     // there ours must still continue the timeline.
@@ -1962,9 +1963,15 @@ fn video_without_container_size_plays_at_the_decoded_size() {
 
 /// Plays `bytes`, a `ext` file that declares no picture size, and checks
 /// that the player state reports the decoded `size`, that the sink was
-/// opened at it, and that every picture equals FFmpeg's decode (run with
-/// `ffmpeg_input_args`).
-fn assert_plays_at_decoded_size(ext: &str, bytes: Vec<u8>, size: (u32, u32), frames: usize, ffmpeg_input_args: &[&str]) {
+/// opened at it, and that every picture equals the reference decode
+/// `oracle` gives for the file.
+fn assert_plays_at_decoded_size(
+    ext: &str,
+    bytes: Vec<u8>,
+    size: (u32, u32),
+    frames: usize,
+    oracle: impl FnOnce(&Path) -> Vec<String>,
+) {
     let path = tempfile(ext);
     std::fs::write(&path, bytes).unwrap();
     let backend = Headless::new();
@@ -1972,7 +1979,7 @@ fn assert_plays_at_decoded_size(ext: &str, bytes: Vec<u8>, size: (u32, u32), fra
     let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), options, |_| {});
     let (_, state) = sample_until(&player, Duration::from_secs(30), finished);
     drop(player);
-    let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", ffmpeg_input_args);
+    let expected = oracle(&path);
     std::fs::remove_file(&path).unwrap();
     assert!(state.ended && state.error.is_none(), "{ext}: {state:?}");
     assert_eq!(state.video_size, Some(size), "{ext}: decoded size not published");
@@ -1994,7 +2001,7 @@ fn raw_hevc_plays_at_the_cropped_decoded_size() {
         "-f", "lavfi", "-i", "testsrc=size=34x18:rate=25:duration=1", "-pix_fmt", "yuv420p",
         "-c:v", "libx265", "-x265-params", "log-level=error:bframes=2",
     ]);
-    assert_plays_at_decoded_size("hevc", bytes, (34, 18), 25, &[]);
+    assert_plays_at_decoded_size("hevc", bytes, (34, 18), 25, |p| refcheck::ffmpeg_video_md5s(p, 0, "yuv420p"));
 }
 
 /// An IVF file of `codec` whose file header declares a 0×0 picture.
@@ -2011,19 +2018,20 @@ fn ivf_without_size(codec: &[&str]) -> Vec<u8> {
 #[test]
 fn ivf_vp8_without_size_plays_at_the_decoded_size() {
     let bytes = ivf_without_size(&["-c:v", "libvpx", "-b:v", "200k"]);
-    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, &[]);
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, |p| refcheck::ffmpeg_video_md5s(p, 0, "yuv420p"));
 }
 
 #[test]
 fn ivf_vp9_without_size_plays_at_the_decoded_size() {
     let bytes = ivf_without_size(&["-c:v", "libvpx-vp9", "-b:v", "200k"]);
-    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, &[]);
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, |p| refcheck::ffmpeg_video_md5s(p, 0, "yuv420p"));
 }
 
 #[test]
 fn ivf_av1_without_size_plays_at_the_decoded_size() {
     let bytes = ivf_without_size(&["-c:v", "libaom-av1", "-cpu-used", "8", "-b:v", "200k"]);
-    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, &[]);
+    // The pinned FFmpeg has no software AV1 decoder: libdav1d is the reference.
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, |p| refcheck::dav1d_video_md5s(p, 0, "yuv420p"));
 }
 
 #[test]
@@ -2034,5 +2042,7 @@ fn ts_mpeg4_plays_at_the_decoded_size() {
     // one the decoder ports (arm64 FFmpeg defaults to NEON, which rounds
     // differently).
     let bytes = ffmpeg_file("ts", &["-f", "lavfi", "-i", ODD_TESTSRC, "-c:v", "mpeg4", "-bf", "2", "-q:v", "4"]);
-    assert_plays_at_decoded_size("ts", bytes, (33, 17), 25, &["-idct", "simple"]);
+    assert_plays_at_decoded_size("ts", bytes, (33, 17), 25, |p| {
+        refcheck::ffmpeg_video_md5s_with(p, 0, "yuv420p", &["-idct", "simple"])
+    });
 }

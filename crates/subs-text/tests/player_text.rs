@@ -75,9 +75,10 @@ fn data(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
 }
 
-fn run(program: &str, args: &[&str]) {
-    let output = Command::new(program).args(args).output().unwrap_or_else(|e| panic!("run {program}: {e}"));
-    assert!(output.status.success(), "{program} {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+fn run(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) {
+    let program = program.as_ref();
+    let output = Command::new(program).args(args).output().unwrap_or_else(|e| panic!("run {}: {e}", program.to_string_lossy()));
+    assert!(output.status.success(), "{} {args:?}: {}", program.to_string_lossy(), String::from_utf8_lossy(&output.stderr));
 }
 
 /// A generated file's path in Cargo's test scratch directory.
@@ -87,17 +88,18 @@ fn scratch(name: &str) -> PathBuf {
     dir.join(name)
 }
 
-/// `source` converted by FFmpeg with subtitle codec `codec` into `name`.
+/// `source` converted by `refcheck::system_ffmpeg` with subtitle codec
+/// `codec` into `name`.
 fn ffmpeg_file(source: &str, codec: &str, name: &str) -> PathBuf {
     let out = scratch(name);
     let source = data(source);
-    run("ffmpeg", &["-nostdin", "-v", "error", "-y", "-i", source.to_str().unwrap(), "-c:s", codec, out.to_str().unwrap()]);
+    run(refcheck::system_ffmpeg(), &["-nostdin", "-v", "error", "-y", "-i", source.to_str().unwrap(), "-c:s", codec, out.to_str().unwrap()]);
     out
 }
 
-/// `ffprobe -show_packets` of the subtitle stream: `(start_us, end_us)`.
+/// The pinned `ffprobe -show_packets` of the subtitle stream: `(start_us, end_us)`.
 fn ffprobe_packets(path: &Path) -> Vec<(i64, i64)> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "s:0", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"])
         .arg(path)
         .output()
@@ -272,9 +274,10 @@ const BLUE: (u8, u8, u8) = (0, 0, 255);
 const WHITE: (u8, u8, u8) = (255, 255, 255);
 
 /// Which of `palette` libass draws at `t` seconds of the ASS script `path`
-/// over black (FFmpeg's `ass` filter, RGB throughout).
+/// over black (FFmpeg's `ass` filter, RGB throughout). The pinned build has
+/// no libass, so this reference comes from `refcheck::system_ffmpeg`.
 fn libass_colours(path: &Path, t: f64, palette: &[(u8, u8, u8)]) -> Vec<(u8, u8, u8)> {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=384x288:r=10,format=rgb24", "-vf"])
         .arg(format!("ass=filename={}", path.display()))
         .args(["-ss", &t.to_string(), "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
@@ -374,7 +377,7 @@ fn mov_mov_text_from_ass() {
 fn mov_tx3g_from_srt() {
     let path = scratch("srt_tx3g.mov");
     let source = data("styled.srt");
-    run("ffmpeg", &["-nostdin", "-v", "error", "-y", "-i", source.to_str().unwrap(), "-c:s", "mov_text", "-tag:s", "tx3g",
+    run(refcheck::system_ffmpeg(), &["-nostdin", "-v", "error", "-y", "-i", source.to_str().unwrap(), "-c:s", "mov_text", "-tag:s", "tx3g",
         path.to_str().unwrap()]);
     assert_plays_like_ffmpeg(&path, "mov_text", false, &[]);
 }

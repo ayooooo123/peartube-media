@@ -22,7 +22,7 @@ fn wma_in_avi_matches_ffmpeg_through_production_registry() {
     std::fs::create_dir_all(&dir).unwrap();
     for codec in ["wmav1", "wmav2"] {
         let path = dir.join(format!("{codec}.avi"));
-        let generated = std::process::Command::new("ffmpeg")
+        let generated = std::process::Command::new(refcheck::system_ffmpeg())
             .args(["-v", "error", "-y", "-f", "lavfi", "-i",
                 "sine=frequency=997:sample_rate=44100:duration=2",
                 "-ac", "2", "-c:a", codec, "-b:a", "128k"])

@@ -115,12 +115,12 @@ pub fn compare(path: &Path, output: &Path) -> Result<Report,String> {
     Ok(ours)
 }
 fn ffmpeg_best_effort(path: &Path) -> Result<Vec<Option<i64>>,String> {
-    let out = Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries","frame=best_effort_timestamp","-of","csv=p=0"]).arg(path).output().map_err(|e|e.to_string())?;
+    let out = Command::new(refcheck::pinned_ffprobe()).args(["-v","error","-select_streams","v:0","-show_entries","frame=best_effort_timestamp","-of","csv=p=0"]).arg(path).output().map_err(|e|e.to_string())?;
     if !out.status.success() { return Err(String::from_utf8_lossy(&out.stderr).into_owned()); }
     Ok(String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().trim_end_matches(',').parse().ok()).collect())
 }
 fn frame_rate(path: &Path) -> Result<f64,String> {
-    let out = Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","default=noprint_wrappers=1:nokey=1"]).arg(path).output().map_err(|e|e.to_string())?;
+    let out = Command::new(refcheck::pinned_ffprobe()).args(["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","default=noprint_wrappers=1:nokey=1"]).arg(path).output().map_err(|e|e.to_string())?;
     if !out.status.success() { return Err(String::from_utf8_lossy(&out.stderr).into_owned()); }
     let text = String::from_utf8(out.stdout).map_err(|e|e.to_string())?;
     let (n,d) = text.lines().next().ok_or("missing frame rate")?.split_once('/').ok_or("invalid frame rate")?;

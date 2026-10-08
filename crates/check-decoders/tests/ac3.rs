@@ -2,7 +2,7 @@
 //! `refcheck::pinned_ffmpeg`, C code paths via `-cpuflags 0`), fed the
 //! packets that FFmpeg's demuxer and parser give its own decoder.
 
-use check_decoders::{decode_packets, pinned_ffmpeg_packets, tool};
+use check_decoders::{decode_packets, ffmpeg_packets, tool};
 use oxideav_core::{AudioFormat, CodecId, CodecParameters, Frame, SampleFormat};
 
 /// Every AC-3 / E-AC-3 stream of the FATE suite's `ac3/` and `eac3/`
@@ -24,9 +24,8 @@ const SAMPLES: &[(&str, &str)] = &[
 
 /// FFmpeg's frames for stream `spec`: (samples per channel, channels).
 fn pinned_frames(path: &str, spec: &str) -> Vec<(u32, u16)> {
-    let ffprobe = refcheck::pinned_ffmpeg().with_file_name("ffprobe");
     let out = tool(
-        &ffprobe,
+        refcheck::pinned_ffprobe(),
         &["-v", "error", "-cpuflags", "0", "-select_streams", spec, "-show_entries", "frame=nb_samples,channels", "-of", "csv=p=0", path],
     );
     String::from_utf8(out)
@@ -97,7 +96,7 @@ fn fate_streams_decode_to_ffmpegs_frames_and_samples() {
     for &(sample, spec) in SAMPLES {
         let path = refcheck::fate(sample);
         let p = path.to_str().expect("UTF-8 path");
-        let packets = pinned_ffmpeg_packets(&path, spec);
+        let packets = ffmpeg_packets(&path, spec, None);
         let codec = if sample.starts_with("eac3/") { "eac3" } else { "ac3" };
         let params = CodecParameters::audio(CodecId::new(codec));
         let (decoded, errors) = decode_packets(&[oxideav_ac3::register], &params, &packets);

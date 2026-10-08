@@ -62,12 +62,12 @@ fn check(path: &Path) {
 
 fn made(name: &str, args: &[&str]) -> PathBuf {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("codec-dv-player-{}-{name}", std::process::id()));
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y"])
         .args(args)
         .arg(&path)
         .output()
-        .expect("ffmpeg on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
     path
 }

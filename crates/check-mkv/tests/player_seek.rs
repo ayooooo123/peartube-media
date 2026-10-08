@@ -21,7 +21,7 @@ use player::{Event, Headless, Player, PlayerOptions};
 /// Made once for both tests, which run in parallel.
 static REPRODUCER: LazyLock<PathBuf> = LazyLock::new(|| {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("opengop_nosei.mkv");
-    let status = Command::new("ffmpeg")
+    let status = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=8",
             "-c:v", "libx264", "-preset", "medium",
             "-x264-params", "keyint=50:min-keyint=50:scenecut=0:open-gop=1:ref=3:bframes=2",

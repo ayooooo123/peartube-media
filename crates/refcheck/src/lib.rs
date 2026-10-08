@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 pub mod trim_fixture;
 
@@ -377,11 +378,12 @@ pub fn pack(frame: &VideoFrame, plane_dims: &[(usize, usize)]) -> Vec<u8> {
     out
 }
 
-/// MD5 of every video frame FFmpeg decodes from stream `0:v:nth`, in the
-/// given pixel format, in output order. Cropping the bitstream signals (SPS
-/// cropping) applies, as decoders output it; container cropping (MOV `clap`)
-/// does not, because the player applies that at presentation. `-fps_mode
-/// passthrough` keeps FFmpeg from duplicating or dropping frames.
+/// MD5 of every video frame [`pinned_ffmpeg`] decodes from stream `0:v:nth`,
+/// in the given pixel format, in output order. Cropping the bitstream
+/// signals (SPS cropping) applies, as decoders output it; container
+/// cropping (MOV `clap`) does not, because the player applies that at
+/// presentation. `-fps_mode passthrough` keeps FFmpeg from duplicating or
+/// dropping frames.
 pub fn ffmpeg_video_md5s(path: &Path, nth: usize, pix_fmt: &str) -> Vec<String> {
     ffmpeg_video_md5s_with(path, nth, pix_fmt, &[])
 }
@@ -390,9 +392,20 @@ pub fn ffmpeg_video_md5s(path: &Path, nth: usize, pix_fmt: &str) -> Vec<String> 
 /// `&["-idct", "simple"]` to pin FFmpeg's C IDCT: on arm64 its default picks
 /// NEON assembly whose rounding differs from the C reference.
 pub fn ffmpeg_video_md5s_with(path: &Path, nth: usize, pix_fmt: &str, input_args: &[&str]) -> Vec<String> {
+    video_md5s(&pinned_ffmpeg(), path, nth, pix_fmt, input_args)
+}
+
+/// [`ffmpeg_video_md5s`] for AV1: libdav1d's pictures, through
+/// [`system_ffmpeg`]. The pinned build has no software AV1 decoder: it has
+/// no libdav1d, and its native `av1` decoder needs hardware acceleration.
+pub fn dav1d_video_md5s(path: &Path, nth: usize, pix_fmt: &str) -> Vec<String> {
+    video_md5s(&system_ffmpeg(), path, nth, pix_fmt, &["-c:v", "libdav1d"])
+}
+
+fn video_md5s(binary: &Path, path: &Path, nth: usize, pix_fmt: &str, input_args: &[&str]) -> Vec<String> {
     let args = ffmpeg_video_md5_args(path, &format!("0:v:{nth}"), pix_fmt, input_args);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    parse_framemd5(&String::from_utf8(ffmpeg(&args)).unwrap())
+    parse_framemd5(&String::from_utf8(run(binary, &args)).unwrap())
 }
 
 /// The arguments (after FFmpeg's global `-v error -nostdin`) of the video
@@ -432,33 +445,63 @@ pub fn md5_hex(bytes: &[u8]) -> String {
     format!("{:x}", md5::compute(bytes))
 }
 
-/// FFmpeg's decode of stream `0:a:nth` as interleaved f32 at the source rate
-/// and channel count.
+/// [`pinned_ffmpeg`]'s decode of stream `0:a:nth` as interleaved f32 at the
+/// source rate and channel count.
 pub fn ffmpeg_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
-    audio_f32(Path::new("ffmpeg"), path, nth)
-}
-
-/// The FFmpeg the ports follow, commit 2da55bf: `$FFMPEG_SRC/ffmpeg`,
-/// default ~/projects/ffmpeg-src. The `ffmpeg` on PATH (9.0.2) predates
-/// some of its behavior, such as reading an iTunes MP3's gapless counts.
-/// With `-cpuflags 0` it runs the C code paths a port reproduces.
-pub fn pinned_ffmpeg() -> PathBuf {
-    std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
-        .join("ffmpeg")
-}
-
-/// [`ffmpeg_audio_f32`] from [`pinned_ffmpeg`].
-pub fn ffmpeg_src_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
-    audio_f32(&pinned_ffmpeg(), path, nth)
-}
-
-fn audio_f32(binary: &Path, path: &Path, nth: usize) -> Vec<f32> {
-    let out = run_ffmpeg(binary, &[
+    let out = run(&pinned_ffmpeg(), &[
         "-i", path.to_str().unwrap(), "-map", &format!("0:a:{nth}"), "-f", "f32le", "-c:a", "pcm_f32le", "-",
     ]);
     out.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+}
+
+/// The FFmpeg tree the ports follow, commit 2da55bf, with its `ffmpeg`
+/// and `ffprobe` built: `$FFMPEG_SRC`, default ~/projects/ffmpeg-src.
+pub fn ffmpeg_src() -> PathBuf {
+    std::env::var_os("FFMPEG_SRC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
+}
+
+/// The `ffmpeg` of [`ffmpeg_src`]. Every reference comes from it: the
+/// `ffmpeg` on PATH (Homebrew 9.0.2) decodes and demuxes some files
+/// differently. With `-cpuflags 0` it runs the C code paths a port
+/// reproduces.
+pub fn pinned_ffmpeg() -> PathBuf {
+    pinned_tool("ffmpeg")
+}
+
+/// The `ffprobe` of [`ffmpeg_src`].
+pub fn pinned_ffprobe() -> PathBuf {
+    pinned_tool("ffprobe")
+}
+
+/// `name` in [`ffmpeg_src`], checked once to report commit 2da55bf, so a
+/// stale or missing build fails loudly.
+fn pinned_tool(name: &str) -> PathBuf {
+    static CHECKED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let path = ffmpeg_src().join(name);
+    let mut checked = CHECKED.lock().unwrap_or_else(|e| e.into_inner());
+    if !checked.iter().any(|c| c == name) {
+        let out = Command::new(&path)
+            .arg("-version")
+            .output()
+            .unwrap_or_else(|e| panic!("{}: {e} (build FFmpeg 2da55bf in FFMPEG_SRC)", path.display()));
+        let version = String::from_utf8_lossy(&out.stdout);
+        assert!(version.contains("2da55bf"), "{} is not FFmpeg 2da55bf: {}", path.display(), version.lines().next().unwrap_or(""));
+        checked.push(name.to_string());
+    }
+    path
+}
+
+/// The `ffmpeg` on PATH (Homebrew 9.0.2), built with external libraries
+/// the pinned build lacks. Use it only for what needs them: test inputs
+/// made with encoders such as libx264, libx265, libvpx, libaom,
+/// libmp3lame, libopus, libvorbis or libtheora, and the two references
+/// FFmpeg's own code cannot give: AV1 pictures ([`dav1d_video_md5s`]) and
+/// ASS rendering (libass). Every other reference comes from
+/// [`pinned_ffmpeg`].
+pub fn system_ffmpeg() -> PathBuf {
+    PathBuf::from("ffmpeg")
 }
 
 /// The layout refcheck reads (and trims) a frame in: the decoder's report,
@@ -558,11 +601,8 @@ pub fn snr_db(reference: &[f32], test: &[f32], slack: usize) -> f64 {
     try_snr_db(reference, test, slack).unwrap_or_else(|e| panic!("snr_db: {e}"))
 }
 
-fn ffmpeg(args: &[&str]) -> Vec<u8> {
-    run_ffmpeg(Path::new("ffmpeg"), args)
-}
-
-fn run_ffmpeg(binary: &Path, args: &[&str]) -> Vec<u8> {
+/// `binary -v error -nostdin <args>`; its stdout.
+fn run(binary: &Path, args: &[&str]) -> Vec<u8> {
     let out = Command::new(binary)
         .args(["-v", "error", "-nostdin"])
         .args(args)

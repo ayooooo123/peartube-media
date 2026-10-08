@@ -13,20 +13,14 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
 
-/// Every packet FFmpeg reads for stream `spec` (`"v:0"`, `"a:1"`) of
-/// `path`, in demux order, after the bitstream filters in `bsf` (e.g.
-/// `h264_mp4toannexb` for length-prefixed H.264): the bytes
-/// `ffmpeg -c copy -f data` writes, cut, timed and flagged as
-/// `-f framecrc` lists the same packets. Panics when FFmpeg fails or the
-/// two outputs disagree.
+/// Every packet the pinned FFmpeg ([`refcheck::pinned_ffmpeg`]) reads for
+/// stream `spec` (`"v:0"`, `"a:1"`) of `path`, in demux order, after the
+/// bitstream filters in `bsf` (e.g. `h264_mp4toannexb` for length-prefixed
+/// H.264): the bytes `ffmpeg -c copy -f data` writes, cut, timed and
+/// flagged as `-f framecrc` lists the same packets. Panics when FFmpeg
+/// fails or the two outputs disagree.
 pub fn ffmpeg_packets(path: &Path, spec: &str, bsf: Option<&str>) -> Vec<Packet> {
-    packets_from(Path::new("ffmpeg"), path, spec, bsf)
-}
-
-/// [`ffmpeg_packets`] as the pinned FFmpeg ([`refcheck::pinned_ffmpeg`])
-/// demuxes and parses them.
-pub fn pinned_ffmpeg_packets(path: &Path, spec: &str) -> Vec<Packet> {
-    packets_from(&refcheck::pinned_ffmpeg(), path, spec, None)
+    packets_from(&refcheck::pinned_ffmpeg(), path, spec, bsf)
 }
 
 fn packets_from(ffmpeg: &Path, path: &Path, spec: &str, bsf: Option<&str>) -> Vec<Packet> {

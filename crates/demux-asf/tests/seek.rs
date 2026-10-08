@@ -4,26 +4,16 @@
 //! asf_read_pts (the dts of the next key packet of the seek stream), then
 //! skips video to a key frame; argo_asf.c seeks to the block holding the
 //! target. After each seek the first packets equal `ffprobe
-//! -read_intervals TARGET%+#N` of the port's ffprobe (FFMPEG_SRC):
+//! -read_intervals TARGET%+#N` of the port's ffprobe (`refcheck::pinned_ffprobe`):
 //! stream, size, payload, key flag, dts and, where FFmpeg knows it, pts.
 //! Then mutated copies of indexed and unindexed samples are seeked.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use oxideav_core::{Error, MediaType, RuntimeContext, TimeBase};
 use refcheck::fate;
-
-fn port_ffprobe() -> PathBuf {
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    let bin = src.join("ffprobe");
-    let out = Command::new(&bin).arg("-version").output().expect("build ffprobe in FFMPEG_SRC");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("2da55bf"), "seek oracle must be FFmpeg 2da55bf");
-    bin
-}
 
 #[derive(Debug, PartialEq)]
 struct Pkt {
@@ -38,7 +28,7 @@ struct Pkt {
 /// FFmpeg's stream time bases and first `n` packets after seeking `path`
 /// to `target` seconds.
 fn ffprobe_after(path: &Path, target: &str, n: usize) -> (Vec<TimeBase>, Vec<Pkt>) {
-    let out = Command::new(port_ffprobe())
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-read_intervals", &format!("{target}%+#{n}"), "-show_data_hash", "md5"])
         .args(["-show_entries", "stream=time_base:packet=stream_index,pts,dts,size,flags,data_hash", "-of", "compact"])
         .arg(path)

@@ -153,14 +153,20 @@ pub fn packet_count(path: &Path, index: u32) -> Result<u64, String> {
     }
 }
 
-/// MD5 of every frame FFmpeg decodes from stream `map`, through refcheck's
-/// video oracle. FFmpeg's C IDCT is pinned for every stream (`-idct simple`,
-/// 6ac540e): the IDCT codecs port FFmpeg's C `simple_idct`, which arm64
-/// FFmpeg replaces with NEON assembly that rounds differently by default,
-/// and decoders without an IDCT ignore the option.
-pub fn video_md5s(path: &Path, map: &str, pix_fmt: &str) -> Result<Vec<String>, String> {
-    let args = refcheck::ffmpeg_video_md5_args(path, map, pix_fmt, &["-idct", "simple"]);
-    let out = tool::ffmpeg(&args, TIMEOUT)?;
+/// MD5 of every frame the reference decodes from stream `map` (codec
+/// `codec_name`), through refcheck's video oracle. AV1 comes from libdav1d
+/// in the system FFmpeg: the pinned build has no software AV1 decoder.
+/// Everything else comes from the pinned build with FFmpeg's C IDCT pinned
+/// (`-idct simple`, 6ac540e): the IDCT codecs port FFmpeg's C
+/// `simple_idct`, which arm64 FFmpeg replaces with NEON assembly that
+/// rounds differently by default, and decoders without an IDCT ignore the
+/// option.
+pub fn video_md5s(path: &Path, map: &str, codec_name: &str, pix_fmt: &str) -> Result<Vec<String>, String> {
+    let out = if codec_name == "av1" {
+        tool::system_ffmpeg(&refcheck::ffmpeg_video_md5_args(path, map, pix_fmt, &["-c:v", "libdav1d"]), TIMEOUT)?
+    } else {
+        tool::ffmpeg(&refcheck::ffmpeg_video_md5_args(path, map, pix_fmt, &["-idct", "simple"]), TIMEOUT)?
+    };
     Ok(refcheck::parse_framemd5(&String::from_utf8_lossy(&out)))
 }
 
@@ -208,35 +214,35 @@ impl Pcm {
     }
 }
 
-/// The FFmpeg a stream's decode is held to: the `ffmpeg` on PATH, or, for
-/// the decoders ported from FFmpeg 2da55bf (AC-3 and E-AC-3), that build
-/// on its C code paths (`refcheck::pinned_ffmpeg`, `-cpuflags 0`). The PATH
-/// 9.0.2 build decodes the FATE AC-3 samples 18-97 dB from it.
+/// The code paths a stream's reference decode runs: the pinned FFmpeg's
+/// defaults, or, for the decoders ported from its C code (AC-3 and
+/// E-AC-3), its C paths (`-cpuflags 0`), since its assembly rounds
+/// differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Build {
-    Path,
-    Pinned,
+pub enum Paths {
+    Default,
+    C,
 }
 
-impl Build {
-    pub fn of(ff: &FfStream) -> Build {
+impl Paths {
+    pub fn of(ff: &FfStream) -> Paths {
         match ff.codec_name.as_str() {
-            "ac3" | "eac3" => Build::Pinned,
-            _ => Build::Path,
+            "ac3" | "eac3" => Paths::C,
+            _ => Paths::Default,
         }
     }
 
     fn ffmpeg(self, args: &[String]) -> Result<Vec<u8>, String> {
         match self {
-            Build::Path => tool::ffmpeg(args, TIMEOUT),
-            Build::Pinned => tool::pinned_ffmpeg(args, TIMEOUT),
+            Paths::Default => tool::ffmpeg(args, TIMEOUT),
+            Paths::C => tool::ffmpeg_c(args, TIMEOUT),
         }
     }
 
     fn ffprobe(self, args: &[String]) -> Result<Vec<u8>, String> {
         match self {
-            Build::Path => tool::ffprobe(args, TIMEOUT),
-            Build::Pinned => tool::pinned_ffprobe(args, TIMEOUT),
+            Paths::Default => tool::ffprobe(args, TIMEOUT),
+            Paths::C => tool::ffprobe_c(args, TIMEOUT),
         }
     }
 }
@@ -245,7 +251,7 @@ impl Build {
 pub fn audio_pcm(path: &Path, ff: &FfStream, pcm: Pcm) -> Result<Vec<u8>, String> {
     let (format, codec) = pcm.ffmpeg();
     let p = path_arg(path)?;
-    Build::of(ff).ffmpeg(&strings(&["-i", &p, "-map", &ff.map(), "-f", format, "-c:a", codec, "-"]))
+    Paths::of(ff).ffmpeg(&strings(&["-i", &p, "-map", &ff.map(), "-f", format, "-c:a", codec, "-"]))
 }
 
 /// FFmpeg's decode of stream `ff` as interleaved f32.
@@ -267,7 +273,7 @@ pub struct AudioFrameInfo {
 pub fn audio_frames(path: &Path, ff: &FfStream) -> Result<Vec<AudioFrameInfo>, String> {
     let p = path_arg(path)?;
     let index = ff.index.to_string();
-    let out = Build::of(ff).ffprobe(&strings(&[
+    let out = Paths::of(ff).ffprobe(&strings(&[
         "-select_streams",
         &index,
         "-show_entries",
@@ -416,13 +422,13 @@ mod tests {
     fn the_video_oracle_pins_the_c_idct_for_idct_codecs_only() {
         // MPEG-2 builds its IDCT through ff_idctdsp_init(avctx->idct_algo).
         let mpeg2 = refcheck::fate("mpeg2/matrixbench_mpeg2.lq1.mpg");
-        let pinned = video_md5s(&mpeg2, "0:0", "yuv420p").unwrap();
+        let pinned = video_md5s(&mpeg2, "0:0", "mpeg2video", "yuv420p").unwrap();
         assert_eq!(pinned, refcheck::ffmpeg_video_md5s_with(&mpeg2, 0, "yuv420p", &["-idct", "simple"]));
         #[cfg(target_arch = "aarch64")]
         assert_ne!(pinned, refcheck::ffmpeg_video_md5s(&mpeg2, 0, "yuv420p"), "arm64's default NEON IDCT rounds differently");
         // H.264 has no IDCT option: the pin changes nothing.
         let h264 = refcheck::fate("mkv/1242-small.mkv");
-        assert_eq!(video_md5s(&h264, "0:1", "yuv420p").unwrap(), refcheck::ffmpeg_video_md5s(&h264, 0, "yuv420p"));
+        assert_eq!(video_md5s(&h264, "0:1", "h264", "yuv420p").unwrap(), refcheck::ffmpeg_video_md5s(&h264, 0, "yuv420p"));
     }
 
     #[test]

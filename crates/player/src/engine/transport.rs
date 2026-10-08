@@ -669,7 +669,7 @@ mod callback_tests {
     #[allow(deprecated)]
     fn application_callback_runs_after_audio_realtime_scope() {
         let path = std::env::temp_dir().join(format!("player-callback-policy-{}.mkv", std::process::id()));
-        let output = std::process::Command::new("ffmpeg")
+        let output = std::process::Command::new(refcheck::system_ffmpeg())
             .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
                 "sine=sample_rate=48000:duration=0.25", "-c:a", "pcm_s16le"])
             .arg(&path).output().unwrap();
@@ -726,12 +726,12 @@ mod callback_tests {
     #[test]
     fn paused_full_output_does_not_retry_until_resumed() {
         let path = std::env::temp_dir().join(format!("player-paused-output-{}.mkv", std::process::id()));
-        let output = std::process::Command::new("ffmpeg")
+        let output = std::process::Command::new(refcheck::system_ffmpeg())
             .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
                 "sine=sample_rate=48000:duration=1", "-c:a", "pcm_s16le"])
             .arg(&path).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        let reference = std::process::Command::new("ffmpeg")
+        let reference = std::process::Command::new(refcheck::pinned_ffmpeg())
             .args(["-nostdin", "-v", "error", "-i"]).arg(&path)
             .args(["-f", "f32le", "-"]).output().unwrap();
         assert!(reference.status.success(), "{}", String::from_utf8_lossy(&reference.stderr));
@@ -794,12 +794,12 @@ mod callback_tests {
     #[test]
     fn suspended_output_is_not_reopened_and_keeps_pcm() {
         let path = std::env::temp_dir().join(format!("player-suspended-output-{}.mkv", std::process::id()));
-        let output = std::process::Command::new("ffmpeg")
+        let output = std::process::Command::new(refcheck::system_ffmpeg())
             .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
                 "sine=sample_rate=48000:duration=1", "-c:a", "pcm_s16le"])
             .arg(&path).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        let reference = std::process::Command::new("ffmpeg")
+        let reference = std::process::Command::new(refcheck::pinned_ffmpeg())
             .args(["-nostdin", "-v", "error", "-i"]).arg(&path)
             .args(["-f", "f32le", "-"]).output().unwrap();
         assert!(reference.status.success(), "{}", String::from_utf8_lossy(&reference.stderr));

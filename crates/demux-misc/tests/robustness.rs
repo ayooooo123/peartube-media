@@ -87,7 +87,7 @@ fn nut_truncated_and_bit_flipped_never_panic() {
     // Mux a small NUT with FFmpeg (the reference muxer), then abuse it.
     let path = std::env::temp_dir().join("demux-misc-nut-fuzz.nut");
     let _ = std::fs::remove_file(&path);
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args([
             "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=1000:duration=0.3",
             "-f", "lavfi", "-i", "testsrc=duration=0.3:size=64x64:rate=10",
@@ -95,7 +95,7 @@ fn nut_truncated_and_bit_flipped_never_panic() {
             path.to_str().unwrap(),
         ])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg mux failed: {}",
@@ -254,13 +254,13 @@ fn seeking_truncated_and_bit_flipped_files_never_panics_or_hangs() {
     .collect();
     for (name, index) in [("indexed.nut", "1"), ("unindexed.nut", "0")] {
         let path = dir.join(name);
-        let out = std::process::Command::new("ffmpeg")
+        let out = std::process::Command::new(refcheck::system_ffmpeg())
             .args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=1000:duration=2", "-f", "lavfi", "-i"])
             .args(["testsrc=duration=2:size=64x64:rate=10", "-c:a", "mp2", "-c:v", "mpeg2video", "-g", "5", "-shortest"])
             .args(["-write_index", index])
             .arg(&path)
             .output()
-            .expect("ffmpeg must be on PATH");
+            .expect("the fixture FFmpeg runs");
         assert!(out.status.success(), "ffmpeg mux failed: {}", String::from_utf8_lossy(&out.stderr));
         cases.push((name.to_string(), "nut", std::fs::read(&path).unwrap()));
     }

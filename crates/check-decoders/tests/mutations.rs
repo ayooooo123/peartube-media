@@ -2,7 +2,7 @@
 //! of FFmpeg's packets of FATE samples go through the decoders, which
 //! must return errors, never panic (fixed seed, 2,000 mutants each).
 
-use check_decoders::{decode_packets, ffmpeg_packets, pinned_ffmpeg_packets};
+use check_decoders::{decode_packets, ffmpeg_packets};
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, SampleFormat};
 
 /// xorshift64*: a fixed sequence, so a failure reproduces.
@@ -81,7 +81,7 @@ fn ac3_survives_truncated_and_flipped_packets() {
         ("eac3/the_great_wall_7.1.eac3", "eac3", 0x6563_3303),
     ] {
         let path = refcheck::fate(sample);
-        let packets: Vec<Packet> = pinned_ffmpeg_packets(&path, "a:0").into_iter().take(12).collect();
+        let packets: Vec<Packet> = ffmpeg_packets(&path, "a:0", None).into_iter().take(12).collect();
         let params = CodecParameters::audio(CodecId::new(codec));
         for mutant in mutants(&packets, 2_000, seed) {
             let (decoded, _) = decode_packets(&[oxideav_ac3::register], &params, &mutant);

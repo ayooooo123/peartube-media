@@ -55,9 +55,10 @@ pub fn process_dir() -> &'static Path {
     &DIR
 }
 
-/// Runs FFmpeg; panics with its error output when it fails.
+/// Runs `refcheck::system_ffmpeg`, which builds the re-encoded inputs;
+/// panics with its error output when it fails.
 pub fn ffmpeg(args: &[&str]) {
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-v", "error", "-nostdin", "-y"])
         .args(args)
         .output()
@@ -97,7 +98,7 @@ pub fn generated(name: &str) -> PathBuf {
 pub fn ffmpeg_captions(path: &Path) -> Captions {
     let name = path.to_str().unwrap();
     assert!(!name.contains([':', ',', ';', '[', ']', '\'', '\\', '=']), "lavfi needs escaping for {name}");
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-f", "lavfi", "-i", &format!("movie={name}[out0+subcc]")])
         .args(["-select_streams", "s", "-show_streams", "-show_packets", "-show_data", "-of", "json"])
         .output()
@@ -213,7 +214,7 @@ pub fn same_time(a: Option<i64>, tb_a: TimeBase, b: Option<i64>, tb_b: TimeBase)
 /// SCC demuxer's `eia_608` triplets): time base, and each packet's pts
 /// and bytes.
 pub fn ffprobe_packets(path: &Path) -> (TimeBase, Vec<(Option<i64>, Vec<u8>)>) {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "0", "-show_streams", "-show_packets", "-show_data", "-of", "json"])
         .arg(path)
         .output()
