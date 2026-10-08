@@ -59,7 +59,7 @@ pub fn exact(decoded: &Decoded, path: &Path, nth: usize) -> Result<bool, String>
         SampleFormat::F64 | SampleFormat::F64P => ("f64le", "pcm_f64le"),
         _ => return Err(format!("unsupported PCM layout {format:?}")),
     };
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-cpuflags", "0", "-i"])
         .arg(path)
         .args(["-map", &format!("0:a:{nth}"), "-f", muxer, "-c:a", codec, "-"])
@@ -95,7 +95,7 @@ pub fn exact(decoded: &Decoded, path: &Path, nth: usize) -> Result<bool, String>
 }
 
 pub fn reference_f32(path: &Path, nth: usize) -> Result<Vec<f32>, String> {
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-cpuflags", "0", "-i"])
         .arg(path)
         .args(["-map", &format!("0:a:{nth}"), "-f", "f32le", "-c:a", "pcm_f32le", "-"])

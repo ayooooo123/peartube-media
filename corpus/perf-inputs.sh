@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # corpus/perf-inputs.sh — makes the standard decode-speed inputs that
 # `cargo run --release -p perf` measures, into $PEARTUBE_CORPUS_DIR/perf
-# (default ~/projects/peartube-media-corpus/perf): 20–30 s each, about
-# 0.4 GB in total. Idempotent: every file is regenerated.
+# (default ~/projects/peartube-media-corpus/perf): 10–30 s each, about
+# 0.45 GB in total. Idempotent: every file is regenerated.
 #
 # Sources come from the FATE suite ($FATE_SUITE, default ~/projects/fate-suite):
 #   video  Big Buck Bunny 854x480p30 (mov/buck480p30_na.mp4), 30 s from 60 s,
@@ -145,9 +145,11 @@ fi
 
 # Decoders added since the first audit. Speex, AMR, ATRAC3+, QDM2, MACE and
 # VP3-VP6 have no encoder in FFmpeg: their manifest samples are measured.
-# ATRAC3 is a FATE sample rewrapped in OMA (WAV loses its extradata until the
-# AviWav branch merges). The MXF file's PCM stream times the MXF demuxer:
-# decoding PCM costs next to nothing. Raw .mp2 is kept to show its routing.
+# ATRAC3 has no input here: its FATE samples are WAV, whose extradata the
+# WAV demuxer drops until the AviWav branch merges, and an OMA rewrap with
+# `-c copy` does not decode in FFmpeg either. The MXF file's PCM stream
+# times the MXF demuxer: decoding PCM costs next to nothing. Raw .mp2 is kept
+# to show its routing.
 if [[ "$GROUP" == all || "$GROUP" == new ]]; then
 echo "H.263 CIF and 4CIF, Sorenson H.263 (FLV) 480p, DVCPRO HD 1080i50"
 ff -ss 60 -t 20 -i "$BBB" -an -vf "scale=352:288:flags=lanczos,$GRAIN" -c:v h263 -b:v 768k -g 300 "$OUT/h263_cif.avi"
@@ -156,11 +158,10 @@ ff -ss 60 -t 20 -i "$BBB" -an -vf "scale=848:480:flags=lanczos,$GRAIN" -c:v flv 
 ff -ss 60 -t 10 -i "$BBB" -an -vf "fps=25,scale=1440:1080:flags=lanczos,$GRAIN" -pix_fmt yuv422p \
   -c:v dvvideo -f mov "$OUT/dvcprohd_1080i50.mov"
 
-echo "MP2 stereo (raw and Matroska), ALAC stereo, ATRAC3 132k (OMA), MXF (MPEG-2 + PCM)"
+echo "MP2 stereo (raw and Matroska), ALAC stereo, MXF (MPEG-2 + PCM)"
 ff -ss 20 -t 30 -i "$MUSIC" -vn -ac 2 -ar 48000 -c:a mp2 -b:a 256k "$OUT/mp2_stereo.mp2"
 ff -i "$OUT/mp2_stereo.mp2" -c copy "$OUT/mp2_stereo.mka"
 ff -ss 20 -t 30 -i "$MUSIC" -vn -ac 2 -ar 44100 -c:a alac "$OUT/alac_stereo.m4a"
-ff -stream_loop 6 -i "$FATE/atrac3/mc_sich_at3_132_small.wav" -c copy -f oma "$OUT/atrac3_132k.oma"
 ff -ss 60 -t 20 -i "$BBB" -ss 20 -t 20 -i "$MUSIC" -map 0:v -map 1:a \
   -vf "scale=720:576:flags=lanczos" -r 25 -c:v mpeg2video -b:v 8M -g 12 \
   -c:a pcm_s16le -ar 48000 -ac 2 -f mxf "$OUT/mpeg2_pcm.mxf"

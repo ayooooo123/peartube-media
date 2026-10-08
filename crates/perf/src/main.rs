@@ -6,15 +6,21 @@
 //! (`codecs::context()`; the decoder `first_decoder` picks, built the way the
 //! engine builds it). The file is read into memory first; a run times demux +
 //! decode of that one stream, no sink, single-threaded
-//! (`ExecutionContext::serial`). ×real-time = media seconds decoded ÷ wall
-//! seconds; the table reports the median of `--runs` runs. A run that passes
-//! `--max-secs` stops there and counts what it decoded (default 0: no cap).
+//! (`ExecutionContext::serial`). ×real-time = media seconds decoded ÷ seconds
+//! spent, both as wall time and as the process's CPU time (user + system);
+//! verdicts use CPU time, which other load on the machine disturbs less. On
+//! macOS each run also records retired instructions and cycles. The table
+//! reports the median of `--runs` runs. A run that passes `--max-secs` stops
+//! there and counts what it decoded (default 0: no cap).
 //!
-//! Each input is decoded once more, untimed, and compared with FFmpeg's
-//! complete decode of the same stream (video: the MD5 of every frame against
-//! `framemd5` with FFmpeg's C IDCT; audio: full PCM bytes for lossless codecs
-//! and SNR for float codecs). Failed comparisons invalidate speed verdicts.
-//! FFmpeg's own single-threaded decode of the stream is timed for reference.
+//! Each input is decoded once more, untimed, and compared with the complete
+//! decode of the same stream by the FFmpeg the ports follow, 2da55bf
+//! (`refcheck::pinned_ffmpeg`; video: the MD5 of every frame against
+//! `framemd5` with FFmpeg's C IDCT; audio, with `-cpuflags 0`: full PCM bytes
+//! for lossless codecs and SNR for float codecs). AV1 is compared with the
+//! `ffmpeg` on PATH: the pinned build has no software AV1 decoder. Failed
+//! comparisons invalidate speed verdicts. The `ffmpeg` on PATH's own
+//! single-threaded decode of the stream is timed for reference.
 //!
 //! ```text
 //! cargo run --release -p perf -- --out target/perf/perf.json
@@ -128,7 +134,6 @@ const STANDARD: &[Standard] = &[
     Standard { label: "new:mp2 stereo raw", file: "mp2_stereo.mp2", kind: Kind::Audio },
     Standard { label: "new:mp2 stereo MKA", file: "mp2_stereo.mka", kind: Kind::Audio },
     Standard { label: "new:alac stereo", file: "alac_stereo.m4a", kind: Kind::Audio },
-    Standard { label: "new:atrac3 132k OMA", file: "atrac3_132k.oma", kind: Kind::Audio },
     Standard { label: "new:dvaudio Ulead WAV", file: "dvaudio_ulead.wav", kind: Kind::Audio },
     Standard { label: "new:mpeg2 in MXF 576p25", file: "mpeg2_pcm.mxf", kind: Kind::Video },
     Standard { label: "new:pcm in MXF", file: "mpeg2_pcm.mxf", kind: Kind::Audio },
@@ -826,10 +831,26 @@ fn check_video(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Result
     }
     let (format, w, h, _) = layout.ok_or("no frames decoded")?;
     let pix = refcheck::ffmpeg_pix_fmt(format);
-    let expect = refcheck::ffmpeg_video_md5s_with(&input.path, stream.nth, pix, &["-idct", "simple"]);
+    // The FFmpeg the ports follow (2da55bf), not the one on PATH. That build
+    // has no software AV1 decoder (no libdav1d), so AV1 uses the one on PATH.
+    let (binary, oracle) = if stream.codec == "av1" {
+        (PathBuf::from("ffmpeg"), "FFmpeg on PATH (libdav1d)")
+    } else {
+        (refcheck::pinned_ffmpeg(), "FFmpeg 2da55bf")
+    };
+    let args = refcheck::ffmpeg_video_md5_args(&input.path, &format!("0:v:{}", stream.nth), pix, &["-idct", "simple"]);
+    let out = Command::new(&binary)
+        .args(["-v", "error", "-nostdin"])
+        .args(&args)
+        .output()
+        .map_err(|e| format!("{}: {e}", binary.display()))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    let expect = refcheck::parse_framemd5(&String::from_utf8_lossy(&out.stdout));
     let matched = ours.iter().zip(&expect).filter(|(a, b)| a == b).count() as u64;
     Ok(Check {
-        method: format!("md5 per frame, {pix} {w}x{h}, FFmpeg -idct simple"),
+        method: format!("md5 per frame, {pix} {w}x{h}, {oracle} -idct simple"),
         ours: tally.frames,
         ffmpeg: expect.len() as u64,
         matched: Some(matched),
@@ -882,7 +903,7 @@ fn check_audio(input: &Input) -> Result<Check, String> {
         "wmalossless" | "mlp" | "truehd" | "ra_144") || stream.codec.starts_with("pcm_");
     let pcm_exact = if lossless { Some(pcm::exact(&decoded, &input.path, stream.nth)?) } else { None };
     Ok(Check {
-        method: if lossless { "full PCM bytes vs FFmpeg -cpuflags 0" } else { "SNR vs FFmpeg f32 -cpuflags 0" }.into(),
+        method: if lossless { "full PCM bytes vs FFmpeg 2da55bf -cpuflags 0" } else { "SNR vs FFmpeg 2da55bf f32 -cpuflags 0" }.into(),
         ours: ours_n,
         ffmpeg: ffmpeg_n,
         matched: None,
