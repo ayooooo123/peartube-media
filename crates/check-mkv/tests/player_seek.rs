@@ -97,10 +97,11 @@ fn player_resumes_video_after_seeking_to_a_container_random_access_point() {
         PlayerOptions { realtime: false, ..PlayerOptions::default() },
         move |event| { let _ = tx.send(event); });
     // Hold playback until the seek is requested: without a realtime clock
-    // the whole file can play to its end before a seek issued after `open`
-    // takes effect, and the demuxer then stops before serving it. Paused,
-    // the video pipeline waits at its first packet while the demuxer
-    // applies the seek; on `play` it starts over at the new generation.
+    // the whole file can play before a seek issued after `open` takes
+    // effect, and the test then compared the uninterrupted playback, which
+    // matches FFmpeg, and passed without seeking. Paused, the video
+    // pipeline waits at its first packet while the demuxer applies the
+    // seek; on `play` it starts over at the new generation.
     player.pause();
     player.seek(target);
     player.play();
