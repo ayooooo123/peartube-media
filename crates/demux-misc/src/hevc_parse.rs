@@ -141,7 +141,12 @@ fn split_nals(buf: &[u8]) -> Vec<(Vec<u8>, u64, u8, u8)> {
 /// prevention bytes removed; how many input bytes it took.
 fn extract_rbsp(src: &[u8]) -> (Vec<u8>, usize) {
     let length = src.len();
-    let mut dst = Vec::with_capacity(length);
+    // The NAL ends at the first 00 00 01 or 00 00 02 (the loop below only
+    // skips 00 00 03, which cannot hide one); its RBSP is no longer. Only
+    // that is reserved: an access unit of many NALs keeps buffers in
+    // proportion to its size.
+    let end = (0..length.saturating_sub(2)).find(|&i| src[i] == 0 && src[i + 1] == 0 && matches!(src[i + 2], 1 | 2)).unwrap_or(length);
+    let mut dst = Vec::with_capacity(end);
     let mut si = 0;
     while si + 2 < length {
         if src[si] == 0 && src[si + 1] == 0 && src[si + 2] <= 3 {
@@ -1116,5 +1121,18 @@ mod tests {
         assert_eq!(data, [0x40, 0x01, 0, 0, 1, 0x80]);
         assert_eq!(used, 7);
         assert_eq!(bit_length(&data, 2, true), 6 * 8 - 8);
+    }
+
+    /// An access unit of 65536 three-byte NAL units (384 KiB, filler
+    /// units never end an HEVC access unit) keeps RBSP buffers in
+    /// proportion to its size, not one buffer of the rest of the unit per
+    /// NAL (12 GiB).
+    #[test]
+    fn many_small_nal_units_keep_memory_linear() {
+        let au = [0, 0, 1, 0x4c, 1, 0x80].repeat(65536);
+        let nals = split_nals(&au);
+        assert_eq!(nals.len(), 65536);
+        let kept: usize = nals.iter().map(|(rbsp, ..)| rbsp.capacity()).sum();
+        assert!(kept <= 4 * au.len(), "{kept} bytes kept for a {}-byte access unit", au.len());
     }
 }
