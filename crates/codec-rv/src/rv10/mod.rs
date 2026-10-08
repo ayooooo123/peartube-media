@@ -14,7 +14,7 @@ mod tables;
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, PixelFormat, Result};
 
 use crate::bits::BitReader;
 use crate::picture::{check_dimensions, Plane};
@@ -287,7 +287,11 @@ pub struct Rv1020Decoder {
     pub(crate) next: Option<Arc<MpvPicture>>,
     pub(crate) block: [[i16; 64]; 6],
 
-    ready: VecDeque<Frame>,
+    /// Output frames not yet returned, each with the size it was cropped
+    /// to (`common_init` drops the references when the size changes).
+    ready: VecDeque<(Frame, (u32, u32))>,
+    /// Size of the frame `receive_frame` last returned.
+    last_output: Option<(u32, u32)>,
 }
 
 /// Header outcome for a slice that FFmpeg drops without error output.
@@ -378,6 +382,7 @@ impl Rv1020Decoder {
             next: None,
             block: [[0; 64]; 6],
             ready: VecDeque::new(),
+            last_output: None,
         };
         d.common_init(width, height);
         LazyLock::force(&TABLES);
@@ -753,14 +758,16 @@ impl Rv1020Decoder {
 
         if self.cur.is_some() && self.mb_y >= self.g.mb_height {
             let cur = self.cur.take().unwrap();
+            // `check_dimensions` bounds both.
+            let size = (self.g.width as u32, self.g.height as u32);
             if cur.pict_type == PICT_B || self.low_delay {
                 let f = self.output_frame(&cur);
                 if self.last.is_some() || self.low_delay {
-                    self.ready.push_back(f);
+                    self.ready.push_back((f, size));
                 }
             } else if let Some(last) = &self.last {
                 let f = self.output_frame(last);
-                self.ready.push_back(f);
+                self.ready.push_back((f, size));
             }
             if cur.pict_type != PICT_B {
                 self.next = Some(Arc::new(cur));
@@ -787,7 +794,20 @@ impl Decoder for Rv1020Decoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        self.ready.pop_front().ok_or(Error::NeedMore)
+        let (frame, size) = self.ready.pop_front().ok_or(Error::NeedMore)?;
+        self.last_output = Some(size);
+        Ok(frame)
+    }
+
+    /// The frame last returned; before the first, the next queued one.
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.last_output
+            .or_else(|| self.ready.front().map(|(_, size)| *size))
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output_video_dimensions().map(|_| PixelFormat::Yuv420P)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -802,6 +822,7 @@ impl Decoder for Rv1020Decoder {
         self.last = None;
         self.next = None;
         self.ready.clear();
+        self.last_output = None;
         self.mb_x = 0;
         self.mb_y = 0;
         Ok(())

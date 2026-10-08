@@ -88,6 +88,7 @@ pub fn decode_packets(
         params: params.clone(),
         audio_format: None,
         frame_formats: Vec::new(),
+        frame_video_layouts: Vec::new(),
         frames: Vec::new(),
         trim_fallbacks: Default::default(),
     };
@@ -97,6 +98,7 @@ pub fn decode_packets(
             Ok(frame) => {
                 out.frames.push(frame);
                 out.frame_formats.push(decoder.output_audio_format());
+                out.frame_video_layouts.push((decoder.output_video_dimensions(), decoder.output_pixel_format()));
             }
             Err(Error::NeedMore) | Err(Error::Eof) => break,
             Err(e) => {

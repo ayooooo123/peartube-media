@@ -999,7 +999,7 @@ dependencies = [
 [[package]]
 name = "oxideav-av1"
 version = "0.1.20"
-source = "git+https://github.com/OxideAV/oxideav-av1?rev=461e63a5bd634fe47a59c7a69cca153af1577c62#461e63a5bd634fe47a59c7a69cca153af1577c62"
+source = "git+https://github.com/ayooooo123/oxideav-av1?rev=cab66b04918136a7533019122da1677c7b2a42b3#cab66b04918136a7533019122da1677c7b2a42b3"
 dependencies = [
  "oxideav-core",
 ]
@@ -1015,7 +1015,7 @@ dependencies = [
 [[package]]
 name = "oxideav-basic"
 version = "0.0.10"
-source = "git+https://github.com/OxideAV/oxideav-basic?rev=c44bb55f9f94e18ede7e9267493b0b6776a8e1c4#c44bb55f9f94e18ede7e9267493b0b6776a8e1c4"
+source = "git+https://github.com/ayooooo123/oxideav-basic?rev=33120ba15b5cf1aa91061662dbf43826153a3fd3#33120ba15b5cf1aa91061662dbf43826153a3fd3"
 dependencies = [
  "oxideav-core",
 ]
@@ -1023,7 +1023,7 @@ dependencies = [
 [[package]]
 name = "oxideav-cinepak"
 version = "0.0.3"
-source = "git+https://github.com/OxideAV/oxideav-cinepak?rev=4dae215ff7509dfd7e2e7d1bae72128630ccce7d#4dae215ff7509dfd7e2e7d1bae72128630ccce7d"
+source = "git+https://github.com/ayooooo123/oxideav-cinepak?rev=6e632ae20703b531c5c5755dadcc67fa32479828#6e632ae20703b531c5c5755dadcc67fa32479828"
 dependencies = [
  "oxideav-core",
 ]
@@ -1049,7 +1049,7 @@ dependencies = [
 [[package]]
 name = "oxideav-dirac"
 version = "0.0.9"
-source = "git+https://github.com/OxideAV/oxideav-dirac?rev=1315f66f5f222dcafa5594bee401c797e5f5a769#1315f66f5f222dcafa5594bee401c797e5f5a769"
+source = "git+https://github.com/ayooooo123/oxideav-dirac?rev=051c87ed060476839493b4368d81fb6dc8294bd6#051c87ed060476839493b4368d81fb6dc8294bd6"
 dependencies = [
  "oxideav-core",
 ]
@@ -1098,7 +1098,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h261"
 version = "0.0.7"
-source = "git+https://github.com/OxideAV/oxideav-h261?rev=bba9abb79f6e54cefa189ea92997a91dd46e1e56#bba9abb79f6e54cefa189ea92997a91dd46e1e56"
+source = "git+https://github.com/ayooooo123/oxideav-h261?rev=0803bf4eb603c9766c01ba89f150259c84c3af7b#0803bf4eb603c9766c01ba89f150259c84c3af7b"
 dependencies = [
  "oxideav-core",
  "oxideav-pixfmt",
@@ -1107,7 +1107,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h263"
 version = "0.0.10"
-source = "git+https://github.com/OxideAV/oxideav-h263?rev=25bf0a12102969034d57ab96f29e686d8d61ddc3#25bf0a12102969034d57ab96f29e686d8d61ddc3"
+source = "git+https://github.com/ayooooo123/oxideav-h263?rev=e922942e0f65386943599badce62d2c74c5ef767#e922942e0f65386943599badce62d2c74c5ef767"
 dependencies = [
  "oxideav-core",
 ]
@@ -1124,7 +1124,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h265"
 version = "0.0.14"
-source = "git+https://github.com/ayooooo123/oxideav-h265?rev=29cf54638f58ee3393474a172831c9c32582b7ad#29cf54638f58ee3393474a172831c9c32582b7ad"
+source = "git+https://github.com/ayooooo123/oxideav-h265?rev=279ecc3f27dc6f4145c5478a0f2388180661e1d1#279ecc3f27dc6f4145c5478a0f2388180661e1d1"
 dependencies = [
  "oxideav-core",
 ]
@@ -1151,7 +1151,7 @@ dependencies = [
 [[package]]
 name = "oxideav-iff"
 version = "0.0.11"
-source = "git+https://github.com/OxideAV/oxideav-iff?rev=5a4bdb43c14007975137543ecf1aa8fa6e4a476c#5a4bdb43c14007975137543ecf1aa8fa6e4a476c"
+source = "git+https://github.com/ayooooo123/oxideav-iff?rev=c054ff2d42a347be36b2c2ba4b0d9490932c210f#c054ff2d42a347be36b2c2ba4b0d9490932c210f"
 dependencies = [
  "oxideav-core",
 ]
@@ -1168,7 +1168,7 @@ dependencies = [
 [[package]]
 name = "oxideav-indeo"
 version = "0.0.1"
-source = "git+https://github.com/OxideAV/oxideav-indeo?rev=c5352660dd42d5d16d50cba0388b21b4fbeb037a#c5352660dd42d5d16d50cba0388b21b4fbeb037a"
+source = "git+https://github.com/ayooooo123/oxideav-indeo?rev=fafc8fa7bb089f743b841cb0d1229c0763612d93#fafc8fa7bb089f743b841cb0d1229c0763612d93"
 dependencies = [
  "oxideav-core",
 ]
@@ -1184,7 +1184,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mjpeg"
 version = "0.1.11"
-source = "git+https://github.com/OxideAV/oxideav-mjpeg?rev=3e8f65f5c36d1dddbc481512487c6e8cd86e6f03#3e8f65f5c36d1dddbc481512487c6e8cd86e6f03"
+source = "git+https://github.com/ayooooo123/oxideav-mjpeg?rev=559c08f7ec06e67b09c125cd1f5af33b81eb63f5#559c08f7ec06e67b09c125cd1f5af33b81eb63f5"
 dependencies = [
  "oxideav-core",
 ]
@@ -1262,7 +1262,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg4video"
 version = "0.1.8"
-source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=ac636cd9e44744a17088cb6a4b02ed02ba232a49#ac636cd9e44744a17088cb6a4b02ed02ba232a49"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=a759321b87caef26a340186f04a86c8f4060ec15#a759321b87caef26a340186f04a86c8f4060ec15"
 dependencies = [
  "oxideav-core",
 ]
@@ -1279,7 +1279,7 @@ dependencies = [
 [[package]]
 name = "oxideav-msmpeg4"
 version = "0.0.10"
-source = "git+https://github.com/OxideAV/oxideav-msmpeg4?rev=f0de9a8c24ca29c79ee453a39f8c4a052334c8a9#f0de9a8c24ca29c79ee453a39f8c4a052334c8a9"
+source = "git+https://github.com/ayooooo123/oxideav-msmpeg4?rev=def8962c09aa5d339dada2d2308c61186a67e074#def8962c09aa5d339dada2d2308c61186a67e074"
 dependencies = [
  "oxideav-core",
 ]
@@ -1400,7 +1400,7 @@ dependencies = [
 [[package]]
 name = "oxideav-svq"
 version = "0.0.3"
-source = "git+https://github.com/OxideAV/oxideav-svq?rev=afb738670f7c73735142d7ef49d529918bce84fe#afb738670f7c73735142d7ef49d529918bce84fe"
+source = "git+https://github.com/ayooooo123/oxideav-svq?rev=660bce1f0d49208e9e9e77225d0c8e89a98c26fc#660bce1f0d49208e9e9e77225d0c8e89a98c26fc"
 dependencies = [
  "oxideav-core",
 ]
@@ -1408,7 +1408,7 @@ dependencies = [
 [[package]]
 name = "oxideav-theora"
 version = "0.0.12"
-source = "git+https://github.com/OxideAV/oxideav-theora?rev=bd07b92ecfe0781de8fb1278fbf26e642e2311ad#bd07b92ecfe0781de8fb1278fbf26e642e2311ad"
+source = "git+https://github.com/ayooooo123/oxideav-theora?rev=a7674665c76370f2a6bbc4e72af5f31256cae8b0#a7674665c76370f2a6bbc4e72af5f31256cae8b0"
 dependencies = [
  "oxideav-core",
 ]
@@ -1432,7 +1432,7 @@ dependencies = [
 [[package]]
 name = "oxideav-vc2"
 version = "0.0.2"
-source = "git+https://github.com/OxideAV/oxideav-vc2?rev=030172fe33153c5072116146d299568f7b0b3db5#030172fe33153c5072116146d299568f7b0b3db5"
+source = "git+https://github.com/ayooooo123/oxideav-vc2?rev=364ebdb0073bf1c57c3d830ffbf057dbd8f53d59#364ebdb0073bf1c57c3d830ffbf057dbd8f53d59"
 dependencies = [
  "oxideav-core",
 ]
@@ -1449,7 +1449,7 @@ dependencies = [
 [[package]]
 name = "oxideav-vp6"
 version = "0.0.9"
-source = "git+https://github.com/OxideAV/oxideav-vp6?rev=580fb6b7f25facf1b3d409c16aeac7be725f33f7#580fb6b7f25facf1b3d409c16aeac7be725f33f7"
+source = "git+https://github.com/ayooooo123/oxideav-vp6?rev=4a2ff51bc5e139b1833f3bf08dd1f167e6225c29#4a2ff51bc5e139b1833f3bf08dd1f167e6225c29"
 dependencies = [
  "oxideav-core",
 ]
@@ -1457,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "oxideav-vp8"
 version = "0.2.7"
-source = "git+https://github.com/OxideAV/oxideav-vp8?rev=fb852a4896dd48f1d5d1a05c471ada8a0208b029#fb852a4896dd48f1d5d1a05c471ada8a0208b029"
+source = "git+https://github.com/ayooooo123/oxideav-vp8?rev=5aad171851320a741981f3d331c1e3cfdb48c044#5aad171851320a741981f3d331c1e3cfdb48c044"
 dependencies = [
  "oxideav-core",
 ]
@@ -1465,7 +1465,7 @@ dependencies = [
 [[package]]
 name = "oxideav-vp9"
 version = "0.0.13"
-source = "git+https://github.com/OxideAV/oxideav-vp9?rev=68e069a4903491474508d76222e8243686b2e9e2#68e069a4903491474508d76222e8243686b2e9e2"
+source = "git+https://github.com/ayooooo123/oxideav-vp9?rev=35a7c43234e04c2d8d12e1cd6a2fda41be5e411e#35a7c43234e04c2d8d12e1cd6a2fda41be5e411e"
 dependencies = [
  "oxideav-core",
 ]

@@ -3,7 +3,7 @@
 //! Decoder factories are first-registered-wins; install our replacements first.
 //! Container factories are keyed by name; install our replacements last.
 
-use oxideav_core::RuntimeContext;
+use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, RuntimeContext};
 
 /// A context holding every container and decoder the player can use.
 pub fn context() -> RuntimeContext {
@@ -97,6 +97,13 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     // MIDI registers its synth only; its decoder plays with the built-in
     // tone instruments.
     oxideav_midi::register_codecs(&mut ctx.codecs);
+    // MPEG-TS and MPEG-PS name MPEG-4 Part 2 video `mpeg4` (FFmpeg's id);
+    // its decoder registers as `mpeg4video`.
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("mpeg4"))
+            .capabilities(CodecCapabilities::video("mpeg4video_sw"))
+            .decoder(oxideav_mpeg4video::make_decoder),
+    );
 
     for register in [
         codec_mlp::register_containers,
