@@ -4,7 +4,9 @@
 //! planar float, FFmpeg's channel order, FFmpeg's samples. Before it,
 //! mapping-family-1 streams came out in the `OpusHead`'s Vorbis channel
 //! order (7.1: -2.3 dB against FFmpeg), and every stream as the RFC 6716
-//! decoder's 16-bit PCM, 80-83 dB from FFmpeg on stereo FATE files.
+//! decoder's 16-bit PCM: CELT files at the 16-bit limit of FFmpeg's own
+//! output (testvector01: 79.8 dB), SILK and hybrid files at 9.6 to 36 dB
+//! (FFmpeg decodes SILK in float and resamples it with libswresample).
 
 use oxideav_core::{AudioFormat, CodecId, CodecParameters, MediaType, SampleFormat};
 use refcheck::Registrar;
@@ -27,6 +29,7 @@ fn assert_matches_ffmpeg(path: &Path, registrars: &[Registrar], channels: u16) {
     let theirs = refcheck::ffmpeg_src_audio_f32(path, 0);
     assert_eq!(ours.len(), theirs.len(), "{name}: interleaved samples vs FFmpeg's");
     let snr = refcheck::snr_db(&theirs, &ours, 0);
+    eprintln!("{name}: {} samples/channel, {snr:.2} dB against FFmpeg", ours.len() / usize::from(channels));
     assert!(snr >= 90.0, "{name}: {snr:.1} dB against FFmpeg");
 }
 
