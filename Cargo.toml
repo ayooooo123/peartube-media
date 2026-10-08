@@ -122,7 +122,7 @@ oxideav-midi = { git = "https://github.com/OxideAV/oxideav-midi", rev = "cf1b26b
 oxideav-mjpeg = { git = "https://github.com/ayooooo123/oxideav-mjpeg", rev = "559c08f7ec06e67b09c125cd1f5af33b81eb63f5" }
 oxideav-mkv = { git = "https://github.com/ayooooo123/oxideav-mkv", rev = "5f9ac53c713d1265be26d21704e0bba77d3d1462" }
 oxideav-mod = { git = "https://github.com/OxideAV/oxideav-mod", rev = "f509819bc977ac4d499fb95f1156bc536a9a964f" }
-oxideav-mov = { git = "https://github.com/ayooooo123/oxideav-mov", rev = "c1e7719a39e436bf9690c0b1f5cffc93f421ea54" }
+oxideav-mov = { git = "https://github.com/ayooooo123/oxideav-mov", rev = "3f877cb7a81a8da1808c84fde2224521211e64a2" }
 oxideav-mp1 = { git = "https://github.com/OxideAV/oxideav-mp1", rev = "e01e2d0dfa651f39d5ba05ee3129b7144282dceb" }
 oxideav-mp2 = { git = "https://github.com/ayooooo123/oxideav-mp2", rev = "1f335d02e92ecee338945777e8f5f9b483bef22a" }
 oxideav-mp3 = { git = "https://github.com/ayooooo123/oxideav-mp3", rev = "ba94ce70a7e6ddb37f02713b3ca34ed5b39f7cf0" }
