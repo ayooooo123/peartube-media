@@ -225,6 +225,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-vp3"
+version = "0.1.0"
+dependencies = [
+ "oxideav-avi",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-vp56"
 version = "0.1.0"
 dependencies = [
@@ -270,6 +279,7 @@ dependencies = [
  "codec-mlp",
  "codec-ra",
  "codec-rv",
+ "codec-vp3",
  "codec-vp56",
  "codec-wma",
  "codec-wmv",
