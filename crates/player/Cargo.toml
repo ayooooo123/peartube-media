@@ -31,6 +31,7 @@ parking_lot = "0.12"
 subs-cc = { path = "../subs-cc" }
 subs-bitmap = { path = "../subs-bitmap" }
 subs-text = { path = "../subs-text" }
+unicode-bidi = "0.3.18"
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-29"] }

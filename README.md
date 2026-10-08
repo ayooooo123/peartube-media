@@ -141,14 +141,22 @@ give each cue the same metadata (FFmpeg's side data) and their `WEBVTT`,
 `STYLE` and `REGION` blocks as extradata. MP4 `wvtt` samples (ISO/IEC
 14496-30, which FFmpeg does not read) decode from their `vttc` boxes. The
 player places WebVTT cues as W3C WebVTT section 7 does: the line (snapped to
-lines or a percentage, with its alignment), position, size and alignment,
-vertical cues, regions from the header, and the moves that keep cues off
-each other; a cue with no room is not shown. `cargo test -p player --test
-webvtt_placement` checks placement through `.vtt`, FFmpeg's Matroska and
-WebM remuxes and a hand-built MP4; `cargo test -p subs-text --test
-webvtt_settings` mutates settings, headers and MP4 samples at least 2000
-times each. CSS from `STYLE` blocks, right-to-left text and ruby are not
-rendered.
+lines or a percentage, with its alignment), position, size and alignment
+(`start` and `end` by the text's direction), vertical cues, regions from
+the header (on the region's box, clipped to its `lines`, so `lines:0`
+shows nothing; `scroll:up` moves the lines up over 0.433 s with CSS's
+`ease`), and the moves that keep cues off each other; a cue with no room
+is not shown. It draws the cue's own text as browsers do: the
+`rgba(0,0,0,0.8)` cue box, the `::cue` rules of `STYLE` blocks (colour,
+background, weight, style, decoration, shadow, opacity, relative size;
+class, voice, language, identifier and type selectors, descendants),
+right-to-left paragraphs reordered by the Unicode Bidirectional Algorithm,
+and ruby text above its base. The bitmap font has one face, so
+`font-family` changes nothing. `cargo test -p player --test
+webvtt_placement --test webvtt_style` checks placement and drawing through
+`.vtt`, FFmpeg's Matroska and WebM remuxes and hand-built MP4s; `cargo
+test -p subs-text --test webvtt_settings` mutates settings, headers, MP4
+samples, cue text and style sheets at least 2000 times each.
 
 `cargo test -p check-mkv -p player --no-fail-fast` compares packet fields
 directly with FFmpeg 9, checks incremental reads and malformed input, and

@@ -209,8 +209,14 @@ fn assert_plays_like_ffmpeg(path: &Path, codec: &str, packets_are_cues: bool, co
     let stream = refcheck_stream_index(path);
     let shown = play(path, stream, codec);
     assert_eq!(shown.len(), styled.len(), "cues shown by the Player for {}", path.display());
+    // WebVTT is drawn as WebVTT (W3C WebVTT §7): FFmpeg's cue text in
+    // that form, on its default line, is the reference.
+    let webvtt = (codec == "webvtt").then(|| ffmpeg_webvtt_payloads(path));
     for (i, (shown, (_, body))) in shown.iter().zip(&styled).enumerate() {
-        let expected = player::subs::render_text_cue(&styled_cue(body), shown.width, shown.height);
+        let expected = match &webvtt {
+            Some(payloads) => player::subs::render_webvtt_text(&payloads[i], shown.width, shown.height),
+            None => player::subs::render_text_cue(&styled_cue(body), shown.width, shown.height),
+        };
         let actual: Vec<Signature> = shown.images.iter().map(signature).collect();
         assert_eq!(actual, vec![signature(&expected)], "cue {i} of {} renders unlike FFmpeg's {body:?}", path.display());
     }
@@ -218,6 +224,28 @@ fn assert_plays_like_ffmpeg(path: &Path, codec: &str, packets_are_cues: bool, co
         let n = pixels_of(&shown[i].images[0], rgb);
         assert!(n > 0, "cue {i} of {} shows no {rgb:?} text", path.display());
     }
+}
+
+/// FFmpeg's decode of the first subtitle stream of `path` re-encoded as
+/// WebVTT: each cue's payload, cues without text left out.
+fn ffmpeg_webvtt_payloads(path: &Path) -> Vec<String> {
+    let output = Command::new(refcheck::pinned_ffmpeg())
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(output.status.success(), "ffmpeg failed: {output:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .replace("\r\n", "\n")
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut lines = block.lines().skip_while(|l| !l.contains("-->"));
+            lines.next()?;
+            Some(lines.collect::<Vec<_>>().join("\n"))
+        })
+        .filter(|payload| !payload.trim().is_empty())
+        .collect()
 }
 
 /// The production registry's decode of the first subtitle stream of `path`:

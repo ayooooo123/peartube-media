@@ -586,6 +586,18 @@ path = "fate:sub/1ededcbd7b.ass"
 rows = ["sub:ass"]
 compare = ["sub:text"]
 
+# SSA (v4.00, FFmpeg reads it as `ass`): karaoke, colours, \pos.
+[[entry]]
+path = "fate:sub/a9-misc.ssa"
+rows = ["sub:ass"]
+compare = ["sub:text"]
+
+# ASS in Matroska (S_TEXT/ASS), as FFmpeg muxes it.
+[[entry]]
+path = "gen:h264_aac_ass.mkv"
+rows = ["sub:ass"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
+
 [[entry]]
 path = "fate:sub/SAMI_capability_tester.smi"
 rows = ["sub:sami"]

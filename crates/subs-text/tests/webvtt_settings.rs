@@ -1,16 +1,20 @@
-//! Untrusted WebVTT placement input, mutated: cue settings, `REGION`
-//! headers and MP4 `wvtt` samples. Each input gets at least 2000 mutations
-//! from a fixed seed. Nothing may panic, and what parses must stay within
-//! the WebVTT specification's ranges: percentages in 0..=100, a cue box
-//! inside the video, regions only by an id the header defines.
+//! Untrusted WebVTT placement and styling input, mutated: cue settings,
+//! `REGION` headers, MP4 `wvtt` samples, cue text and `STYLE` sheets. Each
+//! input gets at least 2000 mutations from a fixed seed. Nothing may
+//! panic, and what parses must stay within the WebVTT specification's
+//! ranges: percentages in 0..=100, a cue box inside the video, regions
+//! only by an id the header defines, styles with alpha and sizes in range.
 //!
 //! The settings inputs are every cue settings line of FATE's two WebVTT
-//! samples plus every setting the specification defines; the headers and
-//! samples are built from the specification's syntax.
+//! samples plus every setting the specification defines; the cue texts
+//! are every cue of those samples; the headers, style sheets and samples
+//! are built from the specification's syntax.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use subs_text::webvtt::mp4_sample_cues;
+use subs_text::webvtt_css::{cascade, StyleSheet};
+use subs_text::webvtt_cue::{parse, Node};
 use subs_text::webvtt_settings::{header_regions, CueSettings, Region};
 
 const TRIALS: usize = 2000;
@@ -84,9 +88,11 @@ fn check_settings(settings: &[u8], regions: &[Region]) {
         None => {}
     }
     assert!(parsed.region.as_ref().is_none_or(|r| regions.contains(r)), "{at:?}: region {:?}", parsed.region);
-    // The cue box lies within the video.
-    let (start, size) = (parsed.box_start(), parsed.computed_size());
-    assert!(start >= -1e-9 && start + size <= 100.0 + 1e-9 && size >= 0.0, "{at:?}: box {start}..{}", start + size);
+    // The cue box lies within the video, whichever the text's direction.
+    for rtl in [false, true] {
+        let (start, size) = (parsed.box_start(rtl), parsed.computed_size(rtl));
+        assert!(start >= -1e-9 && start + size <= 100.0 + 1e-9 && size >= 0.0, "{at:?} (rtl {rtl}): box {start}..{}", start + size);
+    }
     assert!(parsed.computed_line().is_finite(), "{at:?}");
 }
 
@@ -179,5 +185,84 @@ fn mutated_mp4_samples_unpack_without_panicking() {
             }
         }));
         assert!(run.is_ok(), "trial {trial}: {mutated:02x?}");
+    }
+}
+
+/// Nodes of a parsed cue at most (the parser's bound) and the deepest
+/// nesting.
+fn shape(nodes: &[Node]) -> (usize, usize) {
+    nodes.iter().fold((0, 0), |(count, depth), node| match node {
+        Node::Element { children, .. } => {
+            let (c, d) = shape(children);
+            (count + 1 + c, depth.max(d + 1))
+        }
+        _ => (count + 1, depth),
+    })
+}
+
+/// The cue texts of FATE's two WebVTT samples: what follows each timing
+/// line up to the blank line.
+fn fate_cue_texts() -> Vec<String> {
+    ["sub/WebVTT_capability_tester.vtt", "sub/WebVTT_extended_tester.vtt"]
+        .iter()
+        .flat_map(|sample| {
+            let text = std::fs::read_to_string(refcheck::fate(sample)).unwrap().replace("\r\n", "\n");
+            text.split("\n\n")
+                .filter_map(|block| {
+                    let mut lines = block.lines().skip_while(|l| !l.contains("-->"));
+                    lines.next()?;
+                    Some(lines.collect::<Vec<_>>().join("\n"))
+                })
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[test]
+fn mutated_cue_text_parses_within_its_bounds() {
+    let texts = fate_cue_texts();
+    assert!(texts.len() > 20, "{} cue texts", texts.len());
+    let sheet = StyleSheet::parse("::cue(c.a v[voice=\"x\"] rt) { color: red; font-size: 300% } ::cue(i) { font-size: 0.5em } ::cue(ruby) { opacity: 0.5 }");
+    let mut rng = Rng(0x7e47_c0de);
+    for text in &texts {
+        for trial in 0..TRIALS {
+            let mutated = mutate(&mut rng, text.as_bytes());
+            let mutated = String::from_utf8_lossy(&mutated);
+            let run = catch_unwind(AssertUnwindSafe(|| {
+                let nodes = parse(&mutated);
+                let (count, depth) = shape(&nodes);
+                assert!(count <= 4096 && depth <= 32, "{count} nodes, depth {depth}");
+                for style in cascade(&sheet, &nodes, "id") {
+                    assert!((0.0..=1.0).contains(&style.opacity) && (0.25..=8.0).contains(&style.size), "{style:?}");
+                }
+            }));
+            assert!(run.is_ok(), "{text:?} trial {trial}: {mutated:?} failed");
+        }
+    }
+}
+
+#[test]
+fn mutated_style_sheets_parse_within_their_bounds() {
+    let sheets = [
+        "::cue { color: rgba(255,255,0,0.5); background-color: #0008 }\n::cue(.loud) { font-weight: bold; font-size: 150% }",
+        "::cue(v[voice=\"Roger Bingham\"]) { text-shadow: 2px 2px 3px hsl(120, 100%, 50%); text-decoration: underline line-through }",
+        "::cue(#cue7), ::cue(c.a.b i) { opacity: 40%; font-family: \"Roboto\", sans-serif; background: none }\n/* comment */ ::cue(lang[lang='en']) { font-style: italic }",
+    ];
+    let nodes = parse("<v Roger Bingham><c.loud.a.b><i>x</i></c></v><lang en>y</lang>");
+    let mut rng = Rng(0x0c55_57e5);
+    for css in sheets {
+        for trial in 0..TRIALS {
+            let mutated = mutate(&mut rng, css.as_bytes());
+            let mutated = String::from_utf8_lossy(&mutated);
+            let run = catch_unwind(AssertUnwindSafe(|| {
+                let sheet = StyleSheet::from_header(format!("WEBVTT\n\nSTYLE\n{mutated}\n").as_bytes());
+                for style in cascade(&sheet, &nodes, "cue7") {
+                    assert!((0.0..=1.0).contains(&style.opacity) && (0.25..=8.0).contains(&style.size), "{style:?}");
+                    assert!(style.shadow.is_none_or(|s| s.dx.is_finite() && s.dy.is_finite()), "{style:?}");
+                }
+            }));
+            assert!(run.is_ok(), "{css:?} trial {trial}: {mutated:?} failed");
+        }
     }
 }
