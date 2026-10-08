@@ -184,6 +184,21 @@ fn opus_preskip_is_applied_once_in_mp4() { opus_in_container("mp4"); }
 #[test]
 fn opus_preskip_is_applied_once_in_matroska() { opus_in_container("mkv"); }
 
+/// FATE's `silk-lbrr-mono.mka` ends with a packet that discards 570 samples
+/// of padding; flushing the decoder then drains 24 SILK samples its
+/// resampler held back. libavcodec stamps drained frames with the last
+/// packet's side data and cuts the padding only from a frame it fits in
+/// (`decode.c`): the padding comes off the last packet's frame and the
+/// drained samples play.
+#[test]
+fn opus_end_padding_leaves_the_drained_samples() {
+    let path = refcheck::fate("opus/silk-lbrr-mono.mka");
+    exact_length(&path, 43_278);
+    let (played, channels) = play(&path, None);
+    let snr = snr_at(&refcheck::ffmpeg_src_audio_f32(&path, 0), &played, channels, 0, 0);
+    assert!(snr >= 90.0, "silk-lbrr-mono.mka is {snr:.1} dB from FFmpeg's samples");
+}
+
 /// FFmpeg's Vorbis decoder outputs the first packet's frame and drops it
 /// as its own delay (`vorbisdec.c`); FFmpeg's encoders declare that frame
 /// as the WebM CodecDelay, whose skip replaces the delay. OxideAV's decoder

@@ -40,12 +40,22 @@
 //!   after it begins the presentation ([`Pcm::begins_presentation`]), even
 //!   where the container's timestamps put it before zero;
 //! - `discard_padding` comes off the end of the span: output that may still
-//!   be padding is held back until the next span starts or the stream ends
-//!   ([`Trimmer::finish`]). Padding larger than the samples left after
-//!   priming is ignored, as in FFmpeg `decode.c`;
+//!   be padding is held back until the next span starts, the decoder is
+//!   drained ([`Trimmer::drain`]) or the stream ends ([`Trimmer::finish`]).
+//!   Padding larger than the samples left after priming is ignored, as in
+//!   FFmpeg `decode.c`;
 //! - both counts are samples per channel at `sample_rate`, rescaled to the
 //!   rate the decoder actually outputs (an SBR decoder doubles it). A trim
 //!   without a rate is ignored.
+//!
+//! Draining the decoder at the end of the stream ([`Trimmer::drain`], before
+//! `Decoder::flush`) ends the last span. libavcodec returns what a drain
+//! yields with the side data of the packet sent last (`last_pkt_props`), so
+//! each drained frame is trimmed on its own by that packet's trims: a
+//! nonzero skip starts again, and the padding comes off the frame's end only
+//! when the frame is at least that long (`decode.c`). An Opus stream whose
+//! last packet discards 570 samples keeps the 24 SILK samples its decoder's
+//! resampler drains.
 //!
 //! A decoder's own start delay is a default skip that a container's skip
 //! replaces, as libavcodec seeds `skip_samples` with `AVCodecContext::delay`
@@ -315,6 +325,11 @@ pub struct Trimmer<P> {
     drops_first_packet: bool,
     /// That packet has not been sent yet.
     awaiting_first_packet: bool,
+    /// The trims of the packet sent last, which libavcodec stamps on the
+    /// frames a drain returns (`last_pkt_props`).
+    last_sent: Option<AudioTrim>,
+    /// The decoder is being drained ([`Trimmer::drain`]).
+    draining: bool,
 }
 
 impl<P: Pcm> Default for Trimmer<P> {
@@ -322,7 +337,7 @@ impl<P: Pcm> Default for Trimmer<P> {
         Trimmer {
             skip: Count::None, skip_ended: false, queue: VecDeque::new(), current: None,
             association_lost: false, fallbacks: Fallbacks::default(),
-            drops_first_packet: false, awaiting_first_packet: false,
+            drops_first_packet: false, awaiting_first_packet: false, last_sent: None, draining: false,
         }
     }
 }
@@ -361,6 +376,8 @@ impl<P: Pcm> Trimmer<P> {
     /// `packet` went to the decoder; `trim` is its `audio_trim`. Its output
     /// may come later (see the crate docs).
     pub fn packet(&mut self, packet: &Packet, trim: Option<AudioTrim>) {
+        let trim = trim.filter(|t| t.sample_rate > 0);
+        self.last_sent = trim;
         if std::mem::take(&mut self.awaiting_first_packet) {
             // Its output never comes, and its trims are the decoder's.
             return;
@@ -372,7 +389,7 @@ impl<P: Pcm> Trimmer<P> {
         }
         let tb = packet.time_base;
         self.queue.push_back(Queued {
-            trim: trim.filter(|t| t.sample_rate > 0),
+            trim,
             pts: packet.pts,
             duration: packet.duration.filter(|&d| d > 0).map(|ticks| Duration { ticks, num: tb.num(), den: tb.den() }),
         });
@@ -385,6 +402,10 @@ impl<P: Pcm> Trimmer<P> {
     pub fn frame(&mut self, mut pcm: P, mut pts: Option<i64>, out: &mut Vec<P>) {
         if pcm.samples() == 0 {
             out.push(pcm);
+            return;
+        }
+        if self.draining {
+            self.drained(pcm, out);
             return;
         }
         loop {
@@ -447,19 +468,8 @@ impl<P: Pcm> Trimmer<P> {
             return;
         };
         span.produced = span.produced.saturating_add(n);
-        if self.skip != Count::None {
-            let skip = self.skip.at(rate);
-            if skip >= n {
-                self.skip = if skip > n { Count::Output(skip - n) } else { Count::None };
-                self.skip_ended = skip == n;
-                return;
-            }
-            pcm.drop_front(skip as usize);
-            self.skip = Count::None;
-            self.skip_ended = true;
-        }
-        if std::mem::take(&mut self.skip_ended) {
-            pcm.begins_presentation();
+        if !skip_front(&mut self.skip, &mut self.skip_ended, &mut pcm) {
+            return;
         }
         if span.padding == Count::None {
             out.push(pcm);
@@ -492,6 +502,29 @@ impl<P: Pcm> Trimmer<P> {
             span.padding = Count::None;
             self.fallbacks.released_padding_spans = self.fallbacks.released_padding_spans.saturating_add(1);
         }
+    }
+
+    /// A frame the drain returned, trimmed as libavcodec trims it with the
+    /// side data of the packet sent last (`decode.c` `discard_samples`).
+    fn drained(&mut self, mut pcm: P, out: &mut Vec<P>) {
+        let trim = self.last_sent;
+        if let Some(t) = trim.filter(|t| t.skip_samples > 0) {
+            self.skip = Count::declared(t.skip_samples, t.sample_rate);
+        }
+        if !skip_front(&mut self.skip, &mut self.skip_ended, &mut pcm) {
+            return;
+        }
+        if let Some(t) = trim {
+            let n = pcm.samples() as u64;
+            let padding = Count::declared(t.discard_padding, t.sample_rate).at(pcm.rate());
+            if padding > 0 && padding <= n {
+                if padding == n {
+                    return;
+                }
+                let _padding = pcm.split_off((n - padding) as usize);
+            }
+        }
+        out.push(pcm);
     }
 
     /// The queued packet whose span a frame stamped `pts` at `rate` starts,
@@ -538,6 +571,17 @@ impl<P: Pcm> Trimmer<P> {
         }
     }
 
+    /// The decoder is about to be drained (`Decoder::flush`): the span of
+    /// the packet decoded last ends, its padding off the output it produced,
+    /// and packets still queued produced nothing. What the drain returns is
+    /// trimmed frame by frame (see the crate docs).
+    pub fn drain(&mut self, out: &mut Vec<P>) {
+        self.end_span(out);
+        self.queue.clear();
+        self.association_lost = false;
+        self.draining = true;
+    }
+
     /// The decoder is drained: what the last span holds back is the
     /// stream's end padding (unless longer than the span, see `end_span`),
     /// and queued packets produced nothing.
@@ -546,6 +590,7 @@ impl<P: Pcm> Trimmer<P> {
         self.queue.clear();
         self.skip_ended = false;
         self.association_lost = false;
+        self.draining = false;
     }
 
     /// The decoder starts over (a seek). Stale held PCM never plays.
@@ -556,7 +601,31 @@ impl<P: Pcm> Trimmer<P> {
         self.queue.clear();
         self.association_lost = false;
         self.awaiting_first_packet = self.drops_first_packet;
+        self.last_sent = None;
+        self.draining = false;
     }
+}
+
+/// Takes a start skip still pending (`skip`) off the front of `pcm`, and
+/// marks where the presentation begins. False when the skip covers all of
+/// `pcm`.
+fn skip_front<P: Pcm>(skip: &mut Count, skip_ended: &mut bool, pcm: &mut P) -> bool {
+    if *skip != Count::None {
+        let n = pcm.samples() as u64;
+        let at = skip.at(pcm.rate());
+        if at >= n {
+            *skip = if at > n { Count::Output(at - n) } else { Count::None };
+            *skip_ended = at == n;
+            return false;
+        }
+        pcm.drop_front(at as usize);
+        *skip = Count::None;
+        *skip_ended = true;
+    }
+    if std::mem::take(skip_ended) {
+        pcm.begins_presentation();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -836,5 +905,32 @@ mod tests {
             let expected: Vec<_> = (800..end).collect();
             assert_eq!(out.into_iter().flat_map(|run| run.0).collect::<Vec<_>>(), expected, "padding={padding}");
         }
+    }
+
+    #[test]
+    fn a_drain_keeps_a_frame_shorter_than_the_last_padding() {
+        // An Opus decoder's resampler drains 24 delayed samples after the
+        // last packet, which discards 300: libavcodec cuts the padding from
+        // that packet's frame and keeps the 24, too short for it.
+        let mut t = Trimmer::new();
+        let mut out = run(&mut t, &[(None, 0..1024), (trim(0, 300), 1024..2048)]);
+        t.drain(&mut out);
+        t.frame(Run(2048..2072), None, &mut out);
+        t.finish(&mut out);
+        assert_eq!(out, [Run(0..1024), Run(1024..1748), Run(2048..2072)]);
+    }
+
+    #[test]
+    fn a_drained_frame_at_least_as_long_as_the_last_padding_loses_it() {
+        // Every drained frame carries the last packet's side data in
+        // libavcodec: one exactly the padding's length goes, a longer one
+        // loses its end.
+        let mut t = Trimmer::new();
+        let mut out = run(&mut t, &[(trim(0, 300), 0..1024)]);
+        t.drain(&mut out);
+        t.frame(Run(1024..1324), None, &mut out);
+        t.frame(Run(1324..2348), None, &mut out);
+        t.finish(&mut out);
+        assert_eq!(out, [Run(0..724), Run(1324..2048)]);
     }
 }
