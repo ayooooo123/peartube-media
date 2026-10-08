@@ -151,12 +151,8 @@ dependencies = [
 name = "check-mpeg4"
 version = "0.1.0"
 dependencies = [
- "oxideav-avi",
+ "codecs",
  "oxideav-core",
- "oxideav-mkv",
- "oxideav-mp4",
- "oxideav-mpeg4video",
- "oxideav-mpegts",
  "refcheck",
 ]
 
@@ -1408,7 +1404,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg4video"
 version = "0.1.8"
-source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=a759321b87caef26a340186f04a86c8f4060ec15#a759321b87caef26a340186f04a86c8f4060ec15"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=7328e304a215025b415f6483a261dc9873bb7c9e#7328e304a215025b415f6483a261dc9873bb7c9e"
 dependencies = [
  "oxideav-core",
 ]
