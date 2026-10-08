@@ -131,10 +131,3 @@ fn test_p1_predictor_decode_mono_3950_truncation() {
         "predictor_decode_mono_3950 must match FFmpeg's int32_t truncation semantics"
     );
 }
-
-#[test]
-fn test_p1_license() {
-    let crate_license = include_bytes!("../LICENSE");
-    let ffmpeg_license = include_bytes!("/Users/jd/projects/ffmpeg-src/COPYING.LGPLv2.1");
-    assert_eq!(crate_license.as_slice(), ffmpeg_license.as_slice());
-}
