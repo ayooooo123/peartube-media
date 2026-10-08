@@ -62,12 +62,12 @@ fn ffmpeg_pcm(path: &std::path::Path, bytes_per_sample: usize) -> Vec<u8> {
         4 => "s32le",
         _ => panic!("unsupported width"),
     };
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg failed: {}",
@@ -292,11 +292,11 @@ fn lossy_xxch_71_24_48_2046() {
 /// The channel count FFmpeg's decoder reports for stream `0:a:0` (MPEG-TS
 /// input prints the stream once more inside its program).
 fn ffprobe_channels(path: &std::path::Path) -> usize {
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "csv=p=0"])
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {} failed", path.display());
     let text = String::from_utf8_lossy(&out.stdout);
     let first = text.lines().find(|l| !l.trim().is_empty()).expect("ffprobe reported no audio stream");
@@ -357,7 +357,7 @@ struct FfStream {
 /// -show_packets -show_streams` prints it. Fails unless ffprobe succeeds
 /// and reports at least one stream and one packet.
 fn ffprobe_table(path: &std::path::Path) -> (Vec<FfStream>, Vec<FfPacket>) {
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_data_hash", "md5", "-show_entries"])
         .arg(
             "stream=codec_name,time_base,start_pts,duration_ts:\
@@ -366,7 +366,7 @@ fn ffprobe_table(path: &std::path::Path) -> (Vec<FfStream>, Vec<FfPacket>) {
         .args(["-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(
         out.status.success(),
         "ffprobe {} failed: {}",

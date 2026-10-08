@@ -62,11 +62,8 @@ fn fate_opus_files() -> Vec<String> {
 
 /// FFmpeg 2da55bf's `OpusHead` for stream `0:a:0` (`ffprobe -show_data`).
 fn ffmpeg_extradata(path: &Path) -> Vec<u8> {
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
     let out = check_decoders::tool(
-        src.join("ffprobe").to_str().unwrap(),
+        refcheck::pinned_ffprobe(),
         &["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=extradata", "-show_data", "-of", "default=nw=1", path.to_str().unwrap()],
     );
     let text = String::from_utf8(out).expect("UTF-8");
@@ -189,8 +186,8 @@ fn chained_ogg_matches_ffmpeg() {
 
 /// A 7.1 Opus file made by FFmpeg's libopus encoder (mapping family 1:
 /// 5 streams, 3 coupled; CELT), eight tones, 2 s, in the container `ext`
-/// names. Made once per target directory with the `ffmpeg` on PATH; the
-/// comparison is with FFmpeg 2da55bf's decode of the same file.
+/// names. Made once per target directory by `refcheck::system_ffmpeg`
+/// (libopus); the comparison is with FFmpeg 2da55bf's decode of the same file.
 fn ffmpeg_made_7_1(ext: &str) -> PathBuf {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("opus-7.1-libopus.{ext}"));
     if path.is_file() {
@@ -206,7 +203,7 @@ fn ffmpeg_made_7_1(ext: &str) -> PathBuf {
         tones.join(";")
     );
     let partial = path.with_extension(format!("{ext}.part.{}", std::process::id()));
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-v", "error", "-nostdin", "-y", "-filter_complex", &graph, "-map", "[out]"])
         .args(["-c:a", "libopus", "-b:a", "448k", "-f"])
         .arg(match ext {
@@ -216,7 +213,7 @@ fn ffmpeg_made_7_1(ext: &str) -> PathBuf {
         })
         .arg(&partial)
         .output()
-        .expect("ffmpeg with libopus on PATH");
+        .expect("the system FFmpeg runs");
     assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
     std::fs::rename(&partial, &path).expect("rename");
     path

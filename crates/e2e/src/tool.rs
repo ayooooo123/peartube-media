@@ -1,8 +1,10 @@
-//! Bounded runs of the FFmpeg command-line tools: stdin closed, both pipes
-//! drained on their own threads (a full stderr pipe must not stall a child
-//! writing tens of MiB of PCM to stdout), and the child killed when it
-//! outlives its deadline (FFmpeg's subtitle parsers can spin forever on
-//! malformed samples).
+//! Bounded runs of the pinned FFmpeg command-line tools
+//! (`refcheck::pinned_ffmpeg`, `refcheck::pinned_ffprobe`), and of the
+//! system `ffmpeg` for the AV1 references the pinned build cannot give:
+//! stdin closed, both pipes drained on their own threads (a full stderr
+//! pipe must not stall a child writing tens of MiB of PCM to stdout), and
+//! the child killed when it outlives its deadline (FFmpeg's subtitle
+//! parsers can spin forever on malformed samples).
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -12,7 +14,7 @@ use std::time::{Duration, Instant};
 pub fn ffmpeg(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
     let mut all = vec!["-v".to_string(), "error".into(), "-nostdin".into()];
     all.extend_from_slice(args);
-    run("ffmpeg", &all, timeout)
+    run(&refcheck::pinned_ffmpeg().to_string_lossy(), &all, timeout)
 }
 
 /// `ffprobe -v error <args>`; stdout on success. `-nostdin` is an ffmpeg
@@ -20,22 +22,29 @@ pub fn ffmpeg(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
 pub fn ffprobe(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
     let mut all = vec!["-v".to_string(), "error".into()];
     all.extend_from_slice(args);
-    run("ffprobe", &all, timeout)
+    run(&refcheck::pinned_ffprobe().to_string_lossy(), &all, timeout)
 }
 
-/// [`ffmpeg`] as the pinned build (`refcheck::pinned_ffmpeg`) on its C code
-/// paths (`-cpuflags 0`).
-pub fn pinned_ffmpeg(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
-    let mut all = vec!["-v".to_string(), "error".into(), "-nostdin".into(), "-cpuflags".into(), "0".into()];
+/// [`ffmpeg`] on FFmpeg's C code paths (`-cpuflags 0`).
+pub fn ffmpeg_c(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut all = vec!["-cpuflags".to_string(), "0".into()];
     all.extend_from_slice(args);
-    run(&refcheck::pinned_ffmpeg().to_string_lossy(), &all, timeout)
+    ffmpeg(&all, timeout)
 }
 
-/// [`ffprobe`] from the pinned build, on its C code paths.
-pub fn pinned_ffprobe(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
-    let mut all = vec!["-v".to_string(), "error".into(), "-cpuflags".into(), "0".into()];
+/// [`ffprobe`] on FFmpeg's C code paths (`-cpuflags 0`).
+pub fn ffprobe_c(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut all = vec!["-cpuflags".to_string(), "0".into()];
     all.extend_from_slice(args);
-    run(&refcheck::pinned_ffmpeg().with_file_name("ffprobe").to_string_lossy(), &all, timeout)
+    ffprobe(&all, timeout)
+}
+
+/// [`ffmpeg`] as the system build (`refcheck::system_ffmpeg`), whose
+/// libdav1d decodes the AV1 the pinned build cannot.
+pub fn system_ffmpeg(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut all = vec!["-v".to_string(), "error".into(), "-nostdin".into()];
+    all.extend_from_slice(args);
+    run(&refcheck::system_ffmpeg().to_string_lossy(), &all, timeout)
 }
 
 fn run(program: &str, args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {

@@ -123,11 +123,11 @@ fn decode(path: &Path) -> Decoded {
 /// the stream time base, as FFmpeg's decoder returns them (skip-samples
 /// trimming applied).
 fn ffmpeg_frames(path: &Path) -> Vec<(Option<i64>, u32)> {
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "frame=pts,nb_samples", "-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     let frames: Vec<(Option<i64>, u32)> = String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -145,12 +145,12 @@ fn ffmpeg_frames(path: &Path) -> Vec<(Option<i64>, u32)> {
 
 /// FFmpeg's decode of `a:0` as raw interleaved little-endian `fmt`.
 fn ffmpeg_pcm(path: &Path, fmt: &str) -> Vec<u8> {
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     assert!(out.status.success(), "ffmpeg {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     out.stdout
 }

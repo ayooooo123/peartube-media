@@ -56,11 +56,11 @@ fn tmp(name: &str) -> PathBuf {
 /// container of `name`'s extension.
 fn tone(name: &str, codec: &str) -> PathBuf {
     let path = tmp(name);
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1", "-ac", "2", "-c:a", codec])
         .arg(&path)
         .output()
-        .expect("ffmpeg on PATH");
+        .expect("the system FFmpeg runs");
     assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
     path
 }
@@ -99,11 +99,11 @@ fn lpcm_in_aiff() {
 #[test]
 fn lpcm_in_oma() {
     let raw = tmp("oma.s16be");
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1", "-ac", "2", "-f", "s16be"])
         .arg(&raw)
         .output()
-        .expect("ffmpeg on PATH");
+        .expect("the system FFmpeg runs");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let mut file = b"ea3\x03\x00\x00\x00\x00\x00\x00".to_vec();
     let mut ea3 = [0u8; 96];

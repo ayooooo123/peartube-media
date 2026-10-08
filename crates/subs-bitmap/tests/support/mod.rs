@@ -77,12 +77,13 @@ pub struct Cue {
     pub canvas: Vec<u8>,
 }
 
-fn run(program: &str, args: &[&str]) -> Vec<u8> {
+fn run(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Vec<u8> {
+    let program = program.as_ref();
     let out = Command::new(program)
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("run {program}: {e}"));
-    assert!(out.status.success(), "{program} {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        .unwrap_or_else(|e| panic!("run {}: {e}", program.to_string_lossy()));
+    assert!(out.status.success(), "{} {args:?}: {}", program.to_string_lossy(), String::from_utf8_lossy(&out.stderr));
     out.stdout
 }
 
@@ -90,7 +91,7 @@ fn run(program: &str, args: &[&str]) -> Vec<u8> {
 pub fn ffprobe_subtitles(path: &Path, nth: usize) -> Vec<FfSubtitle> {
     let stream = format!("s:{nth}");
     let text = run(
-        "ffprobe",
+        refcheck::pinned_ffprobe(),
         &[
             "-v",
             "error",
@@ -138,7 +139,7 @@ pub struct FfPacket {
 pub fn ffprobe_time_base(path: &Path, nth: usize) -> TimeBase {
     let stream = format!("s:{nth}");
     let text = run(
-        "ffprobe",
+        refcheck::pinned_ffprobe(),
         &["-v", "error", "-select_streams", &stream, "-show_entries", "stream=time_base", "-of", "csv=p=0", path.to_str().unwrap()],
     );
     let text = String::from_utf8(text).unwrap();
@@ -152,7 +153,7 @@ pub fn ffprobe_time_base(path: &Path, nth: usize) -> TimeBase {
 pub fn ffprobe_packets(path: &Path, nth: usize) -> Vec<FfPacket> {
     let stream = format!("s:{nth}");
     let text = run(
-        "ffprobe",
+        refcheck::pinned_ffprobe(),
         &[
             "-v",
             "error",
@@ -228,7 +229,7 @@ fn sub2video_args(path: &Path, nth: usize, format: &str) -> Vec<String> {
 fn sub2video_shape(path: &Path, nth: usize) -> (usize, usize, usize) {
     let args = sub2video_args(path, nth, "framecrc");
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let text = String::from_utf8(run("ffmpeg", &args)).unwrap();
+    let text = String::from_utf8(run(refcheck::pinned_ffmpeg(), &args)).unwrap();
     let mut dims = None;
     let mut count = 0;
     for line in text.lines() {
@@ -253,7 +254,7 @@ enum Event {
 fn ffprobe_events(path: &Path, nth: usize) -> Vec<Event> {
     let stream = format!("s:{nth}");
     let text = run(
-        "ffprobe",
+        refcheck::pinned_ffprobe(),
         &[
             "-v",
             "error",
@@ -358,7 +359,7 @@ pub fn ffmpeg_reference(path: &Path, nth: usize) -> Reference {
     assert_eq!(count, expected.len(), "sub2video frames: {expected:?}");
 
     let args = sub2video_args(path, nth, "rawvideo");
-    let mut child = Command::new("ffmpeg").args(&args).stdout(Stdio::piped()).spawn().expect("run ffmpeg");
+    let mut child = Command::new(refcheck::pinned_ffmpeg()).args(&args).stdout(Stdio::piped()).spawn().expect("run ffmpeg");
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let size = width * height * 4;
     let mut canvases = Vec::with_capacity(subs.len());
@@ -572,13 +573,13 @@ pub fn decode_subtitles(path: &Path, registrars: &[Registrar], nth: usize) -> De
     Decoded { stream, frames, errors }
 }
 
-/// `ffmpeg -c copy` remux of subtitle stream `s:nth` of `path` into a
-/// scratch file named `name`, with extra muxer arguments.
+/// `refcheck::system_ffmpeg -c copy` remux of subtitle stream `s:nth` of
+/// `path` into a scratch file named `name`, with extra muxer arguments.
 pub fn remux(path: &Path, nth: usize, name: &str, muxer: &[&str]) -> PathBuf {
     let scratch = option_env!("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let out = scratch.join(name);
     let map = format!("0:s:{nth}");
-    let status = Command::new("ffmpeg")
+    let status = Command::new(refcheck::system_ffmpeg())
         .args(["-v", "error", "-y", "-copyts", "-i"])
         .arg(path)
         .args(["-map", map.as_str(), "-c:s", "copy"])

@@ -14,12 +14,12 @@ use refcheck::fate;
 type Pkt = (u32, Option<i64>, Option<i64>, usize, bool, String);
 
 fn ffprobe_after_seek(path: &Path, seconds: &str, n: usize) -> Vec<Pkt> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-read_intervals", &format!("{seconds}%+#{n}"), "-show_data_hash", "md5"])
         .args(["-show_entries", "packet=stream_index,pts,dts,size,flags,data_hash", "-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}", path.display());
     let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
     String::from_utf8_lossy(&out.stdout)
@@ -94,7 +94,7 @@ fn constant_byte_count_indexes_land_on_the_edit_unit() {
 #[test]
 fn an_index_that_does_not_reach_the_target_fails_the_seek_as_ffmpegs() {
     let path = fate("mxf/Sony-00001.mxf");
-    let out = Command::new("ffprobe").args(["-v", "error", "-read_intervals", "0.04%+#2", "-show_packets"]).arg(&path).output().unwrap();
+    let out = Command::new(refcheck::pinned_ffprobe()).args(["-v", "error", "-read_intervals", "0.04%+#2", "-show_packets"]).arg(&path).output().unwrap();
     assert!(String::from_utf8_lossy(&out.stderr).contains("Could not seek"), "FFmpeg's seek fails");
     let open = || {
         let mut ctx = RuntimeContext::new();

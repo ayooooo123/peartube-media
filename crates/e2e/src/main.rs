@@ -424,7 +424,7 @@ fn compare_video(path: &Path, cap: &player::VideoCapture, ff: &oracle::FfStream)
     let Some(pix) = refcheck::ffmpeg_pix_fmt_name(cap.pixel_format) else {
         return Compare::fail(output, format!("FFmpeg has no pixel format for {:?}", cap.pixel_format));
     };
-    let expect = match oracle::video_md5s(path, &ff.map(), pix) {
+    let expect = match oracle::video_md5s(path, &ff.map(), &ff.codec_name, pix) {
         Ok(e) => e,
         Err(e) => return Compare::fail(output, e),
     };

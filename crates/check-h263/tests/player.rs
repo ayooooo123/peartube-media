@@ -48,7 +48,7 @@ fn plays_as_ffmpeg(file: &str, snr_floor: f64) {
     let video = capture.video.first().unwrap_or_else(|| panic!("{file}: no video played"));
     assert_frames_equal(file, &video.frame_md5, &ffmpeg_md5s(&path, &[]));
     let audio = capture.audio.first().unwrap_or_else(|| panic!("{file}: no audio played"));
-    let reference = refcheck::ffmpeg_src_audio_f32(&path, 0);
+    let reference = refcheck::ffmpeg_audio_f32(&path, 0);
     assert_eq!(audio.pcm.len(), reference.len(), "{file}: audio samples");
     let snr = refcheck::snr_db(&reference, &audio.pcm, 0);
     assert!(snr >= snr_floor, "{file}: audio {snr} dB from FFmpeg's");

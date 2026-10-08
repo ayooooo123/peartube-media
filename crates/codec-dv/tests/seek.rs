@@ -13,25 +13,25 @@ type Pkt = (u32, Option<i64>, Option<i64>, usize, String);
 
 fn made(name: &str, size: &str, rate: &str, pix_fmt: &str) -> PathBuf {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("codec-dv-seek-{}-{name}", std::process::id()));
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg(format!("testsrc=size={size}:rate={rate}:duration=2"))
         .args(["-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=2"])
         .args(["-c:v", "dvvideo", "-pix_fmt", pix_fmt, "-c:a", "pcm_s16le", "-ac", "2", "-f", "dv"])
         .arg(&path)
         .output()
-        .expect("ffmpeg on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
     path
 }
 
 fn ffprobe_after_seek(path: &Path, seconds: &str, n: usize) -> Vec<Pkt> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-read_intervals", &format!("{seconds}%+#{n}"), "-show_data_hash", "md5"])
         .args(["-show_entries", "packet=stream_index,pts,dts,size,data_hash", "-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
     String::from_utf8_lossy(&out.stdout)
         .lines()

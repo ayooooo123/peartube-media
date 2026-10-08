@@ -36,7 +36,7 @@ fn a_frame_cut_by_the_end_of_file_decodes_like_ffmpeg() {
             })
             .collect();
         let theirs = tool(
-            "ffmpeg",
+            refcheck::pinned_ffmpeg(),
             &["-v", "error", "-nostdin", "-i", path.to_str().unwrap(), "-map", &format!("0:{spec}"), "-f", "s16le", "-"],
         );
         assert_eq!(

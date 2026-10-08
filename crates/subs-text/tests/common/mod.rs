@@ -25,7 +25,7 @@ pub fn srt_timing(start_us: i64, end_us: i64) -> String {
 /// `encoder` (`text` = visible text only, `srt` = SubRip markup) and muxed as
 /// SubRip: one `(timing, body)` per cue FFmpeg emits.
 pub fn ffmpeg_cues(path: &Path, options: &[&str], encoder: &str) -> Vec<(String, String)> {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(refcheck::pinned_ffmpeg())
         .args(["-nostdin", "-v", "error"])
         .args(options)
         .args(["-i", path.to_str().unwrap(), "-map", "0:s:0", "-c:s", encoder, "-f", "srt", "-"])

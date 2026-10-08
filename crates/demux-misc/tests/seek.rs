@@ -1,7 +1,7 @@
 //! Seeking lands where FFmpeg's seek lands. For every format, two or more
 //! targets (mid-block or mid-GOP among them): after `seek_to`, the first
 //! packets equal those `ffprobe -read_intervals TARGET%+#N` of the port's
-//! FFmpeg revision (FFMPEG_SRC/ffprobe, 2da55bf) returns. ffprobe seeks
+//! FFmpeg revision (`refcheck::pinned_ffprobe`, 2da55bf) returns. ffprobe seeks
 //! like `ffmpeg -ss`: avformat_seek_file on the default stream with
 //! AVSEEK_FLAG_BACKWARD, the target rescaled from microseconds with
 //! av_rescale. The seek gets the same stream and timestamp here.
@@ -24,41 +24,22 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::LazyLock;
 
 use oxideav_core::{Demuxer, Error, MediaType, StreamInfo, TimeBase};
 
-fn ffmpeg_src() -> PathBuf {
-    std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
-}
-
-/// The port's ffprobe, checked once to be revision 2da55bf.
-fn port_ffprobe() -> &'static Path {
-    static PORT: LazyLock<PathBuf> = LazyLock::new(|| {
-        let bin = ffmpeg_src().join("ffprobe");
-        let out = Command::new(&bin).arg("-version").output().expect("build ffprobe in FFMPEG_SRC: make ffprobe");
-        let version = String::from_utf8_lossy(&out.stdout);
-        assert!(version.contains("2da55bf"), "seek oracle must be FFmpeg 2da55bf: {version}");
-        bin
-    });
-    &PORT
-}
-
 /// `name` in the scratch directory Cargo gives integration tests, made by
-/// FFmpeg's `ffmpeg` (on PATH) from `args` once per test binary.
+/// `refcheck::system_ffmpeg` from `args` once per test binary.
 fn generated(name: &str, args: &[&str]) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("demux-misc-seek-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     if !path.exists() {
-        let out = Command::new("ffmpeg")
+        let out = Command::new(refcheck::system_ffmpeg())
             .args(["-nostdin", "-v", "error", "-y"])
             .args(args)
             .arg(&path)
             .output()
-            .expect("ffmpeg must be on PATH");
+            .expect("the fixture FFmpeg runs");
         assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
     }
     path
@@ -91,7 +72,7 @@ struct Mode {
 /// The time bases of `path`'s streams and the first `n` packets after
 /// FFmpeg seeks it to `target` seconds; `Err` when FFmpeg cannot seek.
 fn ffprobe_after(path: &Path, format: &str, target: &str, n: usize, mode: Mode) -> Result<(Vec<TimeBase>, Vec<Pkt>), String> {
-    let mut cmd = Command::new(port_ffprobe());
+    let mut cmd = Command::new(refcheck::pinned_ffprobe());
     cmd.args(["-v", "error", "-f", format]);
     if mode.unparsed {
         cmd.args(["-fflags", "+noparse+nofillin"]);

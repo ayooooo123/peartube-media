@@ -107,13 +107,13 @@ fn check(case: &Case) {
     }
 }
 
-/// `(stream_index, pts_ms)` per packet, from `ffprobe -show_packets`.
+/// `(stream_index, pts_ms)` per packet, from the pinned `ffprobe -show_packets`.
 fn ffprobe_packets(path: &std::path::Path) -> Vec<(u32, Option<i64>)> {
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_packets", "-of", "csv"])
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(
         out.status.success(),
         "ffprobe failed: {}",

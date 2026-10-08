@@ -18,14 +18,14 @@ mod support;
 use std::path::Path;
 use std::process::Command;
 
-use support::{archive, audio_packets, pinned};
+use support::{archive, audio_packets};
 
 /// `(pts, dts, duration, size, md5)` of one packet.
 type Row = (Option<i64>, Option<i64>, Option<i64>, usize, String);
 
 /// ffprobe's packets of the first audio stream of `path`.
 fn ffprobe_packets(path: &Path) -> Vec<Row> {
-    let out = Command::new(pinned("ffprobe"))
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-ignore_editlist", "1", "-select_streams", "a:0"])
         .args(["-show_entries", "packet=pts,dts,duration,size,data_hash"])
         .args(["-show_data_hash", "md5", "-of", "csv=p=0"])
