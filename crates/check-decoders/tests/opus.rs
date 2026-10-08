@@ -156,21 +156,22 @@ fn every_fate_opus_file_plays_ffmpegs_samples() {
     assert!(failures.is_empty(), "{} of {} files:\n{}", failures.len(), files.len(), failures.join("\n"));
 }
 
-/// FATE's chained Ogg Opus, first link (mono, 4800 samples after its
-/// pre-skip): FFmpeg's samples at 90 dB or more. FFmpeg also plays the
-/// second link; oxideav-ogg stops after the first (its owner: the Ogg
-/// demuxer), so only the first link is compared.
+/// FATE's chained Ogg Opus (two mono links, 4800 samples each after the
+/// pre-skip): whatever the Ogg demuxer plays, at least the first link, is
+/// FFmpeg's samples at 90 dB or more. The pinned oxideav-ogg stops after
+/// the first link; the `mov-fixes` Ogg fork plays both, as FFmpeg does.
 #[test]
-fn chained_ogg_first_link_matches_ffmpeg() {
+fn chained_ogg_matches_ffmpeg() {
     let path = refcheck::fate("ogg-opus/chained-meta.ogg");
     let registrars: &[Registrar] = &[oxideav_opus::__oxideav_entry, oxideav_ogg::__oxideav_entry];
     let decoded = refcheck::decode(&path, registrars, MediaType::Audio, 0);
     let ours = refcheck::interleaved_f32(&decoded);
     let theirs = refcheck::ffmpeg_src_audio_f32(&path, 0);
-    assert_eq!(ours.len(), 4800, "first link samples");
-    assert!(theirs.len() >= ours.len(), "FFmpeg decodes {} samples", theirs.len());
+    eprintln!("chained-meta.ogg: {} of FFmpeg's {} samples", ours.len(), theirs.len());
+    assert!(ours.len() >= 4800 && ours.len() <= theirs.len(), "{} samples, FFmpeg {}", ours.len(), theirs.len());
     let snr = refcheck::snr_db(&theirs[..ours.len()], &ours, 0);
-    assert!(snr >= 90.0, "first link: {snr:.1} dB against FFmpeg");
+    eprintln!("chained-meta.ogg: {snr:.1} dB");
+    assert!(snr >= 90.0, "{snr:.1} dB against FFmpeg");
 }
 
 /// A 7.1 Opus file made by FFmpeg's libopus encoder (mapping family 1:
