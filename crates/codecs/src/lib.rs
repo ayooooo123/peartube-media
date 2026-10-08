@@ -26,12 +26,20 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         // EIA-608 and CEA-708 caption triplets (the engine feeds them).
         subs_cc::register_codecs,
         codec_rv::register_codecs,
+        // VP30, VP31 and VP40.
+        codec_vp3::register_codecs,
         codec_wmv::register_codecs,
         codec_wma::lib_registration::register_codecs,
         // ALAC, QDM2, QDMC, MACE 3:1 and 6:1.
         codec_apple_audio::register_codecs,
+        // ATRAC1, ATRAC3 (AL) and ATRAC3+ (AL).
+        codec_atrac::register_codecs,
         // VP5, VP6, VP6F and VP6A, ahead of oxideav-vp6.
         codec_vp56::register_codecs,
+        // AMR-NB, AMR-WB and QCELP.
+        codec_speech::register_codecs,
+        // Speex, ahead of oxideav-speex.
+        codec_speex::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -113,6 +121,10 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_wmv::demuxers::register_containers,
         subs_text::register_containers,
         subs_bitmap::register_containers,
+        // The amr and qcp demuxers.
+        codec_speech::register_containers,
+        // AEA (MD STUDIO) and OMA (Sony OpenMG).
+        codec_atrac::register_containers,
     ] {
         register(&mut ctx.containers);
     }

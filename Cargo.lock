@@ -171,6 +171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-atrac"
+version = "0.1.0"
+dependencies = [
+ "check-decoders",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-dca"
 version = "0.1.0"
 dependencies = [
@@ -225,6 +234,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-speech"
+version = "0.1.0"
+dependencies = [
+ "demux-misc",
+ "oxideav-core",
+ "oxideav-mov",
+ "oxideav-mp4",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-speex"
+version = "0.1.0"
+dependencies = [
+ "oxideav-avi",
+ "oxideav-core",
+ "oxideav-flv",
+ "oxideav-ogg",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-vp3"
+version = "0.1.0"
+dependencies = [
+ "oxideav-avi",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-vp56"
 version = "0.1.0"
 dependencies = [
@@ -265,11 +305,15 @@ name = "codecs"
 version = "0.1.0"
 dependencies = [
  "codec-apple-audio",
+ "codec-atrac",
  "codec-dca",
  "codec-dv",
  "codec-mlp",
  "codec-ra",
  "codec-rv",
+ "codec-speech",
+ "codec-speex",
+ "codec-vp3",
  "codec-vp56",
  "codec-wma",
  "codec-wmv",

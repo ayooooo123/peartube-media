@@ -70,12 +70,16 @@ subs-text = { path = "../subs-text" }
 subs-cc = { path = "../subs-cc" }
 codec-ra = { path = "../codec-ra" }
 codec-rv = { path = "../codec-rv" }
+codec-vp3 = { path = "../codec-vp3" }
 codec-wmv = { path = "../codec-wmv" }
 codec-wma = { path = "../codec-wma" }
 subs-bitmap = { path = "../subs-bitmap" }
 codec-apple-audio = { path = "../codec-apple-audio" }
+codec-speech = { path = "../codec-speech" }
 codec-dv = { path = "../codec-dv" }
+codec-atrac = { path = "../codec-atrac" }
 codec-vp56 = { path = "../codec-vp56" }
+codec-speex = { path = "../codec-speex" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

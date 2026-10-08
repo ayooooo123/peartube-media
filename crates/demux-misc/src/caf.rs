@@ -3,20 +3,24 @@
 //
 // Core Audio Format demuxer: 'caff' header, a 'desc' audio description
 // chunk, then 'kuki' (magic cookie / extradata), 'pakt' (packet table),
-// 'chan', 'info' and 'data' chunks. Packets are framed by the packet
-// table: fixed bytes_per_packet/frames_per_packet, or a per-packet table
-// of (bytes, frames) lengths when variable. Timestamps are in samples.
+// 'chan', 'info' and 'data' chunks, the table before or after the data.
+// Packets are framed by the packet table: fixed bytes_per_packet/
+// frames_per_packet, or a per-packet table of (bytes, frames) lengths when
+// variable. Timestamps are in samples. The table's priming frames (first
+// packet) and remainder frames (last packet) reach the player as
+// `AudioTrim`, FFmpeg's skip-samples side data.
 
 use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
-    Packet, ProbeData, ProbeScore, ReadSeek, Result, SampleFormat, StreamInfo,
+    AudioTrim, CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
+    Packet, PacketMetadata, ProbeData, ProbeScore, ReadSeek, Result, SampleFormat, StreamInfo,
     TimeBase, CodecTag, MAX_PROBE_SCORE,
 };
 
 const CAF_MAX_PKT_SIZE: usize = 4096;
-/// Untrusted-input caps.
+/// Untrusted-input caps: chunks read into memory, packets, packet tables.
 const MAX_CHUNK_SIZE: i64 = 256 * 1024 * 1024;
+const MAX_PACKET_SIZE: i64 = 256 * 1024 * 1024;
 const MAX_PACKETS: i64 = 16 * 1024 * 1024;
 
 /// ff_codec_caf_tags (caf.c): tags the player can resolve, keyed by the
@@ -122,31 +126,41 @@ pub fn probe_caf(probe: &ProbeData) -> ProbeScore {
 struct CafDemuxer {
     input: Box<dyn ReadSeek>,
     stream: StreamInfo,
+    sample_rate: u32,
     bytes_per_packet: i64,
     frames_per_packet: i64,
     data_start: u64,
+    /// The data chunk's size without its edit count; negative when it
+    /// runs to the end of the file.
     data_size: i64,
     num_packets: i64,
     packet_cnt: i64,
     frame_cnt: i64,
     /// Per-packet (byte_pos, frame_start) from the pakt chunk when sizes
-    /// are variable; empty for fixed-size packets.
+    /// are variable (FFmpeg's index entries); empty for fixed-size packets.
     table: Vec<(i64, i64)>,
-    /// Total data bytes and total frames after the packet table.
-    total_bytes: i64,
-    total_frames: i64,
+    /// `caf->num_bytes`: the data bytes the packet table covers.
+    num_bytes: i64,
+    /// `st->duration`: the frames after the priming, without the
+    /// remainder.
+    duration: i64,
+    /// Frames to drop from the end of the last packet.
     remainder: u32,
+    /// Frames to drop from the start of the first packet.
     priming: u32,
+    /// The trims of the packet read last (`AV_PKT_DATA_SKIP_SAMPLES`).
+    metadata: PacketMetadata,
 }
 
-/// Read one chunk header: (tag, size).
-fn read_chunk_header(input: &mut Box<dyn ReadSeek>) -> Result<([u8; 4], i64)> {
-    let mut hdr = [0u8; 12];
-    input.read_exact(&mut hdr)?;
+/// Read one chunk header: (tag, size); `None` at the end of the input
+/// (fewer than 12 bytes left, FFmpeg's avio_feof after reading them).
+fn read_chunk_header(input: &mut Box<dyn ReadSeek>) -> Result<Option<([u8; 4], i64)>> {
+    let hdr = read_up_to(input, 12)?;
+    let Ok(hdr) = <[u8; 12]>::try_from(hdr) else { return Ok(None) };
     let size = i64::from_be_bytes([
         hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11],
     ]);
-    Ok(([hdr[0], hdr[1], hdr[2], hdr[3]], size))
+    Ok(Some(([hdr[0], hdr[1], hdr[2], hdr[3]], size)))
 }
 
 /// ff_mp4_read_descr_len (isom.c), used for variable-size packet tables.
@@ -163,6 +177,91 @@ fn read_descr_len(input: &mut Box<dyn ReadSeek>) -> Result<i64> {
     Ok(len)
 }
 
+/// Up to `size` bytes from the reader, which may end sooner. Memory grows
+/// with the bytes that are there, not with what a header claims.
+fn read_up_to(input: &mut Box<dyn ReadSeek>, size: u64) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    input.take(size).read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// What read_pakt_chunk sets.
+#[derive(Default)]
+struct PacketTable {
+    num_packets: i64,
+    priming: u32,
+    remainder: u32,
+    /// `st->duration`
+    duration: i64,
+    /// `caf->num_bytes`
+    num_bytes: i64,
+    /// FFmpeg's index entries: (byte_pos, frame_start), variable sizes only.
+    entries: Vec<(i64, i64)>,
+}
+
+/// read_pakt_chunk: the `size`-byte table at the reader's position, for
+/// packets of `bytes_per_packet` and `frames_per_packet` (0 where they
+/// vary), in a data chunk of `data_size` bytes (0 while the data chunk
+/// is still ahead, as in FFmpeg's zeroed context).
+fn read_pakt(
+    input: &mut Box<dyn ReadSeek>,
+    size: i64,
+    bytes_per_packet: i64,
+    frames_per_packet: i64,
+    data_size: i64,
+) -> Result<PacketTable> {
+    let invalid = || Error::invalid("caf: error reading packet table");
+    let start = input.stream_position()?;
+    if size < 0 {
+        return Err(invalid());
+    }
+    let end = start.checked_add(size as u64).ok_or_else(invalid)?;
+    let mut cnt = [0u8; 24];
+    input.read_exact(&mut cnt)?;
+    let mut num_packets = i64::from_be_bytes(cnt[0..8].try_into().expect("8 bytes"));
+    if !(0..=MAX_PACKETS).contains(&num_packets) {
+        return Err(Error::invalid("caf: packet table too large"));
+    }
+    // cnt[8..16], the valid frames, only adds up FFmpeg's nb_frames.
+    let mut table = PacketTable {
+        priming: u32::from_be_bytes(cnt[16..20].try_into().expect("4 bytes")),
+        remainder: u32::from_be_bytes(cnt[20..24].try_into().expect("4 bytes")),
+        ..PacketTable::default()
+    };
+    let priming = i64::from(table.priming);
+    if bytes_per_packet > 0 && frames_per_packet > 0 {
+        if num_packets == 0 {
+            if data_size < 0 {
+                return Err(invalid());
+            }
+            num_packets = data_size / bytes_per_packet;
+        }
+        table.duration = frames_per_packet.checked_mul(num_packets).ok_or_else(invalid)? - priming;
+        table.num_bytes = bytes_per_packet.checked_mul(num_packets).ok_or_else(invalid)?;
+    } else {
+        // Each entry takes at least one byte of the chunk.
+        table.entries.reserve(num_packets.min(size) as usize);
+        let (mut pos, mut duration) = (0i64, -priming);
+        for _ in 0..num_packets {
+            table.entries.push((pos, duration));
+            pos += if bytes_per_packet != 0 { bytes_per_packet } else { read_descr_len(input)? };
+            duration += if frames_per_packet != 0 { frames_per_packet } else { read_descr_len(input)? };
+            if input.stream_position()? > end {
+                return Err(invalid());
+            }
+        }
+        table.duration = duration;
+        table.num_bytes = pos;
+    }
+    table.duration -= i64::from(table.remainder);
+    if table.duration < 0 || input.stream_position()? > end {
+        return Err(invalid());
+    }
+    input.seek(SeekFrom::Start(end))?;
+    table.num_packets = num_packets;
+    Ok(table)
+}
+
 pub fn open_caf(
     mut input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
@@ -174,7 +273,7 @@ pub fn open_caf(
     }
 
     // audio description chunk
-    let (tag, size) = read_chunk_header(&mut input)?;
+    let (tag, size) = read_chunk_header(&mut input)?.ok_or_else(|| Error::invalid("caf: desc chunk not present"))?;
     if &tag != b"desc" {
         return Err(Error::invalid("caf: desc chunk not present"));
     }
@@ -228,181 +327,168 @@ pub fn open_caf(
         params.sample_format = Some(caf_sample_format(&codec));
     }
 
-    // chunk walk until 'data'
+    // read_header's chunk walk. Past a data chunk of known size it skips
+    // the audio and reads on, so a packet table written after the data
+    // (where FFmpeg's muxer puts it) is found; a data chunk that runs to
+    // the end of the file ends the walk.
     let mut found_data = false;
     let mut data_start = 0u64;
-    let mut data_size = -1i64;
+    let mut data_size = 0i64;
     let mut extradata: Vec<u8> = Vec::new();
-    let mut table: Vec<(i64, i64)> = Vec::new();
-    let mut num_packets = 0i64;
-    let mut total_bytes = 0i64;
-    let mut total_frames = 0i64;
-    let mut priming = 0u32;
-    let mut remainder = 0u32;
+    let mut pakt: Option<PacketTable> = None;
 
-    while !found_data {
-        let (tag, size) = match read_chunk_header(&mut input) {
-            Ok(v) => v,
-            Err(Error::Eof) => break,
-            Err(e) => return Err(e),
-        };
-        if !(0..=MAX_CHUNK_SIZE).contains(&size) {
-            return Err(Error::invalid("caf: oversized or negative chunk"));
+    loop {
+        if found_data && data_size < 0 {
+            break;
         }
+        let Some((tag, size)) = read_chunk_header(&mut input)? else { break };
         let pos = input.stream_position()?;
         match &tag {
             b"data" => {
-                let mut edit = [0u8; 4];
-                input.read_exact(&mut edit)?; // edit count
+                input.seek(SeekFrom::Current(4))?; // edit count
                 data_start = input.stream_position()?;
-                data_size = size - 4;
+                data_size = if size < 0 { -1 } else { size - 4 };
+                if data_start > i64::MAX as u64 || data_size > i64::MAX - data_start as i64 {
+                    return Err(Error::invalid("caf: data chunk overflow"));
+                }
+                if data_size > 0 {
+                    input.seek(SeekFrom::Start(data_start + data_size as u64))?;
+                }
                 found_data = true;
             }
             b"kuki" => {
-                extradata = vec![0u8; size as usize];
-                input.read_exact(&mut extradata)?;
+                if !(0..=MAX_CHUNK_SIZE).contains(&size) {
+                    return Err(Error::invalid("caf: oversized or negative magic cookie"));
+                }
+                extradata = read_up_to(&mut input, size as u64)?;
+                if extradata.len() as i64 != size {
+                    return Err(Error::invalid("caf: truncated magic cookie"));
+                }
             }
             b"pakt" => {
-                let end = pos.checked_add_signed(size).ok_or_else(|| Error::invalid("caf: chunk overflow"))?;
-                let mut cnt = [0u8; 24];
-                input.read_exact(&mut cnt)?;
-                num_packets = i64::from_be_bytes(cnt[0..8].try_into().expect("8 bytes"));
-                let _valid_frames = i64::from_be_bytes(cnt[8..16].try_into().expect("8 bytes"));
-                priming = u32::from_be_bytes(cnt[16..20].try_into().expect("4 bytes"));
-                remainder = u32::from_be_bytes(cnt[20..24].try_into().expect("4 bytes"));
-                if !(0..=MAX_PACKETS).contains(&num_packets) {
-                    return Err(Error::invalid("caf: packet table too large"));
-                }
-                let variable = !(bytes_per_packet > 0 && frames_per_packet > 0);
-                if variable && num_packets > 0 && bytes_per_packet <= 0 && frames_per_packet <= 0 {
-                    return Err(Error::invalid("caf: missing packet table sizes"));
-                }
-                if !variable {
-                    if num_packets == 0 {
-                        num_packets = if data_size > 0 { data_size / bytes_per_packet } else { 0 };
-                    }
-                    total_bytes = bytes_per_packet
-                        .checked_mul(num_packets)
-                        .ok_or_else(|| Error::invalid("caf: packet table overflow"))?;
-                    total_frames = frames_per_packet
-                        .checked_mul(num_packets)
-                        .ok_or_else(|| Error::invalid("caf: packet table overflow"))?;
-                } else {
-                    let mut pkt_pos = 0i64;
-                    let mut frame = -i64::from(priming);
-                    table.reserve(num_packets as usize);
-                    for _ in 0..num_packets {
-                        table.push((pkt_pos, frame));
-                        pkt_pos += if bytes_per_packet > 0 {
-                            bytes_per_packet
-                        } else {
-                            read_descr_len(&mut input)?
-                        };
-                        frame += if frames_per_packet > 0 {
-                            frames_per_packet
-                        } else {
-                            read_descr_len(&mut input)?
-                        };
-                        if input.stream_position()? > end || pkt_pos > MAX_CHUNK_SIZE {
-                            return Err(Error::invalid("caf: error reading packet table"));
-                        }
-                    }
-                    total_bytes = pkt_pos;
-                    total_frames = frame;
-                }
-                if input.stream_position()? > end {
-                    return Err(Error::invalid("caf: error reading packet table"));
-                }
-                input.seek(SeekFrom::Start(end))?;
+                pakt = Some(read_pakt(&mut input, size, bytes_per_packet, frames_per_packet, data_size)?);
             }
+            // 'free', 'chan', 'info' and unknown chunks are skipped.
             _ => {
-                // skip unknown chunk ('free', 'chan', 'info', ...)
-                input.seek(SeekFrom::Current(size))?;
+                if size < 0 {
+                    if found_data {
+                        break;
+                    }
+                    return Err(Error::invalid("caf: chunk of unknown size before the data"));
+                }
             }
+        }
+        if size > 0 {
+            let next = pos.checked_add(size as u64).ok_or_else(|| Error::invalid("caf: chunk overflow"))?;
+            input.seek(SeekFrom::Start(next))?;
         }
     }
 
     if !found_data {
         return Err(Error::invalid("caf: data chunk not found"));
     }
+    let constant = bytes_per_packet > 0 && frames_per_packet > 0;
+    // FFmpeg's st->duration from the packet table; without one, constant
+    // packets give nb_frames.
+    let duration = match &pakt {
+        Some(table) => Some(table.duration),
+        None if constant && data_size > 0 => Some((data_size / bytes_per_packet) * frames_per_packet),
+        None => None,
+    };
+    let pakt = pakt.unwrap_or_default();
+    if !constant && (pakt.entries.is_empty() || pakt.duration <= 0) {
+        return Err(Error::invalid("caf: missing packet table, required when block or frame size varies"));
+    }
     params.extradata = extradata;
-
     let stream = StreamInfo {
         index: 0,
         params,
         time_base: TimeBase::from_rate(sample_rate.max(1)),
-        duration: Some(total_frames - i64::from(priming) - i64::from(remainder)),
+        duration,
         start_time: Some(0),
     };
+    input.seek(SeekFrom::Start(data_start))?;
 
     Ok(Box::new(CafDemuxer {
         input,
         stream,
+        sample_rate,
         bytes_per_packet,
         frames_per_packet,
         data_start,
         data_size,
-        num_packets,
+        num_packets: pakt.num_packets,
         packet_cnt: 0,
-        frame_cnt: -i64::from(priming),
-        table,
-        total_bytes,
-        total_frames,
-        remainder,
-        priming,
+        frame_cnt: -i64::from(pakt.priming),
+        table: pakt.entries,
+        num_bytes: pakt.num_bytes,
+        duration: pakt.duration,
+        remainder: pakt.remainder,
+        priming: pakt.priming,
+        metadata: PacketMetadata::default(),
     }))
 }
 
 impl CafDemuxer {
     fn read_packet(&mut self) -> Result<Packet> {
+        self.metadata = PacketMetadata::default();
         let left = if self.data_size > 0 {
             let end = self.data_start + self.data_size as u64;
-            let cur = self.input.stream_position()?;
-            if cur >= end {
-                return Err(Error::Eof);
+            match end.checked_sub(self.input.stream_position()?) {
+                Some(0) => return Err(Error::Eof),
+                Some(left) => left as i64,
+                None => return Err(Error::invalid("caf: read past the data chunk")),
             }
-            i64::try_from(end - cur).map_err(|_| Error::invalid("caf: data offset overflow"))?
         } else {
             CAF_MAX_PKT_SIZE as i64
         };
 
-        let pkt_size;
-        let mut pkt_frames;
+        let mut pkt_size = self.bytes_per_packet;
+        let mut pkt_frames = self.frames_per_packet;
         let mut remainder = 0u32;
 
-        if self.bytes_per_packet > 0 && self.frames_per_packet == 1 {
+        if pkt_size > 0 && pkt_frames == 1 {
             // Aggregate whole frames into CAF_MAX_PKT_SIZE-sized packets.
             let bpb = self.bytes_per_packet;
-            pkt_size = ((CAF_MAX_PKT_SIZE / bpb as usize) as i64 * bpb).min(left);
+            pkt_size = ((CAF_MAX_PKT_SIZE as i64 / bpb) * bpb).min(left);
             pkt_frames = pkt_size / bpb;
         } else if !self.table.is_empty() {
             let n = self.table.len() as i64;
+            let i = self.packet_cnt as usize;
             if self.packet_cnt < n - 1 {
-                let i = self.packet_cnt as usize;
                 pkt_size = self.table[i + 1].0 - self.table[i].0;
                 pkt_frames = self.table[i + 1].1 - self.table[i].1;
             } else if self.packet_cnt == n - 1 {
-                pkt_size = self.total_bytes - self.table[(n - 1) as usize].0;
-                pkt_frames = self.total_frames - self.table[(n - 1) as usize].1;
+                pkt_size = self.num_bytes - self.table[i].0;
+                pkt_frames = self.duration - self.table[i].1;
                 remainder = self.remainder;
             } else {
                 return Err(Error::Eof);
             }
-        } else {
-            pkt_size = self.bytes_per_packet;
-            pkt_frames = self.frames_per_packet;
-            if self.packet_cnt + 1 == self.num_packets {
-                pkt_frames -= i64::from(self.remainder);
-                remainder = self.remainder;
-            }
+        } else if self.packet_cnt + 1 == self.num_packets {
+            pkt_frames -= i64::from(self.remainder);
+            remainder = self.remainder;
         }
 
-        if pkt_size <= 0 || pkt_frames <= 0 || pkt_size > left {
+        // FFmpeg refuses only a zero frame count: a remainder larger than
+        // the last packet leaves it negative, and the decoder then ignores
+        // the padding as larger than the frame.
+        if pkt_size <= 0 || pkt_frames == 0 || pkt_size > left || pkt_size > MAX_PACKET_SIZE {
             return Err(Error::invalid("caf: invalid packet size"));
         }
 
-        let mut data = vec![0u8; pkt_size as usize];
-        self.input.read_exact(&mut data)?;
+        // av_get_packet: a packet cut short by the end of the file keeps
+        // what is there.
+        let data = read_up_to(&mut self.input, pkt_size as u64)?;
+        if data.is_empty() {
+            return Err(Error::Eof);
+        }
+
+        let priming = if self.packet_cnt == 0 { self.priming } else { 0 };
+        if priming > 0 || remainder > 0 {
+            self.metadata.audio_trim =
+                Some(AudioTrim { skip_samples: priming, discard_padding: remainder, sample_rate: self.sample_rate });
+        }
 
         let pts = self.frame_cnt;
         let mut pkt = Packet {
@@ -415,14 +501,6 @@ impl CafDemuxer {
             data,
         };
         pkt.flags.keyframe = true;
-        // FFmpeg attaches priming/remainder as skip-samples side data; this
-        // crate has no side-data channel, so the first packet is marked
-        // discard for its priming frames (opus/aac) and the last packet's
-        // duration already excludes the remainder via pkt_frames above.
-        if self.packet_cnt == 0 && self.priming > 0 {
-            pkt.flags.discard = true;
-        }
-        let _ = remainder;
 
         self.packet_cnt += 1;
         self.frame_cnt += pkt_frames;
@@ -443,12 +521,19 @@ impl Demuxer for CafDemuxer {
         self.read_packet()
     }
 
+    /// The priming on the first packet and the remainder on the last, as
+    /// FFmpeg's `AV_PKT_DATA_SKIP_SAMPLES`.
+    fn packet_metadata(&self) -> PacketMetadata {
+        self.metadata.clone()
+    }
+
     /// cafdec.c read_seek with AVSEEK_FLAG_BACKWARD. Constant-size packets
     /// go by arithmetic, so PCM resumes at the target sample itself;
     /// a packet table by av_index_search_timestamp over its entries (the
     /// last packet starting at or before the target). Without either,
     /// FFmpeg's fallback (seek_frame_generic) has no index and fails too.
     fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+        self.metadata = PacketMetadata::default();
         let timestamp = pts.max(0);
         let priming = i64::from(self.priming);
         let (pos, packet_cnt, frame_cnt) = if self.frames_per_packet > 0 && self.bytes_per_packet > 0 {
