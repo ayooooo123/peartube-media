@@ -97,3 +97,57 @@ fn bit_flipped_copies_never_panic() {
         }
     }
 }
+
+/// The value bytes of every local tag `tag` (8 bytes long) in `data`.
+fn local_tag_values(data: &[u8], tag: u16) -> Vec<usize> {
+    let pattern = [(tag >> 8) as u8, tag as u8, 0, 8];
+    data.windows(4).enumerate().filter(|(_, w)| *w == pattern).map(|(i, _)| i + 4).collect()
+}
+
+/// The value offsets of the partition packs' 8-byte fields: this, previous
+/// and footer partition, header and index byte counts, body offset.
+fn partition_fields(data: &[u8]) -> Vec<Vec<usize>> {
+    const KEY: [u8; 13] = [0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0d, 0x01, 0x02, 0x01, 0x01];
+    let mut fields = vec![Vec::new(); 6];
+    for (i, _) in data.windows(13).enumerate().filter(|(_, w)| *w == KEY) {
+        let Some(&first) = data.get(i + 16) else { continue };
+        let (len_bytes, value) = if first & 0x80 != 0 { (usize::from(first & 0x7f), i + 17 + usize::from(first & 0x7f)) } else { (0, i + 17) };
+        if len_bytes > 8 || value + 60 > data.len() {
+            continue;
+        }
+        for (k, at) in [8, 16, 24, 32, 40, 52].into_iter().enumerate() {
+            fields[k].push(value + at);
+        }
+    }
+    fields
+}
+
+/// Index segments and partition packs claiming extreme 64-bit counts and
+/// positions (all ones, the sign bit alone, values whose double overflows)
+/// open or fail, read and seek without panicking.
+#[test]
+fn extreme_64_bit_index_and_partition_fields_never_panic() {
+    let mut panicked = Vec::new();
+    for sample in ["mxf/omneon_8.3.0.0_xdcam_startc_footer.mxf", "mxf/Avid-00005.mxf", "mxf/track_02_a01.mxf"] {
+        let data = std::fs::read(fate(sample)).unwrap();
+        let mut groups = vec![
+            ("IndexStartPosition", local_tag_values(&data, 0x3F0C)),
+            ("IndexDuration", local_tag_values(&data, 0x3F0D)),
+        ];
+        let names = ["ThisPartition", "PreviousPartition", "FooterPartition", "HeaderByteCount", "IndexByteCount", "BodyOffset"];
+        groups.extend(names.into_iter().zip(partition_fields(&data)));
+        assert!(!groups[1].1.is_empty(), "{sample}: an IndexDuration to patch");
+        for (field, offsets) in &groups {
+            for value in [u64::MAX, 1 << 63, (1 << 62) + 1, i64::MAX as u64] {
+                let mut patched = data.clone();
+                for &at in offsets {
+                    patched[at..at + 8].copy_from_slice(&value.to_be_bytes());
+                }
+                if std::panic::catch_unwind(|| exercise(patched)).is_err() {
+                    panicked.push(format!("{sample}: {field} = {value:#x}"));
+                }
+            }
+        }
+    }
+    assert!(panicked.is_empty(), "panicked: {panicked:#?}");
+}
