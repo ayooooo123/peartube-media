@@ -41,7 +41,6 @@ oxideav-vp9.workspace = true
 oxideav-aac.workspace = true
 oxideav-ac3.workspace = true
 oxideav-adpcm.workspace = true
-oxideav-ape.workspace = true
 oxideav-cook.workspace = true
 oxideav-dts.workspace = true
 oxideav-flac.workspace = true
@@ -57,7 +56,6 @@ oxideav-s3m.workspace = true
 oxideav-speex.workspace = true
 oxideav-tta.workspace = true
 oxideav-vorbis.workspace = true
-oxideav-wavpack.workspace = true
 oxideav-wma.workspace = true
 oxideav-ass.workspace = true
 oxideav-sub-image.workspace = true
@@ -82,6 +80,8 @@ codec-dv = { path = "../codec-dv" }
 codec-atrac = { path = "../codec-atrac" }
 codec-vp56 = { path = "../codec-vp56" }
 codec-speex = { path = "../codec-speex" }
+codec-ape = { path = "../codec-ape" }
+codec-wavpack = { path = "../codec-wavpack" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

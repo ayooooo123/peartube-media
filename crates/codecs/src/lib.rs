@@ -40,6 +40,10 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_speech::register_codecs,
         // Speex, ahead of oxideav-speex.
         codec_speex::register_codecs,
+        // Monkey's Audio (every version from 3.80) and WavPack (lossless,
+        // hybrid, float, DSD), FFmpeg's decoders ported.
+        codec_ape::register_codecs,
+        codec_wavpack::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -80,7 +84,6 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_aac::__oxideav_entry,
         oxideav_ac3::__oxideav_entry,
         oxideav_adpcm::__oxideav_entry,
-        oxideav_ape::__oxideav_entry,
         oxideav_cook::__oxideav_entry,
         oxideav_dts::__oxideav_entry,
         oxideav_flac::__oxideav_entry,
@@ -95,7 +98,6 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_speex::__oxideav_entry,
         oxideav_tta::__oxideav_entry,
         oxideav_vorbis::__oxideav_entry,
-        oxideav_wavpack::__oxideav_entry,
         oxideav_wma::__oxideav_entry,
         // Subtitles
         oxideav_ass::__oxideav_entry,
@@ -125,6 +127,9 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_speech::register_containers,
         // AEA (MD STUDIO) and OMA (Sony OpenMG).
         codec_atrac::register_containers,
+        // The ape and wv demuxers.
+        codec_ape::register_containers,
+        codec_wavpack::register_containers,
     ] {
         register(&mut ctx.containers);
     }
