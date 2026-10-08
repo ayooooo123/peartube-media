@@ -75,6 +75,7 @@ codec-wmv = { path = "../codec-wmv" }
 codec-wma = { path = "../codec-wma" }
 subs-bitmap = { path = "../subs-bitmap" }
 codec-apple-audio = { path = "../codec-apple-audio" }
+codec-speech = { path = "../codec-speech" }
 codec-dv = { path = "../codec-dv" }
 codec-vp56 = { path = "../codec-vp56" }
 

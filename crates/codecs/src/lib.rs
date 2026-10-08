@@ -34,6 +34,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_apple_audio::register_codecs,
         // VP5, VP6, VP6F and VP6A, ahead of oxideav-vp6.
         codec_vp56::register_codecs,
+        // AMR-NB, AMR-WB and QCELP.
+        codec_speech::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -115,6 +117,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_wmv::demuxers::register_containers,
         subs_text::register_containers,
         subs_bitmap::register_containers,
+        // The amr and qcp demuxers.
+        codec_speech::register_containers,
     ] {
         register(&mut ctx.containers);
     }
