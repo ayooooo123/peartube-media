@@ -1,0 +1,65 @@
+total samples (sum of self): 11971
+
+self by function:
+   1607  13.4%  oxideav_h265::transform_unit::decode_one_residual::h6b9d1f5559a3b739
+   1114   9.3%  oxideav_h265::inter_pred::interp_into::h4fe9b175ef31aada
+   1029   8.6%  _$LT$oxideav_h265..residual..EngineResidualBinSource$u20$as$u20$oxideav_h265..residual..ResidualBinSource$GT$::decision::h8d15f26df70c549e
+    817   6.8%  oxideav_h265::transform::transform_passes::_$u7b$$u7b$closure$u7d$$u7d$::h311071b629d52d48
+    816   6.8%  oxideav_h265::recon::predict_inter_pu_into::_$u7b$$u7b$closure$u7d$$u7d$::h724541d792ad5cd1
+    507   4.2%  oxideav_h265::inter_pred::list_chroma_into::ha244ada8b797b799
+    481   4.0%  oxideav_h265::deblock::filter_luma_block_edge_gated::he0031b5cf813acef
+    444   3.7%  oxideav_h265::sao::sao_ctb_core::h8a6bace0e6990368
+    268   2.2%  oxideav_h265::inter_recon::resolve_and_reconstruct_inter_cu::h40f917ca3ee8f8a9
+    257   2.1%  oxideav_h265::deblock::DeblockEdgeMap::add_cu::hc7d9e7cc56a16a1e
+    238   2.0%  oxideav_h265::slice_data::decode_coding_unit::h297e4a4b76f7f1c6
+    211   1.8%  _xzm_free
+    210   1.8%  oxideav_h265::sao::sao_ctb_core::_$u7b$$u7b$closure$u7d$$u7d$::hb8549d15f1dcce14
+    182   1.5%  _platform_memmove
+    181   1.5%  oxideav_h265::transform::scaled_inverse_transform::h64ad27e1931b4845
+    164   1.4%  oxideav_h265::deblock::deblock_rows_planes::h7667c9fe8ceda231
+    161   1.3%  oxideav_h265::recon::add_residual::h10d0d4449e1695a4
+    147   1.2%  oxideav_h265::inter_pred::gather_window::he287198ae96574bf
+    147   1.2%  _platform_memset
+    141   1.2%  oxideav_h265::inter_recon::reconstruct_inter_leaf_cu::_$u7b$$u7b$closure$u7d$$u7d$::h048719c1996370e7
+    140   1.2%  oxideav_h265::recon::predict_add_store::hdcb47b576614b5cc
+    130   1.1%  _xzm_xzone_malloc_tiny
+    126   1.1%  oxideav_h265::inter_recon::reconstruct_inter_quadtree::h0dfeb93c1ac95fad
+    126   1.1%  oxideav_h265::deblock::filter_luma_block_edge_gated::_$u7b$$u7b$closure$u7d$$u7d$::h57749a91d24332e5
+    120   1.0%  oxideav_h265::motion::MotionField::fill_rect::h2e6a08758fe13b88
+    111   0.9%  oxideav_h265::transform_tree::decode_transform_tree::hf48dfc473d337d2d
+    109   0.9%  oxideav_h265::decoder::H265Decoder::drain::hbe15b2353e5dc8e7
+    105   0.9%  oxideav_h265::slice_data::PictureParseState::record_cu_depth::h53459387a6be8581
+     98   0.8%  oxideav_h265::transform::scaled_inverse_transform::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$::h2a06908a73591c23
+     87   0.7%  _xzm_xzone_malloc
+
+self by line:
+   1573  13.1%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/transform_unit.rs:524 oxideav_h265::transform_unit::decode_one_residual::h6b9d1f5559a3b739
+    778   6.5%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/residual.rs:360 _$LT$oxideav_h265..residual..EngineResidualBinSource$u20$as$u20$oxideav_h265..residual..ResidualBinSource$GT$:
+    659   5.5%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/recon.rs:824 oxideav_h265::recon::predict_inter_pu_into::_$u7b$$u7b$closure$u7d$$u7d$::h724541d792ad5cd1
+    583   4.9%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/transform.rs:789 oxideav_h265::transform::transform_passes::_$u7b$$u7b$closure$u7d$$u7d$::h311071b629d52d48
+    475   4.0%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_pred.rs:1144 oxideav_h265::inter_pred::list_chroma_into::ha244ada8b797b799
+    376   3.1%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_pred.rs:559 oxideav_h265::inter_pred::interp_into::h4fe9b175ef31aada
+    375   3.1%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_pred.rs:578 oxideav_h265::inter_pred::interp_into::h4fe9b175ef31aada
+    257   2.1%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/deblock.rs:936 oxideav_h265::deblock::filter_luma_block_edge_gated::he0031b5cf813acef
+    254   2.1%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/sao.rs:523 oxideav_h265::sao::sao_ctb_core::h8a6bace0e6990368
+    211   1.8%                                           _xzm_free
+    198   1.7%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_recon.rs:356 oxideav_h265::inter_recon::resolve_and_reconstruct_inter_cu::h40f917ca3ee8f8a9
+    182   1.5%                                           _platform_memmove
+    168   1.4%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/residual.rs:345 _$LT$oxideav_h265..residual..EngineResidualBinSource$u20$as$u20$oxideav_h265..residual..ResidualBinSource$GT$:
+    166   1.4%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/transform.rs:617 oxideav_h265::transform::scaled_inverse_transform::h64ad27e1931b4845
+    154   1.3%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/transform.rs:788 oxideav_h265::transform::transform_passes::_$u7b$$u7b$closure$u7d$$u7d$::h311071b629d52d48
+    147   1.2%                                           _platform_memset
+    130   1.1%                                           _xzm_xzone_malloc_tiny
+    129   1.1%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_pred.rs:395 oxideav_h265::inter_pred::gather_window::he287198ae96574bf
+    128   1.1%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_pred.rs:585 oxideav_h265::inter_pred::interp_into::h4fe9b175ef31aada
+    109   0.9%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_recon.rs:1591 oxideav_h265::inter_recon::reconstruct_inter_leaf_cu::_$u7b$$u7b$closure$u7d$$u7d$::h048719c1996370e7
+    109   0.9%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/decoder.rs:202 oxideav_h265::decoder::H265Decoder::drain::hbe15b2353e5dc8e7
+    106   0.9%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/deblock.rs:929 oxideav_h265::deblock::filter_luma_block_edge_gated::he0031b5cf813acef
+    104   0.9%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_pred.rs:551 oxideav_h265::inter_pred::interp_into::h4fe9b175ef31aada
+    100   0.8%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/inter_recon.rs:1395 oxideav_h265::inter_recon::reconstruct_inter_quadtree::h0dfeb93c1ac95fad
+     87   0.7%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/transform.rs:622 oxideav_h265::transform::scaled_inverse_transform::_$u7b$$u7b$closure$u7d$$u7d$::_$u7b$$u7b$closure$u7d$$u7d$:
+     87   0.7%                                           _xzm_xzone_malloc
+     73   0.6%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/recon.rs:848 oxideav_h265::recon::add_residual::h10d0d4449e1695a4
+     71   0.6%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/recon.rs:610 oxideav_h265::recon::predict_add_store::hdcb47b576614b5cc
+     70   0.6%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/slice_data.rs:1061 oxideav_h265::slice_data::decode_coding_unit::h297e4a4b76f7f1c6
+     64   0.5%  oxideav-h265-7fc5e2e80c48304e/279ecc3/src/transform_tree.rs:341 oxideav_h265::transform_tree::decode_transform_tree::hf48dfc473d337d2d

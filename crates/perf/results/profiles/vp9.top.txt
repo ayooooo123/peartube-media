@@ -1,0 +1,65 @@
+total samples (sum of self): 93891
+
+self by function:
+  63589  67.7%  oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+  13877  14.8%  oxideav_vp9::decode_frame::BlockDecoder::predict_inter_region::hc9cae6fd12d642d8
+   2456   2.6%  oxideav_vp9::tokens::tokens::h172ebcfdd53f9a57
+   1238   1.3%  oxideav_vp9::decode_frame::BlockDecoder::decode_block::hcd7fa2bd802c6916
+   1219   1.3%  oxideav_vp9::idct::apply_1d::ha0e40b2c2a7903e0
+   1141   1.2%  oxideav_vp9::idct::inverse_dct::h34392ffc28d4b4f7
+   1095   1.2%  _platform_memmove
+   1094   1.2%  oxideav_vp9::idct::butterfly::hcf71ac921a484675
+   1071   1.1%  oxideav_vp9::decode_frame::decode_single_frame::_$u7b$$u7b$closure$u7d$$u7d$::h5ca72865087c02c5
+    827   0.9%  oxideav_vp9::reconstruct::reconstruct_block::hb6a9c0779e1d4948
+    705   0.8%  _xzm_free
+    543   0.6%  _platform_memset
+    484   0.5%  oxideav_vp9::mv_ref::MvRefGeometry::find_mv_refs::h769fdd9e0147e75f
+    451   0.5%  oxideav_vp9::partition::decode_partition::h043f4e86105f29a4
+    443   0.5%  oxideav_vp9::decode_block::decode_block_apply::h28fee1a2e2fe9250
+    279   0.3%  _xzm_xzone_malloc
+    259   0.3%  mach_absolute_time
+    212   0.2%  _xzm_xzone_malloc_tiny
+    175   0.2%  oxideav_vp9::mv_ref::MvRefGeometry::if_diff_ref_frame_add_mv::h7c68c07091b82ac1
+    167   0.2%  _xzm_malloc_zone_malloc_type_calloc_entry
+    166   0.2%  _free
+    158   0.2%  _malloc_zone_malloc
+    154   0.2%  _$LT$alloc..vec..Vec$LT$T$GT$$u20$as$u20$alloc..vec..spec_from_iter_nested..SpecFromIterNested$LT$T$C$I$GT$$GT$::from_iter::h8b09ed22e13bb263
+    146   0.2%  oxideav_vp9::mv::assign_mv::h3e7f6e81cb2dc3d6
+    145   0.2%  oxideav_vp9::mv_ref::MvRefGeometry::get_block_mv::h992f9c65dbc64c8e
+    123   0.1%  _malloc_zone_calloc
+    121   0.1%  <deduplicated_symbol>
+    118   0.1%  _xzm_xzone_malloc_freelist_outlined
+    111   0.1%  oxideav_vp9::mv::read_mv_component::h7ea844e8e89022fc
+    105   0.1%  oxideav_vp9::codec::pack_plane::hb9cbc4dfc8b56cf8
+
+self by line:
+  50540  53.8%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:399 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+  13684  14.6%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/decode_frame.rs:1074 oxideav_vp9::decode_frame::BlockDecoder::predict_inter_region::hc9cae6fd12d642d8
+   3392   3.6%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:407 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+   2830   3.0%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:398 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+   2487   2.6%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:348 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+   1210   1.3%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/decode_frame.rs:223 oxideav_vp9::decode_frame::BlockDecoder::decode_block::hcd7fa2bd802c6916
+   1159   1.2%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/idct.rs:481 oxideav_vp9::idct::apply_1d::ha0e40b2c2a7903e0
+   1095   1.2%                                           _platform_memmove
+   1059   1.1%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/decode_frame.rs:1870 oxideav_vp9::decode_frame::decode_single_frame::_$u7b$$u7b$closure$u7d$$u7d$::h5ca72865087c02c5
+    850   0.9%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/tokens.rs:785 oxideav_vp9::tokens::tokens::h172ebcfdd53f9a57
+    705   0.8%                                           _xzm_free
+    633   0.7%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/tokens.rs:784 oxideav_vp9::tokens::tokens::h172ebcfdd53f9a57
+    623   0.7%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:329 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    574   0.6%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/idct.rs:253 oxideav_vp9::idct::inverse_dct::h34392ffc28d4b4f7
+    564   0.6%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:312 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    543   0.6%                                           _platform_memset
+    538   0.6%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:368 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    455   0.5%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/idct.rs:123 oxideav_vp9::idct::butterfly::hcf71ac921a484675
+    343   0.4%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/filter_mask.rs:0 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    327   0.3%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/reconstruct.rs:156 oxideav_vp9::reconstruct::reconstruct_block::hb6a9c0779e1d4948
+    316   0.3%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:323 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    301   0.3%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:382 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    279   0.3%                                           _xzm_xzone_malloc
+    259   0.3%                                           mach_absolute_time
+    248   0.3%  /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/core/src/iter/range.rs:0 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    236   0.3%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:300 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    236   0.3%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/partition.rs:839 oxideav_vp9::partition::decode_partition::h043f4e86105f29a4
+    212   0.2%                                           _xzm_xzone_malloc_tiny
+    193   0.2%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/superblock_loop_filter.rs:345 oxideav_vp9::superblock_loop_filter::superblock_loop_filter::h279d21db4104d156
+    182   0.2%  oxideav-vp9-86d6da4e6b50492a/35a7c43/src/idct.rs:0 oxideav_vp9::idct::butterfly::hcf71ac921a484675
