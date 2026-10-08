@@ -12,6 +12,10 @@ autoexamples = false
 # aarch64-linux-android target. Host `cargo test --no-run` skips it because
 # the feature is off by default.
 probe = []
+# https sources (oxideav-http's rustls and ring). Off: the app plays only
+# http streams from its worklet on 127.0.0.1, and an https URL fails to
+# open with an error that names this feature.
+https = ["oxideav-http/tls"]
 
 [dependencies]
 audio-trim = { path = "../audio-trim" }

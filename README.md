@@ -17,7 +17,7 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 
 ## Design
 
-- **Source**: `oxideav-http`'s `HttpSource` (HTTP/1.1 Range, `Read + Seek`) behind a bounded read-ahead ring. Reads have a deadline, so a suspended worklet fails reads instead of hanging them; resume reopens at the last offset.
+- **Source**: `oxideav-http`'s `HttpSource` (HTTP/1.1 Range, `Read + Seek`) behind a bounded read-ahead ring. Reads have a deadline, so a suspended worklet fails reads instead of hanging them; resume reopens at the last offset. Plain http only by default: the app reads every stream from its worklet on 127.0.0.1, so the `oxideav-http` fork builds without its `tls` feature and an `https://` URL fails to open with an error naming it. The player's `https` feature turns TLS back on.
 - **Demux**: `ContainerRegistry::probe_input` (rewinds after reading up to 256 KiB), then `open_demuxer(name, input, &codecs)`. One demux thread fills per-stream packet queues bounded in both duration and bytes.
 - **Packet metadata and seeking**: snapshot `Demuxer::packet_metadata()` with each packet, including queued-byte accounting for owned cue metadata. A container random-access point is separate from the codec parser's keyframe flag; the engine and both native decoder gates accept either without changing parser flags. The open-GOP Matroska regression requires all 100 post-seek frames to match FFmpeg, not merely resumed output. Metadata transport is in place and audio trims are applied (below); WebVTT settings rendering remains incomplete.
 - **Buffering**: the read-ahead ring reports when a read waits for bytes that have not arrived. The clock holds at the start until the first audio and video are decoded and about a second is queued (or the input ends), likewise after a seek, and mid-stream whenever a pipeline runs dry while the source is starved, until a second is queued past the clock again. `buffering` in the state follows the hold; `play`/`pause` stay the user's intent, so a pause during buffering stays paused when the data arrives.
@@ -48,6 +48,8 @@ OxideAV crates are used at pinned git revisions; their crates.io releases lag th
 The player never encodes or muxes. `crates/codecs` turns on the core fork's `decode-only` feature: `CodecInfo::encoder` and `ContainerRegistry::register_muxer` drop their factories, so nothing references OxideAV's encoders and muxers and LTO removes them (Android `libmain.so`: 27.3 MB to 21.0 MB stripped, 13.2 MB to 9.9 MB deflated in the APK).
 
 Release builds compile dependencies and this workspace's cold crates at `opt-level = "s"` and the code that must keep its speed at 3: the H.264, HEVC, AV1, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, VC-1/WMV (`codec-wmv`), AAC, Opus, MP3, AC-3 and DTS (`codec-dca`) decoders, `oxideav-core` (bit readers), `oxideav-pixfmt` (RGBA conversion of software frames), the Ogg demuxer (it runs per packet; at `"s"` Opus in Ogg took about 0.4% more instructions) and `player`. Binaries stay at 3: fat LTO optimises the whole program at the final crate's level, and at `"s"` rustc turns loop and SLP vectorization off for all of it. The app's `mobile/Cargo.toml` carries the same lists (there every dependency not named is `"s"`; here a workspace crate not named is 3), so a new crate goes on one of them in both files. This saves another 1.5 MB raw, 1.1 MB deflated.
+
+Leaving TLS out (rustls, ring and the webpki roots, through `oxideav-http`'s `tls` feature) saves another 0.86 MB raw, 0.54 MB deflated, in the Android `libmain.so`.
 
 ### Matroska packet compatibility
 

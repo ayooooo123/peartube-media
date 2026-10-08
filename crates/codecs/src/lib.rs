@@ -40,6 +40,14 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_speech::register_codecs,
         // Speex, ahead of oxideav-speex.
         codec_speex::register_codecs,
+        // SVQ3, ahead of oxideav-svq.
+        codec_svq3::register_codecs,
+        // Monkey's Audio (every version from 3.80), Musepack SV7 and SV8,
+        // and WavPack (lossless, hybrid, float, DSD): FFmpeg's decoders,
+        // ported.
+        codec_ape::register_codecs,
+        codec_musepack::register_codecs,
+        codec_wavpack::register_codecs,
         // DVD-Video and Blu-ray LPCM.
         codec_lpcm::register_codecs,
     ] {
@@ -82,7 +90,6 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_aac::__oxideav_entry,
         oxideav_ac3::__oxideav_entry,
         oxideav_adpcm::__oxideav_entry,
-        oxideav_ape::__oxideav_entry,
         oxideav_cook::__oxideav_entry,
         oxideav_dts::__oxideav_entry,
         oxideav_flac::__oxideav_entry,
@@ -91,13 +98,11 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_mp1::__oxideav_entry,
         oxideav_mp2::__oxideav_entry,
         oxideav_mp3::__oxideav_entry,
-        oxideav_musepack::__oxideav_entry,
         oxideav_opus::__oxideav_entry,
         oxideav_s3m::__oxideav_entry,
         oxideav_speex::__oxideav_entry,
         oxideav_tta::__oxideav_entry,
         oxideav_vorbis::__oxideav_entry,
-        oxideav_wavpack::__oxideav_entry,
         oxideav_wma::__oxideav_entry,
         // Subtitles
         oxideav_ass::__oxideav_entry,
@@ -129,6 +134,10 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_speech::register_containers,
         // AEA (MD STUDIO) and OMA (Sony OpenMG).
         codec_atrac::register_containers,
+        // The ape, mpc (SV7), mpc8 (SV8) and wv demuxers.
+        codec_ape::register_containers,
+        codec_musepack::register_containers,
+        codec_wavpack::register_containers,
     ] {
         register(&mut ctx.containers);
     }

@@ -12,3 +12,5 @@ demux-seek-core.workspace = true
 md5 = "0.7"
 refcheck.workspace = true
 oxideav-mkv.workspace = true
+oxideav-mp4.workspace = true
+oxideav-mpegts.workspace = true
