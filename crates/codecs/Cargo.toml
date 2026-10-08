@@ -76,6 +76,7 @@ subs-bitmap = { path = "../subs-bitmap" }
 codec-apple-audio = { path = "../codec-apple-audio" }
 codec-dv = { path = "../codec-dv" }
 codec-vp56 = { path = "../codec-vp56" }
+codec-speex = { path = "../codec-speex" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }
