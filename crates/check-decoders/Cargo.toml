@@ -16,3 +16,4 @@ demux-misc = { path = "../demux-misc" }
 oxideav-h264.workspace = true
 oxideav-mp2.workspace = true
 oxideav-ac3.workspace = true
+oxideav-mp3.workspace = true
