@@ -57,7 +57,6 @@ oxideav-cook = "*"
 oxideav-dts = "*"
 oxideav-flac = "*"
 oxideav-g711 = "*"
-oxideav-midi = "*"
 oxideav-mp2 = "*"
 oxideav-mp3 = "*"
 oxideav-opus = "*"
@@ -219,7 +218,6 @@ oxideav-id3 = { git = "https://github.com/OxideAV/oxideav-id3", rev = "d1b462e3d
 oxideav-iff = { git = "https://github.com/ayooooo123/oxideav-iff", rev = "50e0fc05c1c13303df6c9d212e7046f5eb2a3ea5" }
 oxideav-image-filter = { git = "https://github.com/OxideAV/oxideav-image-filter", rev = "601f4fe832e31fdd9dc3f2bf171389cc09f0dd68" }
 oxideav-indeo = { git = "https://github.com/ayooooo123/oxideav-indeo", rev = "34d5d899b74bd4add72e0572813458bd9fa9a853" }
-oxideav-midi = { git = "https://github.com/OxideAV/oxideav-midi", rev = "cf1b26b7b44b3427e78378c2b74e80e695c12e58" }
 oxideav-mjpeg = { git = "https://github.com/ayooooo123/oxideav-mjpeg", rev = "f0ec865380f1dffd79468587497ce50aea7a138d" }
 oxideav-mkv = { git = "https://github.com/ayooooo123/oxideav-mkv", rev = "0de83f90bd7a9390a893ad92d9992057d90ca5ae" }
 oxideav-mov = { git = "https://github.com/ayooooo123/oxideav-mov", rev = "d6af48d7db0428583b60ae52b0f2bbc0901d4318" }
