@@ -18,6 +18,10 @@ pub fn run(binary: &Path, args: &[&str]) -> Vec<u8> {
 /// `name` in the persistent scratch directory, made by the `ffmpeg` on
 /// PATH from `input` with `output_args` on first use, published by rename.
 pub fn remux(name: &str, input: &Path, output_args: &[&str]) -> PathBuf {
+    // Tests in one binary run in parallel and share the per-process partial
+    // name: make one remux at a time so none renames another's file away.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("codec-speech");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
