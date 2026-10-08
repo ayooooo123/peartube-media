@@ -14,9 +14,10 @@
 //!   in order, type and codec;
 //! - the packets equal ffprobe's one for one: stream, size, payload MD5;
 //! - containers and raw audio: pts and dts, rescaled to FFmpeg's stream
-//!   time base, equal ffprobe's. PVA and NUT compare with FFmpeg's
+//!   time base, equal ffprobe's. NUT and PVA video compare with FFmpeg's
 //!   demuxer output (`-fflags +noparse+nofillin`), excluding parser
-//!   reframing and decoder-dependent DTS interpolation.
+//!   reframing and decoder-dependent DTS interpolation; PVA audio with
+//!   the MP2 frames FFmpeg's parser cuts.
 //! - raw video elementary streams (MPEG-1/2, H.264, HEVC): the access
 //!   units and key flags FFmpeg's parsers produce (key flags from
 //!   `ffmpeg -dump`). Raw MPEG-1/2 also compares pts, dts (a missing one
@@ -735,10 +736,42 @@ fn x264_and_x265_streams_are_untimed_with_their_frame_durations() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// PES payloads with the PTS each PES carries.
+/// PVA: video PES payloads with the PTS each PES carries, as FFmpeg's
+/// demuxer output (`-fflags +noparse+nofillin`, the MPEG-2 decoder takes
+/// them whole); audio as the MP2 frames FFmpeg's mpegaudio parser cuts,
+/// with the pts, dts and duration its demuxer layer gives them.
 #[test]
 fn pva() {
-    check_inventory("pva", &["pva"], Mode { unparsed: true, ..CONTAINER });
+    for rel in inventory("pva", &["pva"]) {
+        let path = suite_path(&rel);
+        let ctx = codecs::context();
+        assert_eq!(probe(&ctx, &path).as_deref(), Some("pva"), "{rel}: probe");
+        let mut demuxer = ctx.containers.open_demuxer("pva", Box::new(std::fs::File::open(&path).unwrap()), &ctx.codecs).unwrap();
+        let mut ours = Vec::new();
+        while let Ok(p) = demuxer.next_packet() {
+            ours.push(Pkt {
+                stream: p.stream_index,
+                size: p.data.len(),
+                md5: refcheck::md5_hex(&p.data),
+                pts: p.pts,
+                dts: p.dts,
+                duration: p.duration,
+                key: p.flags.keyframe,
+            });
+        }
+        let (_, unparsed) = ffprobe(&path, "pva", true);
+        let (_, parsed) = ffprobe(&path, "pva", false);
+        for (stream, table, durations) in [(0, &unparsed, false), (1, &parsed, true)] {
+            let mine: Vec<&Pkt> = ours.iter().filter(|p| p.stream == stream).collect();
+            let theirs: Vec<&Pkt> = table.iter().filter(|p| p.stream == stream).collect();
+            assert_eq!(mine.len(), theirs.len(), "{rel}: stream {stream} packets");
+            for (n, (got, want)) in mine.iter().zip(&theirs).enumerate() {
+                let same = (got.size, &got.md5, got.pts, got.dts) == (want.size, &want.md5, want.pts, want.dts)
+                    && (!durations || got.duration == want.duration);
+                assert!(same, "{rel}: stream {stream} packet {n}: ours {got:?}, ffprobe {want:?}");
+            }
+        }
+    }
 }
 
 /// adpcm.mak: one packet per block (at most 2048 bytes), timed in

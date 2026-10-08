@@ -316,12 +316,33 @@ fn nut() {
 /// bounds on the index: on what avformat_find_stream_info read ahead,
 /// which this demuxer does not model (FFmpeg reads 59 packets of this
 /// file, and lands 0.08 s later at 18979.75 than without them). FFmpeg
-/// therefore runs without read-ahead here.
+/// therefore runs without read-ahead here. Each stream is compared on its
+/// own: video with FFmpeg's demuxer output (the decoder takes the PES
+/// payloads whole), audio with the MP2 frames its parser cuts. At
+/// 18979.75 FFmpeg with its parsers on lands later than with them off
+/// (its stream discovery reads differently: the first video packet comes
+/// from byte 338004, not 254852), so the parsed audio there answers
+/// another landing and is not compared.
 #[test]
 fn pva() {
     let rel = "pva/PVA_test-partial.pva";
-    let mode = Mode { unparsed: true, no_read_ahead: true, ..CONTAINER };
-    check(&refcheck::fate(rel), rel, "pva", &["0.5", "18979.3", "18979.75", "18980.1"], 6, mode);
+    let path = refcheck::fate(rel);
+    let mut failures = Vec::new();
+    for target in ["0.5", "18979.3", "18979.75", "18980.1"] {
+        let (streams, landed, ours) = ours_after(&path, "pva", target, 96).unwrap_or_else(|e| panic!("{rel} @ {target}: {e}"));
+        let audio = target != "18979.75";
+        for (stream, unparsed) in [(0u32, true), (1, false)].into_iter().filter(|&(s, _)| s == 0 || audio) {
+            let mode = Mode { unparsed, no_read_ahead: true, ..CONTAINER };
+            let (time_bases, want) = ffprobe_after(&path, "pva", target, 96, mode).unwrap_or_else(|e| panic!("{rel} @ {target}: {e}"));
+            let pick = |packets: Vec<Pkt>| packets.into_iter().filter(|p| p.stream == stream).take(6).collect::<Vec<_>>();
+            let want = pick(without(want, mode));
+            let got = pick(comparable(&ours, &streams, &time_bases, mode));
+            if want.len() < 6 || got != want {
+                failures.push(format!("{rel} @ {target} stream {stream}: landed {landed}\n  ours   {got:?}\n  ffmpeg {want:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} PVA seeks differ from FFmpeg:\n{}", failures.len(), failures.join("\n"));
 }
 
 /// The streams the MPEG-PS demuxer re-frames with FFmpeg's parsers.

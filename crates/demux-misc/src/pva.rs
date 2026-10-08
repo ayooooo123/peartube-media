@@ -1,5 +1,6 @@
 // Ported from FFmpeg libavformat/pva.c (commit 2da55bf), with the
-// timestamp seek of libavformat/seek.c (ff_seek_frame_binary).
+// timestamp seek of libavformat/seek.c (ff_seek_frame_binary); the audio
+// is cut into frames by the mpegaudio parser (see parser.rs).
 // License: LGPL-2.1-or-later
 
 use std::io::{Read, Seek, SeekFrom};
@@ -9,7 +10,11 @@ use oxideav_core::{
     PROBE_SCORE_EXTENSION,
 };
 
+use std::collections::VecDeque;
+
 use demux_seek_core::{gen_search, Allowance, Bounds, Index};
+
+use crate::parser::{AudioClock, MpegAudio, Parser};
 
 const PVA_MAGIC: u16 = 0x4156; // "AV"
 const PVA_MAX_PAYLOAD_LENGTH: usize = 0x17F8;
@@ -55,12 +60,24 @@ pub fn probe_pva(probe: &ProbeData) -> ProbeScore {
 pub struct PvaDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    continue_pes: usize,
+    /// PES bytes still to come in later PVA audio packets
+    /// (continue_pes; FFmpeg resets it to 0 when it goes negative).
+    continue_pes: i64,
     /// Per stream: where each PVA packet with a pts starts, by pts
     /// (read_part_of_packet indexes them; pva_read_header adds 0 at 0).
     index: [Index; 2],
     /// What the seek under way may still read.
     allowance: Allowance,
+    /// The MP2 frames FFmpeg's mpegaudio parser cuts from the audio
+    /// payloads, timed by its demuxer layer (pts_wrap_bits 33).
+    audio: Parser<MpegAudio>,
+    clock: AudioClock,
+    /// Packets parsed and not yet returned.
+    queue: VecDeque<Packet>,
+    /// Reading has ended (the parser has handed over all it held).
+    ended: bool,
+    /// The error that ended reading, returned once the queue is empty.
+    error: Option<Error>,
 }
 
 pub fn open_pva(
@@ -100,6 +117,11 @@ pub fn open_pva(
         continue_pes: 0,
         index,
         allowance,
+        audio: Parser::new(MpegAudio::new("mp2")),
+        clock: AudioClock::new(1, 90_000, 33),
+        queue: VecDeque::new(),
+        ended: false,
+        error: None,
     }))
 }
 
@@ -204,6 +226,100 @@ impl PvaDemuxer {
         let file_size = self.input.seek(SeekFrom::End(0))? as i64;
         gen_search(timestamp, bounds, 0, file_size, &mut |pos, limit| self.read_timestamp(pos, limit, stream))
     }
+
+    /// pva_read_packet: the next PVA packet's payload as the container
+    /// carries it, and where its header starts. read_part_of_packet with
+    /// its recovery: an audio packet that should start a PES and does not
+    /// is skipped (`trying to recover`), the next one read.
+    fn read_pva(&mut self) -> Result<(Packet, i64)> {
+        loop {
+            let startpos = self.input.stream_position()? as i64;
+            let mut hdr = [0u8; 8];
+            match self.input.read(&mut hdr) {
+                Ok(0) => return Err(Error::Eof),
+                Ok(n) if n < 8 => return Err(Error::Eof),
+                Ok(_) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let magic = u16::from_be_bytes([hdr[0], hdr[1]]);
+            let streamid = hdr[2];
+            let flags = hdr[5];
+            let mut length = i64::from(u16::from_be_bytes([hdr[6], hdr[7]]));
+            if magic != PVA_MAGIC || (streamid != PVA_VIDEO_PAYLOAD && streamid != PVA_AUDIO_PAYLOAD) {
+                return Err(Error::invalid("pva: invalid syncword or stream id"));
+            }
+            if length > PVA_MAX_PAYLOAD_LENGTH as i64 {
+                return Err(Error::invalid("pva: payload length exceeds maximum"));
+            }
+            let mut pva_pts: Option<i64> = None;
+            if streamid == PVA_VIDEO_PAYLOAD && flags & 0x10 != 0 {
+                let (pts, _) = read_padded::<4>(&mut *self.input)?;
+                pva_pts = Some(i64::from(u32::from_be_bytes(pts)));
+                length -= 4;
+            } else if streamid == PVA_AUDIO_PAYLOAD {
+                // A PES starts at the start of a PVA audio packet or not
+                // at all; the others continue the previous PES.
+                if self.continue_pes == 0 {
+                    let (pes, eof) = read_padded::<9>(&mut *self.input)?;
+                    if eof {
+                        return Err(Error::Eof);
+                    }
+                    let pes_signal = (u32::from(pes[0]) << 16) | (u32::from(pes[1]) << 8) | u32::from(pes[2]);
+                    let pes_packet_length = i64::from(u16::from_be_bytes([pes[4], pes[5]]));
+                    let pes_flags = u16::from_be_bytes([pes[6], pes[7]]);
+                    let header_len = usize::from(pes[8]);
+                    if pes_signal != 1 || header_len == 0 {
+                        // "expected non empty signaled PES packet, trying
+                        // to recover": past the rest of the packet.
+                        self.input.seek(SeekFrom::Current(length - 9))?;
+                        continue;
+                    }
+                    let mut header = vec![0u8; header_len];
+                    self.input.read_exact(&mut header)?;
+                    length -= 9 + header_len as i64;
+                    self.continue_pes = pes_packet_length - 3 - header_len as i64;
+                    if pes_flags & 0x80 != 0 && header[0] & 0xF0 == 0x20 {
+                        if header_len < 5 {
+                            self.input.seek(SeekFrom::Current(length))?;
+                            return Err(Error::invalid("pva: PES header too short"));
+                        }
+                        pva_pts = Some(parse_pes_pts(&header));
+                    }
+                }
+                self.continue_pes -= length;
+                if self.continue_pes < 0 {
+                    // "audio data corruption"
+                    self.continue_pes = 0;
+                }
+            }
+            if length < 0 {
+                return Err(Error::invalid("pva: payload shorter than its headers"));
+            }
+            let stream_index = u32::from(streamid - 1);
+            if let Some(pts) = pva_pts {
+                self.index[stream_index as usize].add(startpos, pts, 0, 0, true);
+            }
+            // av_get_packet: a cut file ends mid-packet with the bytes it
+            // has; nothing at all ends reading.
+            let mut payload = Vec::with_capacity(length as usize);
+            (&mut *self.input).take(length as u64).read_to_end(&mut payload)?;
+            if payload.is_empty() {
+                return Err(Error::Eof);
+            }
+            let mut pkt = Packet {
+                stream_index,
+                time_base: TimeBase::new(1, 90000),
+                pts: pva_pts,
+                // pva_read_packet supplies PTS only, not decoder-order time.
+                dts: None,
+                duration: None,
+                flags: Default::default(),
+                data: payload,
+            };
+            pkt.flags.keyframe = true;
+            return Ok((pkt, startpos));
+        }
+    }
 }
 
 impl Demuxer for PvaDemuxer {
@@ -215,96 +331,39 @@ impl Demuxer for PvaDemuxer {
         &self.streams
     }
 
+    /// av_read_frame: video payloads as the container carries them, audio
+    /// as the MP2 frames FFmpeg's mpegaudio parser cuts from the payloads
+    /// (AVSTREAM_PARSE_FULL), timed by its demuxer layer. When reading
+    /// ends, at the end of the input or on an error, the parser hands
+    /// over what it holds before the end or the error is returned
+    /// (read_frame_internal flushes every parser).
     fn next_packet(&mut self) -> Result<Packet> {
-        let startpos = self.input.stream_position()? as i64;
-        let mut hdr = [0u8; 8];
-        match self.input.read(&mut hdr) {
-            Ok(0) => return Err(Error::Eof),
-            Ok(n) if n < 8 => return Err(Error::Eof),
-            Ok(_) => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        let magic = u16::from_be_bytes([hdr[0], hdr[1]]);
-        let streamid = hdr[2];
-        let flags = hdr[5];
-        let mut length = u16::from_be_bytes([hdr[6], hdr[7]]) as usize;
-
-        if magic != PVA_MAGIC || (streamid != PVA_VIDEO_PAYLOAD && streamid != PVA_AUDIO_PAYLOAD) {
-            return Err(Error::invalid("pva: invalid syncword or stream id"));
-        }
-        if length > PVA_MAX_PAYLOAD_LENGTH {
-            return Err(Error::invalid("pva: payload length exceeds maximum"));
-        }
-
-        let pts_flag = (flags & 0x10) != 0;
-        let mut pva_pts: Option<i64> = None;
-
-        let stream_index = (streamid - 1) as u32;
-
-        if streamid == PVA_VIDEO_PAYLOAD && pts_flag {
-            let mut pts_buf = [0u8; 4];
-            self.input.read_exact(&mut pts_buf)?;
-            pva_pts = Some(i64::from(u32::from_be_bytes(pts_buf)));
-            length = length.saturating_sub(4);
-        } else if streamid == PVA_AUDIO_PAYLOAD {
-            if self.continue_pes == 0 && length >= 9 {
-                let mut pes_hdr = [0u8; 9];
-                self.input.read_exact(&mut pes_hdr)?;
-                let pes_signal = ((pes_hdr[0] as u32) << 16) | ((pes_hdr[1] as u32) << 8) | (pes_hdr[2] as u32);
-                let pes_packet_len = u16::from_be_bytes([pes_hdr[4], pes_hdr[5]]) as usize;
-                let pes_flags = u16::from_be_bytes([pes_hdr[6], pes_hdr[7]]);
-                let pes_header_data_len = pes_hdr[8] as usize;
-
-                length -= 9;
-                if pes_signal == 1 && pes_header_data_len > 0 {
-                    let mut pes_data = vec![0u8; pes_header_data_len];
-                    self.input.read_exact(&mut pes_data)?;
-                    length = length.saturating_sub(pes_header_data_len);
-
-                    if (pes_flags & 0x80) != 0
-                        && pes_data.len() >= 5
-                        && (pes_data[0] & 0xF0) == 0x20
-                    {
-                        pva_pts = Some(parse_pes_pts(&pes_data));
+        loop {
+            if let Some(packet) = self.queue.pop_front() {
+                return Ok(packet);
+            }
+            if self.ended {
+                return Err(self.error.take().unwrap_or(Error::Eof));
+            }
+            let mut units = Vec::new();
+            match self.read_pva() {
+                Ok((packet, pos)) if packet.stream_index == 1 => {
+                    self.audio.push(&packet.data, packet.pts, None, pos, &mut units);
+                }
+                Ok((packet, _)) => return Ok(packet),
+                Err(e) => {
+                    self.audio.flush(&mut units);
+                    self.ended = true;
+                    if !matches!(e, Error::Eof) {
+                        self.error = Some(e);
                     }
                 }
-                self.continue_pes = pes_packet_len.saturating_sub(3 + pes_header_data_len);
             }
-            self.continue_pes = self.continue_pes.saturating_sub(length);
-        }
-        if let Some(pts) = pva_pts {
-            self.index[stream_index as usize].add(startpos, pts, 0, 0, true);
-        }
-
-        let mut payload = vec![0u8; length];
-        // A cut file ends mid-packet; FFmpeg's av_get_packet returns
-        // the partial read and then errors next round.
-        let mut got = 0usize;
-        while got < length {
-            let n = self.input.read(&mut payload[got..])?;
-            if n == 0 {
-                break;
+            for unit in units {
+                let packet = self.clock.stamp(unit, 1, TimeBase::new(1, 90000), &mut self.queue);
+                self.queue.push_back(packet);
             }
-            got += n;
         }
-        payload.truncate(got);
-        if payload.is_empty() {
-            return Err(Error::Eof);
-        }
-
-        let mut pkt = Packet {
-            stream_index,
-            time_base: TimeBase::new(1, 90000),
-            pts: pva_pts,
-            // pva_read_packet supplies PTS only, not decoder-order time.
-            dts: None,
-            duration: None,
-            flags: Default::default(),
-            data: payload,
-        };
-        pkt.flags.keyframe = true;
-        Ok(pkt)
     }
 
     /// pva.c has no read_seek: FFmpeg bisects with pva_read_timestamp
@@ -330,6 +389,11 @@ impl Demuxer for PvaDemuxer {
         match landed {
             Ok(Some(ts)) => {
                 self.continue_pes = 0;
+                // ff_read_frame_flush, then the clock from the landing.
+                self.queue.clear();
+                (self.ended, self.error) = (false, None);
+                self.audio = Parser::new(self.audio.split.reset());
+                self.clock.seeked(ts);
                 Ok(ts)
             }
             failed => {
