@@ -61,6 +61,11 @@ grouped or fragmented byte chunks, fixing the same loss in MP2-in-WAV.
 Its WAV layer probe distinguishes Layer II from the shared `0x0050` tag's
 Layer-I fallback. Input remains compressed until receive, bounded at
 8 MiB / 4096 chunks; only an incomplete final EOF frame is zero-padded.
+The PVA parser independently checks retained plus incoming bytes before
+insertion, with the same 8-MiB access-unit limit as MPEG-PS. Overflow discards
+the unfinished unit, reports an error once and ends reading until seek.
+Fragmented frames, bounded EOF draining and seek reset remain supported;
+small-budget regressions exercise the boundary without a large allocation.
 
 The MPEG-1/2 fork ports FFmpeg 2da55bf's 4:2:0 frame-picture decoding and
 error concealment: retain decoded macroblocks, reconstruct missing motion/DC

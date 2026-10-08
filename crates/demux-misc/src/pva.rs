@@ -20,6 +20,7 @@ const PVA_MAGIC: u16 = 0x4156; // "AV"
 const PVA_MAX_PAYLOAD_LENGTH: usize = 0x17F8;
 const PVA_VIDEO_PAYLOAD: u8 = 0x01;
 const PVA_AUDIO_PAYLOAD: u8 = 0x02;
+const MAX_AUDIO_ACCESS_UNIT: usize = 8 * 1024 * 1024;
 
 fn pva_check(p: &[u8]) -> Option<usize> {
     if p.len() < 8 {
@@ -71,6 +72,7 @@ pub struct PvaDemuxer {
     /// The MP2 frames FFmpeg's mpegaudio parser cuts from the audio
     /// payloads, timed by its demuxer layer (pts_wrap_bits 33).
     audio: Parser<MpegAudio>,
+    audio_input_limit: usize,
     clock: AudioClock,
     /// Packets parsed and not yet returned.
     queue: VecDeque<Packet>,
@@ -84,6 +86,10 @@ pub fn open_pva(
     input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(new_pva(input)))
+}
+
+fn new_pva(input: Box<dyn ReadSeek>) -> PvaDemuxer {
     let video_params = CodecParameters::video(CodecId::new("mpeg2video"));
     let mut audio_params = CodecParameters::audio(CodecId::new("mp2"));
     audio_params.sample_rate = Some(48000);
@@ -111,18 +117,19 @@ pub fn open_pva(
         stream.add(0, 0, 0, 0, true);
     }
     let allowance = Allowance::default();
-    Ok(Box::new(PvaDemuxer {
+    PvaDemuxer {
         input: Box::new(allowance.meter(input)),
         streams,
         continue_pes: 0,
         index,
         allowance,
         audio: Parser::new(MpegAudio::new("mp2")),
+        audio_input_limit: MAX_AUDIO_ACCESS_UNIT,
         clock: AudioClock::new(1, 90_000, 33),
         queue: VecDeque::new(),
         ended: false,
         error: None,
-    }))
+    }
 }
 
 /// `N` bytes as avio reads them: zeros past the end, which it reports.
@@ -336,7 +343,9 @@ impl Demuxer for PvaDemuxer {
     /// (AVSTREAM_PARSE_FULL), timed by its demuxer layer. When reading
     /// ends, at the end of the input or on an error, the parser hands
     /// over what it holds before the end or the error is returned
-    /// (read_frame_internal flushes every parser).
+    /// (read_frame_internal flushes every parser). An over-budget unfinished
+    /// audio unit is instead discarded and reported once as an input error;
+    /// reading then ends until a successful seek starts a new epoch.
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
             if let Some(packet) = self.queue.pop_front() {
@@ -348,6 +357,15 @@ impl Demuxer for PvaDemuxer {
             let mut units = Vec::new();
             match self.read_pva() {
                 Ok((packet, pos)) if packet.stream_index == 1 => {
+                    // Match MPEG-PS: a small PES does not bound the parser's
+                    // unfinished access unit. Check before Combine appends.
+                    if self.audio.split.buffered_bytes().saturating_add(packet.data.len()) > self.audio_input_limit {
+                        // Do not flush an over-budget unfinished unit into a
+                        // second allocation. Stop this epoch; seek resets it.
+                        self.audio = Parser::new(self.audio.split.reset());
+                        self.ended = true;
+                        return Err(Error::invalid("pva: audio access unit exceeds 8 MiB"));
+                    }
                     self.audio.push(&packet.data, packet.pts, None, pos, &mut units);
                 }
                 Ok((packet, _)) => return Ok(packet),
@@ -409,4 +427,72 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("pva", open_pva);
     reg.register_probe("pva", probe_pva);
     reg.register_extension("pva", "pva");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn pva_packet(stream: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'A', b'V', stream, 0, 0x55, flags];
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn audio_packet(payload: &[u8]) -> Vec<u8> {
+        let mut pes = vec![0, 0, 1, 0xc0];
+        pes.extend_from_slice(&((payload.len() + 4) as u16).to_be_bytes());
+        // One nonempty header byte, no timestamp; each PVA starts a PES.
+        pes.extend_from_slice(&[0x80, 0, 1, 0]);
+        pes.extend_from_slice(payload);
+        pva_packet(PVA_AUDIO_PAYLOAD, 0, &pes)
+    }
+
+    #[test]
+    fn audio_retained_plus_incoming_is_bounded_before_insertion() {
+        // Tiny budgets prove both aggregate growth and an oversized first
+        // payload, without allocating or scanning a resource-exhaustion input.
+        for lengths in [vec![16, 16, 1], vec![33]] {
+            let input: Vec<u8> = lengths.into_iter().flat_map(|n| audio_packet(&vec![0; n])).collect();
+            let mut demux = new_pva(Box::new(Cursor::new(input)));
+            demux.audio_input_limit = 32;
+            let error = demux.next_packet().expect_err("retained + incoming must reject above 32 bytes");
+            assert!(error.to_string().contains("audio access unit"), "{error}");
+            assert_eq!(demux.audio.split.buffered_bytes(), 0, "discard oversized unfinished data");
+            assert!(matches!(demux.next_packet(), Err(Error::Eof)), "overflow terminates this read epoch");
+        }
+    }
+
+    #[test]
+    fn exact_budget_still_drains_at_eof() {
+        let mut demux = new_pva(Box::new(Cursor::new(audio_packet(&[0; 32]))));
+        demux.audio_input_limit = 32;
+        assert_eq!(demux.next_packet().unwrap().data, [0; 32]);
+        assert!(matches!(demux.next_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn fragmented_frames_eof_tail_and_seek_reset_survive_the_bound() {
+        let mut frame = vec![0; 576];
+        frame[..4].copy_from_slice(&[0xff, 0xfd, 0xa4, 0]);
+        let elementary = [frame.as_slice(), frame.as_slice(), &frame[..49]].concat();
+        let mut video = 90u32.to_be_bytes().to_vec();
+        video.push(0);
+        let mut input = pva_packet(PVA_VIDEO_PAYLOAD, 0x10, &video);
+        for chunk in elementary.chunks(200) { input.extend(audio_packet(chunk)); }
+        let mut demux = new_pva(Box::new(Cursor::new(input)));
+        demux.audio_input_limit = 768;
+        assert_eq!(demux.next_packet().unwrap().stream_index, 0);
+        assert_eq!(demux.next_packet().unwrap().data, frame);
+        assert!(demux.audio.split.buffered_bytes() > 0, "seek while the next frame is partial");
+        assert_eq!(demux.seek_to(0, 90).unwrap(), 90);
+        assert_eq!(demux.audio.split.buffered_bytes(), 0);
+        assert_eq!(demux.next_packet().unwrap().stream_index, 0);
+        assert_eq!(demux.next_packet().unwrap().data, frame);
+        assert_eq!(demux.next_packet().unwrap().data, frame);
+        assert_eq!(demux.next_packet().unwrap().data, frame[..49]);
+        assert!(matches!(demux.next_packet(), Err(Error::Eof)));
+    }
 }
