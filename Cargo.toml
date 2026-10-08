@@ -119,6 +119,10 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.oxideav-ac3]
 opt-level = 3
+# The Ogg demuxer runs per packet: at "s" it costs Opus in Ogg about 0.4%
+# more instructions (16 KB). The Matroska demuxer at 3 changed nothing.
+[profile.release.package.oxideav-ogg]
+opt-level = 3
 # Hot workspace crates (player, codec-wmv, codec-dca) keep the default 3.
 [profile.release.package.audio-trim]
 opt-level = "s"
@@ -167,7 +171,7 @@ oxideav-avi = { git = "https://github.com/ayooooo123/oxideav-avi", rev = "b919db
 oxideav-basic = { git = "https://github.com/OxideAV/oxideav-basic", rev = "c44bb55f9f94e18ede7e9267493b0b6776a8e1c4" }
 oxideav-cinepak = { git = "https://github.com/OxideAV/oxideav-cinepak", rev = "4dae215ff7509dfd7e2e7d1bae72128630ccce7d" }
 oxideav-cook = { git = "https://github.com/OxideAV/oxideav-cook", rev = "f8584e427c6f87de24e2f2de124e0242824f7006" }
-oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "d7f2beab2e5f23f8ee2c4a75d3744692c9672abd" }
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "57e5fa9cbf9eda25e4b992391c121a306f78cac4" }
 oxideav-dirac = { git = "https://github.com/OxideAV/oxideav-dirac", rev = "1315f66f5f222dcafa5594bee401c797e5f5a769" }
 oxideav-dts = { git = "https://github.com/OxideAV/oxideav-dts", rev = "9a7c128366aa4914331825e3b5d40a3d3304c090" }
 oxideav-dvd = { git = "https://github.com/OxideAV/oxideav-dvd", rev = "f237f8c05fb3a70d0d9c7e7c99c56110c570d849" }
