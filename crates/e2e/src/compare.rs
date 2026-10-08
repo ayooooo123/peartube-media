@@ -181,8 +181,8 @@ fn srt_ms(ms: i64) -> String {
 }
 
 /// A cue's end as FFmpeg's `srt` muxer writes it. A display state up until
-/// the next (`end_us == i64::MAX`, as captions are) ends where FFmpeg's
-/// does: its `end_display_time` is `UINT32_MAX` milliseconds.
+/// the next (`end_us == i64::MAX`, as EIA-608 captions are) ends where
+/// FFmpeg's does: its `end_display_time` is `UINT32_MAX` milliseconds.
 fn srt_end(start_us: i64, end_us: i64) -> String {
     match end_us {
         i64::MAX => srt_ms(us_to_ms(start_us) + i64::from(u32::MAX)),
@@ -191,12 +191,12 @@ fn srt_end(start_us: i64, end_us: i64) -> String {
 }
 
 /// A display state that puts nothing up: a bitmap state with no visible
-/// pixel (DVB's page clears), or a text state up until the next with no
-/// text (an emptied caption screen). It takes down what is up.
+/// pixel (DVB's page clears), or a caption state with no text (an emptied
+/// caption screen). It takes down what is up.
 fn blank_state(cue: &Cue) -> bool {
     match cue {
         Cue::Bitmap { blank, .. } => *blank,
-        Cue::Text { end_us, text, .. } => *end_us == i64::MAX && plain_text(text).is_empty(),
+        Cue::Text { state, text, .. } => *state && plain_text(text).is_empty(),
     }
 }
 
@@ -256,7 +256,7 @@ pub fn text_cues(cues: &[Cue], shown: usize, reference: &[SrtCue]) -> Result<(St
     let mut ours = Vec::with_capacity(cues.len());
     for (i, cue) in cues.iter().enumerate() {
         match cue {
-            Cue::Text { start_us, end_us, text } => ours.push(SrtCue {
+            Cue::Text { start_us, end_us, text, .. } => ours.push(SrtCue {
                 timing: format!("{} --> {}", srt_time(*start_us), srt_end(*start_us, *end_us)),
                 body: text.replace("\r\n", "\n").trim().to_string(),
             }),
@@ -436,7 +436,7 @@ mod tests {
     }
 
     fn text(start_ms: i64, end_ms: i64, body: &str) -> Cue {
-        Cue::Text { start_us: start_ms * 1000, end_us: end_ms * 1000, text: body.into() }
+        Cue::Text { start_us: start_ms * 1000, end_us: end_ms * 1000, text: body.into(), state: false }
     }
 
     fn srt(timing: &str, body: &str) -> SrtCue {
@@ -505,7 +505,7 @@ mod tests {
     /// emptied screen, puts nothing up.
     #[test]
     fn caption_states_compare_with_ffmpegs_real_time_events() {
-        let state = |us: i64, body: &str| Cue::Text { start_us: us, end_us: i64::MAX, text: body.into() };
+        let state = |us: i64, body: &str| Cue::Text { start_us: us, end_us: i64::MAX, text: body.into(), state: true };
         let reference = [srt("00:00:00,968 --> 1193:02:48,263", "<font face=\"Monospace\">{\\an7}(<i> inaudibl</i></font>"), srt("00:00:01,168 --> 1193:02:48,463", "")];
         let ours = [state(967_633, "(<i> inaudibl</i>"), state(1_167_833, "")];
         assert!(text_cues(&ours, 1, &reference).is_ok());
