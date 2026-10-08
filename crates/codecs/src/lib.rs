@@ -3,7 +3,7 @@
 //! Decoder factories are first-registered-wins; install our replacements first.
 //! Container factories are keyed by name; install our replacements last.
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, RuntimeContext};
+use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag, RuntimeContext};
 
 /// A context holding every container and decoder the player can use.
 pub fn context() -> RuntimeContext {
@@ -110,11 +110,13 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     // tone instruments.
     oxideav_midi::register_codecs(&mut ctx.codecs);
     // MPEG-TS and MPEG-PS name MPEG-4 Part 2 video `mpeg4` (FFmpeg's id);
-    // its decoder registers as `mpeg4video`.
+    // its decoder registers as `mpeg4video`. 3ivx Delta 4's `3IV2` is
+    // MPEG-4 Part 2 in QuickTime and AVI (FFmpeg's isom_tags.c and riff.c).
     ctx.codecs.register(
         CodecInfo::new(CodecId::new("mpeg4"))
             .capabilities(CodecCapabilities::video("mpeg4video_sw"))
-            .decoder(oxideav_mpeg4video::make_decoder),
+            .decoder(oxideav_mpeg4video::make_decoder)
+            .tag(CodecTag::fourcc(b"3IV2")),
     );
 
     for register in [

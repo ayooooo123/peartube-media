@@ -46,9 +46,40 @@ fn resolve(path: &str) -> Option<PathBuf> {
             root.join(rel)
         }
         Some(("gen", name)) => corpus_dir().join(name),
+        Some(("samples", rel)) => samples_dir().join(rel),
         _ => return None,
     };
     p.is_file().then_some(p)
+}
+
+/// FFmpeg's sample archive (<https://samples.ffmpeg.org/>) under its own
+/// paths: `$FFMPEG_SAMPLES`, default ~/projects/oracles/ffmpeg-samples
+/// (corpus/fetch-samples.sh fills it).
+fn samples_dir() -> PathBuf {
+    std::env::var_os("FFMPEG_SAMPLES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs_home().join("projects/oracles/ffmpeg-samples"))
+}
+
+/// The SHA-256 of every `samples:` file, as corpus/samples.sha256 pins it.
+const SAMPLE_PINS: &str = include_str!("../../../corpus/samples.sha256");
+
+/// A `samples:` file must be the one corpus/samples.sha256 pins; other
+/// paths have no pin.
+fn check_pin(path: &str, file: &Path) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let Some(rel) = path.strip_prefix("samples:") else { return Ok(()) };
+    let want = SAMPLE_PINS
+        .lines()
+        .find_map(|line| line.split_once("  ").filter(|(_, name)| *name == rel).map(|(hash, _)| hash))
+        .ok_or_else(|| format!("{rel} has no pin in corpus/samples.sha256"))?;
+    let data = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let got = format!("{:x}", Sha256::digest(&data));
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!("{rel}: SHA-256 {got} is not the pinned {want} (corpus/samples.sha256)"))
+    }
 }
 
 fn dirs_home() -> PathBuf {
@@ -1125,25 +1156,26 @@ fn main() {
     println!("{}", "-".repeat(74));
 
     for entry in &entries {
-        let Some(path) = resolve(&entry.path) else {
-            entry_results.push(EntryResult {
-                path: entry.path.clone(),
-                demuxer: None,
-                tracks: Vec::new(),
-                claims: entry
-                    .rows
-                    .iter()
-                    .map(|row| ClaimResult { row: row.clone(), standing: "FAIL", reason: Some("sample missing".into()) })
-                    .collect(),
-                streams: vec![StreamResult::entry_level(
-                    "open",
-                    0,
-                    None,
-                    "sample missing (rsync may still be filling)",
-                )],
-            });
-            println!("{:<44} {:>9}", entry.path, "MISSING");
-            continue;
+        let available = resolve(&entry.path)
+            .ok_or_else(|| ("sample missing", "sample missing (rsync may still be filling)".to_string()))
+            .and_then(|path| check_pin(&entry.path, &path).map(|()| path).map_err(|why| ("sample not pinned", why)));
+        let path = match available {
+            Ok(path) => path,
+            Err((reason, detail)) => {
+                entry_results.push(EntryResult {
+                    path: entry.path.clone(),
+                    demuxer: None,
+                    tracks: Vec::new(),
+                    claims: entry
+                        .rows
+                        .iter()
+                        .map(|row| ClaimResult { row: row.clone(), standing: "FAIL", reason: Some(reason.into()) })
+                        .collect(),
+                    streams: vec![StreamResult::entry_level("open", 0, None, &detail)],
+                });
+                println!("{:<44} {:>9}", entry.path, if reason == "sample missing" { "MISSING" } else { "UNPINNED" });
+                continue;
+            }
         };
 
         let mut result = run_entry(entry, &path, http_base.as_deref());
@@ -1231,7 +1263,7 @@ fn main() {
         let mut fr = FuzzReport::default();
         println!("\nfuzz: 20 deterministic mutations per entry");
         for entry in &entries {
-            let Some(path) = resolve(&entry.path) else { continue };
+            let Some(path) = resolve(&entry.path).filter(|path| check_pin(&entry.path, path).is_ok()) else { continue };
             fuzz_entry(entry, &path, &mut fr);
         }
         fr.finish();

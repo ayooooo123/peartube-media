@@ -149,11 +149,11 @@ lives on another branch.
 
 ## Licenses
 
-Code in this repository is MIT unless a crate says otherwise. Decoders with no public specification (TrueHD/MLP, several Windows Media and RealMedia codecs) are ports of FFmpeg's LGPL-2.1-or-later decoders; each such crate is LGPL-2.1-or-later, carries its own LICENSE, and ports only FFmpeg files whose headers say LGPL. The audio-trim producers in the MP4, MP3 and Ogg forks are such ports too; those crates are `MIT AND LGPL-2.1-or-later`, with the ported files marked.
+Code in this repository is MIT unless a crate says otherwise. Decoders with no public specification (TrueHD/MLP, several Windows Media and RealMedia codecs, DVD and Blu-ray LPCM in `codec-lpcm`) are ports of FFmpeg's LGPL-2.1-or-later decoders; each such crate is LGPL-2.1-or-later, carries its own LICENSE, and ports only FFmpeg files whose headers say LGPL. The audio-trim producers in the MP4, MP3 and Ogg forks and the FFmpeg-exact ADPCM and G.726 decoders in the ADPCM fork are such ports too; those crates are `MIT AND LGPL-2.1-or-later`, with the ported files marked.
 
 ## Verification
 
-`cargo run -p e2e --release` plays the corpus (FFmpeg's FATE samples plus generated files) through the headless backend and compares every stream with FFmpeg: `framemd5` for bit-exact codecs, PSNR/SNR thresholds for the rest. Every format on the list needs a passing file. The result is `target/e2e/codecs.json`.
+`cargo run -p e2e --release` plays the corpus (FFmpeg's FATE samples, generated files, and files from FFmpeg's sample archive that `corpus/fetch-samples.sh` fetches and `corpus/samples.sha256` pins) through the headless backend and compares every stream with FFmpeg: `framemd5` for bit-exact codecs, PSNR/SNR thresholds for the rest. Every format on the list needs a passing file. The result is `target/e2e/codecs.json`.
 
 `cargo test -p player --lib engine::subtitle_tests` checks PGS, DVB and DVD/VobSub (paired, MPEG-PS and Matroska) show/replacement/clear media times against FFmpeg with an injected clock, pinning each boundary to FFmpeg's microsecond rounding (±0.5 µs; the engine keeps exact 90 kHz times), and compares every complete subtitle canvas with sub2video, including final DVB and DVD expirations at EOF. `cargo test -p player --test subtitle_timing` independently checks the real Player's PGS state sequence and canvases. These are logical-timing and integration checks, not a demonstrated wall-clock presentation-latency bound; under shared-machine load, a requested 5.9 ms wait took 65 ms and a 100 ms wait took 313 ms.
 

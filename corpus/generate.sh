@@ -126,12 +126,22 @@ cp "$TMP_DIR/sub.usf" "$CORPUS_DIR/sub.usf"
 run "${A_IN[@]}" "${DUR[@]}" -c:a flac "$CORPUS_DIR/audio.flac"
 run "${A_IN[@]}" "${DUR[@]}" -c:a alac "$CORPUS_DIR/audio_alac.m4a"
 run "${A_IN[@]}" "${DUR[@]}" -c:a libvorbis "$CORPUS_DIR/audio_vorbis.ogg"
+# Raw containers: ADTS AAC and Opus in an .opus file.
+run "${A_IN[@]}" "${DUR[@]}" -c:a aac -f adts "$CORPUS_DIR/audio.aac"
+run "${A_IN[@]}" "${DUR[@]}" -c:a libopus -b:a 128k "$CORPUS_DIR/audio.opus"
 run "${V_IN[@]}" "${A_IN[@]}" "${DUR[@]}" -c:v libtheora -pix_fmt yuv420p -c:a libvorbis \
   "$CORPUS_DIR/video_theora.ogg"
 run -f lavfi -i "sine=frequency=440:sample_rate=8000" "${DUR[@]}" -c:a pcm_alaw "$CORPUS_DIR/audio_alaw.wav"
 run -f lavfi -i "sine=frequency=440:sample_rate=8000" "${DUR[@]}" -c:a pcm_mulaw "$CORPUS_DIR/audio_ulaw.wav"
 run "${A_IN[@]}" "${DUR[@]}" -c:a pcm_s16le "$CORPUS_DIR/audio_lpcm.wav"
 run -f lavfi -i "sine=frequency=440:sample_rate=44100" "${DUR[@]}" -c:a adpcm_ms "$CORPUS_DIR/audio_adpcm.wav"
+run -f lavfi -i "sine=frequency=440:sample_rate=8000" "${DUR[@]}" -c:a g726 -b:a 24k "$CORPUS_DIR/audio_g726.wav"
+# Blu-ray LPCM (stream type 0x80 under the HDMV registration) in M2TS.
+run "${A_IN[@]}" "${DUR[@]}" -c:a pcm_bluray -sample_fmt s16 -ac 2 -mpegts_m2ts_mode 1 -f mpegts \
+  "$CORPUS_DIR/audio_pcm_bluray.m2ts"
+# Raw DV (PAL 4:2:0, 48 kHz stereo PCM) as FFmpeg's dv muxer writes it.
+run -f lavfi -i "testsrc2=size=720x576:rate=25" "${A_IN[@]}" "${DUR[@]}" -c:v dvvideo -pix_fmt yuv420p \
+  -c:a pcm_s16le -ac 2 -f dv "$CORPUS_DIR/video.dv"
 run "${A_IN[@]}" "${DUR[@]}" -c:a libmp3lame -b:a 128k "$CORPUS_DIR/audio.mp3"
 # Genuine WMV1/WMA1, rather than attributing the WMV2/WMA2 FATE clip to both.
 run "${V_IN[@]}" "${A_IN[@]}" "${DUR[@]}" -c:v wmv1 -q:v 10 -c:a wmav1 -b:a 128k \
