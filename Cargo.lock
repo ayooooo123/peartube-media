@@ -1190,7 +1190,7 @@ dependencies = [
 [[package]]
 name = "oxideav-http"
 version = "0.0.8"
-source = "git+https://github.com/OxideAV/oxideav-http?rev=f54f106e1e131300387d1df1a71d2686690ccdca#f54f106e1e131300387d1df1a71d2686690ccdca"
+source = "git+https://github.com/ayooooo123/oxideav-http?rev=ebbc1911048ee0288c5e76bbc0603d5df989dd3f#ebbc1911048ee0288c5e76bbc0603d5df989dd3f"
 dependencies = [
  "oxideav-core",
  "oxideav-source",
