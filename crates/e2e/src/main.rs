@@ -432,7 +432,7 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStream,
             let Some(pcm) = ff.sample_fmt.as_deref().and_then(oracle::Pcm::of_sample_fmt) else {
                 return Compare::fail(metric, format!("no canonical PCM for FFmpeg's {:?}", ff.sample_fmt));
             };
-            match oracle::audio_pcm(path, &ff.map(), pcm)
+            match oracle::audio_pcm(path, ff, pcm)
                 .and_then(|reference| compare::exact_pcm(&cap.pcm, &reference, pcm, cap.channels as usize))
             {
                 Ok(m) => Compare::pass(m),
@@ -440,8 +440,8 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStream,
             }
         }
         Policy::AudioSnr(floor) => {
-            let slack = oracle::audio_frames(path, ff.index).and_then(|frames| compare::lossy_slack(&frames, cap.channels));
-            let reference = oracle::audio_f32(path, &ff.map());
+            let slack = oracle::audio_frames(path, ff).and_then(|frames| compare::lossy_slack(&frames, cap.channels));
+            let reference = oracle::audio_f32(path, ff);
             match (slack, reference) {
                 (Ok(slack), Ok(reference)) => {
                     let mut c = compare::snr_pcm(&cap.pcm, &reference, slack, floor);
@@ -462,8 +462,8 @@ fn audio_diagnostics(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStr
         return Vec::new();
     }
     let snr = check_audio_layout(cap, ff).and_then(|()| {
-        let slack = compare::lossy_slack(&oracle::audio_frames(path, ff.index)?, cap.channels)?;
-        refcheck::try_snr_db(&oracle::audio_f32(path, &ff.map())?, &cap.pcm, slack)
+        let slack = compare::lossy_slack(&oracle::audio_frames(path, ff)?, cap.channels)?;
+        refcheck::try_snr_db(&oracle::audio_f32(path, ff)?, &cap.pcm, slack)
     });
     floors
         .iter()

@@ -9,6 +9,7 @@
 
 use oxideav_core::{CodecParameters, Decoder, Error, Packet, RuntimeContext, TimeBase};
 use refcheck::{Decoded, Registrar};
+use std::ffi::OsStr;
 use std::path::Path;
 use std::process::Command;
 
@@ -19,6 +20,16 @@ use std::process::Command;
 /// `-f framecrc` lists the same packets. Panics when FFmpeg fails or the
 /// two outputs disagree.
 pub fn ffmpeg_packets(path: &Path, spec: &str, bsf: Option<&str>) -> Vec<Packet> {
+    packets_from(Path::new("ffmpeg"), path, spec, bsf)
+}
+
+/// [`ffmpeg_packets`] as the pinned FFmpeg ([`refcheck::pinned_ffmpeg`])
+/// demuxes and parses them.
+pub fn pinned_ffmpeg_packets(path: &Path, spec: &str) -> Vec<Packet> {
+    packets_from(&refcheck::pinned_ffmpeg(), path, spec, None)
+}
+
+fn packets_from(ffmpeg: &Path, path: &Path, spec: &str, bsf: Option<&str>) -> Vec<Packet> {
     let p = path.to_str().expect("UTF-8 path");
     let map = format!("0:{spec}");
     // `-copyinkf`: a stream copy otherwise drops the packets before the
@@ -27,9 +38,9 @@ pub fn ffmpeg_packets(path: &Path, spec: &str, bsf: Option<&str>) -> Vec<Packet>
     if let Some(bsf) = bsf {
         args.extend(["-bsf", bsf]);
     }
-    let table = String::from_utf8(tool("ffmpeg", &[&args[..], &["-f", "framecrc", "-"]].concat()))
+    let table = String::from_utf8(tool(ffmpeg, &[&args[..], &["-f", "framecrc", "-"]].concat()))
         .expect("framecrc output is UTF-8");
-    let data = tool("ffmpeg", &[&args[..], &["-f", "data", "-"]].concat());
+    let data = tool(ffmpeg, &[&args[..], &["-f", "data", "-"]].concat());
 
     let mut time_base = None;
     let mut packets = Vec::new();
@@ -119,13 +130,14 @@ pub fn decode_packets(
     (out, errors)
 }
 
-/// Runs an FFmpeg tool (`ffmpeg`, `ffprobe`) and returns its stdout;
-/// panics with its stderr when it fails.
-pub fn tool(program: &str, args: &[&str]) -> Vec<u8> {
+/// Runs an FFmpeg tool (`ffmpeg`, `ffprobe`, or a path to one) and returns
+/// its stdout; panics with its stderr when it fails.
+pub fn tool(program: impl AsRef<OsStr>, args: &[&str]) -> Vec<u8> {
+    let program = program.as_ref();
     let out = Command::new(program)
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("{program} must be on PATH: {e}"));
-    assert!(out.status.success(), "{program} {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        .unwrap_or_else(|e| panic!("{} must be on PATH: {e}", program.to_string_lossy()));
+    assert!(out.status.success(), "{} {args:?}: {}", program.to_string_lossy(), String::from_utf8_lossy(&out.stderr));
     out.stdout
 }

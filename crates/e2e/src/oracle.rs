@@ -160,16 +160,49 @@ impl Pcm {
     }
 }
 
-/// FFmpeg's decode of stream `map` as interleaved little-endian `pcm`.
-pub fn audio_pcm(path: &Path, map: &str, pcm: Pcm) -> Result<Vec<u8>, String> {
-    let (format, codec) = pcm.ffmpeg();
-    let p = path_arg(path)?;
-    tool::ffmpeg(&strings(&["-i", &p, "-map", map, "-f", format, "-c:a", codec, "-"]), TIMEOUT)
+/// The FFmpeg a stream's decode is held to: the `ffmpeg` on PATH, or, for
+/// the decoders ported from FFmpeg 2da55bf (AC-3 and E-AC-3), that build
+/// on its C code paths (`refcheck::pinned_ffmpeg`, `-cpuflags 0`). The PATH
+/// 9.0.2 build decodes the FATE AC-3 samples 18-97 dB from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Build {
+    Path,
+    Pinned,
 }
 
-/// FFmpeg's decode of stream `map` as interleaved f32.
-pub fn audio_f32(path: &Path, map: &str) -> Result<Vec<f32>, String> {
-    let bytes = audio_pcm(path, map, Pcm::F32)?;
+impl Build {
+    pub fn of(ff: &FfStream) -> Build {
+        match ff.codec_name.as_str() {
+            "ac3" | "eac3" => Build::Pinned,
+            _ => Build::Path,
+        }
+    }
+
+    fn ffmpeg(self, args: &[String]) -> Result<Vec<u8>, String> {
+        match self {
+            Build::Path => tool::ffmpeg(args, TIMEOUT),
+            Build::Pinned => tool::pinned_ffmpeg(args, TIMEOUT),
+        }
+    }
+
+    fn ffprobe(self, args: &[String]) -> Result<Vec<u8>, String> {
+        match self {
+            Build::Path => tool::ffprobe(args, TIMEOUT),
+            Build::Pinned => tool::pinned_ffprobe(args, TIMEOUT),
+        }
+    }
+}
+
+/// FFmpeg's decode of stream `ff` as interleaved little-endian `pcm`.
+pub fn audio_pcm(path: &Path, ff: &FfStream, pcm: Pcm) -> Result<Vec<u8>, String> {
+    let (format, codec) = pcm.ffmpeg();
+    let p = path_arg(path)?;
+    Build::of(ff).ffmpeg(&strings(&["-i", &p, "-map", &ff.map(), "-f", format, "-c:a", codec, "-"]))
+}
+
+/// FFmpeg's decode of stream `ff` as interleaved f32.
+pub fn audio_f32(path: &Path, ff: &FfStream) -> Result<Vec<f32>, String> {
+    let bytes = audio_pcm(path, ff, Pcm::F32)?;
     Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
 }
 
@@ -180,16 +213,21 @@ pub struct AudioFrameInfo {
     pub channels: u16,
 }
 
-/// The frames FFmpeg's decoder emits for stream `index` (`ffprobe
+/// The frames FFmpeg's decoder emits for stream `ff` (`ffprobe
 /// -show_frames`): their sizes bound how far a lossy decode may run long
 /// or short.
-pub fn audio_frames(path: &Path, index: u32) -> Result<Vec<AudioFrameInfo>, String> {
+pub fn audio_frames(path: &Path, ff: &FfStream) -> Result<Vec<AudioFrameInfo>, String> {
     let p = path_arg(path)?;
-    let index = index.to_string();
-    let out = tool::ffprobe(
-        &strings(&["-select_streams", &index, "-show_entries", "frame=nb_samples,channels", "-of", "csv=p=0", &p]),
-        TIMEOUT,
-    )?;
+    let index = ff.index.to_string();
+    let out = Build::of(ff).ffprobe(&strings(&[
+        "-select_streams",
+        &index,
+        "-show_entries",
+        "frame=nb_samples,channels",
+        "-of",
+        "csv=p=0",
+        &p,
+    ]))?;
     let text = String::from_utf8_lossy(&out);
     text.lines()
         .filter(|l| !l.trim().is_empty())
@@ -372,7 +410,9 @@ mod tests {
     #[test]
     fn audio_frames_reports_decoder_frame_sizes() {
         // cook: 1024-sample stereo frames.
-        let frames = audio_frames(&refcheck::fate("real/ra_cook.rm"), 0).unwrap();
+        let path = refcheck::fate("real/ra_cook.rm");
+        let ff = streams(&path).unwrap().into_iter().find(|s| s.codec_type == "audio").unwrap();
+        let frames = audio_frames(&path, &ff).unwrap();
         assert!(!frames.is_empty());
         assert!(frames.iter().all(|f| f.nb_samples == 1024 && f.channels == 2), "{:?}", &frames[..3]);
     }

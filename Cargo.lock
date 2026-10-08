@@ -934,7 +934,7 @@ dependencies = [
 [[package]]
 name = "oxideav-ac3"
 version = "0.0.11"
-source = "git+https://github.com/OxideAV/oxideav-ac3?rev=99228831d2b29a35fe2b2035118a18f8cb0cae59#99228831d2b29a35fe2b2035118a18f8cb0cae59"
+source = "git+https://github.com/ayooooo123/oxideav-ac3?rev=239a59825b733a522cf4818c93e7cb3c35e5ce3a#239a59825b733a522cf4818c93e7cb3c35e5ce3a"
 dependencies = [
  "oxideav-core",
 ]

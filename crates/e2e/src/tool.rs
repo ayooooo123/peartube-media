@@ -23,6 +23,21 @@ pub fn ffprobe(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
     run("ffprobe", &all, timeout)
 }
 
+/// [`ffmpeg`] as the pinned build (`refcheck::pinned_ffmpeg`) on its C code
+/// paths (`-cpuflags 0`).
+pub fn pinned_ffmpeg(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut all = vec!["-v".to_string(), "error".into(), "-nostdin".into(), "-cpuflags".into(), "0".into()];
+    all.extend_from_slice(args);
+    run(&refcheck::pinned_ffmpeg().to_string_lossy(), &all, timeout)
+}
+
+/// [`ffprobe`] from the pinned build, on its C code paths.
+pub fn pinned_ffprobe(args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
+    let mut all = vec!["-v".to_string(), "error".into(), "-cpuflags".into(), "0".into()];
+    all.extend_from_slice(args);
+    run(&refcheck::pinned_ffmpeg().with_file_name("ffprobe").to_string_lossy(), &all, timeout)
+}
+
 fn run(program: &str, args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
     let mut child = Command::new(program)
         .args(args)
