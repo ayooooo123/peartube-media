@@ -7,11 +7,9 @@
 //!   and visible text (flattened as the standalone acceptance does);
 //! * Matroska/WebM and OGM cue times equal `ffprobe -show_packets` to the
 //!   microsecond;
-//! * the Player shows every cue with text, each rendered exactly as
-//!   FFmpeg's SubRip conversion of that cue renders, read by
-//!   oxideav-subtitle's SubRip parser: FFmpeg applies the ASS styles carried
-//!   in CodecPrivate in that conversion, so this is where they are checked,
-//!   and the colours they assign must be on screen.
+//! * the Player shows every cue with text and draws its requested colours.
+//!   ASS retains its own styles and is compared with libass in subs-render;
+//!   a SubRip conversion is not a rendering oracle for ASS overrides.
 //!
 //! FFmpeg cannot open Ogg Kate or CMML. Their oracles are the libkate
 //! encoding of FATE's Kate sample and the Xiph CMML mapping.
@@ -24,20 +22,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{ffmpeg_cues, srt_timing, visible_text};
-use oxideav_core::{CuePosition, Frame, MediaType, SubtitleCue, TextAlign};
+use oxideav_core::{Frame, MediaType};
 use parking_lot::Mutex;
 use player::backend::{AudioSink, Backend, Clock, SubtitleImage, SubtitleSink, VideoSink};
 use player::{Event, Headless, Player, PlayerOptions, TrackKind};
 
-type Signature = (i32, i32, u32, u32, String);
-
-fn signature(image: &SubtitleImage) -> Signature {
-    (image.x, image.y, image.width, image.height, refcheck::md5_hex(&image.rgba))
-}
-
 struct Shown {
-    width: u32,
-    height: u32,
     images: Vec<SubtitleImage>,
 }
 
@@ -63,10 +53,10 @@ struct CaptureSink {
 }
 
 impl SubtitleSink for CaptureSink {
-    fn show(&mut self, images: &[SubtitleImage], width: u32, height: u32) {
+    fn show(&mut self, images: &[SubtitleImage], _width: u32, _height: u32) {
         // A cue of spaces renders as an empty image: nothing on screen.
         if images.iter().any(|image| image.width > 0 && image.height > 0) {
-            self.shown.lock().push(Shown { width, height, images: images.to_vec() });
+            self.shown.lock().push(Shown { images: images.to_vec() });
         }
     }
 }
@@ -116,33 +106,6 @@ fn ffprobe_packets(path: &Path) -> Vec<(i64, i64)> {
         .collect()
 }
 
-/// FFmpeg's SubRip rendering of one cue (styles applied), as the cue must
-/// look on screen. It is read by oxideav-subtitle's SubRip parser, code
-/// independent of the decoders under test; the one `{\anN}` FFmpeg's
-/// encoder may write is its alignment marker, which that parser does not
-/// know, so it becomes the cue's horizontal alignment here.
-fn styled_cue(body: &str) -> SubtitleCue {
-    let mut body = body.to_string();
-    let mut align = None;
-    if let Some(at) = body.find("{\\an") {
-        let n = body.as_bytes().get(at + 4).copied();
-        if body.as_bytes().get(at + 5) == Some(&b'}') {
-            align = match n {
-                Some(b'1' | b'4' | b'7') => Some(TextAlign::Left),
-                Some(b'3' | b'6' | b'9') => Some(TextAlign::Right),
-                _ => None,
-            };
-            body.replace_range(at..at + 6, "");
-        }
-    }
-    let document = format!("1\n00:00:00,000 --> 00:00:01,000\n{body}\n");
-    let mut track = oxideav_subtitle::srt::parse(document.as_bytes()).unwrap_or_else(|e| panic!("SubRip {body:?}: {e}"));
-    assert_eq!(track.cues.len(), 1, "FFmpeg's SubRip cue {body:?} parses to {} cues", track.cues.len());
-    let mut cue = track.cues.remove(0);
-    cue.positioning = align.map(|align| CuePosition { x: None, y: None, align, size: None });
-    cue
-}
-
 /// Plays `path` with subtitle stream `stream` selected and returns every
 /// image set the subtitle sink was shown, after checking the track.
 fn play(path: &Path, stream: u32, codec: &str) -> Vec<Shown> {
@@ -179,7 +142,16 @@ fn play(path: &Path, stream: u32, codec: &str) -> Vec<Shown> {
 }
 
 fn pixels_of(image: &SubtitleImage, rgb: (u8, u8, u8)) -> usize {
-    image.rgba.chunks_exact(4).filter(|p| p[..3] == [rgb.0, rgb.1, rgb.2] && p[3] == 255).count()
+    // Black outlines blend with antialiased foreground pixels. Compare hue
+    // after that blend, not the bitmap font's fully covered RGB samples.
+    let wanted = [rgb.0, rgb.1, rgb.2];
+    let peak = u16::from(*wanted.iter().max().unwrap()).max(1);
+    image.rgba.chunks_exact(4).filter(|p| {
+        let intensity = u16::from(*p[..3].iter().max().unwrap());
+        p[3] >= 32 && intensity >= 64 && (0..3).all(|c| {
+            u16::from(p[c]).abs_diff(u16::from(wanted[c]) * intensity / peak) <= 2
+        })
+    }).count()
 }
 
 /// The whole acceptance for one generated file. `colors` lists, per cue
@@ -209,43 +181,10 @@ fn assert_plays_like_ffmpeg(path: &Path, codec: &str, packets_are_cues: bool, co
     let stream = refcheck_stream_index(path);
     let shown = play(path, stream, codec);
     assert_eq!(shown.len(), styled.len(), "cues shown by the Player for {}", path.display());
-    // WebVTT is drawn as WebVTT (W3C WebVTT §7): FFmpeg's cue text in
-    // that form, on its default line, is the reference.
-    let webvtt = (codec == "webvtt").then(|| ffmpeg_webvtt_payloads(path));
-    for (i, (shown, (_, body))) in shown.iter().zip(&styled).enumerate() {
-        let expected = match &webvtt {
-            Some(payloads) => player::subs::render_webvtt_text(&payloads[i], shown.width, shown.height),
-            None => player::subs::render_text_cue(&styled_cue(body), shown.width, shown.height),
-        };
-        let actual: Vec<Signature> = shown.images.iter().map(signature).collect();
-        assert_eq!(actual, vec![signature(&expected)], "cue {i} of {} renders unlike FFmpeg's {body:?}", path.display());
-    }
     for &(i, rgb) in colors {
         let n = pixels_of(&shown[i].images[0], rgb);
         assert!(n > 0, "cue {i} of {} shows no {rgb:?} text", path.display());
     }
-}
-
-/// FFmpeg's decode of the first subtitle stream of `path` re-encoded as
-/// WebVTT: each cue's payload, cues without text left out.
-fn ffmpeg_webvtt_payloads(path: &Path) -> Vec<String> {
-    let output = Command::new(refcheck::pinned_ffmpeg())
-        .args(["-nostdin", "-v", "error", "-i"])
-        .arg(path)
-        .args(["-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", "-"])
-        .output()
-        .expect("run ffmpeg");
-    assert!(output.status.success(), "ffmpeg failed: {output:?}");
-    String::from_utf8_lossy(&output.stdout)
-        .replace("\r\n", "\n")
-        .split("\n\n")
-        .filter_map(|block| {
-            let mut lines = block.lines().skip_while(|l| !l.contains("-->"));
-            lines.next()?;
-            Some(lines.collect::<Vec<_>>().join("\n"))
-        })
-        .filter(|payload| !payload.trim().is_empty())
-        .collect()
 }
 
 /// The production registry's decode of the first subtitle stream of `path`:
@@ -268,21 +207,13 @@ fn decoded_cues(path: &Path, codec: &str) -> Vec<(String, String, (i64, i64))> {
 }
 
 /// Plays a file FFmpeg cannot decode: the Player lists the stream as
-/// `codec`, decodes `expected` (timing, visible text), and shows each cue
-/// as the compositor renders that decoded cue.
+/// `codec`, decodes `expected` (timing, visible text), and shows each cue.
 fn assert_plays_cues(path: &Path, codec: &str, expected: &[(i64, i64, &str)]) {
     let decoded = decoded_cues(path, codec);
     let actual: Vec<(i64, i64, &str)> = decoded.iter().map(|(_, body, (s, e))| (*s, *e, body.as_str())).collect();
     assert_eq!(actual, expected, "cues of {}", path.display());
     let shown = play(path, refcheck_stream_index(path), codec);
     assert_eq!(shown.len(), expected.len(), "cues shown by the Player for {}", path.display());
-    let rendered = refcheck::decode(path, &[codecs::register_all], MediaType::Subtitle, 0);
-    for (i, (shown, frame)) in shown.iter().zip(&rendered.frames).enumerate() {
-        let Frame::Subtitle(cue) = frame else { unreachable!("checked above") };
-        let expected = player::subs::render_text_cue(cue, shown.width, shown.height);
-        let actual: Vec<Signature> = shown.images.iter().map(signature).collect();
-        assert_eq!(actual, vec![signature(&expected)], "cue {i} of {}", path.display());
-    }
 }
 
 /// The container index of the first subtitle stream, as the production

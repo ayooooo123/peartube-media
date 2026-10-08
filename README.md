@@ -121,7 +121,9 @@ OxideAV crates are used at pinned git revisions; their crates.io releases lag th
 
 The player never encodes or muxes. `crates/codecs` turns on the core fork's `decode-only` feature: `CodecInfo::encoder` and `ContainerRegistry::register_muxer` drop their factories, so nothing references OxideAV's encoders and muxers and LTO removes them (Android `libmain.so`: 27.3 MB to 21.0 MB stripped, 13.2 MB to 9.9 MB deflated in the APK).
 
-Release builds compile dependencies and this workspace's cold crates at `opt-level = "s"` and the code that must keep its speed at 3: the H.264, HEVC, AV1, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, VC-1/WMV (`codec-wmv`), AAC, Opus, MP3, AC-3 and DTS (`codec-dca`) decoders, `oxideav-core` (bit readers), `oxideav-pixfmt` (RGBA conversion of software frames), the Ogg demuxer (it runs per packet; at `"s"` Opus in Ogg took about 0.4% more instructions) and `player`. Binaries stay at 3: fat LTO optimises the whole program at the final crate's level, and at `"s"` rustc turns loop and SLP vectorization off for all of it. The app's `mobile/Cargo.toml` carries the same lists (there every dependency not named is `"s"`; here a workspace crate not named is 3), so a new crate goes on one of them in both files. This saves another 1.5 MB raw, 1.1 MB deflated.
+Release builds compile dependencies and this workspace's cold crates at `opt-level = "s"`. The speed-critical set stays at 3: H.264, HEVC, AV1, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, VC-1/WMV (`codec-wmv`), DV (`codec-dv`), AAC, MP3 and DTS (`codec-dca`), plus `oxideav-core`, `oxideav-pixfmt`, the Ogg demuxer and `player`. Opus and AC-3 retain ample measured audio headroom at `"s"`. Binaries stay at 3 because fat LTO optimises the whole program at the final crate's level; `"s"` there disables loop and SLP vectorization throughout.
+
+The app's `mobile/Cargo.toml` and this manifest must keep the same effective profiles. App dependencies default to `"s"`, but workspace crates default to 3, so new cold workspace crates need explicit entries here. `codec-midi`, `codec-mp2`, `codec-tracker` and `subs-render` now match the app's `"s"` setting. The earlier profile split saved 1.5 MB raw and 1.1 MB deflated; that historical library measurement is not a new APK size claim.
 
 Leaving TLS out (rustls, ring and the webpki roots, through `oxideav-http`'s `tls` feature) saves another 0.86 MB raw, 0.54 MB deflated, in the Android `libmain.so`.
 
@@ -414,8 +416,7 @@ is not shown. It draws the cue's own text as browsers do: the
 background, weight, style, decoration, shadow, opacity, relative size;
 class, voice, language, identifier and type selectors, descendants),
 right-to-left paragraphs reordered by the Unicode Bidirectional Algorithm,
-and ruby text above its base. The bitmap font has one face, so
-`font-family` changes nothing. `cargo test -p player --test
+and ruby text above its base, using runtime fonts. `cargo test -p player --test
 webvtt_placement --test webvtt_style` checks placement and drawing through
 `.vtt`, FFmpeg's Matroska and WebM remuxes and hand-built MP4s; `cargo
 test -p subs-text --test webvtt_settings` mutates settings, headers, MP4
@@ -462,9 +463,65 @@ flags and frame-unit timing. `cargo run -j 2 -p e2e --release -- --filter
 dirac` plays both raw profiles through the headless Player from disk and
 HTTP; each has 30 frame MD5s equal to pinned FFmpeg.
 
+### Runtime fonts and ASS/SSA
+
+`subs-render` uses `ttf-parser` for font outlines, Rustybuzz for shaping,
+`unicode-bidi` for text direction and `ab_glyph_rasterizer` for coverage.
+No TTF/OTF files are bundled. Android reads its system font configuration;
+Apple and Unix builds read platform font directories. ASS embedded fonts
+and Matroska font attachments take precedence. Missing glyphs fall back to
+another face; the old bitmap font is used only when no runtime fonts exist.
+Bitmap subtitles do not trigger system-font discovery.
+
+`PlayerOptions.fonts` accepts `FontOptions { directories, default_family }`.
+`directories: None` selects platform fonts; `Some(paths)` uses only those
+directories and track fonts, including for fallback. WebVTT `font-family`
+now selects real faces, and its default font size is 5% of the video height.
+Cue text and ruby share an 8,192-character layout budget.
+
+ASS/SSA keeps raw events and styles instead of converting them to plain
+text before drawing. The safe Rust libass 0.17.5 port handles positioning,
+movement, fades, transforms, borders, blur, shadows, clipping, drawings,
+karaoke, wrapping and layer/collision placement. Animated events follow
+the playback clock; capture-only playback samples the middle of each cue.
+Only admitted ASS chunks reserve `ReadOrder` IDs; rejected chunks leave no
+duplicate history. Pruning retires expired IDs, and flush/seek resets clear
+the live IDs.
+TTML supports inherited text styles and timing, timed spans, sequential
+containers, frame/tick clocks and standalone document playback through
+the same font renderer. XML entities and DTDs are disabled.
+
+Run `python3 scripts/fetch-subtitle-fonts.py` to install the SHA-256-pinned
+DejaVu 2.37 and Noto Sans Devanagari 2.007 test fonts outside this repository.
+`SUBTITLE_TEST_FONTS` may select another directory holding those same files.
+`cargo test -j 2 -p subs-render` checks every cue in FATE's
+`sub/1ededcbd7b.ass` and `sub/a9-misc.ssa`, plus ten override/shaping cases,
+at two points per event against the system FFmpeg's libass. Both sides
+use the fixed fonts and full-range RGB. Limits: 2 pixels of bounds error,
+8 levels of mean colour error and 20 dB PSNR over the subtitle union crop,
+not the mostly empty video frame. All 106 samples pass; minimum cropped
+PSNR is 33.83 dB for ASS, 23.58 dB for SSA and 25.52 dB for the extra cases.
+This is bounded pixel agreement on isolated, font-normalized cues, not
+byte-identical rasterization or a check of overlapping cues. The
+e2e subtitle rows still compare decoded text and timing with pinned FFmpeg.
+The renderer tests also run 2,000 fixed-seed mutations per ASS override
+and drawing input. `cargo test -j 2 -p subs-text --test ttml` checks TTML
+style inheritance and cue boundaries.
+
+At `dcc9148`, the `ab_glyph_rasterizer 0.1.10` arm64 Android/API 29
+stripped release probe of `Player::open` and the codec registry grows
+from 13,754,288 to 14,201,808 bytes against `6f4242f`: +447,520 raw bytes,
+or +195,173 bytes with zlib level 9. Both builds use fat LTO and one
+codegen unit. This is a library comparison, not an APK measurement or
+device playback check.
+
 ## Licenses
 
 Code in this repository is MIT unless a crate says otherwise. Decoders with no public specification (TrueHD/MLP, several Windows Media and RealMedia codecs, DVD and Blu-ray LPCM in `codec-lpcm`) are ports of FFmpeg's LGPL-2.1-or-later decoders; each such crate is LGPL-2.1-or-later, carries its own LICENSE, and ports only FFmpeg files whose headers say LGPL. The audio-trim producers in the MP4, MP3 and Ogg forks and the FFmpeg-exact ADPCM and G.726 decoders in the ADPCM fork are such ports too; those crates are `MIT AND LGPL-2.1-or-later`, with the ported files marked.
+
+`subs-render` is `MIT AND ISC`; its libass-derived files retain their ISC
+copyright and permission notices. Test-font licenses stay beside the
+external test fonts; those files are not shipped with the player.
 
 ## Verification
 

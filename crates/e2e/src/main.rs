@@ -866,6 +866,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
         audio: entry.selection.audio,
         subtitle: selected.iter().find(|s| s.track.kind == Kind::Subtitle).map(|s| s.track.stream),
         soundfont: std::env::var_os("PEARTUBE_SOUNDFONT").map(Into::into),
+        ..PlayerOptions::default()
     };
     let ff_streams = oracle::streams(path);
 

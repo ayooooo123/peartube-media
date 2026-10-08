@@ -41,6 +41,7 @@ pub mod subviewer1;
 pub mod text;
 pub mod text_common;
 mod text_reader;
+pub mod ttml;
 pub mod usf;
 pub mod vplayer;
 pub mod webvtt;
@@ -144,6 +145,12 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .tag(oxideav_core::CodecTag::fourcc(b"tx3g"))
             .tag(oxideav_core::CodecTag::fourcc(b"text")),
     );
+    reg.register(
+        CodecInfo::new(CodecId::new(ttml::CODEC_ID))
+            .capabilities(subtitle_caps("ttml_sw"))
+            .decoder(ttml::make_decoder)
+            .tag(oxideav_core::CodecTag::fourcc(b"stpp")),
+    );
     // Raw text (FFmpeg's `text`): OGM text streams.
     reg.register(
         CodecInfo::new(CodecId::new(TEXT_CODEC_ID))
@@ -212,6 +219,12 @@ pub fn register_containers(reg: &mut oxideav_core::ContainerRegistry) {
     reg.register_probe_with_priority(webvtt::CONTAINER_NAME, webvtt::probe, 50);
     reg.register_extension_with_priority("vtt", webvtt::CONTAINER_NAME, 50);
     reg.register_extension_with_priority("webvtt", webvtt::CONTAINER_NAME, 50);
+
+    reg.register_demuxer(ttml::CODEC_ID, ttml::open_demuxer);
+    reg.register_probe_with_priority(ttml::CODEC_ID, ttml::probe, 50);
+    for extension in ["ttml", "dfxp", "xml"] {
+        reg.register_extension_with_priority(extension, ttml::CODEC_ID, 50);
+    }
 
     // Scenarist Closed Captions: EIA-608 pairs, decoded by subs-cc.
     reg.register_demuxer(scc::CONTAINER_NAME, scc::open_demuxer);

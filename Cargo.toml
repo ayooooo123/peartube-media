@@ -130,9 +130,13 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.codec-gsm]
 opt-level = "s"
+[profile.release.package.codec-midi]
+opt-level = "s"
 [profile.release.package.codec-mlp]
 opt-level = "s"
 [profile.release.package.codec-mp1]
+opt-level = "s"
+[profile.release.package.codec-mp2]
 opt-level = "s"
 [profile.release.package.codec-musepack]
 opt-level = "s"
@@ -143,6 +147,8 @@ opt-level = "s"
 [profile.release.package.codec-shorten]
 opt-level = "s"
 [profile.release.package.codec-tak]
+opt-level = "s"
+[profile.release.package.codec-tracker]
 opt-level = "s"
 [profile.release.package.codec-tta]
 opt-level = "s"
@@ -165,6 +171,8 @@ opt-level = "s"
 [profile.release.package.subs-bitmap]
 opt-level = "s"
 [profile.release.package.subs-cc]
+opt-level = "s"
+[profile.release.package.subs-render]
 opt-level = "s"
 [profile.release.package.subs-text]
 opt-level = "s"

@@ -50,6 +50,8 @@ pub struct PlayerOptions {
     /// Local user-selected SF2 bank for MIDI. `None` makes MIDI report
     /// "needs a SoundFont". No bank is bundled or downloaded.
     pub soundfont: Option<PathBuf>,
+    /// Runtime font discovery; a fixed directory disables OS fallback.
+    pub fonts: subs_render::FontOptions,
 }
 
 impl Default for PlayerOptions {
@@ -60,6 +62,7 @@ impl Default for PlayerOptions {
             subtitle: None,
             realtime: true,
             soundfont: None,
+            fonts: subs_render::FontOptions::default(),
         }
     }
 }
@@ -918,7 +921,7 @@ fn run_player_pipeline(
         audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
     shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
     run.sub_thread = find_stream(&streams, current_subtitle)
-        .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime));
+        .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime, &options.fonts, run.demuxer.attachments()));
 
     // 8. From here the buffering hold follows the pipelines' data.
     shared.pipelines_started();
@@ -1077,11 +1080,21 @@ fn spawn_subtitles(
     lane: &Arc<Lane>,
     demux_cv: &Arc<Condvar>,
     realtime: bool,
+    fonts: &subs_render::FontOptions,
+    attachments: &[oxideav_core::Attachment],
 ) -> PipelineThread {
     let consumer = Consumer::new(lane, demux_cv);
     let sink = shared.backend.subtitles();
     let clock = shared.sink_clock();
     let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
+    let fonts = fonts.clone();
+    let mut bytes = 0usize;
+    let attachments: Vec<Arc<[u8]>> = attachments.iter().filter_map(|attachment| {
+        let signature = attachment.data.get(..4)?;
+        if ![&b"\0\x01\0\0"[..], &b"OTTO"[..], &b"ttcf"[..], &b"true"[..]].contains(&signature) { return None; }
+        bytes = bytes.saturating_add(attachment.data.len());
+        (bytes <= 64 << 20).then(|| Arc::from(attachment.data.as_slice()))
+    }).collect();
     PipelineThread::spawn("peartube-subtitles", move |retired| {
         let _consumer = consumer;
         let mut params = stream.params.clone();
@@ -1108,7 +1121,16 @@ fn spawn_subtitles(
         // WebVTT cues are placed per their settings and the regions the
         // stream's header (extradata) defines.
         let webvtt = (params.codec_id.as_str() == subs_text::webvtt::CODEC_ID)
-            .then(|| crate::webvtt::WebVttTrack::new(&params.extradata));
+            .then(|| crate::webvtt::WebVttTrack::with_fonts(&params.extradata, &fonts));
+        if let Some(track) = &webvtt {
+            for data in &attachments { track.add_font(data.clone()); }
+        }
+        let ass = matches!(params.codec_id.as_str(), "ass" | "ssa").then(|| {
+            let mut track = subs_render::Track::new();
+            let header = subs_text::text_common::decode_subtitle_text(&params.extradata);
+            track.process_codec_private(header.as_bytes());
+            track
+        });
         let pipeline = SubtitlePipeline {
             decoder,
             new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
@@ -1127,6 +1149,9 @@ fn spawn_subtitles(
             stopped: shared.stopped.clone(),
             retired,
             webvtt,
+            ass,
+            fonts,
+            attachments,
         };
         run_subtitle_loop(pipeline, sink);
     })
@@ -1460,7 +1485,7 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
         let stream = find_stream(run.streams, run.current_subtitle)
             .filter(|s| s.params.media_type == MediaType::Subtitle);
         if let Some(stream) = stream {
-            run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime));
+            run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime, &run.options.fonts, run.demuxer.attachments()));
         }
     }
 
