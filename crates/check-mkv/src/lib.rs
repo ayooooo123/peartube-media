@@ -133,10 +133,11 @@ impl Pkt {
     }
 }
 
-/// `ffprobe`'s packets for `path`; `args` go before the input
+/// The pinned `ffprobe`'s packets for `path` (the build of
+/// [`refcheck::pinned_ffmpeg`]); `args` go before the input
 /// (`-select_streams`, `-read_intervals`).
 pub fn ffprobe_packets(path: &Path, args: &[&str]) -> Vec<Pkt> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffmpeg().with_file_name("ffprobe"))
         .args(["-v", "error", "-show_data_hash", "md5"])
         .args(["-show_entries", "packet=stream_index,pts,dts,size,flags,data_hash"])
         .args(["-of", "compact=p=0"])

@@ -1576,8 +1576,12 @@ fn run_audio_thread(
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
-                // Drain the decoder's tail into the sink. What the trimmer
-                // still holds after that is the stream's end padding.
+                // Drain the decoder's tail into the sink. The last packet's
+                // span ends first: drained frames take that packet's trims
+                // frame by frame, as libavcodec's do (audio_trim::Trimmer::
+                // drain). What the trimmer still holds after that is the
+                // stream's end padding.
+                trimmer.drain(&mut kept);
                 let _ = decoder.flush();
                 let mut packet_pts = None;
                 while !quit() {

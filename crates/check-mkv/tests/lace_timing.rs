@@ -1,7 +1,7 @@
 //! Laced fixed-frame audio without DefaultDuration: Matroska stores only
-//! each Block's first timestamp, and FFmpeg 9 times the later laces from
-//! frame durations. Every packet field must equal `ffprobe -show_packets
-//! -show_data_hash md5`.
+//! each Block's first timestamp, and FFmpeg times the later laces from
+//! frame durations. Every packet field must equal the pinned FFmpeg's
+//! (2da55bf) `ffprobe -show_packets -show_data_hash md5`.
 //!
 //! Inputs are made here with ffmpeg, laced by mkvmerge (8 frames a Block),
 //! then stripped of DefaultDuration with mkvpropedit. Sources: a 2 s 48 kHz
@@ -67,7 +67,7 @@ fn fixture(dir: &Path, name: &str, input: &Input, mkvmerge: &[&str]) -> PathBuf 
 /// Whether FFmpeg reads laced Blocks from `path`: consecutive packets
 /// from one Block share its position.
 fn laced(path: &Path) -> bool {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffmpeg().with_file_name("ffprobe"))
         .args(["-v", "error", "-show_entries", "packet=pos", "-of", "csv=p=0"])
         .arg(path)
         .output()
