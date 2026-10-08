@@ -234,6 +234,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-vp56"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "oxideav-avi",
+ "oxideav-core",
+ "oxideav-flv",
+ "oxideav-mov",
+ "player",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-wma"
 version = "0.1.0"
 dependencies = [
@@ -267,6 +280,7 @@ dependencies = [
  "codec-mlp",
  "codec-ra",
  "codec-rv",
+ "codec-vp56",
  "codec-wma",
  "codec-wmv",
  "demux-asf",

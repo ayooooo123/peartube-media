@@ -32,6 +32,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_apple_audio::register_codecs,
         // ATRAC1, ATRAC3 (AL) and ATRAC3+ (AL).
         codec_atrac::register_codecs,
+        // VP5, VP6, VP6F and VP6A, ahead of oxideav-vp6.
+        codec_vp56::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
