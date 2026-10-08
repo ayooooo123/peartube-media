@@ -14,7 +14,7 @@ use crate::mpc7_data::{
     MPC7_DSCF, MPC7_HDR, MPC7_IDX30, MPC7_IDX31, MPC7_IDX32, MPC7_IDX50, MPC7_IDX51, MPC7_QUANT_VLCS,
     MPC7_QUANT_VLC_OFF, MPC7_QUANT_VLC_SIZES, MPC7_SCFI,
 };
-use crate::synth::MpaSynth;
+use mpegaudiodsp::MpaSynth;
 use crate::vlc::Vlc;
 
 struct Mpc7Tables {

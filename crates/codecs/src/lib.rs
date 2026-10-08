@@ -49,13 +49,14 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_musepack::register_codecs,
         codec_wavpack::register_codecs,
         // GSM 06.10 and Microsoft GSM (MSN Audio rates too), TTA, Shorten,
-        // TAK, and MPEG-4 ALS (MP4 object type 0x40 with ALS's config;
-        // ahead of the AAC decoders that claim that tag too).
+        // TAK, MPEG-4 ALS (MP4 object type 0x40 with ALS's config; ahead of
+        // the AAC decoders that claim that tag too), and MPEG audio Layer I.
         codec_gsm::register_codecs,
         codec_tta::register_codecs,
         codec_shorten::register_codecs,
         codec_tak::register_codecs,
         codec_als::register_codecs,
+        codec_mp1::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -101,7 +102,6 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_flac::__oxideav_entry,
         oxideav_g711::__oxideav_entry,
         oxideav_mod::__oxideav_entry,
-        oxideav_mp1::__oxideav_entry,
         oxideav_mp2::__oxideav_entry,
         oxideav_mp3::__oxideav_entry,
         oxideav_opus::__oxideav_entry,

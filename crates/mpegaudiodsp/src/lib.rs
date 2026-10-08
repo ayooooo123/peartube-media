@@ -1,6 +1,13 @@
-// Ported from FFmpeg libavcodec/mpegaudiodsp.c, mpegaudiodsp_template.c,
-// dct32_template.c and mpegaudiodsp_data.c (commit 2da55bf), LGPL-2.1-or-later.
-// Copyright (c) 2001, 2002 Fabrice Bellard; Copyright (c) 2011 Mans Rullgard.
+//! FFmpeg's fixed-point MPEG audio synthesis filter: `dct32_fixed`, the
+//! windowing with its dither state, and the per-channel ring buffer. The
+//! MPEG audio (Layer I) and Musepack decoders share it.
+//!
+//! Ported from FFmpeg libavcodec/mpegaudiodsp.c, mpegaudiodsp_template.c,
+//! dct32_template.c and mpegaudiodsp_data.c (commit 2da55bf),
+//! LGPL-2.1-or-later (see LICENSE).
+//! Copyright (c) 2001, 2002 Fabrice Bellard; Copyright (c) 2011 Mans Rullgard.
+
+#![forbid(unsafe_code)]
 
 pub const MPA_SYNTH_WINDOW_FIXED: [i32; 512] = [
     0, -1, -1, -1, -1, -1, -1, -2,

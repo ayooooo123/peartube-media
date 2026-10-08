@@ -251,5 +251,107 @@ for i, (ms, clip) in enumerate(clips):
 open(sys.argv[1], 'wb').write(out)
 PYEOF
 
+# 8e. MPEG-1 Layer I (.mpa) for audio:mp1 / container:mp3: FFmpeg has no MP1
+#     encoder. Written in the subband domain (no analysis filter): a 440 Hz
+#     tone on the left (subband 0), a tone in subband 1 on the right, and
+#     quieter shared tones in subbands 5-20, louder on the left. 44.1 kHz,
+#     384 kbit/s with the padding rule, joint stereo with the mode extension
+#     stepping through its four bounds every frame, CRC words over the header
+#     and the bit allocation as ISO 11172-3 has them (FFmpeg's crccheck, off
+#     by default, covers 256 bits for any two-channel frame and so reports
+#     joint stereo frames as mismatches). 689 frames, 6 s.
+python3 - "$CORPUS_DIR/audio_mp1.mpa" <<'PYEOF'
+import math, sys
+RATE, BITRATE, FRAMES = 44100, 384000, 689
+SUBBAND_RATE = RATE / 32
+def crc16(bits):
+    crc = 0xFFFF
+    for b in bits:
+        top = (crc >> 15) & 1
+        crc = (crc << 1) & 0xFFFF
+        if top != b:
+            crc ^= 0x8005
+    return crc
+def scf_index(peak):
+    # The smallest Layer I scale factor 2 * 2^(-i/3) at or above peak.
+    return max(0, min(62, int(math.floor(3 * math.log2(2.0 / peak)))))
+def scf(i):
+    return 2.0 * 2.0 ** (-i / 3)
+def quant(x, nb):
+    half = (1 << (nb - 1)) - 1
+    return max(0, min((1 << nb) - 2, int(round(x * half)) + half))
+def tone(freq, n, phase=0.0):
+    return math.cos(2 * math.pi * freq * n / SUBBAND_RATE + phase)
+out = bytearray()
+rest = 0
+for f in range(FRAMES):
+    rest += BITRATE * 12 % RATE
+    pad = 1 if rest >= RATE else 0
+    rest -= RATE * pad
+    size = (BITRATE * 12 // RATE + pad) * 4
+    mode_ext = f % 4
+    bound = (mode_ext + 1) * 4
+    header = 0xFFF00000 | 1 << 19 | 3 << 17 | 12 << 12 | pad << 9 | 1 << 6 | mode_ext << 4 | 1 << 2
+    n0 = 12 * f
+    # Per band: the allocation (mantissa bits - 1) and each channel's
+    # samples, or one shared normalized signal and two amplitudes.
+    alloc = [[0] * 32, [0] * 32]
+    samples = [[None] * 32, [None] * 32]
+    alloc[0][0] = 14
+    samples[0][0] = [0.5 * tone(440, n0 + j) for j in range(12)]
+    alloc[1][1] = 14
+    samples[1][1] = [0.4 * tone(300, n0 + j) for j in range(12)]
+    shared = {}
+    for sb in range(5, 21):
+        s = [tone(37 + 11 * sb, n0 + j, sb) for j in range(12)]
+        shared[sb] = s
+        for ch, amp in ((0, 0.03), (1, 0.015)):
+            alloc[ch][sb] = 5
+            samples[ch][sb] = [amp * v for v in s]
+    bits = []
+    def put(v, n):
+        bits.extend((v >> i) & 1 for i in range(n - 1, -1, -1))
+    put(header, 32)
+    put(0, 16)
+    for sb in range(bound):
+        for ch in range(2):
+            put(alloc[ch][sb], 4)
+    for sb in range(bound, 32):
+        put(alloc[0][sb], 4)
+    crc = crc16(bits[16:32] + bits[48:])
+    bits[32:48] = [(crc >> i) & 1 for i in range(15, -1, -1)]
+    # Scale factors and normalized samples; above the bound one set of
+    # samples (the shared signal) with a scale factor per channel.
+    sfs = [[0] * 32, [0] * 32]
+    norm = [[None] * 32, [None] * 32]
+    for sb in range(32):
+        for ch in range(2):
+            if alloc[ch][sb]:
+                peak = max(abs(v) for v in samples[ch][sb]) or 1e-9
+                sfs[ch][sb] = scf_index(peak)
+                norm[ch][sb] = [v / scf(sfs[ch][sb]) for v in samples[ch][sb]]
+        if sb >= bound and alloc[0][sb]:
+            peak = max(abs(v) for v in shared[sb])
+            norm[0][sb] = [v / peak for v in shared[sb]]
+            for ch, amp in ((0, 0.03), (1, 0.015)):
+                sfs[ch][sb] = scf_index(amp * peak)
+    for sb in range(32):
+        for ch in range(2):
+            if alloc[0 if sb >= bound else ch][sb]:
+                put(sfs[ch][sb], 6)
+    for j in range(12):
+        for sb in range(bound):
+            for ch in range(2):
+                if alloc[ch][sb]:
+                    put(quant(norm[ch][sb][j], alloc[ch][sb] + 1), alloc[ch][sb] + 1)
+        for sb in range(bound, 32):
+            if alloc[0][sb]:
+                put(quant(norm[0][sb][j], alloc[0][sb] + 1), alloc[0][sb] + 1)
+    assert len(bits) <= size * 8, "frame overflow"
+    bits += [0] * (size * 8 - len(bits))
+    out += int("".join(map(str, bits)), 2).to_bytes(size, "big")
+open(sys.argv[1], "wb").write(bytes(out))
+PYEOF
+
 # 8c. Copy the USF alongside (done above). Done.
 echo "Done! Corpus in $CORPUS_DIR ($(ls "$CORPUS_DIR" | wc -l | tr -d ' ') files)."

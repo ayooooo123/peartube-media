@@ -47,7 +47,6 @@ oxideav-flac.workspace = true
 oxideav-g711.workspace = true
 oxideav-midi.workspace = true
 oxideav-mod.workspace = true
-oxideav-mp1.workspace = true
 oxideav-mp2.workspace = true
 oxideav-mp3.workspace = true
 oxideav-opus.workspace = true
@@ -87,6 +86,7 @@ codec-tta = { path = "../codec-tta" }
 codec-shorten = { path = "../codec-shorten" }
 codec-tak = { path = "../codec-tak" }
 codec-als = { path = "../codec-als" }
+codec-mp1 = { path = "../codec-mp1" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }
