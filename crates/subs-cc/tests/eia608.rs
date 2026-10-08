@@ -32,7 +32,7 @@ struct FfCue {
 }
 
 fn run_ffmpeg(input: &[&str], format: &str, real_time: bool) -> String {
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-copyts"])
         .args(if real_time { &["-real_time", "1"][..] } else { &[][..] })
         .args(input)

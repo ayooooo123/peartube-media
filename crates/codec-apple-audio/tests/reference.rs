@@ -1,6 +1,6 @@
 //! Decodes through the production demuxers compared with FFmpeg
-//! 2da55bf's decode of the same file (`$FFMPEG_SRC/ffmpeg`, default
-//! ~/projects/ffmpeg-src, run with `-cpuflags 0`: its C code paths).
+//! 2da55bf's decode of the same file (`refcheck::pinned_ffmpeg`, run with
+//! `-cpuflags 0`: its C code paths).
 //!
 //! ALAC and MACE are integer decoders: every sample must be equal,
 //! compared as signed 32-bit (`-f s32le`, which FFmpeg fills from 16-bit
@@ -24,13 +24,13 @@ use std::path::{Path, PathBuf};
 
 use oxideav_core::{Frame, MediaType, SampleFormat};
 use refcheck::{decode, fate};
-use support::{archive, caf_remux, ffmpeg, generated, pinned, run, track_caf, REGISTRARS};
+use support::{archive, caf_remux, ffmpeg, generated, run, track_caf, REGISTRARS};
 
 /// FFmpeg 2da55bf's decode of the first audio stream through its C code
 /// paths, as signed 32-bit samples.
 fn ffmpeg_s32(path: &Path) -> Vec<i32> {
     let args = ["-cpuflags", "0", "-i", path.to_str().unwrap(), "-map", "0:a:0", "-f", "s32le", "-c:a", "pcm_s32le", "-"];
-    run(&pinned("ffmpeg"), &args)
+    run(&refcheck::pinned_ffmpeg(), &args)
         .chunks_exact(4)
         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()

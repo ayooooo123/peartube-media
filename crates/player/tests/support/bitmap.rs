@@ -32,12 +32,13 @@ impl Drop for Scratch {
     }
 }
 
+/// `refcheck::system_ffmpeg <args>`: builds the subtitle tests' inputs.
 pub fn ffmpeg(args: &[&str]) {
-    let output = Command::new("ffmpeg")
+    let output = Command::new(refcheck::system_ffmpeg())
         .args(["-v", "error", "-nostdin", "-y"])
         .args(args)
         .output()
-        .expect("ffmpeg on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(output.status.success(), "ffmpeg {args:?}: {}", String::from_utf8_lossy(&output.stderr));
 }
 

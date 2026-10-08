@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use check_decoders::{decode_packets, pinned_ffmpeg_packets};
+use check_decoders::{decode_packets, ffmpeg_packets};
 use oxideav_core::{CodecId, CodecParameters, Frame, SampleFormat};
 
 /// FATE's mp3-conformance streams. `he_free.bit` is left out: it is
@@ -39,7 +39,7 @@ fn conformance_streams_decode_within_90_db_of_ffmpeg() {
     let mut failures = Vec::new();
     for name in STREAMS {
         let path = refcheck::fate(&format!("mp3-conformance/{name}.bit"));
-        let packets = pinned_ffmpeg_packets(&path, "a:0");
+        let packets = ffmpeg_packets(&path, "a:0", None);
         let mut params = CodecParameters::audio(CodecId::new("mp3"));
         // A hint: every frame header gives the real rate and channel count.
         params.channels = Some(2);

@@ -4,13 +4,14 @@
 //! |---------|------------|-----------------------------------------------------|---------------------------|
 //! | SubRip  | `subrip`   | `.srt`; Matroska `S_TEXT/UTF8`                      | FFmpeg `srtdec.c` (both), `htmlsubtitles.c` (LGPL-2.1-or-later, ported) |
 //! | ASS/SSA | `ass`, `ssa` | `.ass`/`.ssa`; Matroska `S_TEXT/ASS` / `S_TEXT/SSA` | FFmpeg `assdec.c` (both), `ass_split.c` (LGPL-2.1-or-later, ported) |
-//! | WebVTT  | `webvtt`   | `.vtt`; Matroska / WebM WebVTT tracks               | FFmpeg `webvttdec.c` (both) (LGPL-2.1-or-later, ported) |
+//! | WebVTT  | `webvtt`   | `.vtt`; Matroska / WebM WebVTT tracks; MP4 `wvtt`   | FFmpeg `webvttdec.c` (both) (LGPL-2.1-or-later, ported); cue settings and regions from the W3C WebVTT spec (clean-room, [`webvtt_settings`]) |
 //! | MicroDVD| `microdvd` | `.sub`                                              | FFmpeg `microdvddec.c` (both) (LGPL-2.1-or-later, ported) |
 //! | SubViewer 2 | `subviewer2` | `.sub`                                       | FFmpeg `subviewerdec.c` (both) (LGPL-2.1-or-later, ported) |
 //! | mov_text| `mov_text` | MP4 sample entries `tx3g` / `text`                  | FFmpeg `movtextdec.c` (LGPL-2.1-or-later, ported) |
 //! | USF     | `usf`      | Matroska `S_TEXT/USF`                               | VLC `subsusf.c` + `subsdec.c` (LGPL-2.1-or-later, ported) |
 //! | CMML    | `cmml`     | Ogg logical stream, ident `CMML\0\0\0\0`            | Xiph CMML spec (clean-room) |
 //! | Kate    | `kate`     | Ogg logical stream, ident `\x80kate\0\0\0`; Matroska `S_KATE` | Xiph OggKate spec + libkate bitstream docs (clean-room) |
+//! | SCC     | `eia_608` (subs-cc decodes it) | `.scc` (Scenarist Closed Captions) | FFmpeg `sccdec.c` (LGPL-2.1-or-later, ported) |
 //!
 //! Decoders consume one packet per cue and emit `Frame::Subtitle`
 //! (`oxideav_core::SubtitleCue`). Formats FFmpeg decodes to ASS go through
@@ -33,6 +34,7 @@ pub mod microdvd;
 pub mod mov_text;
 pub mod sami;
 mod scan;
+pub mod scc;
 pub mod srt;
 pub mod subviewer;
 pub mod subviewer1;
@@ -42,6 +44,7 @@ mod text_reader;
 pub mod usf;
 pub mod vplayer;
 pub mod webvtt;
+pub mod webvtt_settings;
 pub mod xml;
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, MediaType};
 
@@ -207,6 +210,11 @@ pub fn register_containers(reg: &mut oxideav_core::ContainerRegistry) {
     reg.register_probe_with_priority(webvtt::CONTAINER_NAME, webvtt::probe, 50);
     reg.register_extension_with_priority("vtt", webvtt::CONTAINER_NAME, 50);
     reg.register_extension_with_priority("webvtt", webvtt::CONTAINER_NAME, 50);
+
+    // Scenarist Closed Captions: EIA-608 pairs, decoded by subs-cc.
+    reg.register_demuxer(scc::CONTAINER_NAME, scc::open_demuxer);
+    reg.register_probe_with_priority(scc::CONTAINER_NAME, scc::probe, 50);
+    reg.register_extension_with_priority("scc", scc::CONTAINER_NAME, 50);
 
     // MicroDVD
     reg.register_demuxer(microdvd::CONTAINER_NAME, microdvd::open_demuxer);

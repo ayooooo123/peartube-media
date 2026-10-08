@@ -35,6 +35,25 @@ pub use timeline::CaptionTimeline;
 /// until its end (`i64::MAX`: none). An empty state clears the screen.
 pub const STATE_STYLE: &str = "subs-cc:state";
 
+/// The caption services a picture's `cc_data` triplets carry, as the
+/// player lists caption tracks: valid EIA-608 pairs that are not padding
+/// (cc_type 0 or 1), and valid CEA-708 data (cc_type 2 or 3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Services {
+    pub eia608: bool,
+    pub cea708: bool,
+}
+
+impl Services {
+    pub fn of(triplets: &[[u8; 3]]) -> Services {
+        let valid = |t: &&[u8; 3]| t[0] & 0x04 != 0;
+        Services {
+            eia608: triplets.iter().filter(valid).any(|t| t[0] & 0x03 < 2 && (t[1] & 0x7f != 0 || t[2] & 0x7f != 0)),
+            cea708: triplets.iter().filter(valid).any(|t| t[0] & 0x03 >= 2),
+        }
+    }
+}
+
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, MediaType, RuntimeContext};
 
 /// A subtitle decoder's capabilities: decode-only, intra-only.

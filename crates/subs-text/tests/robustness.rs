@@ -300,6 +300,12 @@ fn mov_text_packets_with_sample_entry() {
     mutate_stream(&fate("sub/MovText_capability_tester.mp4"), "mov_text", 11);
 }
 
+/// SCC's `cc_data` triplets through the EIA-608 decoder.
+#[test]
+fn scc_packets() {
+    mutate_stream(&fate("sub/witch.scc"), "eia_608", 40);
+}
+
 #[test]
 fn kate_packets_with_headers() {
     mutate_stream(&fate("ogg-kate/kate-subtitles.ogg"), "kate", 12);
@@ -434,7 +440,7 @@ fn mutate_file(sample: &str, container: &str, seed: u64) {
 }
 
 /// The reference subtitle files the probe trials mutate.
-const FILES: [&str; 12] = [
+const FILES: [&str; 13] = [
     "sub/SubRip_capability_tester.srt",
     "sub/madness.srt",
     "sub/1ededcbd7b.ass",
@@ -447,6 +453,7 @@ const FILES: [&str; 12] = [
     "sub/VPlayer_capability_tester.txt",
     "sub/SAMI_capability_tester.smi",
     "sub/MPL2_capability_tester.txt",
+    "sub/witch.scc",
 ];
 
 /// Every probe the player's registry runs on an opened file sees the same
@@ -504,4 +511,12 @@ fn vplayer_sami_and_mpl2_files() {
     mutate_file("sub/VPlayer_capability_tester.txt", "vplayer", 30);
     mutate_file("sub/SAMI_capability_tester.smi", "sami", 31);
     mutate_file("sub/MPL2_capability_tester.txt", "mpl2", 32);
+}
+
+/// FATE's SCC sample, mutated 2000 times: twice the trials of the files
+/// above, as the demuxer is new.
+#[test]
+fn scc_files() {
+    mutate_file("sub/witch.scc", "scc", 33);
+    mutate_file("sub/witch.scc", "scc", 34);
 }

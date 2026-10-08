@@ -1,7 +1,7 @@
 //! Playback after a seek through demuxers ported here: the player
 //! (Headless backend, every codec of the app) seeks where FFmpeg 2da55bf
 //! seeks, then presents exactly the video frames and audio samples that
-//! `ffmpeg -ss TARGET` of the port's ffmpeg (FFMPEG_SRC) decodes from the
+//! `ffmpeg -ss TARGET` of the port's ffmpeg (`refcheck::pinned_ffmpeg`) decodes from the
 //! target on. The seek goes back after the whole file played, so the
 //! demuxer must move: right after opening, the engine would reach the
 //! target by decoding and dropping everything before it. An IVF VP8 seek
@@ -15,36 +15,25 @@ use std::time::{Duration, Instant};
 
 use player::{Capture, Event, Headless, Player, PlayerOptions};
 
-/// The port's ffmpeg, checked to be revision 2da55bf.
-fn port_ffmpeg() -> PathBuf {
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    let bin = src.join("ffmpeg");
-    let out = Command::new(&bin).arg("-version").output().expect("build ffmpeg in FFMPEG_SRC: make ffmpeg");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("2da55bf"), "seek oracle must be FFmpeg 2da55bf");
-    bin
-}
-
 /// What the port's ffmpeg writes to stdout for `args`.
 fn port_ffmpeg_output(args: &[String]) -> Vec<u8> {
-    let out = Command::new(port_ffmpeg()).args(["-v", "error", "-nostdin"]).args(args).output().unwrap();
+    let out = Command::new(refcheck::pinned_ffmpeg()).args(["-v", "error", "-nostdin"]).args(args).output().unwrap();
     assert!(out.status.success(), "ffmpeg {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     out.stdout
 }
 
 /// `name` in the scratch directory Cargo gives integration tests, made by
-/// the `ffmpeg` on PATH (it has the encoders) from `args`.
+/// `refcheck::system_ffmpeg` (it has the encoders) from `args`.
 fn generated(name: &str, args: &[&str]) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("demux-misc-player-seek-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y"])
         .args(args)
         .arg(&path)
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
     path
 }

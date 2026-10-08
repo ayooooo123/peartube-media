@@ -4,7 +4,7 @@
 //! target. Every FATE VC-1 sample has a single key frame, so each test file
 //! is a FATE sample twice over (a second key frame mid-file). After each
 //! seek the first packets equal `ffprobe -read_intervals TARGET%+#N` of
-//! the port's ffprobe (FFMPEG_SRC): size, payload, key flag, dts, and pts
+//! the port's ffprobe (`refcheck::pinned_ffprobe`): size, payload, key flag, dts, and pts
 //! where FFmpeg sets one.
 
 use std::collections::HashMap;
@@ -12,16 +12,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxideav_core::{Error, RuntimeContext, TimeBase};
-
-fn port_ffprobe() -> PathBuf {
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    let bin = src.join("ffprobe");
-    let out = Command::new(&bin).arg("-version").output().expect("build ffprobe in FFMPEG_SRC");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("2da55bf"), "seek oracle must be FFmpeg 2da55bf");
-    bin
-}
 
 #[derive(Debug, PartialEq)]
 struct Pkt {
@@ -34,7 +24,7 @@ struct Pkt {
 
 /// FFmpeg's first `n` packets after seeking `path` to `target` seconds.
 fn ffprobe_after(path: &Path, format: &str, target: &str, n: usize) -> Vec<Pkt> {
-    let out = Command::new(port_ffprobe())
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-f", format, "-read_intervals", &format!("{target}%+#{n}")])
         .args(["-show_data_hash", "md5", "-show_entries", "packet=pts,dts,size,flags,data_hash", "-of", "compact"])
         .arg(path)

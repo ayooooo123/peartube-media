@@ -1,7 +1,7 @@
 //! Reference tests: decode every FATE TrueHD / MLP sample through this
 //! crate's decoders and the raw `truehd` / `mlp` demuxers, and the generated
 //! corpus' TrueHD through the MPEG-TS, Matroska and MP4 demuxers, and compare
-//! with FFmpeg 2da55bf (`$FFMPEG_SRC/ffmpeg`, default `~/projects/ffmpeg-src`).
+//! with FFmpeg 2da55bf (`refcheck::pinned_ffmpeg`).
 //! The decoders are integer ports of FFmpeg's, so the comparison is
 //! byte-exact: the interleaved PCM must equal FFmpeg's `-f s32le` /
 //! `-f s16le` output (what FFmpeg's own FATE tests hash for these samples).
@@ -43,10 +43,7 @@ fn ffmpeg_pcm(path: &Path, format: SampleFormat) -> Vec<u8> {
         SampleFormat::S16 => ("s16le", "pcm_s16le"),
         other => panic!("no FFmpeg PCM muxer for {other:?}"),
     };
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    let binary = src.join("ffmpeg");
+    let binary = refcheck::pinned_ffmpeg();
     let out = std::process::Command::new(&binary)
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)

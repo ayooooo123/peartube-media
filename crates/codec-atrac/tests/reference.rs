@@ -7,7 +7,7 @@
 //! emit FFmpeg's packets, and the whole path, demuxer to samples, must
 //! match FFmpeg's decode.
 
-use check_decoders::{decode_packets, pinned_ffmpeg_packets, tool};
+use check_decoders::{decode_packets, ffmpeg_packets, tool};
 use oxideav_core::{CodecId, CodecParameters, Demuxer, Error, Frame, RuntimeContext, SampleFormat};
 
 /// FATE's ATRAC samples (tests/fate/atrac.mak, oma.mak and the aea / oma
@@ -34,9 +34,8 @@ const DEMUX_SAMPLES: &[(&str, &str)] = &[
 ];
 
 fn ffprobe(args: &[&str]) -> String {
-    let ffprobe = refcheck::pinned_ffmpeg().with_file_name("ffprobe");
     String::from_utf8(tool(
-        &ffprobe,
+        refcheck::pinned_ffprobe(),
         &[&["-v", "error", "-cpuflags", "0"][..], args].concat(),
     ))
     .expect("UTF-8")
@@ -209,7 +208,7 @@ fn decoders_match_ffmpeg_on_its_packets() {
         params
             .options
             .insert("block_align", block_align.to_string());
-        let packets = pinned_ffmpeg_packets(&path, "a:0");
+        let packets = ffmpeg_packets(&path, "a:0", None);
         let (decoded, errors) = decode_packets(&[codec_atrac::register], &params, &packets);
 
         let ours: Vec<(u32, u16)> = decoded

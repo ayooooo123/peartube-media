@@ -1,6 +1,6 @@
 [package]
 name = "check-decoders"
-description = "Regression tests: OxideAV decoder forks (H.264, MP2, AC-3, Opus) against FFmpeg"
+description = "Regression tests: OxideAV decoder forks (H.264, MP2, AC-3, Opus, ADPCM) against FFmpeg"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,8 @@ refcheck.workspace = true
 
 [dev-dependencies]
 demux-misc = { path = "../demux-misc" }
+# The Player's registry, containers included (the ADPCM sweep).
+codecs = { path = "../codecs" }
 # The forks under test (pinned in the workspace [patch.crates-io]).
 oxideav-h264.workspace = true
 oxideav-mp2.workspace = true
@@ -22,7 +24,5 @@ oxideav-opus.workspace = true
 oxideav-mkv.workspace = true
 oxideav-mpegts.workspace = true
 oxideav-ogg.workspace = true
-# The video tests decode through the player's registry and pack frames as
-# its headless sink does.
-codecs = { path = "../codecs" }
+# The video tests pack frames as the player's headless sink does.
 player = { path = "../player" }

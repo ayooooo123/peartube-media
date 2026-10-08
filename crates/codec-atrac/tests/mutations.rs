@@ -5,7 +5,7 @@
 
 use std::io::Cursor;
 
-use check_decoders::{decode_packets, pinned_ffmpeg_packets};
+use check_decoders::{decode_packets, ffmpeg_packets};
 use oxideav_core::{CodecId, CodecParameters, Error, Frame, Packet, RuntimeContext};
 
 /// xorshift64*: a fixed sequence, so a failure reproduces.
@@ -89,7 +89,7 @@ fn decoders_survive_cut_and_flipped_packets() {
         ),
     ];
     for (sample, params, seed) in cases {
-        let packets: Vec<Packet> = pinned_ffmpeg_packets(&refcheck::fate(sample), "a:0")
+        let packets: Vec<Packet> = ffmpeg_packets(&refcheck::fate(sample), "a:0", None)
             .into_iter()
             .take(16)
             .collect();

@@ -1,5 +1,6 @@
 //! Miscellaneous container demuxers for PearTube media: raw AC-3/E-AC-3,
-//! raw MPEG video, raw H.264 and HEVC Annex B, MPEG-1/2 program streams,
+//! raw MPEG video, raw MPEG-4 Part 2 video (m4v), raw H.264 and HEVC
+//! Annex B, MPEG-1/2 program streams,
 //! TechnoTrend PVA, NUT, Creative VOC, Core Audio Format (CAF), On2 IVF
 //! and Standard MIDI Files. Ported from FFmpeg's libavformat (commit
 //! 2da55bf), with the libavcodec parsers that cut its packets, except
@@ -16,8 +17,8 @@
 //! FFmpeg source with its built ffmpeg and ffprobe at FFMPEG_SRC
 //! (revision 2da55bf). The inventory expands tests/fate/*.mak and rejects
 //! missing inputs. Raw video compares complete access units and key flags;
-//! raw MPEG-1/2, H.264 and HEVC also FFmpeg's timestamps and durations
-//! (H.264 and HEVC are untimed, as FFmpeg leaves them).
+//! raw MPEG-1/2, MPEG-4 Part 2, H.264 and HEVC also FFmpeg's timestamps
+//! and durations (H.264 and HEVC are untimed, as FFmpeg leaves them).
 #![forbid(unsafe_code)]
 
 mod ac3;
@@ -27,6 +28,7 @@ mod h264_parse;
 mod hevc;
 mod hevc_parse;
 mod ivf;
+mod m4v;
 mod mpegps;
 mod mpegvideo;
 mod nut;
@@ -45,6 +47,7 @@ pub fn register(ctx: &mut RuntimeContext) {
     hevc::register(&mut ctx.containers);
     ivf::register(&mut ctx.containers);
     mpegps::register(&mut ctx.containers);
+    m4v::register(&mut ctx.containers);
     mpegvideo::register(&mut ctx.containers);
     nut::register(&mut ctx.containers);
     pva::register(&mut ctx.containers);

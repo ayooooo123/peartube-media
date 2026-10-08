@@ -1,4 +1,5 @@
-//! Demuxer reference tests for crates/demux-misc against FFmpeg's ffprobe.
+//! Demuxer reference tests for crates/demux-misc against the ffprobe of
+//! FFmpeg 2da55bf (`FFMPEG_SRC`, default ~/projects/ffmpeg-src).
 //!
 //! Inputs: every FATE input that FFmpeg's test makefiles name
 //! (tests/fate/*.mak of the FFmpeg tree this crate ports, commit 2da55bf,
@@ -17,12 +18,10 @@
 //!   demuxer output (`-fflags +noparse+nofillin`), excluding parser
 //!   reframing and decoder-dependent DTS interpolation.
 //! - raw video elementary streams (MPEG-1/2, H.264, HEVC): the access
-//!   units and key flags FFmpeg's parsers produce. Key flags use the
-//!   port's FFmpeg revision (`FFMPEG_SRC/ffmpeg -dump`): 9.0.2 predates
-//!   its H.264 data-partition key detection. Raw MPEG-1/2 also compares
-//!   pts, dts (a missing one included) and duration with that revision's
-//!   packet table (`FFMPEG_SRC/ffprobe`). H.264 and HEVC timestamps are
-//!   not compared: FFmpeg leaves them to its decoder.
+//!   units and key flags FFmpeg's parsers produce (key flags from
+//!   `ffmpeg -dump`). Raw MPEG-1/2 also compares pts, dts (a missing one
+//!   included) and duration. H.264 and HEVC timestamps are not compared:
+//!   FFmpeg leaves them to its decoder.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,12 +38,6 @@ fn suite_path(rel: &str) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/fate-suite"))
         .join(rel)
-}
-
-fn ffmpeg_src() -> PathBuf {
-    std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
 }
 
 /// The text of a makefile with continuation lines joined.
@@ -168,7 +161,7 @@ impl Makefiles {
 /// Every FATE input path the makefiles name, relative to the suite.
 fn fate_inputs() -> &'static [String] {
     static INPUTS: LazyLock<Vec<String>> = LazyLock::new(|| {
-        let dir = ffmpeg_src().join("tests/fate");
+        let dir = refcheck::ffmpeg_src().join("tests/fate");
         let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
             .unwrap_or_else(|e| panic!("FATE makefiles at {}: {e}", dir.display()))
             .map(|e| e.unwrap().path())
@@ -219,13 +212,13 @@ fn fate_inputs() -> &'static [String] {
     &INPUTS
 }
 
-/// FFmpeg's demuxer for `path`, as ffprobe names it.
+/// FFmpeg's demuxer for `path`, as the pinned ffprobe names it.
 fn ffprobe_format(path: &Path) -> String {
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "quiet", "-show_entries", "format=format_name", "-of", "csv=p=0"])
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe format {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -270,26 +263,9 @@ struct Pkt {
     key: bool,
 }
 
-/// The ffprobe of the port's FFmpeg revision (`FFMPEG_SRC/ffprobe`,
-/// 2da55bf), checked once to be that revision.
-fn port_ffprobe() -> &'static Path {
-    static PORT: LazyLock<PathBuf> = LazyLock::new(|| {
-        let bin = ffmpeg_src().join("ffprobe");
-        let out = std::process::Command::new(&bin)
-            .arg("-version")
-            .output()
-            .expect("build ffprobe in FFMPEG_SRC (the port's revision): make ffprobe");
-        let version = String::from_utf8_lossy(&out.stdout);
-        assert!(version.contains("2da55bf"), "packet-table oracle must be FFmpeg 2da55bf: {version}");
-        bin
-    });
-    &PORT
-}
-
-/// `ffprobe -f format` on `path`: streams, then packets. `port` takes the
-/// table from the port's FFmpeg revision instead of the installed one.
-fn ffprobe(path: &Path, format: &str, unparsed: bool, port: bool) -> (Vec<FfStream>, Vec<Pkt>) {
-    let mut cmd = std::process::Command::new(if port { port_ffprobe() } else { Path::new("ffprobe") });
+/// The pinned `ffprobe -f format` on `path`: streams, then packets.
+fn ffprobe(path: &Path, format: &str, unparsed: bool) -> (Vec<FfStream>, Vec<Pkt>) {
+    let mut cmd = std::process::Command::new(refcheck::pinned_ffprobe());
     cmd.args(["-v", "quiet", "-f", format]);
     if unparsed {
         cmd.args(["-fflags", "+noparse+nofillin"]);
@@ -300,7 +276,7 @@ fn ffprobe(path: &Path, format: &str, unparsed: bool, port: bool) -> (Vec<FfStre
         .args(["-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
     let (mut streams, mut packets) = (Vec::new(), Vec::new());
@@ -333,20 +309,18 @@ fn ffprobe(path: &Path, format: &str, unparsed: bool, port: bool) -> (Vec<FfStre
     (streams, packets)
 }
 
-/// The port's parser flags, not the older system ffprobe's: 2da55bf
-/// recognizes H.264 partition-A slices, which 9.0.2 does not. Compare
-/// every raw-video packet's size as well, so this oracle cannot silently
-/// use a different set of boundaries.
+/// The port's parser flags (2da55bf recognizes H.264 partition-A slices,
+/// which 9.0.2 does not), with every raw-video packet's size, so this
+/// oracle cannot silently use a different set of boundaries.
 fn raw_video_flags(path: &Path, format: &str) -> Vec<(usize, bool)> {
-    let out = std::process::Command::new(ffmpeg_src().join("ffmpeg"))
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-nostdin", "-v", "info", "-dump", "-f", format, "-i"])
         .arg(path)
         .args(["-map", "0:v", "-c", "copy", "-f", "null", "-"])
         .output()
-        .expect("build ffmpeg from FFMPEG_SRC (the port's revision)");
+        .expect("the pinned FFmpeg runs");
     let log = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "ffmpeg packet flags {}: {log}", path.display());
-    assert!(log.contains("2da55bf"), "packet-flag oracle must be FFmpeg 2da55bf: {log}");
     let mut key = None;
     let mut packets = Vec::new();
     for line in log.lines().map(str::trim) {
@@ -401,11 +375,9 @@ struct Mode {
     durations: bool,
     /// Compare key flags.
     keys: bool,
-    /// Take the packet table from the port's FFmpeg revision.
-    port: bool,
 }
 
-const CONTAINER: Mode = Mode { unparsed: false, times: true, durations: false, keys: false, port: false };
+const CONTAINER: Mode = Mode { unparsed: false, times: true, durations: false, keys: false };
 /// Raw H.264 and HEVC: access units, key flags, and FFmpeg 2da55bf's
 /// timing of them: no pts or dts (FFmpeg does not interpolate H.264 or
 /// HEVC timestamps), and the duration compute_frame_duration gives. Where
@@ -413,11 +385,11 @@ const CONTAINER: Mode = Mode { unparsed: false, times: true, durations: false, k
 /// analysing the stream by the raw demuxer's 25 fps and later ones by
 /// one tick (its r_frame_rate fallback, the time base); the port keeps
 /// 25 fps, so those one-tick durations are not compared.
-const RAW_VIDEO: Mode = Mode { unparsed: false, times: true, durations: true, keys: true, port: true };
+const RAW_VIDEO: Mode = Mode { unparsed: false, times: true, durations: true, keys: true };
 /// Raw MPEG-1/2 video: access units, key flags, and the pts, dts (a
 /// missing one included) and duration FFmpeg 2da55bf's demuxer layer
 /// gives each.
-const RAW_MPEG: Mode = Mode { unparsed: false, times: true, durations: true, keys: true, port: true };
+const RAW_MPEG: Mode = Mode { unparsed: false, times: true, durations: true, keys: true };
 
 /// `rel` through the player's registry against ffprobe's table for
 /// `format`; the first difference, if any.
@@ -447,7 +419,7 @@ fn compare(path: &Path, rel: &str, format: &str, mode: Mode) -> Result<(), Strin
         return Err(format!("{rel}: streams at open {at_open:?}, after demuxing {at_end:?}"));
     }
 
-    let (ff_streams, mut ff_packets) = ffprobe(path, format, mode.unparsed, mode.port);
+    let (ff_streams, mut ff_packets) = ffprobe(path, format, mode.unparsed);
     if mode.keys {
         let flags = raw_video_flags(path, format);
         assert_eq!(flags.len(), ff_packets.len(), "{rel}: FFmpeg revisions disagree on packet count");
@@ -530,13 +502,13 @@ fn scratch_dir(test: &str) -> PathBuf {
 /// `source`.
 fn encode(dir: &Path, name: &str, codec: &str, source: &str, args: &[&str]) -> PathBuf {
     let path = dir.join(name);
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", source, "-c:v", codec])
         .args(args)
         .args(["-f", codec])
         .arg(&path)
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
     path
 }
@@ -558,6 +530,17 @@ fn sequence_headers(bytes: &[u8]) -> Vec<(usize, u8, Option<(u8, u8, u8)>)> {
 /// The offset of each picture header of a raw MPEG-1/2 stream.
 fn picture_headers(bytes: &[u8]) -> Vec<usize> {
     (0..bytes.len().saturating_sub(4)).filter(|&i| bytes[i..i + 4] == [0, 0, 1, 0]).collect()
+}
+
+/// Raw MPEG-4 Part 2 video (m4v; FATE names some `.h263`): the VOPs
+/// FFmpeg's mpeg4video parser cuts with the headers before them, key for
+/// I-VOPs, timed by their VOP times as FFmpeg 2da55bf's demuxer layer
+/// times them: B-frame delay (the Xvid stream), plain (the resolution
+/// changes), FFmpeg's guessed time_increment_bits (demo.m4v) and the
+/// studio profile's untimed VOP.
+#[test]
+fn m4v() {
+    check_inventory("m4v", &["m4v", "h263"], RAW_MPEG);
 }
 
 /// Raw MPEG-1/2 video: the frames FFmpeg's mpegvideo parser cuts, timed
@@ -736,13 +719,13 @@ fn x264_and_x265_streams_are_untimed_with_their_frame_durations() {
         ("x30.hevc", "libx265", "hevc", "30000/1001"),
     ] {
         let path = dir.join(name);
-        let out = std::process::Command::new("ffmpeg")
+        let out = std::process::Command::new(refcheck::system_ffmpeg())
             .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
             .arg(format!("testsrc=size=176x144:rate={rate}:duration=2"))
             .args(["-c:v", codec, "-bf", "2", "-g", "25", "-x265-params", "log-level=error", "-f", format])
             .arg(&path)
             .output()
-            .expect("ffmpeg must be on PATH");
+            .expect("the fixture FFmpeg runs");
         assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
         if let Err(e) = compare(&path, &format!("generated {name}"), format, RAW_VIDEO) {
             failures.push(e);
@@ -777,13 +760,13 @@ fn caf() {
     let dir = scratch_dir("caf");
     let remux = |name: &str, source: &str| {
         let path = dir.join(name);
-        let out = std::process::Command::new("ffmpeg")
+        let out = std::process::Command::new(refcheck::system_ffmpeg())
             .args(["-nostdin", "-v", "error", "-y", "-i"])
             .arg(suite_path(source))
             .args(["-map", "0:a", "-c", "copy", "-f", "caf"])
             .arg(&path)
             .output()
-            .expect("ffmpeg must be on PATH");
+            .expect("the fixture FFmpeg runs");
         assert!(out.status.success(), "{name}: ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
         let chunks = caf_chunks(&path);
         let at = |tag: &[u8; 4]| chunks.iter().position(|c| c == tag);
@@ -796,7 +779,7 @@ fn caf() {
         ("inside.caf (ALAC)", remux("inside.caf", "lossless-audio/inside.m4a")),
         ("surge-2-16-B-QDM2.caf", remux("surge-2-16-B-QDM2.caf", "qt-surge-suite/surge-2-16-B-QDM2.mov")),
     ];
-    let timed = Mode { durations: true, port: true, ..CONTAINER };
+    let timed = Mode { durations: true, ..CONTAINER };
     for (rel, path) in &inputs {
         compare(path, rel, "caf", timed).unwrap();
         assert_eq!(caf_trims(path), ffprobe_trims(path), "{rel}: priming and remainder trims per packet");
@@ -838,7 +821,7 @@ fn caf_trims(path: &Path) -> Vec<Option<(u32, u32)>> {
 /// Each packet's skip-samples side data (skip, discard) from FFmpeg
 /// 2da55bf's ffprobe.
 fn ffprobe_trims(path: &Path) -> Vec<Option<(u32, u32)>> {
-    let out = std::process::Command::new(port_ffprobe())
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "quiet", "-show_entries", "packet=pts:packet_side_data=skip_samples,discard_padding", "-of", "compact"])
         .arg(path)
         .output()
@@ -868,7 +851,7 @@ fn ivf() {
 #[test]
 fn nut() {
     let path = std::env::temp_dir().join(format!("demux-misc-nut-{}.nut", std::process::id()));
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args([
             "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=1000:duration=0.5",
             "-f", "lavfi", "-i", "testsrc=duration=0.5:size=64x64:rate=10",
@@ -876,7 +859,7 @@ fn nut() {
         ])
         .arg(&path)
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "ffmpeg mux failed: {}", String::from_utf8_lossy(&out.stderr));
     // NUT carries PTS only. Disable libavformat's decoder-dependent
     // DTS fill-in, as for the unparsed PVA contract.
@@ -907,7 +890,7 @@ fn inventory_expands_fate_macros() {
 /// contract probing only, unlike the complete packet fixtures above.
 #[test]
 fn extensionless_program_stream_probes() {
-    let text = std::fs::read_to_string(ffmpeg_src().join("tests/fate/probe.mak")).unwrap();
+    let text = std::fs::read_to_string(refcheck::ffmpeg_src().join("tests/fate/probe.mak")).unwrap();
     let names: Vec<&str> = text.lines().filter_map(|line| {
         let (name, value) = line.split_once(':')?;
         let (_, format) = value.split_once('=')?;

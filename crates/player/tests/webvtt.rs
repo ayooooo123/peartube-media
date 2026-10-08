@@ -43,7 +43,7 @@ fn generated_webvtt_matches_ffmpeg_and_reaches_player_sink() {
     let root = std::env::var_os("PEARTUBE_CORPUS_DIR").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join("projects/peartube-media-corpus"));
     let path = root.join("vp9_opus_vtt.webm");
-    let output = Command::new("ffmpeg").args(["-v", "error", "-nostdin", "-i"])
+    let output = Command::new(refcheck::pinned_ffmpeg()).args(["-v", "error", "-nostdin", "-i"])
         .arg(&path).args(["-map", "0:s:0", "-c:s", "webvtt", "-f", "webvtt", "-"])
         .output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

@@ -45,12 +45,12 @@ fn unknown_at_open_geometry_is_published_before_eof() {
 /// sequence that follows.
 fn late_header_program_stream() -> PathBuf {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("mpeg12-late-header.mpg");
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x204060:s=720x480:r=5:d=2",
             "-c:v", "mpeg2video", "-bf", "0", "-g", "1", "-f", "vob"])
         .arg(&path)
         .status()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(status.success());
     let original = std::fs::read(&path).unwrap();
     assert_eq!(&original[..4], &[0, 0, 1, 0xba]);
@@ -72,7 +72,7 @@ fn sparse_pes_timestamps_match_ffmpeg_through_production_ps() {
     // stamps only the first picture commencing in it; anchors and B-pictures
     // then lack their own PTS.
     let path = output("sparse-pts").with_file_name("sparse-pts.mpg");
-    let status = std::process::Command::new("ffmpeg")
+    let status = std::process::Command::new(refcheck::system_ffmpeg())
         .args(["-v","error","-nostdin","-y","-threads","1","-f","lavfi","-i","testsrc2=size=176x144:rate=25",
             "-frames:v","60","-c:v","mpeg2video","-threads","1","-bf","2","-g","12","-b:v","150k","-f","mpeg"])
         .arg(&path).status().expect("FFmpeg generates the sparse-PTS input");

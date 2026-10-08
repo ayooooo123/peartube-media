@@ -1,7 +1,11 @@
 # corpus/manifest.toml
-# One entry per corpus sample. `path` is `fate:<relative-under-FATE_SUITE>` or
+# One entry per corpus sample. `path` is `fate:<relative-under-FATE_SUITE>`,
 # `gen:<name>` (files made by corpus/generate.sh into PEARTUBE_CORPUS_DIR,
-# default ~/projects/peartube-media-corpus).
+# default ~/projects/peartube-media-corpus), or `samples:<archive path>` (a
+# file of FFmpeg's sample archive, https://samples.ffmpeg.org/, which
+# corpus/fetch-samples.sh fetches into FFMPEG_SAMPLES, default
+# ~/projects/oracles/ffmpeg-samples; corpus/samples.sha256 pins each one,
+# and the runner refuses a file that differs).
 # rows    = yardstick rows covered (ids from corpus/yardstick.toml)
 # compare = one policy per stream kind the sample has (a played stream with
 #           no policy fails):
@@ -65,10 +69,10 @@ path = "gen:mpeg4_xvid.avi"
 rows = ["video:mpeg4", "video:xvid", "container:avi"]
 compare = ["video:md5"]
 
-# 3ivx = MPEG-4 ASP under the 3IV1 tag; no true 3ivx sample exists, so this
-# exercises the container-tag → decoder path.
+# 3ivx: a real 3ivx Delta 4 movie from FFmpeg's sample archive (MPEG-4 ASP
+# under the 3IV2 tag). FFmpeg cannot decode the older 3IV1 coding.
 [[entry]]
-path = "gen:mpeg4_3ivx.avi"
+path = "samples:V-codecs/3iv2/3IV2.mov"
 rows = ["video:3ivx"]
 compare = ["video:md5"]
 
@@ -230,7 +234,7 @@ compare = ["video:md5", "audio:snr:90"]
 # ---------------- Audio ----------------
 
 [[entry]]
-path = "gen:audio_mp1.mpa"
+path = "samples:A-codecs/mp1-sample.mp1"
 rows = ["audio:mp1", "container:mp3"]
 compare = ["audio:md5"]
 
@@ -431,7 +435,7 @@ compare = ["audio:md5"]
 
 [[entry]]
 path = "fate:amrnb/10.2k.amr"
-rows = ["audio:amrnb", "container:raw_aac"]
+rows = ["audio:amrnb"]
 compare = ["audio:snr:90", "diag:audio:snr:80"]
 
 [[entry]]
@@ -464,6 +468,33 @@ path = "fate:qt-surge-suite/surge-1-16-B-ima4.mov"
 rows = ["audio:adpcm"]
 compare = ["audio:md5", "diag:audio:snr:70"]
 
+# MS ADPCM and IMA WAV in QuickTime (ms\0\x02, ms\0\x11), OKI, G.726, and
+# Creative ADPCM in WAV.
+[[entry]]
+path = "fate:qt-surge-suite/surge-2-16-L-ms02.mov"
+rows = ["audio:adpcm", "container:mov"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:qt-surge-suite/surge-2-16-L-ms11.mov"
+rows = ["audio:adpcm", "container:mov"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:oki/test.wav"
+rows = ["audio:adpcm", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio_g726.wav"
+rows = ["audio:adpcm", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:creative/intro-partial.wav"
+rows = ["audio:adpcm", "container:wav"]
+compare = ["audio:md5"]
+
 [[entry]]
 path = "fate:qcp/0036580847.QCP"
 rows = ["audio:qcelp"]
@@ -479,12 +510,11 @@ path = "fate:qt-surge-suite/surge-2-16-B-QDM2.mov"
 rows = ["audio:qdm2", "container:mov"]
 compare = ["audio:snr:90", "diag:audio:snr:60"]
 
-# QDMC: no FATE sample and no encoder exists anywhere (ffmpeg has the decoder
-# but nothing produces QDMC bitstreams). This entry documents the gap; the
-# runner reports the row as failing until a sample arrives.
+# QDMC: FATE has none and nothing encodes it; QuickTime's own encode from
+# FFmpeg's sample archive. FFmpeg's decoder computes in floats, as QDM2's.
 [[entry]]
-path = "gen:audio_qdmc_placeholder.bin"
-rows = ["audio:qdmc"]
+path = "samples:A-codecs/QDMC/rumcoke.mov"
+rows = ["audio:qdmc", "container:mov"]
 compare = ["audio:snr:90"]
 
 [[entry]]
@@ -571,18 +601,33 @@ path = "fate:sub/MPL2_capability_tester.txt"
 rows = ["sub:mpl2"]
 compare = ["sub:text"]
 
+# Closed captions in MPEG-2 video (A/53): the player offers them as
+# synthetic tracks, EIA-608 as stream 65536 and CEA-708 service 1 as 65537.
+# FFmpeg reads EIA-608 through lavfi `movie=...[out0+subcc]` and decodes it
+# in real time mode, as the player shows captions; it has no CEA-708
+# decoder, so that track can only decode.
 [[entry]]
 path = "fate:sub/Closedcaption_rollup.m2v"
 rows = ["sub:eia608"]
+streams = { subtitle = 65536 }
 compare = ["video:md5", "sub:text"]
 
 [[entry]]
-path = "fate:sub/witch.scc"
+path = "fate:sub/Closedcaption_rollup.m2v"
 rows = ["sub:cea708"]
+streams = { subtitle = 65537 }
+compare = ["video:md5", "sub:decodes"]
+
+# Scenarist Closed Captions carry EIA-608 pairs (FFmpeg: eia_608).
+[[entry]]
+path = "fate:sub/witch.scc"
+rows = ["sub:eia608"]
 compare = ["sub:text"]
 
+# USF in Matroska from FFmpeg's sample archive (XviD, Vorbis, USF). FFmpeg
+# cannot decode USF.
 [[entry]]
-path = "gen:h264_aac_usf.mkv"
+path = "samples:sub/usf/usf.mkv"
 rows = ["sub:usf"]
 compare = ["video:md5", "audio:snr:90", "sub:decodes"]
 
@@ -628,9 +673,11 @@ path = "gen:h264_aac_pgs.mkv"
 rows = ["sub:pgs", "container:mkv"]
 compare = ["video:md5", "sub:bitmap"]
 
-# SVCD: no FATE sample and no ffmpeg encoder. SVCD OGT is covered by the
-# subs-bitmap worker's FATE-less row via psx-str; this entry documents the
-# gap.
+# SVCD (OGT) subpictures: no real sample found. FATE has none; FFmpeg's
+# sample archive (its full index, MPEG-VOB/SVCD-bug's 52 MB disc image,
+# MPEG-VOB/interlaced/twc-teme-svcd-sample.mpg) and VLC's SVCD/karaoke.bin
+# carry no private stream 1 at all; FFmpeg and mkvmerge cannot write OGT.
+# This entry documents the gap; the runner reports the row as missing.
 [[entry]]
 path = "gen:sub_svcd_placeholder.bin"
 rows = ["sub:svcd"]
@@ -721,14 +768,26 @@ path = "fate:dts/dts_es.dts"
 rows = ["container:raw_dts"]
 compare = ["audio:snr:90"]
 
+# Raw containers: ADTS AAC, Opus in an .opus file, raw DV (FFmpeg's dv
+# muxer, and a camera's single frame from FFmpeg's sample archive).
 [[entry]]
-path = "fate:amrnb/10.2k.amr"
-rows = ["container:raw_aac"]
-compare = ["audio:snr:90", "diag:audio:snr:80"]
+path = "gen:audio.aac"
+rows = ["container:raw_aac", "audio:aac"]
+compare = ["audio:snr:90"]
 
 [[entry]]
-path = "fate:dv/dvcprohd_720p50.mov"
-rows = ["container:raw_dv"]
+path = "gen:audio.opus"
+rows = ["container:ogg", "audio:opus"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "gen:video.dv"
+rows = ["container:raw_dv", "video:dv"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "samples:DV-raw/shots0000.dv"
+rows = ["container:raw_dv", "video:dv"]
 compare = ["video:md5"]
 
 [[entry]]
@@ -756,9 +815,20 @@ path = "gen:audio.mid"
 rows = ["container:midi"]
 compare = ["audio:decodes"]
 
+# Sound Blaster Pro 4-, 2.6- and 2-bit ADPCM (FATE's adpcm-creative tests).
 [[entry]]
 path = "fate:creative/BBC_4BIT.VOC"
-rows = ["container:voc"]
+rows = ["container:voc", "audio:adpcm"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:creative/BBC_3BIT.VOC"
+rows = ["container:voc", "audio:adpcm"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:creative/BBC_2BIT.VOC"
+rows = ["container:voc", "audio:adpcm"]
 compare = ["audio:md5"]
 
 [[entry]]
@@ -805,6 +875,17 @@ compare = ["video:md5"]
 [[entry]]
 path = "gen:audio_lpcm.wav"
 rows = ["container:wav"]
+compare = ["audio:md5"]
+
+# DVD LPCM at 24 bits (FATE pcm.mak) and Blu-ray LPCM in M2TS.
+[[entry]]
+path = "fate:pcm-dvd/coolitnow-partial.vob"
+rows = ["audio:lpcm", "container:mpeg_ps"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "gen:audio_pcm_bluray.m2ts"
+rows = ["audio:lpcm", "container:mpeg_ts"]
 compare = ["audio:md5"]
 
 [[entry]]

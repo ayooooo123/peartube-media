@@ -16,12 +16,6 @@ use refcheck::{Decoded, Registrar, VideoLayout};
 /// forked `oxideav-h263` among them.
 pub const REGISTRARS: [Registrar; 1] = [codecs::register_all];
 
-pub fn ffmpeg_src() -> PathBuf {
-    std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
-}
-
 /// A file from FFmpeg's sample archive (samples.ffmpeg.org), hash-pinned
 /// in `tests/data/ffmpeg-samples`: `$FFMPEG_SAMPLES/<archive path>`,
 /// default ~/projects/oracles/ffmpeg-samples.
@@ -60,10 +54,10 @@ fn generated(name: &str, make: impl FnOnce(&Path)) -> PathBuf {
 }
 
 /// FFmpeg's FATE source generator `tests/<name>.c`, built from
-/// `$FFMPEG_SRC` by the C compiler on PATH.
+/// `refcheck::ffmpeg_src()` by the C compiler on PATH.
 fn fate_tool(name: &str) -> PathBuf {
     generated(name, |out| {
-        let source = ffmpeg_src().join("tests").join(format!("{name}.c"));
+        let source = refcheck::ffmpeg_src().join("tests").join(format!("{name}.c"));
         let status = Command::new("cc").arg("-O2").arg("-o").arg(out).arg(&source).status().expect("cc");
         assert!(status.success(), "cc {}", source.display());
     })
@@ -76,7 +70,7 @@ fn fate_tool(name: &str) -> PathBuf {
 fn vsynth_yuv(source: &str) -> PathBuf {
     let (tool, input) = match source {
         "vsynth1" => (fate_tool("videogen"), None),
-        "vsynth2" => (fate_tool("rotozoom"), Some(ffmpeg_src().join("tests/reference.pnm"))),
+        "vsynth2" => (fate_tool("rotozoom"), Some(refcheck::ffmpeg_src().join("tests/reference.pnm"))),
         "vsynth_lena" => (fate_tool("rotozoom"), Some(refcheck::fate("lena.pnm"))),
         _ => panic!("no FATE source {source}"),
     };
@@ -99,7 +93,7 @@ fn vsynth_yuv(source: &str) -> PathBuf {
 /// frame as raw YUV 4:2:0).
 pub fn fate_vsynth(source: &str, test: &str) -> (PathBuf, String) {
     let name = format!("{source}-{test}");
-    let reference = std::fs::read_to_string(ffmpeg_src().join("tests/ref/vsynth").join(&name)).unwrap();
+    let reference = std::fs::read_to_string(refcheck::ffmpeg_src().join("tests/ref/vsynth").join(&name)).unwrap();
     // "<md5> *<avi>", "<size> <avi>", "<md5> *<out.rawvideo>", "stddev: ..."
     let tokens: Vec<&str> = reference.split_whitespace().collect();
     let (stream_md5, decoded_md5) = (tokens[0], tokens[4]);

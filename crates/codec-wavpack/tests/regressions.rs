@@ -202,7 +202,7 @@ fn regression_custom_sample_rate() {
     // Test custom sample rate 176400 Hz (outside the table, uses WP_ID_SAMPLE_RATE).
     // Generate temporary fixture using ffmpeg.
     let path = std::env::temp_dir().join("test_custom_176400.wv");
-    let status = Command::new("ffmpeg")
+    let status = Command::new(refcheck::system_ffmpeg())
         .args([
             "-y",
             "-v",

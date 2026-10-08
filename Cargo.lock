@@ -33,6 +33,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "block-padding"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -144,12 +153,8 @@ dependencies = [
 name = "check-mpeg4"
 version = "0.1.0"
 dependencies = [
- "oxideav-avi",
+ "codecs",
  "oxideav-core",
- "oxideav-mkv",
- "oxideav-mp4",
- "oxideav-mpeg4video",
- "oxideav-mpegts",
  "refcheck",
 ]
 
@@ -229,6 +234,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-lpcm"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-mlp"
 version = "0.1.0"
 dependencies = [
@@ -287,6 +301,15 @@ dependencies = [
  "oxideav-core",
  "oxideav-flv",
  "oxideav-ogg",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-svq1"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "oxideav-mov",
  "refcheck",
 ]
 
@@ -364,12 +387,14 @@ dependencies = [
  "codec-atrac",
  "codec-dca",
  "codec-dv",
+ "codec-lpcm",
  "codec-mlp",
  "codec-musepack",
  "codec-ra",
  "codec-rv",
  "codec-speech",
  "codec-speex",
+ "codec-svq1",
  "codec-svq3",
  "codec-vp3",
  "codec-vp56",
@@ -517,6 +542,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
+]
+
+[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -542,6 +577,9 @@ dependencies = [
  "refcheck",
  "serde",
  "serde_json",
+ "sha2",
+ "subs-bitmap",
+ "subs-cc",
  "toml",
 ]
 
@@ -1085,7 +1123,7 @@ dependencies = [
 [[package]]
 name = "oxideav-adpcm"
 version = "0.0.7"
-source = "git+https://github.com/OxideAV/oxideav-adpcm?rev=0802fb34c6c57bfa8913670fe78882547416fd16#0802fb34c6c57bfa8913670fe78882547416fd16"
+source = "git+https://github.com/ayooooo123/oxideav-adpcm?rev=9b406df6912068e06743cd04f8c2758ebf8c97f1#9b406df6912068e06743cd04f8c2758ebf8c97f1"
 dependencies = [
  "oxideav-core",
 ]
@@ -1121,7 +1159,7 @@ dependencies = [
 [[package]]
 name = "oxideav-basic"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-basic?rev=b7329a9198fab533fabe6d8d9b5a408eeb77cec4#b7329a9198fab533fabe6d8d9b5a408eeb77cec4"
+source = "git+https://github.com/ayooooo123/oxideav-basic?rev=609c78b793f7d303e21cff5d60e0fb98313ea288#609c78b793f7d303e21cff5d60e0fb98313ea288"
 dependencies = [
  "oxideav-core",
 ]
@@ -1145,7 +1183,7 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.1.37"
-source = "git+https://github.com/ayooooo123/oxideav-core?rev=57e5fa9cbf9eda25e4b992391c121a306f78cac4#57e5fa9cbf9eda25e4b992391c121a306f78cac4"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=9a314bf862480d019dc1133847ff6262d14ba628#9a314bf862480d019dc1133847ff6262d14ba628"
 dependencies = [
  "bytemuck",
  "serde_json",
@@ -1213,7 +1251,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h263"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-h263?rev=88189ab8c65491d366345bdb1ab3124b9589e784#88189ab8c65491d366345bdb1ab3124b9589e784"
+source = "git+https://github.com/ayooooo123/oxideav-h263?rev=e7b9b47922e996f41fbd9003e61f0a172b39200d#e7b9b47922e996f41fbd9003e61f0a172b39200d"
 dependencies = [
  "oxideav-core",
 ]
@@ -1360,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg12video"
 version = "0.0.13"
-source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=9c4c24c2d336ffde2e23f29d55812e75c40d780a#9c4c24c2d336ffde2e23f29d55812e75c40d780a"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg12video?rev=51af52c9c46f4878d001eaa2a7db89baabdc633a#51af52c9c46f4878d001eaa2a7db89baabdc633a"
 dependencies = [
  "oxideav-core",
 ]
@@ -1368,7 +1406,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg4video"
 version = "0.1.8"
-source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=a759321b87caef26a340186f04a86c8f4060ec15#a759321b87caef26a340186f04a86c8f4060ec15"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=7328e304a215025b415f6483a261dc9873bb7c9e#7328e304a215025b415f6483a261dc9873bb7c9e"
 dependencies = [
  "oxideav-core",
 ]
@@ -1376,7 +1414,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpegts"
 version = "0.0.3"
-source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=cae69e3c911a830b07e8e35b1b88e26f2e842b62#cae69e3c911a830b07e8e35b1b88e26f2e842b62"
+source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=cc1142280d1a3da64528887e5634ffe728a8395a#cc1142280d1a3da64528887e5634ffe728a8395a"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",
@@ -1417,7 +1455,7 @@ dependencies = [
 [[package]]
 name = "oxideav-pixfmt"
 version = "0.1.9"
-source = "git+https://github.com/OxideAV/oxideav-pixfmt?rev=82b63ba210c097fc62bea63d98412ed88823fd77#82b63ba210c097fc62bea63d98412ed88823fd77"
+source = "git+https://github.com/ayooooo123/oxideav-pixfmt?rev=77d0d3731fb9d8e9a10893a28ddf86b19219188b#77d0d3731fb9d8e9a10893a28ddf86b19219188b"
 dependencies = [
  "oxideav-core",
 ]
@@ -1639,6 +1677,7 @@ dependencies = [
  "refcheck",
  "subs-bitmap",
  "subs-cc",
+ "subs-text",
  "thiserror 2.0.21",
 ]
 
@@ -1804,6 +1843,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

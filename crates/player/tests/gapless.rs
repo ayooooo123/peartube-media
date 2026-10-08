@@ -46,7 +46,7 @@ fn playback_has_ffmpegs_samples_and_refchecks() {
     for rel in SAMPLES {
         let path = refcheck::fate(rel);
         let (played, channels) = play(&path);
-        let ff = refcheck::ffmpeg_src_audio_f32(&path, 0);
+        let ff = refcheck::ffmpeg_audio_f32(&path, 0);
         let decoded = refcheck::decode(&path, &[codecs::register_all], MediaType::Audio, 0);
         let kept = refcheck::interleaved_f32(&decoded);
         let snr = refcheck::try_snr_db(&ff, &played, usize::MAX);

@@ -56,7 +56,7 @@ fn ffmpeg_f32(path: &Path) -> Vec<f32> {
 fn phone_remux(source: &str, format: &str) -> PathBuf {
     let stem = Path::new(source).file_stem().unwrap().to_str().unwrap();
     let path = std::env::temp_dir().join(format!("amr-{}-{stem}.{format}", std::process::id()));
-    let status = Command::new("ffmpeg")
+    let status = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-i"])
         .arg(refcheck::fate(source))
         .args(["-c", "copy", "-f", format])

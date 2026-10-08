@@ -117,8 +117,8 @@ fn drain(decoder: &mut dyn Decoder) -> usize {
 
 /// `CASES` packets of `path` into one decoder, damaged but for one in
 /// eight, then four intact packets from the first (intra) picture, which
-/// must give a frame; then `CASES` decoders from damaged parameters fed
-/// three intact packets each.
+/// must give a frame; then decoders from every pair of edge sizes, and
+/// `CASES` from damaged parameters, fed three intact packets each.
 fn survive(name: &str, path: &Path, seed: u64) {
     let ctx = codecs::context();
     let (params, packets) = video_packets(path);
@@ -144,6 +144,28 @@ fn survive(name: &str, path: &Path, seed: u64) {
     let _ = decoder.flush();
     frames += drain(decoder.as_mut());
     assert!(frames > 0, "{name}: no frame from intact packets after the damage (seed {seed:#x})");
+
+    // Each side of every size bound, and the top of the `u32` range,
+    // which random picks almost never reach (Intel H.263 takes its size
+    // from these parameters).
+    const EDGES: [u32; 15] =
+        [0, 1, 15, 16, 17, 1151, 1152, 1153, 2047, 2048, 2049, u32::MAX - 16, u32::MAX - 15, u32::MAX - 1, u32::MAX];
+    for (w, h) in EDGES.iter().flat_map(|&w| EDGES.iter().map(move |&h| (w, h))) {
+        let mut setup = params.clone();
+        setup.width = Some(w);
+        setup.height = Some(h);
+        let run = catch_unwind(AssertUnwindSafe(|| {
+            if let Ok(mut decoder) = ctx.codecs.first_decoder(&setup) {
+                for packet in &packets[..3] {
+                    let _ = decoder.send_packet(packet);
+                    drain(decoder.as_mut());
+                }
+                let _ = decoder.flush();
+                drain(decoder.as_mut());
+            }
+        }));
+        assert!(run.is_ok(), "{name}: setup {w}x{h} panicked");
+    }
 
     for case in 0..CASES {
         let mut setup = params.clone();

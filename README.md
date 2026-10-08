@@ -136,9 +136,19 @@ decoder (the FFmpeg port standalone `.vtt` files use), timed by the packet.
 `Demuxer::packet_metadata().webvtt` replaces the typed-only accessor and
 preserves each cue's identifier/settings through lacing and seeks. The
 accessor clears before the next read/seek, including errors and EOF;
-previously captured owned snapshots remain valid.
-**WebVTT settings/layout still need consumer rendering integration**; cue
-text and timing work, but exposing side data alone is not end-to-end support.
+previously captured owned snapshots remain valid. Standalone `.vtt` files
+give each cue the same metadata (FFmpeg's side data) and their `WEBVTT`,
+`STYLE` and `REGION` blocks as extradata. MP4 `wvtt` samples (ISO/IEC
+14496-30, which FFmpeg does not read) decode from their `vttc` boxes. The
+player places WebVTT cues as W3C WebVTT section 7 does: the line (snapped to
+lines or a percentage, with its alignment), position, size and alignment,
+vertical cues, regions from the header, and the moves that keep cues off
+each other; a cue with no room is not shown. `cargo test -p player --test
+webvtt_placement` checks placement through `.vtt`, FFmpeg's Matroska and
+WebM remuxes and a hand-built MP4; `cargo test -p subs-text --test
+webvtt_settings` mutates settings, headers and MP4 samples at least 2000
+times each. CSS from `STYLE` blocks, right-to-left text and ruby are not
+rendered.
 
 `cargo test -p check-mkv -p player --no-fail-fast` compares packet fields
 directly with FFmpeg 9, checks incremental reads and malformed input, and
@@ -151,11 +161,11 @@ lives on another branch.
 
 ## Licenses
 
-Code in this repository is MIT unless a crate says otherwise. Decoders with no public specification (TrueHD/MLP, several Windows Media and RealMedia codecs) are ports of FFmpeg's LGPL-2.1-or-later decoders; each such crate is LGPL-2.1-or-later, carries its own LICENSE, and ports only FFmpeg files whose headers say LGPL. The audio-trim producers in the MP4, MP3 and Ogg forks are such ports too; those crates are `MIT AND LGPL-2.1-or-later`, with the ported files marked.
+Code in this repository is MIT unless a crate says otherwise. Decoders with no public specification (TrueHD/MLP, several Windows Media and RealMedia codecs, DVD and Blu-ray LPCM in `codec-lpcm`) are ports of FFmpeg's LGPL-2.1-or-later decoders; each such crate is LGPL-2.1-or-later, carries its own LICENSE, and ports only FFmpeg files whose headers say LGPL. The audio-trim producers in the MP4, MP3 and Ogg forks and the FFmpeg-exact ADPCM and G.726 decoders in the ADPCM fork are such ports too; those crates are `MIT AND LGPL-2.1-or-later`, with the ported files marked.
 
 ## Verification
 
-`cargo run -p e2e --release` plays the corpus (FFmpeg's FATE samples plus generated files) through the headless backend and compares every stream with FFmpeg: `framemd5` for bit-exact codecs, PSNR/SNR thresholds for the rest. Every format on the list needs a passing file. The result is `target/e2e/codecs.json`.
+`cargo run -p e2e --release` plays the corpus (FFmpeg's FATE samples, generated files, and files from FFmpeg's sample archive that `corpus/fetch-samples.sh` fetches and `corpus/samples.sha256` pins) through the headless backend and compares every stream with FFmpeg: `framemd5` for bit-exact codecs, PSNR/SNR thresholds for the rest. Every format on the list needs a passing file. The result is `target/e2e/codecs.json`.
 
 `cargo test -p player --lib engine::subtitle_tests` checks PGS, DVB and DVD/VobSub (paired, MPEG-PS and Matroska) show/replacement/clear media times against FFmpeg with an injected clock, pinning each boundary to FFmpeg's microsecond rounding (±0.5 µs; the engine keeps exact 90 kHz times), and compares every complete subtitle canvas with sub2video, including final DVB and DVD expirations at EOF. `cargo test -p player --test subtitle_timing` independently checks the real Player's PGS state sequence and canvases. These are logical-timing and integration checks, not a demonstrated wall-clock presentation-latency bound; under shared-machine load, a requested 5.9 ms wait took 65 ms and a 100 ms wait took 313 ms.
 
@@ -166,6 +176,8 @@ Bitmap subtitle input is bounded where FFmpeg is not: canvases (a PGS presentati
 A blank bitmap state cancels any previous timeout and has no pending expiration of its own; even when DVB labels it with a page timeout, it must not delay EOF or emit a redundant clear.
 
 `subs_bitmap::open_vobsub(idx, sub)` accepts two explicit `Box<dyn ReadSeek>` inputs. It never guesses a sibling filename or reads a path from an untrusted index. It retains the index palette, language, timestamps and split-SPU boundaries; seeking returns the preceding indexed subtitle. `crates/codecs` installs `subs_bitmap::register_codecs` before oxideav-sub-image, whose decoders claim the same ids, and `register_containers` after it. Matroska `S_VOBSUB`, MPEG-PS DVD subpicture units and paired VobSub use decoder ID `dvd_subtitle`; `dvdsub` (FFmpeg's decoder name) and `vobsub` are also claimed.
+
+`Player::open` on a `.idx` URL plays the index with the program stream beside it: the `.sub` of the same name, named as FFmpeg's vobsub demuxer names it (`IDX` becomes `SUB`, any other case `sub`), for files and HTTP alike (`cargo test -p player --test subtitle_canvas paired_vobsub`). The corpus runner opens the pair the same way.
 
 `cargo test -p subs-bitmap --test vcd --test vcd_spumux -- --nocapture` compiles the original VLC C CVD/OGT decoders, bit reader and YUVP-to-RGBA converter at revision `2e358f3098c2f2b7621d1dc568de8b61ad786322` and compares every complete RGBA canvas and display interval with the Rust ports. Set `VLC_SRC` to that checkout (default `~/projects/vlc-src`); `cc` is required. The adapter supplies callbacks/types and places converted regions on the canvas, clipped at its edges; it does not replace parsing, RLE or palette conversion. That placement is harness code mirroring the port's, so the comparison covers decoding, colours and timing, not VLC's on-screen geometry: VLC's renderer also scales each region by its sample aspect ratio (`vout_subpictures.c`), which OGT sets from the region's size (`svcdsub.c`). Test output prints exact compiler and replay commands, and retains encoded `.packets` inputs and complete timing/rectangle/RGBA `.rgba` outputs under `CARGO_TARGET_TMPDIR/subs-bitmap-vlc-<pid>`. `vcd` uses hand-authored structural packets (fragmentation, truncated image data, colours without a palette entry, unchecked OGT packet numbers, regions leaving the canvas) plus 4,800 mutations. `vcd_spumux` reads CVD and SVCD files authored by an independent encoder, dvdauthor 0.7.2 `spumux` (`tests/data/spumux/generate.sh` records the exact invocation), through the production MPEG-PS demuxer, including three-packet subtitles. Neither is an archived disc stream: none has been found, so interoperability with real discs remains unproven, and no FFmpeg CVD/OGT parity is claimed (FFmpeg has neither decoder). VLC, and therefore this port, renders spumux CVD colours with Cb and Cr exchanged (spumux writes Y, Cr, Cb; VLC reads Y, Cb, Cr) and shows each spumux CVD subtitle for 5.86 s, reading the `04 08 0c 10` spumux appends after the recorded unit size as a duration field.
 
@@ -182,6 +194,8 @@ Selecting a subtitle track never seeks: the new track shows from the next cue th
 Closed captions (EIA-608 and CEA-708 carried as ATSC A/53 caption data in H.264, HEVC and MPEG-1/2 video) are the `subs-cc` crate. The demux loop reads each packet of the playing video as the demuxer reads it, up to two seconds ahead of the clock, and puts its caption data in presentation order (`engine/captions.rs`). When the video codec can carry captions, the playback has two caption streams, `0x10000` (EIA-608, FFmpeg's `cc_dec`) and `0x10001` (CEA-708 service 1, VLC's decoder). Each is listed in `State::tracks` once its data shows up, and is selectable with `select_subtitle`. A caption screen is a display state: it comes up when it changes and stays until the next screen replaces it, as VLC shows captions, with EIA-608 in FFmpeg's `real_time` mode. QuickTime `c608` tracks are data streams in the MP4 demuxer and are not listed.
 
 `cargo test -p subs-cc` checks the caption data against FFmpeg's `-a53cc 1` side data, read back through its lavfi `movie=…[out0+subcc]` source, picture by picture and at the same times. Inputs: FATE `sub/Closedcaption_rollup.m2v` (A/53 Part 4) and `sub/scte20.ts` (SCTE-20), and the roll-up captions re-encoded into H.264 and HEVC SEI in Matroska and TS. EIA-608 cues equal `ffmpeg -c:s srt` (times, text) and `-c:s ass` (positions, styles) cue for cue, and FFmpeg's `-real_time 1` events, on the video inputs and FATE `sub/witch.scc`. CEA-708 outputs equal those of VLC's unmodified `modules/codec/cea708.c`, built into a test harness from the VLC source tree and driven as `cc.c` drives it, on the video inputs and on three seeded random service streams. 2000+ truncated and bit-flipped real packets per stage never panic. `cargo test -p player --test captions` plays the H.264 captions in Matroska and TS in realtime: both caption tracks are listed, and every image put up is the caption screen current on the clock (FFmpeg's real-time events for EIA-608, the decoder's outputs for CEA-708), at most 300 ms after its time; every screen that stays 300 ms comes up, and the screen is clear at Ended. The bound is loose because the test runs unoptimized, often beside builds; the times themselves are checked exactly in `subs-cc`.
+
+Scenarist Closed Captions (`.scc`, EIA-608 pairs by SMPTE time code) open with the SCC demuxer `subs-text` ports from FFmpeg's `sccdec.c`; every packet of FATE `sub/witch.scc` equals ffprobe's (`cargo test -p subs-text --test scc`). The corpus runner lists the caption tracks of the played video as the engine does and compares the EIA-608 track with FFmpeg's SubRip of the lavfi `subcc` output, in real time mode with the stream's own times (`-copyts -real_time 1`); FFmpeg has no CEA-708 decoder, so that track only decodes there.
 
 ### Audio-master timing
 

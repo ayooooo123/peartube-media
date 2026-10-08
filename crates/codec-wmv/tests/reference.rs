@@ -44,12 +44,12 @@ struct ProbedPacket {
 }
 
 fn ffprobe(args: &[&str], path: &std::path::Path) -> String {
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error"])
         .args(args)
         .arg(path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap()
 }

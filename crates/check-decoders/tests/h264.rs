@@ -21,7 +21,7 @@ fn ours(path: &Path) -> Vec<String> {
     // FFmpeg's decoder starts from the reorder depth its probe measured
     // (codecpar->video_delay, which ffprobe prints as has_b_frames).
     let probe = tool(
-        "ffprobe",
+        refcheck::pinned_ffprobe(),
         &["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=has_b_frames", "-of", "csv=p=0", path.to_str().unwrap()],
     );
     if let Some(delay) = String::from_utf8(probe).unwrap().lines().map(str::trim).find(|l| !l.is_empty()) {
@@ -48,14 +48,14 @@ fn ours(path: &Path) -> Vec<String> {
 fn theirs(path: &Path) -> Result<Vec<String>, String> {
     let p = path.to_str().unwrap();
     let probe = tool(
-        "ffprobe",
+        refcheck::pinned_ffprobe(),
         &["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", p],
     );
     // A transport stream lists its streams once per program too.
     let probe = String::from_utf8(probe).unwrap();
     let pix_fmt = probe.lines().map(str::trim).find(|l| !l.is_empty()).ok_or("ffprobe: no pix_fmt")?;
     let args = refcheck::ffmpeg_video_md5_args(path, "0:v:0", pix_fmt, &["-max_error_rate", "1"]);
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin"])
         .args(&args)
         .output()

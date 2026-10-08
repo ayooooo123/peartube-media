@@ -39,11 +39,11 @@ fn raw(ctx: &mut RuntimeContext) {
 
 /// FFmpeg's pixel format and size for stream `0:v:0`.
 fn ffprobe_video(path: &Path) -> (String, usize, usize) {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=pix_fmt,width,height", "-of", "csv=p=0"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     let text = String::from_utf8_lossy(&out.stdout);
     let f: Vec<&str> = text.lines().next().expect("a video stream").split(',').collect();
     let (w, h) = (f[0].parse().unwrap(), f[1].parse().unwrap());
@@ -149,7 +149,7 @@ static GENERATED: LazyLock<PathBuf> = LazyLock::new(|| {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("codec-dv-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     for (name, video, audio, pix_fmt) in MADE {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = Command::new(refcheck::system_ffmpeg());
         cmd.args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"]).arg(format!("testsrc=size={video}:duration=1"));
         if let Some(rate) = audio {
             cmd.args(["-f", "lavfi", "-i"]).arg(format!("sine=frequency=1000:duration=1:sample_rate={rate}"));
@@ -191,12 +191,12 @@ type Pkt = (u32, Option<i64>, Option<i64>, Option<i64>, usize, bool, String);
 
 /// ffprobe's codecs and packet table.
 fn ffprobe_packets(path: &Path) -> (Vec<String>, Vec<Pkt>) {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_data_hash", "md5", "-of", "compact"])
         .args(["-show_entries", "stream=codec_name:packet=stream_index,pts,dts,duration,size,flags,data_hash"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     let text = String::from_utf8_lossy(&out.stdout);
     let kv = |l: &str| l.split('|').filter_map(|f| f.split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
     let num = |m: &HashMap<String, String>, k: &str| m.get(k).and_then(|v| v.parse::<i64>().ok());

@@ -13,9 +13,6 @@ oxideav-core.workspace = true
 
 [dev-dependencies]
 refcheck.workspace = true
-oxideav-avi.workspace = true
-oxideav-mkv.workspace = true
-oxideav-mp4.workspace = true
-oxideav-mpegts.workspace = true
-# The fork under test (pinned in the workspace [patch.crates-io]).
-oxideav-mpeg4video = "*"
+# The product registry: the forked MPEG-4 Part 2 decoder (pinned in the
+# workspace [patch.crates-io]) behind the player's demuxers.
+codecs = { path = "../codecs" }

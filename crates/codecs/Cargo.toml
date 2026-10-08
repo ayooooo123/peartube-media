@@ -79,10 +79,12 @@ codec-dv = { path = "../codec-dv" }
 codec-atrac = { path = "../codec-atrac" }
 codec-vp56 = { path = "../codec-vp56" }
 codec-speex = { path = "../codec-speex" }
+codec-svq1 = { path = "../codec-svq1" }
 codec-svq3 = { path = "../codec-svq3" }
 codec-ape = { path = "../codec-ape" }
 codec-wavpack = { path = "../codec-wavpack" }
 codec-musepack = { path = "../codec-musepack" }
+codec-lpcm = { path = "../codec-lpcm" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

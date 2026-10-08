@@ -15,8 +15,9 @@ pub fn run(binary: &Path, args: &[&str]) -> Vec<u8> {
     out.stdout
 }
 
-/// `name` in the persistent scratch directory, made by the `ffmpeg` on
-/// PATH from `input` with `output_args` on first use, published by rename.
+/// `name` in the persistent scratch directory, made by
+/// `refcheck::system_ffmpeg` from `input` with `output_args` on first use,
+/// published by rename.
 pub fn remux(name: &str, input: &Path, output_args: &[&str]) -> PathBuf {
     // Tests in one binary run in parallel and share the per-process partial
     // name: make one remux at a time so none renames another's file away.
@@ -30,7 +31,7 @@ pub fn remux(name: &str, input: &Path, output_args: &[&str]) -> PathBuf {
         let mut args = vec!["-nostdin", "-y", "-i", input.to_str().unwrap()];
         args.extend_from_slice(output_args);
         args.push(partial.to_str().unwrap());
-        run(Path::new("ffmpeg"), &args);
+        run(&refcheck::system_ffmpeg(), &args);
         std::fs::rename(&partial, &path).unwrap();
     }
     path

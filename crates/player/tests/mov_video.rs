@@ -53,7 +53,7 @@ fn played(path: &Path) -> Played {
 /// stereo AAC.
 fn phone_movie(name: &str, video: &[&str]) -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!("mov-video-{}-{name}.mov", std::process::id()));
-    let status = Command::new("ffmpeg")
+    let status = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-noautorotate", "-display_rotation", "90", "-f", "lavfi", "-i",
             "testsrc2=size=320x240:rate=30", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "2",
             "-map", "0:v", "-map", "1:a", "-pix_fmt", "yuv420p"])
@@ -70,7 +70,7 @@ fn plays_like_ffmpeg(path: &Path) {
     let name = path.display();
     let expected = refcheck::ffmpeg_video_md5s_with(path, 0, "yuv420p", &["-noautorotate"]);
     assert!(!expected.is_empty(), "FFmpeg decodes no frame from {name}");
-    let reference = refcheck::ffmpeg_src_audio_f32(path, 0);
+    let reference = refcheck::ffmpeg_audio_f32(path, 0);
     let played = played(path);
     assert_eq!(played.size, Some((320, 240)), "{name}: video size");
     assert_eq!(played.frames.len(), expected.len(), "{name}: frame count");

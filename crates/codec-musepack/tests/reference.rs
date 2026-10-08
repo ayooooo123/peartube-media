@@ -1,13 +1,9 @@
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use oxideav_core::{Demuxer, MediaType, TimeBase};
-use refcheck::{decode, fate, pinned_ffmpeg};
-
-fn pinned_ffprobe() -> PathBuf {
-    pinned_ffmpeg().parent().unwrap().join("ffprobe")
-}
+use refcheck::{decode, fate, pinned_ffmpeg, pinned_ffprobe};
 
 fn run_pinned_ffmpeg(path: &Path) -> Vec<u8> {
     let out = Command::new(pinned_ffmpeg())

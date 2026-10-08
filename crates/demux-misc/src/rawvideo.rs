@@ -245,6 +245,11 @@ pub(crate) struct Stamp {
 }
 
 impl Stamp {
+    /// A unit's key flag, pts, dts and duration.
+    pub(crate) fn new(key: bool, pts: Option<i64>, dts: Option<i64>, duration: Option<i64>) -> Self {
+        Self { key, pts, dts, duration }
+    }
+
     /// A unit of a raw H.264 or HEVC stream as av_read_frame returns it:
     /// no pts or dts (compute_pkt_fields does not interpolate either
     /// codec), the key flag and duration its parser gave. Where the
@@ -341,7 +346,7 @@ pub(crate) const RAW_VIDEO_CLOCK: i64 = 1_200_000;
 /// RELATIVE_TS_BASE (avformat_internal.h): the dts FFmpeg starts a stream
 /// without timestamps from. av_read_frame returns a timestamp relative to
 /// it (is_relative: above RELATIVE_TS_BASE - 2^48) less it.
-const RELATIVE_TS_BASE: i64 = i64::MAX - (1 << 48);
+pub(crate) const RELATIVE_TS_BASE: i64 = i64::MAX - (1 << 48);
 
 /// How FFmpeg times raw MPEG-1/2 video, which carries no timestamps: what
 /// mpegvideo_extract_headers leaves in the parser and codec contexts, and
@@ -494,12 +499,12 @@ impl MpegClock {
 
 /// A timestamp as av_read_frame returns it: less RELATIVE_TS_BASE when
 /// relative to it.
-fn returned(ts: i64) -> i64 {
+pub(crate) fn returned(ts: i64) -> i64 {
     if ts > RELATIVE_TS_BASE - (1 << 48) { ts - RELATIVE_TS_BASE } else { ts }
 }
 
 /// av_rescale_q(a, b, c), rounding to nearest with ties away from zero.
-fn rescale(a: i64, b: (i64, i64), c: (i64, i64)) -> i64 {
+pub(crate) fn rescale(a: i64, b: (i64, i64), c: (i64, i64)) -> i64 {
     let num = i128::from(a) * i128::from(b.0) * i128::from(c.1);
     let den = i128::from(b.1) * i128::from(c.0);
     if den == 0 {
@@ -512,7 +517,7 @@ fn rescale(a: i64, b: (i64, i64), c: (i64, i64)) -> i64 {
 /// av_add_stable(1/1200000, ts, num/den, 1): `ts` moved on by num/den
 /// seconds without accumulating rounding errors. Where a fractional tick
 /// count rounds depends on `ts` itself, not only on how far it moved.
-fn add_stable(ts: i64, num: i64, den: i64) -> i64 {
+pub(crate) fn add_stable(ts: i64, num: i64, den: i64) -> i64 {
     let clock = (1, RAW_VIDEO_CLOCK);
     let (m, d) = (i128::from(num) * i128::from(RAW_VIDEO_CLOCK), i128::from(den));
     if m % d == 0 {

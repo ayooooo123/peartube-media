@@ -21,7 +21,7 @@ use player::{Event, Headless, Player, PlayerOptions};
 /// Made once for both tests, which run in parallel.
 static REPRODUCER: LazyLock<PathBuf> = LazyLock::new(|| {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("opengop_nosei.mkv");
-    let status = Command::new("ffmpeg")
+    let status = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=8",
             "-c:v", "libx264", "-preset", "medium",
             "-x264-params", "keyint=50:min-keyint=50:scenecut=0:open-gop=1:ref=3:bframes=2",
@@ -96,7 +96,15 @@ fn player_resumes_video_after_seeking_to_a_container_random_access_point() {
     let player = Player::open(path.to_str().unwrap(), backend.clone(), Arc::new(codecs::context()),
         PlayerOptions { realtime: false, ..PlayerOptions::default() },
         move |event| { let _ = tx.send(event); });
+    // Hold playback until the seek is requested: without a realtime clock
+    // the whole file can play before a seek issued after `open` takes
+    // effect, and the test then compared the uninterrupted playback, which
+    // matches FFmpeg, and passed without seeking. Paused, the video
+    // pipeline waits at its first packet while the demuxer applies the
+    // seek; on `play` it starts over at the new generation.
+    player.pause();
     player.seek(target);
+    player.play();
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {

@@ -8,11 +8,8 @@ use std::path::Path;
 use std::process::Command;
 
 use oxideav_core::{CodecId, Demuxer, Frame, MediaType, SampleFormat};
-use refcheck::{decode, fate, pinned_ffmpeg, Decoded, Registrar};
+use refcheck::{decode, fate, pinned_ffmpeg, pinned_ffprobe, Decoded, Registrar};
 
-fn pinned_ffprobe() -> std::path::PathBuf {
-    pinned_ffmpeg().with_file_name("ffprobe")
-}
 fn registrars() -> Vec<Registrar> {
     vec![codec_wavpack::register]
 }

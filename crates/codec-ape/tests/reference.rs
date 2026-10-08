@@ -178,7 +178,7 @@ fn demuxer_packets_nolegacy_cut() {
 
 fn check_demuxer_packets(rel: &str) {
     let path = fate(rel);
-    let ffprobe = pinned_ffmpeg().with_file_name("ffprobe");
+    let ffprobe = refcheck::pinned_ffprobe();
     let out = Command::new(&ffprobe)
         .args([
             "-v", "error", "-cpuflags", "0",
@@ -223,7 +223,7 @@ fn check_demuxer_packets(rel: &str) {
 #[test]
 fn demuxer_seek_luckynight_partial() {
     let path = fate("lossless-audio/luckynight-partial.ape");
-    let ffprobe = pinned_ffmpeg().with_file_name("ffprobe");
+    let ffprobe = refcheck::pinned_ffprobe();
     let out = Command::new(&ffprobe)
         .args([
             "-v", "error", "-cpuflags", "0",

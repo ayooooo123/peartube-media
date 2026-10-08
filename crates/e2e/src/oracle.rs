@@ -34,6 +34,10 @@ pub struct FfStream {
     /// Cover art: FFmpeg lists it as a video stream, OxideAV as an attached
     /// picture of the container.
     pub attached_pic: bool,
+    /// Not one of the file's streams: the closed captions of its video, as
+    /// FFmpeg's `movie` source reads them over the file (its `subcc`
+    /// output, stream 1 beside the video).
+    pub subcc: bool,
 }
 
 impl FfStream {
@@ -41,6 +45,49 @@ impl FfStream {
     pub fn map(&self) -> String {
         format!("0:{}", self.index)
     }
+
+    /// The closed captions of the file's video, an EIA-608 subtitle stream
+    /// (FFmpeg decodes no CEA-708).
+    pub fn subcc() -> FfStream {
+        FfStream {
+            index: 1,
+            codec_type: "subtitle".into(),
+            codec_name: "eia_608".into(),
+            codec_tag: String::new(),
+            sample_fmt: None,
+            sample_rate: None,
+            channels: None,
+            attached_pic: false,
+            subcc: true,
+        }
+    }
+}
+
+/// `s` as a filter option value in a filtergraph: escaped for the option
+/// value, then for the graph (FFmpeg's two escaping levels).
+fn lavfi_escape(s: &str) -> String {
+    let escape = |s: &str, special: &[char]| {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            if special.contains(&c) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    };
+    escape(&escape(s, &['\\', '\'', ':']), &['\\', '\'', '[', ']', ',', ';'])
+}
+
+/// The arguments that open `ff`'s input: the file, or FFmpeg's `movie`
+/// source over it for its closed captions.
+fn input(path: &Path, ff: &FfStream) -> Result<Vec<String>, String> {
+    let p = path_arg(path)?;
+    Ok(if ff.subcc {
+        vec!["-f".into(), "lavfi".into(), "-i".into(), format!("movie={}[out0+subcc]", lavfi_escape(&p))]
+    } else {
+        vec!["-i".into(), p]
+    })
 }
 
 /// Every stream of `path`, in FFmpeg's order.
@@ -70,6 +117,7 @@ pub fn streams(path: &Path) -> Result<Vec<FfStream>, String> {
             sample_rate: s["sample_rate"].as_str().and_then(|r| r.parse().ok()),
             channels: s["channels"].as_u64().map(|c| c as u16),
             attached_pic: s["disposition"]["attached_pic"].as_u64() == Some(1),
+            subcc: false,
         })
         .collect())
 }
@@ -105,14 +153,20 @@ pub fn packet_count(path: &Path, index: u32) -> Result<u64, String> {
     }
 }
 
-/// MD5 of every frame FFmpeg decodes from stream `map`, through refcheck's
-/// video oracle. FFmpeg's C IDCT is pinned for every stream (`-idct simple`,
-/// 6ac540e): the IDCT codecs port FFmpeg's C `simple_idct`, which arm64
-/// FFmpeg replaces with NEON assembly that rounds differently by default,
-/// and decoders without an IDCT ignore the option.
-pub fn video_md5s(path: &Path, map: &str, pix_fmt: &str) -> Result<Vec<String>, String> {
-    let args = refcheck::ffmpeg_video_md5_args(path, map, pix_fmt, &["-idct", "simple"]);
-    let out = tool::ffmpeg(&args, TIMEOUT)?;
+/// MD5 of every frame the reference decodes from stream `map` (codec
+/// `codec_name`), through refcheck's video oracle. AV1 comes from libdav1d
+/// in the system FFmpeg: the pinned build has no software AV1 decoder.
+/// Everything else comes from the pinned build with FFmpeg's C IDCT pinned
+/// (`-idct simple`, 6ac540e): the IDCT codecs port FFmpeg's C
+/// `simple_idct`, which arm64 FFmpeg replaces with NEON assembly that
+/// rounds differently by default, and decoders without an IDCT ignore the
+/// option.
+pub fn video_md5s(path: &Path, map: &str, codec_name: &str, pix_fmt: &str) -> Result<Vec<String>, String> {
+    let out = if codec_name == "av1" {
+        tool::system_ffmpeg(&refcheck::ffmpeg_video_md5_args(path, map, pix_fmt, &["-c:v", "libdav1d"]), TIMEOUT)?
+    } else {
+        tool::ffmpeg(&refcheck::ffmpeg_video_md5_args(path, map, pix_fmt, &["-idct", "simple"]), TIMEOUT)?
+    };
     Ok(refcheck::parse_framemd5(&String::from_utf8_lossy(&out)))
 }
 
@@ -160,35 +214,35 @@ impl Pcm {
     }
 }
 
-/// The FFmpeg a stream's decode is held to: the `ffmpeg` on PATH, or, for
-/// the decoders ported from FFmpeg 2da55bf (AC-3 and E-AC-3), that build
-/// on its C code paths (`refcheck::pinned_ffmpeg`, `-cpuflags 0`). The PATH
-/// 9.0.2 build decodes the FATE AC-3 samples 18-97 dB from it.
+/// The code paths a stream's reference decode runs: the pinned FFmpeg's
+/// defaults, or, for the decoders ported from its C code (AC-3 and
+/// E-AC-3), its C paths (`-cpuflags 0`), since its assembly rounds
+/// differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Build {
-    Path,
-    Pinned,
+pub enum Paths {
+    Default,
+    C,
 }
 
-impl Build {
-    pub fn of(ff: &FfStream) -> Build {
+impl Paths {
+    pub fn of(ff: &FfStream) -> Paths {
         match ff.codec_name.as_str() {
-            "ac3" | "eac3" => Build::Pinned,
-            _ => Build::Path,
+            "ac3" | "eac3" => Paths::C,
+            _ => Paths::Default,
         }
     }
 
     fn ffmpeg(self, args: &[String]) -> Result<Vec<u8>, String> {
         match self {
-            Build::Path => tool::ffmpeg(args, TIMEOUT),
-            Build::Pinned => tool::pinned_ffmpeg(args, TIMEOUT),
+            Paths::Default => tool::ffmpeg(args, TIMEOUT),
+            Paths::C => tool::ffmpeg_c(args, TIMEOUT),
         }
     }
 
     fn ffprobe(self, args: &[String]) -> Result<Vec<u8>, String> {
         match self {
-            Build::Path => tool::ffprobe(args, TIMEOUT),
-            Build::Pinned => tool::pinned_ffprobe(args, TIMEOUT),
+            Paths::Default => tool::ffprobe(args, TIMEOUT),
+            Paths::C => tool::ffprobe_c(args, TIMEOUT),
         }
     }
 }
@@ -197,7 +251,7 @@ impl Build {
 pub fn audio_pcm(path: &Path, ff: &FfStream, pcm: Pcm) -> Result<Vec<u8>, String> {
     let (format, codec) = pcm.ffmpeg();
     let p = path_arg(path)?;
-    Build::of(ff).ffmpeg(&strings(&["-i", &p, "-map", &ff.map(), "-f", format, "-c:a", codec, "-"]))
+    Paths::of(ff).ffmpeg(&strings(&["-i", &p, "-map", &ff.map(), "-f", format, "-c:a", codec, "-"]))
 }
 
 /// FFmpeg's decode of stream `ff` as interleaved f32.
@@ -219,7 +273,7 @@ pub struct AudioFrameInfo {
 pub fn audio_frames(path: &Path, ff: &FfStream) -> Result<Vec<AudioFrameInfo>, String> {
     let p = path_arg(path)?;
     let index = ff.index.to_string();
-    let out = Build::of(ff).ffprobe(&strings(&[
+    let out = Paths::of(ff).ffprobe(&strings(&[
         "-select_streams",
         &index,
         "-show_entries",
@@ -243,11 +297,12 @@ pub fn audio_frames(path: &Path, ff: &FfStream) -> Result<Vec<AudioFrameInfo>, S
         .collect()
 }
 
-/// Whether FFmpeg decodes stream `map` without error: a `decodes` policy is
+/// Whether FFmpeg decodes stream `ff` without error: a `decodes` policy is
 /// only for streams FFmpeg cannot produce a reference for.
-pub fn decodes(path: &Path, map: &str) -> bool {
-    let Ok(p) = path_arg(path) else { return false };
-    tool::ffmpeg(&strings(&["-i", &p, "-map", map, "-f", "null", "-"]), TIMEOUT).is_ok()
+pub fn decodes(path: &Path, ff: &FfStream) -> bool {
+    let Ok(mut args) = input(path, ff) else { return false };
+    args.extend(strings(&["-map", &ff.map(), "-f", "null", "-"]));
+    tool::ffmpeg(&args, TIMEOUT).is_ok()
 }
 
 /// One cue of FFmpeg's decode, as its `srt` encoder writes it.
@@ -258,11 +313,21 @@ pub struct SrtCue {
     pub body: String,
 }
 
-/// FFmpeg's decode of the text subtitle stream `map`, re-encoded as SubRip:
-/// every cue's timing (to the millisecond) and body, in order.
-pub fn subtitle_srt(path: &Path, map: &str) -> Result<Vec<SrtCue>, String> {
-    let p = path_arg(path)?;
-    let out = tool::ffmpeg(&strings(&["-i", &p, "-map", map, "-c:s", "srt", "-f", "srt", "-"]), TIMEOUT)?;
+/// FFmpeg's decode of the text subtitle stream `ff`, re-encoded as SubRip:
+/// every cue's timing (to the millisecond) and body, in order. The times
+/// are the stream's own (`-copyts`), as the player times cues: otherwise
+/// FFmpeg subtracts the input's start (the `subcc` output of a video that
+/// starts at 0.1 s comes out 0.1 s early). EIA-608 decodes in real time
+/// mode (`-real_time 1`), as the player shows captions: each screen as it
+/// changes, up until the next.
+pub fn subtitle_srt(path: &Path, ff: &FfStream) -> Result<Vec<SrtCue>, String> {
+    let mut args = strings(&["-copyts"]);
+    if ff.codec_name == "eia_608" {
+        args.extend(strings(&["-real_time", "1"]));
+    }
+    args.extend(input(path, ff)?);
+    args.extend(strings(&["-map", &ff.map(), "-c:s", "srt", "-f", "srt", "-"]));
+    let out = tool::ffmpeg(&args, TIMEOUT)?;
     Ok(parse_srt(&String::from_utf8_lossy(&out)))
 }
 
@@ -363,20 +428,38 @@ mod tests {
     fn the_video_oracle_pins_the_c_idct_for_idct_codecs_only() {
         // MPEG-2 builds its IDCT through ff_idctdsp_init(avctx->idct_algo).
         let mpeg2 = refcheck::fate("mpeg2/matrixbench_mpeg2.lq1.mpg");
-        let pinned = video_md5s(&mpeg2, "0:0", "yuv420p").unwrap();
+        let pinned = video_md5s(&mpeg2, "0:0", "mpeg2video", "yuv420p").unwrap();
         assert_eq!(pinned, refcheck::ffmpeg_video_md5s_with(&mpeg2, 0, "yuv420p", &["-idct", "simple"]));
         #[cfg(target_arch = "aarch64")]
         assert_ne!(pinned, refcheck::ffmpeg_video_md5s(&mpeg2, 0, "yuv420p"), "arm64's default NEON IDCT rounds differently");
         // H.264 has no IDCT option: the pin changes nothing.
         let h264 = refcheck::fate("mkv/1242-small.mkv");
-        assert_eq!(video_md5s(&h264, "0:1", "yuv420p").unwrap(), refcheck::ffmpeg_video_md5s(&h264, 0, "yuv420p"));
+        assert_eq!(video_md5s(&h264, "0:1", "h264", "yuv420p").unwrap(), refcheck::ffmpeg_video_md5s(&h264, 0, "yuv420p"));
     }
 
     #[test]
     fn subtitle_srt_reads_ffmpegs_decoded_cues() {
-        let cues = subtitle_srt(&refcheck::fate("sub/SubRip_capability_tester.srt"), "0:0").unwrap();
+        let path = refcheck::fate("sub/SubRip_capability_tester.srt");
+        let cues = subtitle_srt(&path, &streams(&path).unwrap()[0]).unwrap();
         assert!(cues.len() > 10, "{}", cues.len());
         assert!(cues.iter().all(|c| c.timing.contains(" --> ")));
+    }
+
+    /// The closed captions of a file come through FFmpeg's `movie` source
+    /// in real time mode, whatever characters its path holds that the
+    /// filtergraph syntax gives meaning to: every event lasts until the
+    /// next (`UINT32_MAX` ms), the first at the FATE sample's 1.068 s (its
+    /// video starts at 0.1 s).
+    #[test]
+    fn subcc_reads_captions_of_paths_lavfi_must_escape() {
+        let dir = std::env::temp_dir().join(format!("e2e-subcc-{}", std::process::id())).join("we ird:d's[1],x;y\\z");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cc.m2v");
+        std::fs::copy(refcheck::fate("sub/Closedcaption_rollup.m2v"), &path).unwrap();
+        let cues = subtitle_srt(&path, &FfStream::subcc()).unwrap();
+        assert_eq!(cues, subtitle_srt(&refcheck::fate("sub/Closedcaption_rollup.m2v"), &FfStream::subcc()).unwrap());
+        assert_eq!(cues.first().map(|c| c.timing.as_str()), Some("00:00:01,068 --> 1193:02:48,363"));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]
