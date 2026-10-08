@@ -1167,7 +1167,7 @@ dependencies = [
 [[package]]
 name = "oxideav-cinepak"
 version = "0.0.3"
-source = "git+https://github.com/ayooooo123/oxideav-cinepak?rev=944df75b2209d4da585ae571a8d39323ee130324#944df75b2209d4da585ae571a8d39323ee130324"
+source = "git+https://github.com/ayooooo123/oxideav-cinepak?rev=22c2931117975f87facb30bf0981cfe71b773c52#22c2931117975f87facb30bf0981cfe71b773c52"
 dependencies = [
  "oxideav-core",
 ]

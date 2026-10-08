@@ -174,6 +174,11 @@ buffer. Flushing emits the pictures still waiting; a seek reset drops
 them and clears the reference and output state. A new sequence drains the
 old sequence and restarts its picture count, unlike FFmpeg.
 
+Known seek limit (deferred): a raw Dirac seek can reset away the sequence
+header and land on a picture-only packet. Pictures may then be dropped
+until another sequence header arrives. The sequential playback checks
+below do not cover this recovery path.
+
 `cargo test -p check-decoders --test video` compares every decoded frame
 with pinned FFmpeg: Dirac main/low-delay, MJPEG including interlaced and
 4:2:2 files, 24-bit Cinepak, H.261 and Indeo 3. Indeo 3 emits native
