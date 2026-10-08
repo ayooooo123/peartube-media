@@ -103,6 +103,7 @@ dependencies = [
 name = "check-decoders"
 version = "0.1.0"
 dependencies = [
+ "codecs",
  "demux-misc",
  "oxideav-ac3",
  "oxideav-core",
@@ -113,6 +114,7 @@ dependencies = [
  "oxideav-mpegts",
  "oxideav-ogg",
  "oxideav-opus",
+ "player",
  "refcheck",
 ]
 
@@ -1111,7 +1113,7 @@ dependencies = [
 [[package]]
 name = "oxideav-avi"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-avi?rev=941c480806700fd9833b405a8c47efe60ccd75d1#941c480806700fd9833b405a8c47efe60ccd75d1"
+source = "git+https://github.com/ayooooo123/oxideav-avi?rev=63c9de77230f6d723460b132821019252de57ef7#63c9de77230f6d723460b132821019252de57ef7"
 dependencies = [
  "oxideav-core",
 ]
@@ -1127,7 +1129,7 @@ dependencies = [
 [[package]]
 name = "oxideav-cinepak"
 version = "0.0.3"
-source = "git+https://github.com/ayooooo123/oxideav-cinepak?rev=6e632ae20703b531c5c5755dadcc67fa32479828#6e632ae20703b531c5c5755dadcc67fa32479828"
+source = "git+https://github.com/ayooooo123/oxideav-cinepak?rev=944df75b2209d4da585ae571a8d39323ee130324#944df75b2209d4da585ae571a8d39323ee130324"
 dependencies = [
  "oxideav-core",
 ]
@@ -1202,7 +1204,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h261"
 version = "0.0.7"
-source = "git+https://github.com/ayooooo123/oxideav-h261?rev=0803bf4eb603c9766c01ba89f150259c84c3af7b#0803bf4eb603c9766c01ba89f150259c84c3af7b"
+source = "git+https://github.com/ayooooo123/oxideav-h261?rev=b6e9db48f814bbfd95de98c7c422cff131067f84#b6e9db48f814bbfd95de98c7c422cff131067f84"
 dependencies = [
  "oxideav-core",
  "oxideav-pixfmt",
@@ -1288,7 +1290,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mjpeg"
 version = "0.1.11"
-source = "git+https://github.com/ayooooo123/oxideav-mjpeg?rev=559c08f7ec06e67b09c125cd1f5af33b81eb63f5#559c08f7ec06e67b09c125cd1f5af33b81eb63f5"
+source = "git+https://github.com/ayooooo123/oxideav-mjpeg?rev=f0ec865380f1dffd79468587497ce50aea7a138d#f0ec865380f1dffd79468587497ce50aea7a138d"
 dependencies = [
  "oxideav-core",
 ]
