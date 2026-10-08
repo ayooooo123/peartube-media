@@ -106,6 +106,12 @@ run "${V_IN[@]}" "${A_IN[@]}" -i "$TMP_DIR/sub.srt" "${DUR[@]}" -c:v libvpx-vp9 
   -c:a libopus -c:s webvtt "$CORPUS_DIR/vp9_opus_vtt.webm"
 run "${V_IN[@]}" "${A_IN[@]}" -i "$TMP_DIR/sub.srt" "${DUR[@]}" $VENC -c:a aac -c:s mov_text \
   "$CORPUS_DIR/h264_aac_movtext.mp4"
+# QuickTime: FFmpeg writes mov_text into MOV as a `text` entry; `-tag:s tx3g`
+# keeps the 3GPP entry MP4 uses.
+run "${V_IN[@]}" "${A_IN[@]}" -i "$TMP_DIR/sub.srt" "${DUR[@]}" $VENC -c:a aac -c:s mov_text \
+  "$CORPUS_DIR/h264_aac_movtext.mov"
+run "${V_IN[@]}" "${A_IN[@]}" -i "$TMP_DIR/sub.srt" "${DUR[@]}" $VENC -c:a aac -c:s mov_text -tag:s tx3g \
+  "$CORPUS_DIR/h264_aac_tx3g.mov"
 # PGS into MKV: ffmpeg cannot encode PGS; remux FATE's .sup when present.
 if [ -f "$HOME/projects/fate-suite/sub/pgs_sub.sup" ]; then
   run -f lavfi -i "testsrc2=size=320x240:rate=25:duration=6" -i "$HOME/projects/fate-suite/sub/pgs_sub.sup" \
@@ -205,6 +211,44 @@ for i, note in enumerate([60, 64, 67, 72]):
 ev(0, b"\xff\x2f\x00")
 smf = b"MThd" + struct.pack(">IHHH", 6, 0, 1, 96) + b"MTrk" + struct.pack(">I", len(track)) + bytes(track)
 open(sys.argv[1], "wb").write(smf)
+PYEOF
+
+# 8d. CMML in Ogg (https://wiki.xiph.org/CMML): the ident header (granule
+#     rate 1000/1, shift 32), the preamble and head headers, one clip per
+#     page at granule (time << 32 | previous clip), an empty clip on the EOS
+#     page. FFmpeg cannot write or read CMML.
+python3 - "$CORPUS_DIR/sub_cmml.ogg" <<'PYEOF'
+import struct, sys
+TABLE = []
+for i in range(256):
+    r = i << 24
+    for _ in range(8):
+        r = ((r << 1) ^ 0x04C11DB7) if r & 0x80000000 else (r << 1)
+        r &= 0xFFFFFFFF
+    TABLE.append(r)
+def crc(data):
+    c = 0
+    for b in data:
+        c = ((c << 8) & 0xFFFFFFFF) ^ TABLE[((c >> 24) ^ b) & 0xFF]
+    return c
+def page(flags, granule, seq, packets):
+    lacing = b''.join(b'\xff' * (len(p) // 255) + bytes([len(p) % 255]) for p in packets)
+    head = b'OggS' + bytes([0, flags]) + struct.pack('<qII', granule, 0x434D4D4C, seq)
+    tail = bytes([len(lacing)]) + lacing + b''.join(packets)
+    return head + struct.pack('<I', crc(head + b'\0\0\0\0' + tail)) + tail
+ident = b'CMML\0\0\0\0' + struct.pack('<HHqqB', 2, 1, 1000, 1, 32)
+preamble = (b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            b'<!DOCTYPE cmml SYSTEM "cmml.dtd">\n<?cmml lang="en"?>')
+head = b'<head>\n<title>PearTube corpus</title>\n</head>'
+clips = [(1000, b'<clip id="one" track="main"><desc>First clip</desc></clip>'),
+         (3000, b'<clip id="two" track="main"><desc>Second clip</desc></clip>'),
+         (5000, b'<clip track="main"/>')]
+out = page(2, 0, 0, [ident]) + page(0, 0, 1, [preamble, head])
+previous = 0
+for i, (ms, clip) in enumerate(clips):
+    out += page(4 if i == len(clips) - 1 else 0, (ms << 32) | previous, i + 2, [clip])
+    previous = ms
+open(sys.argv[1], 'wb').write(out)
 PYEOF
 
 # 8c. Copy the USF alongside (done above). Done.
