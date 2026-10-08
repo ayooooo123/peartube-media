@@ -1,0 +1,20 @@
+[package]
+name = "codec-dv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+description = "DV video (dvvideo) and Ulead DV audio (dvaudio) decoders and the raw DV demuxer (dv), ported from FFmpeg"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck = { workspace = true }
+oxideav-mov = { workspace = true }
+oxideav-avi = { workspace = true }
+oxideav-basic = { workspace = true }
+demux-mxf = { path = "../demux-mxf" }
+# Playback through the engine.
+codecs = { path = "../codecs" }
+player = { path = "../player" }

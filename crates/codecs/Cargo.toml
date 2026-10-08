@@ -74,6 +74,7 @@ codec-wmv = { path = "../codec-wmv" }
 codec-wma = { path = "../codec-wma" }
 subs-bitmap = { path = "../subs-bitmap" }
 codec-apple-audio = { path = "../codec-apple-audio" }
+codec-dv = { path = "../codec-dv" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

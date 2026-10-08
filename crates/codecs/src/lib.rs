@@ -107,7 +107,7 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     ] {
         register(&mut ctx.containers);
     }
-    for register in [demux_asf::register, demux_misc::register, demux_rm::register, demux_mxf::register] {
+    for register in [demux_asf::register, demux_misc::register, demux_rm::register, demux_mxf::register, codec_dv::register] {
         register(ctx);
     }
 }
