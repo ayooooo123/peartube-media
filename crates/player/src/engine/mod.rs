@@ -1311,37 +1311,6 @@ fn lanes_full(run: &Run<'_>) -> bool {
         || full(run.sub_lane, run.sub_tb, SUB_MAX_BYTES)
 }
 
-/// Where the demuxer seeks for a seek to `target`, in seconds, as fftools'
-/// `-ss` input seek does (2da55bf ffmpeg_demux.c): 3/23 s early when a
-/// stream has a decoding delay (FFmpeg's `codecpar->video_delay`) and the
-/// format does not seek by presentation time (`AVFMT_SEEK_TO_PTS`: FFmpeg's
-/// mov, mxf, nut, dhav and dvdvideo demuxers). The demuxer starts from the
-/// random access point at or before that time, so the pictures FFmpeg
-/// shows from the target decode from the same references; frames before
-/// the target are still dropped. Starting from the random access point at
-/// the target instead loses pictures that reference earlier ones, such as
-/// those after a non-IDR I frame without a recovery point.
-fn seek_position(format: &str, streams: &[StreamInfo], target: Duration) -> f64 {
-    const SEEKS_TO_PTS: [&str; 7] = ["mov", "mp4", "ismv", "mxf", "nut", "dhav", "dvdvideo"];
-    let mut micros = i64::try_from(target.as_micros()).unwrap_or(i64::MAX);
-    if !SEEKS_TO_PTS.contains(&format) && streams.iter().any(|s| video_delay(&s.params) > 0) {
-        micros -= 3 * 1_000_000 / 23;
-    }
-    micros as f64 / 1e6
-}
-
-/// FFmpeg's `codecpar->video_delay` for a stream, when its parameters tell:
-/// the demuxer's `video_delay` option (demuxers that port
-/// find_stream_info set it), and for H.264 the reorder depth its SPS
-/// declares. 0 otherwise.
-fn video_delay(params: &CodecParameters) -> u32 {
-    match params.codec_id.as_str() {
-        "h264" => oxideav_h264::h264_decoder::video_delay(params),
-        _ => params.options.get("video_delay").and_then(|v| v.parse().ok()),
-    }
-    .unwrap_or(0)
-}
-
 fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool) {
     let shared = run.shared;
     // Convert to the seek stream's time base. The demuxer seeks the video
@@ -1353,7 +1322,7 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
         .find(|s| s.index == seek_stream)
         .map(|s| s.time_base)
         .unwrap_or_else(|| TimeBase::new(1, 1000));
-    let ticks = tb.ticks_of(seek_position(run.demuxer.format_name(), run.streams, target)).max(0);
+    let ticks = tb.ticks_of(target.as_secs_f64());
 
     // `seek_target` keeps the newest request: the generation decides what
     // has been applied, so a seek arriving meanwhile is not lost.

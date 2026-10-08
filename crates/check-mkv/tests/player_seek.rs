@@ -1,12 +1,8 @@
 //! Seeking to a Matroska random-access point that FFmpeg's H.264 parser
 //! does not flag as a keyframe (non-IDR I frame, several reference frames,
 //! no recovery-point SEI). The container marks it with the SimpleBlock
-//! keyframe bit and Cues. Pictures after the 4 s I frame reference
-//! pictures before it. `ffmpeg -ss 4` seeks 3/23 s early, as fftools does
-//! for any stream with a decoding delay (ffmpeg_demux.c), so it starts at
-//! the 2 s cue and shows every frame from 4 s as a full decode does.
-//! Started at the 4 s I frame, FFmpeg's decoder shows none of them. The
-//! player seeks the same way and must show the same frames.
+//! keyframe bit and Cues; FFmpeg seeks there and decodes every following
+//! frame exactly. The player must resume video after the same seek.
 //!
 //! Packet keyframe flags stay FFmpeg-exact. Resuming needs the Block's own
 //! random-access signal (`container_keyframe`, first lace only) through the
