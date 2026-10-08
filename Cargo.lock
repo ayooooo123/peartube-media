@@ -112,6 +112,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "check-h263"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "check-mkv"
 version = "0.1.0"
 dependencies = [
@@ -245,6 +254,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-speex"
+version = "0.1.0"
+dependencies = [
+ "oxideav-avi",
+ "oxideav-core",
+ "oxideav-flv",
+ "oxideav-ogg",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-vp3"
 version = "0.1.0"
 dependencies = [
@@ -301,6 +321,7 @@ dependencies = [
  "codec-ra",
  "codec-rv",
  "codec-speech",
+ "codec-speex",
  "codec-vp3",
  "codec-vp56",
  "codec-wma",
@@ -1009,7 +1030,7 @@ dependencies = [
 [[package]]
 name = "oxideav-ac3"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-ac3?rev=239a59825b733a522cf4818c93e7cb3c35e5ce3a#239a59825b733a522cf4818c93e7cb3c35e5ce3a"
+source = "git+https://github.com/ayooooo123/oxideav-ac3?rev=65384d52a21eddd59ab72409278f497f045f9a7f#65384d52a21eddd59ab72409278f497f045f9a7f"
 dependencies = [
  "oxideav-core",
 ]
@@ -1053,7 +1074,7 @@ dependencies = [
 [[package]]
 name = "oxideav-avi"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-avi?rev=498b1097cee7002a235ff9a527e6a7009050cfb9#498b1097cee7002a235ff9a527e6a7009050cfb9"
+source = "git+https://github.com/ayooooo123/oxideav-avi?rev=941c480806700fd9833b405a8c47efe60ccd75d1#941c480806700fd9833b405a8c47efe60ccd75d1"
 dependencies = [
  "oxideav-core",
 ]
@@ -1085,7 +1106,7 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.1.37"
-source = "git+https://github.com/ayooooo123/oxideav-core?rev=96094a916d8b9f2695f70bb0d53e5956b8a79847#96094a916d8b9f2695f70bb0d53e5956b8a79847"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=57e5fa9cbf9eda25e4b992391c121a306f78cac4#57e5fa9cbf9eda25e4b992391c121a306f78cac4"
 dependencies = [
  "bytemuck",
  "serde_json",
@@ -1128,7 +1149,7 @@ dependencies = [
 [[package]]
 name = "oxideav-flv"
 version = "0.0.5"
-source = "git+https://github.com/OxideAV/oxideav-flv?rev=02e9158a20786a214a707da2f4ae7650146f3b3e#02e9158a20786a214a707da2f4ae7650146f3b3e"
+source = "git+https://github.com/ayooooo123/oxideav-flv?rev=5b1b6656065c3bea804bc3de3b95970d3286ad3c#5b1b6656065c3bea804bc3de3b95970d3286ad3c"
 dependencies = [
  "oxideav-core",
 ]
@@ -1153,7 +1174,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h263"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-h263?rev=e922942e0f65386943599badce62d2c74c5ef767#e922942e0f65386943599badce62d2c74c5ef767"
+source = "git+https://github.com/ayooooo123/oxideav-h263?rev=88189ab8c65491d366345bdb1ab3124b9589e784#88189ab8c65491d366345bdb1ab3124b9589e784"
 dependencies = [
  "oxideav-core",
 ]
@@ -1289,7 +1310,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mp4"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-mp4?rev=758b8688ef5e6043386735e67272805a8db2f964#758b8688ef5e6043386735e67272805a8db2f964"
+source = "git+https://github.com/ayooooo123/oxideav-mp4?rev=350f323370d7567bc3505933a682c03ac2fe7169#350f323370d7567bc3505933a682c03ac2fe7169"
 dependencies = [
  "aes",
  "cbc",
@@ -1341,7 +1362,7 @@ dependencies = [
 [[package]]
 name = "oxideav-ogg"
 version = "0.1.9"
-source = "git+https://github.com/ayooooo123/oxideav-ogg?rev=9bacc1e0dbe406f82fc2a97c60dd54f425fa8f64#9bacc1e0dbe406f82fc2a97c60dd54f425fa8f64"
+source = "git+https://github.com/ayooooo123/oxideav-ogg?rev=0f651ce5b48fef181dfb5100495aef978d42ac3f#0f651ce5b48fef181dfb5100495aef978d42ac3f"
 dependencies = [
  "oxideav-core",
 ]

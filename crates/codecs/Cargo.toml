@@ -7,7 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-oxideav-core.workspace = true
+# The player never encodes or muxes: OxideAV siblings' register functions
+# then leave their encoders and muxers unreferenced, and LTO drops them.
+oxideav-core = { workspace = true, features = ["decode-only"] }
 oxideav-avi.workspace = true
 oxideav-basic.workspace = true
 oxideav-dvd.workspace = true
@@ -79,6 +81,7 @@ codec-speech = { path = "../codec-speech" }
 codec-dv = { path = "../codec-dv" }
 codec-atrac = { path = "../codec-atrac" }
 codec-vp56 = { path = "../codec-vp56" }
+codec-speex = { path = "../codec-speex" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

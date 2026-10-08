@@ -18,6 +18,10 @@ pub fn run(binary: &Path, args: &[&str]) -> Vec<u8> {
 /// `name` in the persistent scratch directory, made by the `ffmpeg` on
 /// PATH from `input` with `output_args` on first use, published by rename.
 pub fn remux(name: &str, input: &Path, output_args: &[&str]) -> PathBuf {
+    // Tests in one binary run in parallel and share the per-process partial
+    // name: make one remux at a time so none renames another's file away.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("codec-speech");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
@@ -33,10 +37,8 @@ pub fn remux(name: &str, input: &Path, output_args: &[&str]) -> PathBuf {
 }
 
 /// FATE's `amrwb/<name>.awb` (3GP) remuxed by FFmpeg to the raw
-/// `#!AMR-WB` storage format. Read from the 3GP files the stream says 2
-/// channels: 3GPP fixes the sample entry's channel count at 2, and
-/// oxideav-mp4 passes it on where FFmpeg's MOV demuxer forces mono for
-/// AMR, so the decoder (as FFmpeg's would) expects two frames a packet.
+/// `#!AMR-WB` storage format: the `amr` demuxer's AMR-WB input, as FATE
+/// has no raw AMR-WB file.
 pub fn raw_amr_wb(name: &str) -> PathBuf {
     let source = refcheck::fate(&format!("amrwb/{name}.awb"));
     remux(&format!("{name}.amr"), &source, &["-c", "copy", "-f", "amr"])

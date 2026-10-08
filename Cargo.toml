@@ -82,6 +82,75 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Size, as the app's mobile/Cargo.toml builds libmain.so (keep the two in
+# step). Dependencies and this workspace's cold crates build for size; the
+# code that must keep its speed builds at 3: the decoders that play HD video
+# or sit near PerfAudit's real-time floors, oxideav-core's bit readers,
+# oxideav-pixfmt's RGBA conversion and the engine. Binaries stay at 3: fat LTO
+# optimises the whole program at the final crate's level, and at "s" rustc
+# turns off loop and SLP vectorization for all of it. Workspace crates default
+# to 3 here but are "s" in the app unless listed there: put a new crate in one
+# of the two lists.
+[profile.release.package."*"]
+opt-level = "s"
+[profile.release.package.oxideav-core]
+opt-level = 3
+[profile.release.package.oxideav-pixfmt]
+opt-level = 3
+[profile.release.package.oxideav-h264]
+opt-level = 3
+[profile.release.package.oxideav-h265]
+opt-level = 3
+[profile.release.package.oxideav-av1]
+opt-level = 3
+[profile.release.package.oxideav-vp8]
+opt-level = 3
+[profile.release.package.oxideav-vp9]
+opt-level = 3
+[profile.release.package.oxideav-mpeg12video]
+opt-level = 3
+[profile.release.package.oxideav-mpeg4video]
+opt-level = 3
+[profile.release.package.oxideav-aac]
+opt-level = 3
+[profile.release.package.oxideav-opus]
+opt-level = 3
+[profile.release.package.oxideav-mp3]
+opt-level = 3
+[profile.release.package.oxideav-ac3]
+opt-level = 3
+# The Ogg demuxer runs per packet: at "s" it costs Opus in Ogg about 0.4%
+# more instructions (16 KB). The Matroska demuxer at 3 changed nothing.
+[profile.release.package.oxideav-ogg]
+opt-level = 3
+# Hot workspace crates (player, codec-wmv, codec-dca) keep the default 3.
+[profile.release.package.audio-trim]
+opt-level = "s"
+[profile.release.package.codec-mlp]
+opt-level = "s"
+[profile.release.package.codec-ra]
+opt-level = "s"
+[profile.release.package.codec-rv]
+opt-level = "s"
+[profile.release.package.codec-wma]
+opt-level = "s"
+[profile.release.package.codecs]
+opt-level = "s"
+[profile.release.package.demux-asf]
+opt-level = "s"
+[profile.release.package.demux-misc]
+opt-level = "s"
+[profile.release.package.demux-rm]
+opt-level = "s"
+[profile.release.package.demux-seek-core]
+opt-level = "s"
+[profile.release.package.subs-bitmap]
+opt-level = "s"
+[profile.release.package.subs-cc]
+opt-level = "s"
+[profile.release.package.subs-text]
+opt-level = "s"
+
 # Tests decode real samples; unoptimized codecs make them crawl.
 [profile.dev]
 opt-level = 1
@@ -93,24 +162,24 @@ opt-level = 3
 # BEGIN pin-oxideav
 [patch.crates-io]
 oxideav-aac = { git = "https://github.com/ayooooo123/oxideav-aac", rev = "d9f6d8eb2a62b19518e957868702d57eb0123124" }
-oxideav-ac3 = { git = "https://github.com/ayooooo123/oxideav-ac3", rev = "239a59825b733a522cf4818c93e7cb3c35e5ce3a" }
+oxideav-ac3 = { git = "https://github.com/ayooooo123/oxideav-ac3", rev = "65384d52a21eddd59ab72409278f497f045f9a7f" }
 oxideav-adpcm = { git = "https://github.com/OxideAV/oxideav-adpcm", rev = "0802fb34c6c57bfa8913670fe78882547416fd16" }
 oxideav-ape = { git = "https://github.com/OxideAV/oxideav-ape", rev = "ea6e8ca2848b18716a49ca6de0fe4d8d26d4893a" }
 oxideav-ass = { git = "https://github.com/OxideAV/oxideav-ass", rev = "e89607612ef19285c60b84f51ce5d34c72a493b1" }
 oxideav-av1 = { git = "https://github.com/ayooooo123/oxideav-av1", rev = "cab66b04918136a7533019122da1677c7b2a42b3" }
-oxideav-avi = { git = "https://github.com/ayooooo123/oxideav-avi", rev = "498b1097cee7002a235ff9a527e6a7009050cfb9" }
+oxideav-avi = { git = "https://github.com/ayooooo123/oxideav-avi", rev = "941c480806700fd9833b405a8c47efe60ccd75d1" }
 oxideav-basic = { git = "https://github.com/ayooooo123/oxideav-basic", rev = "b7329a9198fab533fabe6d8d9b5a408eeb77cec4" }
 oxideav-cinepak = { git = "https://github.com/ayooooo123/oxideav-cinepak", rev = "6e632ae20703b531c5c5755dadcc67fa32479828" }
 oxideav-cook = { git = "https://github.com/OxideAV/oxideav-cook", rev = "f8584e427c6f87de24e2f2de124e0242824f7006" }
-oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "57e5fa9cbf9eda25e4b992391c121a306f78cac4" }
 oxideav-dirac = { git = "https://github.com/ayooooo123/oxideav-dirac", rev = "051c87ed060476839493b4368d81fb6dc8294bd6" }
 oxideav-dts = { git = "https://github.com/OxideAV/oxideav-dts", rev = "9a7c128366aa4914331825e3b5d40a3d3304c090" }
 oxideav-dvd = { git = "https://github.com/OxideAV/oxideav-dvd", rev = "f237f8c05fb3a70d0d9c7e7c99c56110c570d849" }
 oxideav-flac = { git = "https://github.com/OxideAV/oxideav-flac", rev = "cfcc7c4359d1f97d39c228dfd95ed46e9246b458" }
-oxideav-flv = { git = "https://github.com/OxideAV/oxideav-flv", rev = "02e9158a20786a214a707da2f4ae7650146f3b3e" }
+oxideav-flv = { git = "https://github.com/ayooooo123/oxideav-flv", rev = "5b1b6656065c3bea804bc3de3b95970d3286ad3c" }
 oxideav-g711 = { git = "https://github.com/OxideAV/oxideav-g711", rev = "72af018b7c04e8c3aacc6c0b7628cd6e43cde37a" }
 oxideav-h261 = { git = "https://github.com/ayooooo123/oxideav-h261", rev = "0803bf4eb603c9766c01ba89f150259c84c3af7b" }
-oxideav-h263 = { git = "https://github.com/ayooooo123/oxideav-h263", rev = "e922942e0f65386943599badce62d2c74c5ef767" }
+oxideav-h263 = { git = "https://github.com/ayooooo123/oxideav-h263", rev = "88189ab8c65491d366345bdb1ab3124b9589e784" }
 oxideav-h264 = { git = "https://github.com/ayooooo123/oxideav-h264", rev = "103743224259f2b8663dc882fa60a18cd95c134a" }
 oxideav-h265 = { git = "https://github.com/ayooooo123/oxideav-h265", rev = "279ecc3f27dc6f4145c5478a0f2388180661e1d1" }
 oxideav-http = { git = "https://github.com/OxideAV/oxideav-http", rev = "f54f106e1e131300387d1df1a71d2686690ccdca" }
@@ -126,13 +195,13 @@ oxideav-mov = { git = "https://github.com/ayooooo123/oxideav-mov", rev = "3cb57f
 oxideav-mp1 = { git = "https://github.com/OxideAV/oxideav-mp1", rev = "e01e2d0dfa651f39d5ba05ee3129b7144282dceb" }
 oxideav-mp2 = { git = "https://github.com/ayooooo123/oxideav-mp2", rev = "1f335d02e92ecee338945777e8f5f9b483bef22a" }
 oxideav-mp3 = { git = "https://github.com/ayooooo123/oxideav-mp3", rev = "ba94ce70a7e6ddb37f02713b3ca34ed5b39f7cf0" }
-oxideav-mp4 = { git = "https://github.com/ayooooo123/oxideav-mp4", rev = "758b8688ef5e6043386735e67272805a8db2f964" }
+oxideav-mp4 = { git = "https://github.com/ayooooo123/oxideav-mp4", rev = "350f323370d7567bc3505933a682c03ac2fe7169" }
 oxideav-mpeg12video = { git = "https://github.com/ayooooo123/oxideav-mpeg12video", rev = "9c4c24c2d336ffde2e23f29d55812e75c40d780a" }
 oxideav-mpeg4video = { git = "https://github.com/ayooooo123/oxideav-mpeg4video", rev = "a759321b87caef26a340186f04a86c8f4060ec15" }
 oxideav-mpegts = { git = "https://github.com/ayooooo123/oxideav-mpegts", rev = "cae69e3c911a830b07e8e35b1b88e26f2e842b62" }
 oxideav-msmpeg4 = { git = "https://github.com/ayooooo123/oxideav-msmpeg4", rev = "def8962c09aa5d339dada2d2308c61186a67e074" }
 oxideav-musepack = { git = "https://github.com/OxideAV/oxideav-musepack", rev = "c60b07708683e0e25c6e0007bffbb887e03876f7" }
-oxideav-ogg = { git = "https://github.com/ayooooo123/oxideav-ogg", rev = "9bacc1e0dbe406f82fc2a97c60dd54f425fa8f64" }
+oxideav-ogg = { git = "https://github.com/ayooooo123/oxideav-ogg", rev = "0f651ce5b48fef181dfb5100495aef978d42ac3f" }
 oxideav-opus = { git = "https://github.com/OxideAV/oxideav-opus", rev = "fd97e6110860d21a69c76ba4d051984486fea9fb" }
 oxideav-otf = { git = "https://github.com/OxideAV/oxideav-otf", rev = "554299a740ce7236bf2c5e751bb7df5befd52dd0" }
 oxideav-pixfmt = { git = "https://github.com/OxideAV/oxideav-pixfmt", rev = "82b63ba210c097fc62bea63d98412ed88823fd77" }

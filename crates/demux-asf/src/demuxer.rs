@@ -1649,6 +1649,24 @@ impl AsfDemuxer {
 
         Ok(())
     }
+
+    /// `avio_skip(pb, n)`: moves `n` bytes on. A cut file declares packets
+    /// past its end: a file seeks there and then reads nothing, but an HTTP
+    /// source refuses a seek past the end of the resource, so such a skip
+    /// lands at the end instead, where FFmpeg's buffered reader stops too.
+    fn skip(&mut self, n: u64) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let target = self.input.stream_position()?.saturating_add(n);
+        if let Err(e) = self.input.seek(SeekFrom::Start(target)) {
+            let end = self.input.seek(SeekFrom::End(0))?;
+            if target <= end {
+                return Err(e.into());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Demuxer for AsfDemuxer {
@@ -1754,9 +1772,7 @@ impl Demuxer for AsfDemuxer {
                 } else {
                     0
                 };
-                if skip > 0 {
-                    self.input.seek(SeekFrom::Current(skip as i64))?;
-                }
+                self.skip(skip)?;
                 let cur = self.input.stream_position()?;
                 self.packet_pos = cur;
                 // Do not exceed the size of the data object (FFmpeg's
