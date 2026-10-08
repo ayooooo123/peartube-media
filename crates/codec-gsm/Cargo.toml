@@ -1,0 +1,17 @@
+[package]
+name = "codec-gsm"
+description = "GSM 06.10 and Microsoft GSM decoders and the raw GSM demuxer (a port of FFmpeg's gsmdec.c)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# A port of FFmpeg's LGPL files (see the src/ headers); not the workspace's MIT.
+license = "LGPL-2.1-or-later"
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-basic.workspace = true
+oxideav-mov.workspace = true

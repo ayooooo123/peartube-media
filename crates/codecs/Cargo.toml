@@ -53,7 +53,6 @@ oxideav-mp3.workspace = true
 oxideav-opus.workspace = true
 oxideav-s3m.workspace = true
 oxideav-speex.workspace = true
-oxideav-tta.workspace = true
 oxideav-vorbis.workspace = true
 oxideav-wma.workspace = true
 oxideav-ass.workspace = true
@@ -83,6 +82,8 @@ codec-svq3 = { path = "../codec-svq3" }
 codec-ape = { path = "../codec-ape" }
 codec-wavpack = { path = "../codec-wavpack" }
 codec-musepack = { path = "../codec-musepack" }
+codec-gsm = { path = "../codec-gsm" }
+codec-tta = { path = "../codec-tta" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

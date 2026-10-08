@@ -48,6 +48,9 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_ape::register_codecs,
         codec_musepack::register_codecs,
         codec_wavpack::register_codecs,
+        // GSM 06.10 and Microsoft GSM (MSN Audio rates too), and TTA.
+        codec_gsm::register_codecs,
+        codec_tta::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -99,7 +102,6 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_opus::__oxideav_entry,
         oxideav_s3m::__oxideav_entry,
         oxideav_speex::__oxideav_entry,
-        oxideav_tta::__oxideav_entry,
         oxideav_vorbis::__oxideav_entry,
         oxideav_wma::__oxideav_entry,
         // Subtitles
@@ -134,6 +136,9 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_ape::register_containers,
         codec_musepack::register_containers,
         codec_wavpack::register_containers,
+        // Raw GSM (.gsm) and TTA (.tta).
+        codec_gsm::register_containers,
+        codec_tta::register_containers,
     ] {
         register(&mut ctx.containers);
     }

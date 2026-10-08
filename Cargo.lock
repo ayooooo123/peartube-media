@@ -226,6 +226,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-gsm"
+version = "0.1.0"
+dependencies = [
+ "oxideav-basic",
+ "oxideav-core",
+ "oxideav-mov",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-mlp"
 version = "0.1.0"
 dependencies = [
@@ -298,6 +308,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-tta"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-vp3"
 version = "0.1.0"
 dependencies = [
@@ -361,6 +379,7 @@ dependencies = [
  "codec-atrac",
  "codec-dca",
  "codec-dv",
+ "codec-gsm",
  "codec-mlp",
  "codec-musepack",
  "codec-ra",
@@ -368,6 +387,7 @@ dependencies = [
  "codec-speech",
  "codec-speex",
  "codec-svq3",
+ "codec-tta",
  "codec-vp3",
  "codec-vp56",
  "codec-wavpack",
@@ -420,7 +440,6 @@ dependencies = [
  "oxideav-subtitle",
  "oxideav-svq",
  "oxideav-theora",
- "oxideav-tta",
  "oxideav-vc2",
  "oxideav-vorbis",
  "oxideav-vp6",
@@ -1312,7 +1331,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mov"
 version = "0.0.6"
-source = "git+https://github.com/ayooooo123/oxideav-mov?rev=3cb57f8548867149753f340f3470c281bec36010#3cb57f8548867149753f340f3470c281bec36010"
+source = "git+https://github.com/ayooooo123/oxideav-mov?rev=d6af48d7db0428583b60ae52b0f2bbc0901d4318#d6af48d7db0428583b60ae52b0f2bbc0901d4318"
 dependencies = [
  "compcol",
  "oxideav-core",
@@ -1504,14 +1523,6 @@ dependencies = [
 name = "oxideav-theora"
 version = "0.0.12"
 source = "git+https://github.com/ayooooo123/oxideav-theora?rev=a7674665c76370f2a6bbc4e72af5f31256cae8b0#a7674665c76370f2a6bbc4e72af5f31256cae8b0"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
-name = "oxideav-tta"
-version = "0.0.4"
-source = "git+https://github.com/OxideAV/oxideav-tta?rev=53432dc2b2de77f0b6de6e55f7e742fbdd11b04f#53432dc2b2de77f0b6de6e55f7e742fbdd11b04f"
 dependencies = [
  "oxideav-core",
 ]
