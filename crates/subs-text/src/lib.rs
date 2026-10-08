@@ -11,6 +11,7 @@
 //! | USF     | `usf`      | Matroska `S_TEXT/USF`                               | VLC `subsusf.c` + `subsdec.c` (LGPL-2.1-or-later, ported) |
 //! | CMML    | `cmml`     | Ogg logical stream, ident `CMML\0\0\0\0`            | Xiph CMML spec (clean-room) |
 //! | Kate    | `kate`     | Ogg logical stream, ident `\x80kate\0\0\0`; Matroska `S_KATE` | Xiph OggKate spec + libkate bitstream docs (clean-room) |
+//! | SCC     | `eia_608` (subs-cc decodes it) | `.scc` (Scenarist Closed Captions) | FFmpeg `sccdec.c` (LGPL-2.1-or-later, ported) |
 //!
 //! Decoders consume one packet per cue and emit `Frame::Subtitle`
 //! (`oxideav_core::SubtitleCue`). Formats FFmpeg decodes to ASS go through
@@ -33,6 +34,7 @@ pub mod microdvd;
 pub mod mov_text;
 pub mod sami;
 mod scan;
+pub mod scc;
 pub mod srt;
 pub mod subviewer;
 pub mod subviewer1;
@@ -207,6 +209,11 @@ pub fn register_containers(reg: &mut oxideav_core::ContainerRegistry) {
     reg.register_probe_with_priority(webvtt::CONTAINER_NAME, webvtt::probe, 50);
     reg.register_extension_with_priority("vtt", webvtt::CONTAINER_NAME, 50);
     reg.register_extension_with_priority("webvtt", webvtt::CONTAINER_NAME, 50);
+
+    // Scenarist Closed Captions: EIA-608 pairs, decoded by subs-cc.
+    reg.register_demuxer(scc::CONTAINER_NAME, scc::open_demuxer);
+    reg.register_probe_with_priority(scc::CONTAINER_NAME, scc::probe, 50);
+    reg.register_extension_with_priority("scc", scc::CONTAINER_NAME, 50);
 
     // MicroDVD
     reg.register_demuxer(microdvd::CONTAINER_NAME, microdvd::open_demuxer);

@@ -570,6 +570,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subs-bitmap",
+ "subs-cc",
  "toml",
 ]
 

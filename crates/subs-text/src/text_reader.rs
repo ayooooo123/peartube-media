@@ -221,6 +221,11 @@ impl SubtitleQueue {
         self.events.len()
     }
 
+    /// The event inserted last (FFmpeg demuxers keep its `AVPacket *`).
+    pub fn last_mut(&mut self) -> Option<&mut QueuedEvent> {
+        self.events.last_mut()
+    }
+
     /// `ff_subtitles_queue_finalize` followed by the packets
     /// `ff_subtitles_queue_read_packet` hands out.
     pub fn finalize(mut self, time_base: TimeBase) -> VecDeque<Packet> {

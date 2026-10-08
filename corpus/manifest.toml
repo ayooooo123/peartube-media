@@ -601,14 +601,27 @@ path = "fate:sub/MPL2_capability_tester.txt"
 rows = ["sub:mpl2"]
 compare = ["sub:text"]
 
+# Closed captions in MPEG-2 video (A/53): the player offers them as
+# synthetic tracks, EIA-608 as stream 65536 and CEA-708 service 1 as 65537.
+# FFmpeg reads EIA-608 through lavfi `movie=...[out0+subcc]` and decodes it
+# in real time mode, as the player shows captions; it has no CEA-708
+# decoder, so that track can only decode.
 [[entry]]
 path = "fate:sub/Closedcaption_rollup.m2v"
 rows = ["sub:eia608"]
+streams = { subtitle = 65536 }
 compare = ["video:md5", "sub:text"]
 
 [[entry]]
-path = "fate:sub/witch.scc"
+path = "fate:sub/Closedcaption_rollup.m2v"
 rows = ["sub:cea708"]
+streams = { subtitle = 65537 }
+compare = ["video:md5", "sub:decodes"]
+
+# Scenarist Closed Captions carry EIA-608 pairs (FFmpeg: eia_608).
+[[entry]]
+path = "fate:sub/witch.scc"
+rows = ["sub:eia608"]
 compare = ["sub:text"]
 
 # USF in Matroska from FFmpeg's sample archive (XviD, Vorbis, USF). FFmpeg

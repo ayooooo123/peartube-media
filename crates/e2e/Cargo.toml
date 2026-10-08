@@ -10,6 +10,8 @@ publish.workspace = true
 player = { path = "../player" }
 codecs = { path = "../codecs" }
 refcheck = { path = "../refcheck" }
+subs-bitmap = { path = "../subs-bitmap" }
+subs-cc = { path = "../subs-cc" }
 oxideav-core.workspace = true
 oxideav-subtitle = { workspace = true, features = ["text"] }
 parking_lot = "0.12"

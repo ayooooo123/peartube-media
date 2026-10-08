@@ -498,3 +498,28 @@ fn vobsub_explicit_size_wins_over_smaller_video() {
     assert_eq!(reference.cues.len(), 1);
     check_player(&path, &streams, (reference.width, reference.height), &reference.cues.into_iter().map(|cue| cue.canvas).collect::<Vec<_>>());
 }
+
+/// A VobSub index opened as the player's source plays its program stream
+/// (`.sub` beside it, named as FFmpeg's vobsub demuxer names it): every
+/// cue's canvas equals FFmpeg's.
+#[test]
+fn paired_vobsub_index_plays_like_ffmpeg() {
+    let idx = refcheck::fate("sub/vobsub.idx");
+    let reference = support::ffmpeg_reference(&idx, 0);
+    let headless = Headless::new();
+    headless.set_active_streams(None, None, None, false);
+    let backend = Arc::new(CanvasBackend { video: headless, shows: Arc::new(Mutex::new(Vec::new())), hashed: None });
+    let options = PlayerOptions { subtitle: Some(0), realtime: false, ..PlayerOptions::default() };
+    let player = Player::open(idx.to_str().unwrap(), backend.clone(), Arc::new(context()), options, |_| {});
+    let state = player.wait();
+    drop(player);
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let shows = backend.shows.lock();
+    let visible: Vec<_> = shows.iter().filter(|show| !show.blank).collect();
+    assert_eq!(visible.len(), reference.cues.len(), "every cue");
+    for (index, (show, cue)) in visible.iter().zip(&reference.cues).enumerate() {
+        assert_eq!((show.width, show.height), (reference.width, reference.height), "cue {index}: canvas size");
+        let diff = support::canvas_diff(&cue.canvas, &show.canvas, reference.width, support::Match::Visible);
+        assert!(diff.is_none(), "cue {index}: {diff:?}");
+    }
+}

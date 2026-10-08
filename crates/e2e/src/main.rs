@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use compare::{Compare, Verdict};
 use manifest::{Entry, Kind, Policy};
-use oxideav_core::{MediaType, RuntimeContext};
+use oxideav_core::{Demuxer, MediaType, RuntimeContext, StreamInfo};
 use player::{Headless, Player, PlayerOptions};
 use serde::Serialize;
 
@@ -305,24 +305,38 @@ struct TrackInfo {
 }
 
 /// What the player is offered, found the way the player finds it: its probe
-/// rule and registry, and the engine's track filter (audio, video within the
-/// size caps, subtitles; at most 64 streams).
+/// rule and registry (a VobSub index opens with its program stream, as the
+/// engine opens it), the engine's track filter (audio, video within the
+/// size caps, subtitles; at most 64 streams), and the closed-caption tracks
+/// of the video it plays (`wanted_video`, else the first).
 struct Discovery {
     demuxer: String,
     tracks: Vec<TrackInfo>,
 }
 
-fn discover(path: &Path) -> Result<Discovery, String> {
+fn discover(path: &Path, wanted_video: Option<u32>) -> Result<Discovery, String> {
     let ctx = &*tap::PLAIN;
-    let demuxer = refcheck::probe_container(ctx, path)?;
-    let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.containers.open_demuxer(&demuxer, Box::new(file), &ctx.codecs)
+    let vobsub = player::source::vobsub_stream_url(&path.to_string_lossy());
+    type Opened = Result<(String, Box<dyn Demuxer>), String>;
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Opened {
+        let file = |p: &Path| std::fs::File::open(p).map_err(|e| format!("open {}: {e}", p.display()));
+        let failed = |e: oxideav_core::Error| format!("failed to open demuxer: {e}");
+        match &vobsub {
+            Some(sub) => {
+                let d = subs_bitmap::open_vobsub(Box::new(file(path)?), Box::new(file(Path::new(sub))?)).map_err(failed)?;
+                Ok((d.format_name().to_string(), d))
+            }
+            None => {
+                let name = refcheck::probe_container(ctx, path)?;
+                let d = ctx.containers.open_demuxer(&name, Box::new(file(path)?), &ctx.codecs).map_err(failed)?;
+                Ok((name, d))
+            }
+        }
     }));
-    let d = match opened {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => return Err(format!("failed to open demuxer: {e}")),
-        Err(_) => return Err(format!("the {demuxer} demuxer panicked while opening")),
+    let (demuxer, mut d) = match opened {
+        Ok(Ok(opened)) => opened,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("the demuxer panicked while opening".into()),
     };
     let mut tracks = Vec::new();
     for s in d.streams().iter().take(64) {
@@ -340,7 +354,45 @@ fn discover(path: &Path) -> Result<Discovery, String> {
         };
         tracks.push(TrackInfo { stream: s.index, kind, codec: s.params.codec_id.as_str().to_string() });
     }
+    let video = wanted_video.or_else(|| tracks.iter().find(|t| t.kind == Kind::Video).map(|t| t.stream));
+    if let Some(info) = video.and_then(|v| d.streams().iter().find(|s| s.index == v)).cloned() {
+        let scan = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| caption_tracks(&mut *d, &info)));
+        tracks.extend(scan.unwrap_or_default());
+    }
     Ok(Discovery { demuxer, tracks })
+}
+
+/// The closed-caption tracks the player lists for `video`, the video stream
+/// it plays: one per service that shows up in its pictures' caption data,
+/// taken in presentation order as the engine takes it, listed in the order
+/// the engine lists them. Reads `demuxer` to its end.
+fn caption_tracks(demuxer: &mut dyn Demuxer, video: &StreamInfo) -> Vec<TrackInfo> {
+    fn list(released: Vec<subs_cc::timeline::Timed>, tracks: &mut Vec<TrackInfo>) {
+        for (_, triplets) in released {
+            let services = subs_cc::Services::of(&triplets);
+            for (present, stream, codec) in [
+                (services.eia608, player::CAPTIONS_608, subs_cc::eia608::CODEC_ID),
+                (services.cea708, player::CAPTIONS_708, subs_cc::cea708::CODEC_ID),
+            ] {
+                if present && !tracks.iter().any(|t| t.stream == stream) {
+                    tracks.push(TrackInfo { stream, kind: Kind::Subtitle, codec: codec.to_string() });
+                }
+            }
+        }
+    }
+    let Some(mut extractor) = subs_cc::CcExtractor::new(video.params.codec_id.as_str(), &video.params.extradata) else {
+        return Vec::new();
+    };
+    let mut timeline = subs_cc::CaptionTimeline::new();
+    let mut tracks = Vec::new();
+    while let Ok(packet) = demuxer.next_packet() {
+        if packet.stream_index == video.index {
+            let triplets = extractor.extract(&packet.data);
+            list(timeline.push(packet.pts, packet.dts, triplets), &mut tracks);
+        }
+    }
+    list(timeline.finish(), &mut tracks);
+    tracks
 }
 
 fn track_kind(kind: player::TrackKind) -> Kind {
@@ -388,8 +440,16 @@ fn select(entry: &Entry, disc: &Discovery) -> Result<Vec<Selected>, String> {
 /// FFmpeg's stream for a selected track: the same position among FFmpeg's
 /// streams of the kind (cover art excluded) as among the player's tracks of
 /// the kind. Both lists must be equally long, or the position means nothing.
+/// Closed captions are none of the file's streams: FFmpeg reads EIA-608
+/// from the video (its `subcc` output) and decodes no CEA-708.
 fn map_to_ffmpeg(track: &TrackInfo, disc: &Discovery, ff: &[oracle::FfStream]) -> Result<oracle::FfStream, String> {
-    let ours: Vec<u32> = disc.tracks.iter().filter(|t| t.kind == track.kind).map(|t| t.stream).collect();
+    let caption = |stream: u32| stream == player::CAPTIONS_608 || stream == player::CAPTIONS_708;
+    match track.stream {
+        player::CAPTIONS_608 => return Ok(oracle::FfStream::subcc()),
+        player::CAPTIONS_708 => return Err("FFmpeg decodes no CEA-708: the caption track has no FFmpeg counterpart".into()),
+        _ => {}
+    }
+    let ours: Vec<u32> = disc.tracks.iter().filter(|t| t.kind == track.kind && !caption(t.stream)).map(|t| t.stream).collect();
     let theirs = oracle::of_type(ff, track.kind.ffmpeg_type());
     if ours.len() != theirs.len() {
         return Err(format!(
@@ -526,7 +586,7 @@ fn compare_subtitles(
     }
     let verdict = match policy {
         Policy::SubText => {
-            oracle::subtitle_srt(path, &ff.map()).and_then(|reference| compare::text_cues(cues, shown, &reference))
+            oracle::subtitle_srt(path, ff).and_then(|reference| compare::text_cues(cues, shown, &reference))
         }
         Policy::SubBitmap => oracle::subtitle_events(path, ff.index).and_then(|events| {
             let (dims, canvases) = oracle::subtitle_canvases(path, ff.index)?;
@@ -560,7 +620,7 @@ fn judge(
         return (None, Compare::fail(output, format!("the manifest declares no {} policy for this entry", kind.name())));
     };
     let cmp = match (policy, ff) {
-        (Policy::Decodes(_), Ok(ff)) if oracle::decodes(path, &ff.map()) => Compare::fail(
+        (Policy::Decodes(_), Ok(ff)) if oracle::decodes(path, ff) => Compare::fail(
             output,
             format!("FFmpeg decodes {}: declare an oracle policy, not {}", ff.map(), policy.token()),
         ),
@@ -715,12 +775,10 @@ fn judge_track(
                     other => misapplied(other, Kind::Subtitle),
                 },
                 || {
-                    if shown > 0 && shown == cues.len() {
-                        Compare::decodes(output.clone())
-                    } else if shown != cues.len() {
-                        Compare::fail(output.clone(), format!("the pipeline showed {shown} of the {} decoded cues", cues.len()))
-                    } else {
-                        Compare::fail(output.clone(), missing())
+                    match compare::shown_all(cues, shown) {
+                        Ok(()) if shown > 0 => Compare::decodes(output.clone()),
+                        Ok(()) => Compare::fail(output.clone(), missing()),
+                        Err(e) => Compare::fail(output.clone(), e),
                     }
                 },
             );
@@ -787,7 +845,7 @@ fn run_entry(entry: &Entry, path: &Path, http_base: Option<&str>) -> EntryResult
     let mut result =
         EntryResult { path: entry.path.clone(), demuxer: None, tracks: Vec::new(), streams: Vec::new(), claims: Vec::new() };
 
-    let disc = match discover(path) {
+    let disc = match discover(path, entry.selection.video) {
         Ok(d) => d,
         Err(e) => {
             result.streams.push(StreamResult::entry_level("open", 0, None, e));
@@ -1334,6 +1392,7 @@ mod tests {
             sample_rate: None,
             channels: None,
             attached_pic,
+            subcc: false,
         }
     }
 

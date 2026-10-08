@@ -24,8 +24,16 @@ use serde::Serialize;
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum Cue {
     /// A text cue: its timing and its body rendered as SubRip markup (the
-    /// rendering FFmpeg's `srt` encoder produces from its decode).
-    Text { start_us: i64, end_us: i64, text: String },
+    /// rendering FFmpeg's `srt` encoder produces from its decode). A
+    /// display `state` (captions, `subs_cc::STATE_STYLE`) stays up until
+    /// the next replaces it (or its end, `i64::MAX`: none).
+    Text {
+        start_us: i64,
+        end_us: i64,
+        text: String,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        state: bool,
+    },
     /// A bitmap cue: an RGBA canvas, timed as the player times it (frame
     /// pts, else packet pts; end from the packet duration when there is one).
     Bitmap { start_us: i64, end_us: Option<i64>, width: usize, height: usize, md5: String, blank: bool },
@@ -100,6 +108,7 @@ impl Tap {
                 start_us: cue.start_us,
                 end_us: cue.end_us,
                 text: oxideav_subtitle::srt::render_segments(&cue.segments),
+                state: cue.style_ref.as_deref() == Some(subs_cc::STATE_STYLE),
             }),
             Frame::Video(vf) => {
                 let (pts, duration, tb) = self.last_packet.unwrap_or((None, None, TimeBase::new(1, 1000)));

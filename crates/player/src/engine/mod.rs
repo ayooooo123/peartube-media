@@ -14,6 +14,8 @@ use oxideav_core::{
 
 mod captions;
 
+pub use captions::{CAPTIONS_608, CAPTIONS_708};
+
 use crate::backend::{AudioSink, Backend, Clock, SinkError, VideoSink};
 use crate::clock::MasterClock;
 use crate::headless::find_headless;
@@ -658,8 +660,10 @@ fn run_player_pipeline(
     let ctx = &*shared.ctx;
     // 1. One read-ahead source feeds the probe and then the demuxer. The
     //    engine keeps its monitor: starvation reports drive the buffering
-    //    hold, suspend/resume pause the download.
-    let mut source = match open_source(&url) {
+    //    hold, suspend/resume pause the download. A VobSub index (`.idx`)
+    //    plays from its program stream (`.sub`): that is the source.
+    let vobsub = crate::source::vobsub_stream_url(&url);
+    let mut source = match open_source(vobsub.as_deref().unwrap_or(&url)) {
         Ok(s) => s,
         Err(e) => {
             if !shared.stopped.load(Ordering::SeqCst) {
@@ -682,30 +686,45 @@ fn run_player_pipeline(
         return;
     }
 
-    // 2. Probe (rule from engine-api.md, same as refcheck), then rewind.
-    let container = match probe_container(&url, &mut source, &shared) {
-        Ok(c) => c,
-        Err(e) => {
-            if !shared.stopped.load(Ordering::SeqCst) {
-                set_error(&shared, e);
+    let mut demuxer = if vobsub.is_some() {
+        // 2-3. VobSub: the index, read whole as it opens, beside the
+        //    program stream (FFmpeg's vobsub demuxer pairs them the same
+        //    way). No probe: no registered container reads the pair.
+        let opened = open_source(&url).map_err(|e| e.to_string()).and_then(|index| {
+            subs_bitmap::open_vobsub(Box::new(index), Box::new(source)).map_err(|e| e.to_string())
+        });
+        match opened {
+            Ok(d) => d,
+            Err(e) => {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, format!("failed to open demuxer: {e}"));
+                }
+                return;
             }
-            return;
         }
-    };
-
-    // 3. Demuxer. Container codec tags resolve through the registry — the
-    //    mpeg4video fork claims Matroska's MPEG-4 Part 2 CodecIDs
-    //    (V_MPEG4/ISO/ASP, //SP, //AP) directly.
-    let mut demuxer = match ctx
-        .containers
-        .open_demuxer(&container, Box::new(source), &ctx.codecs)
-    {
-        Ok(d) => d,
-        Err(e) => {
-            if !shared.stopped.load(Ordering::SeqCst) {
-                set_error(&shared, format!("failed to open demuxer: {e}"));
+    } else {
+        // 2. Probe (rule from engine-api.md, same as refcheck), then rewind.
+        let container = match probe_container(&url, &mut source, &shared) {
+            Ok(c) => c,
+            Err(e) => {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, e);
+                }
+                return;
             }
-            return;
+        };
+
+        // 3. Demuxer. Container codec tags resolve through the registry —
+        //    the mpeg4video fork claims Matroska's MPEG-4 Part 2 CodecIDs
+        //    (V_MPEG4/ISO/ASP, //SP, //AP) directly.
+        match ctx.containers.open_demuxer(&container, Box::new(source), &ctx.codecs) {
+            Ok(d) => d,
+            Err(e) => {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, format!("failed to open demuxer: {e}"));
+                }
+                return;
+            }
         }
     };
 

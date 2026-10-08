@@ -164,18 +164,49 @@ pub fn snr_pcm(ours: &[f32], reference: &[f32], slack: usize, floor: f64) -> Com
 
 // ---------------------------------------------------------------- subtitles
 
-/// A time as SubRip writes it: `hh:mm:ss,mmm`, truncated to the millisecond.
+/// A time as FFmpeg's `srt` muxer writes it: `hh:mm:ss,mmm`, the
+/// microseconds rounded to the nearest millisecond (FFmpeg rescales a
+/// subtitle's times to the muxer's milliseconds rounding to nearest).
 pub fn srt_time(us: i64) -> String {
-    let ms = (us / 1000).max(0);
+    srt_ms(us_to_ms(us))
+}
+
+fn us_to_ms(us: i64) -> i64 {
+    us.max(0).saturating_add(500) / 1000
+}
+
+fn srt_ms(ms: i64) -> String {
     let s = ms / 1000;
     format!("{:02}:{:02}:{:02},{:03}", s / 3600, s / 60 % 60, s % 60, ms % 1000)
 }
 
+/// A cue's end as FFmpeg's `srt` muxer writes it. A display state up until
+/// the next (`end_us == i64::MAX`, as EIA-608 captions are) ends where
+/// FFmpeg's does: its `end_display_time` is `UINT32_MAX` milliseconds.
+fn srt_end(start_us: i64, end_us: i64) -> String {
+    match end_us {
+        i64::MAX => srt_ms(us_to_ms(start_us) + i64::from(u32::MAX)),
+        end => srt_time(end),
+    }
+}
+
+/// A display state that puts nothing up: a bitmap state with no visible
+/// pixel (DVB's page clears), or a caption state with no text (an emptied
+/// caption screen). It takes down what is up.
+fn blank_state(cue: &Cue) -> bool {
+    match cue {
+        Cue::Bitmap { blank, .. } => *blank,
+        Cue::Text { state, text, .. } => *state && plain_text(text).is_empty(),
+    }
+}
+
 /// Every cue the decoder handed the pipeline was shown: the headless
-/// capture's non-empty shows must number the decoded cues.
-fn shown_all(cues: &[Cue], shown: usize) -> Result<(), String> {
-    if shown != cues.len() {
-        return Err(format!("the pipeline showed {shown} of the {} decoded cues", cues.len()));
+/// capture's non-empty shows must number the decoded cues that are not
+/// blank states, which no non-empty show records.
+pub fn shown_all(cues: &[Cue], shown: usize) -> Result<(), String> {
+    let visible = cues.iter().filter(|c| !blank_state(c)).count();
+    if shown != visible {
+        return Err(format!("the pipeline showed {shown} of the {visible} decoded non-blank cues"));
     }
     Ok(())
 }
@@ -184,7 +215,8 @@ fn shown_all(cues: &[Cue], shown: usize) -> Result<(), String> {
 /// override blocks (`{...}`) removed, each line trimmed, empty lines
 /// dropped. Markup conventions differ between renderers (`#0000FF` against
 /// FFmpeg's `#0000ff`, ASS styles FFmpeg's `srt` encoder turns into `<font>`
-/// tags), the words on screen do not.
+/// tags), the words on screen do not. FFmpeg's `srt` encoder leaves an ASS
+/// hard space as `\h`: it counts as the no-break space it stands for.
 pub fn plain_text(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();
@@ -208,7 +240,7 @@ pub fn plain_text(body: &str) -> String {
             None => out.push(c),
         }
     }
-    out.replace("\r\n", "\n")
+    out.replace("\r\n", "\n").replace("\\h", "\u{a0}")
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -225,8 +257,8 @@ pub fn text_cues(cues: &[Cue], shown: usize, reference: &[SrtCue]) -> Result<(St
     let mut ours = Vec::with_capacity(cues.len());
     for (i, cue) in cues.iter().enumerate() {
         match cue {
-            Cue::Text { start_us, end_us, text } => ours.push(SrtCue {
-                timing: format!("{} --> {}", srt_time(*start_us), srt_time(*end_us)),
+            Cue::Text { start_us, end_us, text, .. } => ours.push(SrtCue {
+                timing: format!("{} --> {}", srt_time(*start_us), srt_end(*start_us, *end_us)),
                 body: text.replace("\r\n", "\n").trim().to_string(),
             }),
             Cue::Bitmap { .. } => return Err(format!("cue {i} is a bitmap; the policy expects text")),
@@ -405,7 +437,7 @@ mod tests {
     }
 
     fn text(start_ms: i64, end_ms: i64, body: &str) -> Cue {
-        Cue::Text { start_us: start_ms * 1000, end_us: end_ms * 1000, text: body.into() }
+        Cue::Text { start_us: start_ms * 1000, end_us: end_ms * 1000, text: body.into(), state: false }
     }
 
     fn srt(timing: &str, body: &str) -> SrtCue {
@@ -443,11 +475,13 @@ mod tests {
         ];
         let canvases = [blank.clone(), "aa".to_string(), "aa".to_string(), blank.clone()];
         let ours = [bitmap(67, "aa", false), bitmap(900, &blank, true)];
-        assert!(bitmap_cues(&ours, 2, &events, (2, 1), &canvases).is_ok());
+        // The blank state clears the screen: one non-empty show.
+        assert!(bitmap_cues(&ours, 1, &events, (2, 1), &canvases).is_ok());
+        assert!(bitmap_cues(&ours, 2, &events, (2, 1), &canvases).unwrap_err().contains("showed 2 of the 1"));
         let wrong_pixels = [bitmap(67, "bb", false), bitmap(900, &blank, true)];
-        assert!(bitmap_cues(&wrong_pixels, 2, &events, (2, 1), &canvases).unwrap_err().contains("canvas states"));
+        assert!(bitmap_cues(&wrong_pixels, 1, &events, (2, 1), &canvases).unwrap_err().contains("canvas states"));
         let late = [bitmap(167, "aa", false), bitmap(900, &blank, true)];
-        assert!(bitmap_cues(&late, 2, &events, (2, 1), &canvases).unwrap_err().contains("starts at"));
+        assert!(bitmap_cues(&late, 1, &events, (2, 1), &canvases).unwrap_err().contains("starts at"));
     }
 
     #[test]
@@ -456,12 +490,40 @@ mod tests {
         assert_eq!(plain_text("{\\an8}<b>top</b>\n second "), "top\nsecond");
         assert_eq!(plain_text("a < b"), "a < b");
         assert_eq!(plain_text("[SIZE]20"), "[SIZE]20");
+        // FFmpeg's SubRip of a caption: hard spaces as `\h`, ours U+00A0.
+        assert_eq!(plain_text("\\h\\hDONNA\\hEIS"), plain_text("\u{a0}\u{a0}DONNA\u{a0}EIS"));
+        assert_eq!(plain_text("\\h\\hDONNA\\hEIS"), "DONNA\u{a0}EIS");
     }
 
     #[test]
-    fn srt_time_truncates_to_the_millisecond() {
-        assert_eq!(srt_time(3_723_456_789), "01:02:03,456");
+    fn srt_time_rounds_to_the_millisecond_as_ffmpeg_does() {
+        assert_eq!(srt_time(3_723_456_789), "01:02:03,457");
+        assert_eq!(srt_time(3_723_456_499), "01:02:03,456");
         assert_eq!(srt_time(-5), "00:00:00,000");
+    }
+
+    /// Captions are display states up until the next: FFmpeg's real time
+    /// EIA-608 events end `UINT32_MAX` ms after their start. The first
+    /// event is FATE Closedcaption_rollup.m2v's (a picture at 1.067733 s),
+    /// as `ffmpeg -copyts -real_time 1 ... -c:s srt` writes it; the second,
+    /// an emptied screen, puts nothing up; the third has the body of FATE
+    /// witch.scc's first event, whose hard spaces FFmpeg writes as `\h`.
+    #[test]
+    fn caption_states_compare_with_ffmpegs_real_time_events() {
+        let state = |us: i64, body: &str| Cue::Text { start_us: us, end_us: i64::MAX, text: body.into(), state: true };
+        let reference = [
+            srt("00:00:01,068 --> 1193:02:48,363", "<font face=\"Monospace\">{\\an7}(</font>"),
+            srt("00:00:01,268 --> 1193:02:48,563", ""),
+            srt(
+                "00:00:02,000 --> 1193:02:49,295",
+                "<font face=\"Monospace\"></font><font face=\"Monospace\">{\\an7}♪<i> PIES IESU DOMINE, \n</i>\\hDONNA EIS REQUIEM ♪</font>",
+            ),
+        ];
+        let ours = [state(1_067_733, "("), state(1_267_933, ""), state(2_000_000, "♪<i> PIES IESU DOMINE, </i>\n\u{a0}DONNA EIS REQUIEM ♪")];
+        assert!(text_cues(&ours, 2, &reference).is_ok());
+        assert!(text_cues(&ours, 3, &reference).unwrap_err().contains("showed 3 of the 2"));
+        let late = [state(1_068_733, "("), state(1_267_933, ""), state(2_000_000, "♪<i> PIES IESU DOMINE, </i>\n\u{a0}DONNA EIS REQUIEM ♪")];
+        assert!(text_cues(&late, 2, &reference).unwrap_err().contains("cue 0"));
     }
 
     #[test]
