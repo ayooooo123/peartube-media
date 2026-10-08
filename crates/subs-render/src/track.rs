@@ -861,8 +861,8 @@ impl Track {
 
     /// `ass_process_chunk`: one Matroska ASS event (`ReadOrder, Layer,
     /// Style, Name, MarginL, MarginR, MarginV, Effect, Text`) shown from
-    /// `timecode` for `duration` milliseconds. A ReadOrder seen before is a
-    /// duplicate and dropped.
+    /// `timecode` for `duration` milliseconds. A ReadOrder belonging to an
+    /// admitted event is a duplicate until that event is pruned or flushed.
     pub fn process_chunk(&mut self, data: &[u8], timecode: i64, duration: i64) {
         if self.event_format.is_none() || self.events.len() >= MAX_EVENTS {
             return;
@@ -871,14 +871,17 @@ impl Track {
         let mut p = 0;
         let Some(token) = next_token(s, &mut p, false) else { return };
         let read_order = atoi(token);
-        // The ReadOrder is marked seen even when the rest fails to parse.
-        if self.parser.check_readorder && !self.parser.read_orders.insert(read_order) {
+        if self.parser.check_readorder && self.parser.read_orders.contains(&read_order) {
             return;
         }
         let Some(token) = next_token(s, &mut p, false) else { return };
         let mut event = Event { read_order, layer: parse_int_header(token), ..Event::default() };
         if !self.process_event_tail(&mut event, &s[p..], 3) {
             return;
+        }
+        // Rejected chunks own no event for pruning to retire.
+        if self.parser.check_readorder {
+            self.parser.read_orders.insert(read_order);
         }
         event.start = timecode;
         event.duration = duration;
@@ -978,6 +981,58 @@ mod tests {
         assert_eq!(track.events.len(), 1);
         track.process_chunk(b"0,0,Default,,0,0,0,,first again", 3000, 500);
         assert_eq!(track.events.len(), 2);
+    }
+
+    #[test]
+    fn read_orders_follow_admitted_chunk_lifetimes() {
+        let mut track = Track::new();
+        track.process_codec_private(b"[Script Info]\nScriptType: v4.00+\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n");
+        track.process_chunk(b"10,0,Default,,0,0,0,,first", 1000, 500);
+        track.process_chunk(b"11,0,Default,,0,0,0,,live", 1200, 2000);
+
+        // Reject one missing layer and one incomplete event tail.
+        track.process_chunk(b"20", 1000, 500);
+        track.process_chunk(b"21,0,Default", 1000, 500);
+        assert_eq!(track.parser.read_orders, HashSet::from([10, 11]),
+            "rejected chunks must not reserve ReadOrder values");
+        track.process_chunk(b"20,0,Default,,0,0,0,,layer retry", 1000, 500);
+        track.process_chunk(b"21,0,Default,,0,0,0,,tail retry", 1000, 500);
+        track.process_chunk(b"10,0,Default,,0,0,0,,duplicate", 2000, 900);
+        let events: Vec<_> = track.events.iter()
+            .map(|e| (e.read_order, e.text.as_slice(), e.start, e.duration)).collect();
+        assert_eq!(events, [
+            (10, b"first".as_slice(), 1000, 500),
+            (11, b"live".as_slice(), 1200, 2000),
+            (20, b"layer retry".as_slice(), 1000, 500),
+            (21, b"tail retry".as_slice(), 1000, 500),
+        ]);
+
+        track.prune_events(1500);
+        assert_eq!(track.parser.read_orders, HashSet::from([10, 11, 20, 21]),
+            "pruning retains events ending at the deadline");
+        track.prune_events(1501);
+        assert_eq!(track.parser.read_orders, HashSet::from([11]));
+        track.process_chunk(b"10,0,Default,,0,0,0,,reused", 2000, 500);
+        track.process_chunk(b"11,0,Default,,0,0,0,,duplicate live", 2000, 500);
+        let events: Vec<_> = track.events.iter()
+            .map(|e| (e.read_order, e.text.as_slice(), e.start, e.duration)).collect();
+        assert_eq!(events, [
+            (11, b"live".as_slice(), 1200, 2000),
+            (10, b"reused".as_slice(), 2000, 500),
+        ]);
+
+        // Player uses this reset after a seek; both live IDs may replay.
+        track.flush_events();
+        assert!(track.events.is_empty() && track.parser.read_orders.is_empty());
+        track.process_chunk(b"10,0,Default,,0,0,0,,first", 1000, 500);
+        track.process_chunk(b"11,0,Default,,0,0,0,,live", 1200, 2000);
+        assert_eq!(track.parser.read_orders, HashSet::from([10, 11]));
+        let events: Vec<_> = track.events.iter()
+            .map(|e| (e.read_order, e.text.as_slice(), e.start, e.duration)).collect();
+        assert_eq!(events, [
+            (10, b"first".as_slice(), 1000, 500),
+            (11, b"live".as_slice(), 1200, 2000),
+        ]);
     }
 
     #[test]

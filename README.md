@@ -187,6 +187,9 @@ text before drawing. The safe Rust libass 0.17.5 port handles positioning,
 movement, fades, transforms, borders, blur, shadows, clipping, drawings,
 karaoke, wrapping and layer/collision placement. Animated events follow
 the playback clock; capture-only playback samples the middle of each cue.
+Only admitted ASS chunks reserve `ReadOrder` IDs; rejected chunks leave no
+duplicate history. Pruning retires expired IDs, and flush/seek resets clear
+the live IDs.
 TTML supports inherited text styles and timing, timed spans, sequential
 containers, frame/tick clocks and standalone document playback through
 the same font renderer. XML entities and DTDs are disabled.
@@ -201,17 +204,19 @@ use the fixed fonts and full-range RGB. Limits: 2 pixels of bounds error,
 8 levels of mean colour error and 20 dB PSNR over the subtitle union crop,
 not the mostly empty video frame. All 106 samples pass; minimum cropped
 PSNR is 33.83 dB for ASS, 23.58 dB for SSA and 25.52 dB for the extra cases.
-This is bounded pixel agreement, not byte-identical rasterization. The
+This is bounded pixel agreement on isolated, font-normalized cues, not
+byte-identical rasterization or a check of overlapping cues. The
 e2e subtitle rows still compare decoded text and timing with pinned FFmpeg.
 The renderer tests also run 2,000 fixed-seed mutations per ASS override
 and drawing input. `cargo test -j 2 -p subs-text --test ttml` checks TTML
 style inheritance and cue boundaries.
 
-With `ab_glyph_rasterizer 0.1.10`, a stripped arm64 Android/API 29 release
-probe of `Player::open` and the codec registry grows from 13,754,288 to
-14,201,808 bytes against `6f4242f`: +447,520 raw bytes, or +195,173 bytes
-with zlib level 9. Both builds use fat LTO and one codegen unit. This is a
-library comparison, not an APK measurement or device playback check.
+At `dcc9148`, the `ab_glyph_rasterizer 0.1.10` arm64 Android/API 29
+stripped release probe of `Player::open` and the codec registry grows
+from 13,754,288 to 14,201,808 bytes against `6f4242f`: +447,520 raw bytes,
+or +195,173 bytes with zlib level 9. Both builds use fat LTO and one
+codegen unit. This is a library comparison, not an APK measurement or
+device playback check.
 
 ## Licenses
 
