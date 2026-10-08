@@ -27,27 +27,26 @@ impl AudioClockState {
             playing: false, held_frames: 0.0, started_ns: 0 }
     }
 
-    /// Frame position and the CLOCK_MONOTONIC time at which it was heard.
-    /// Ignore the previous run's timestamp after pause/resume until AAudio
-    /// supplies a fresh one; stale extrapolation would include the pause.
-    fn anchor(&self) -> (f64, i64) {
-        if let Some(stream) = &self.stream {
-            if let Ok(ts) = stream.0.timestamp(Clockid::Monotonic) {
-                if ts.time_nanoseconds >= self.started_ns {
-                    return ((ts.frame_position - self.base_frame) as f64, ts.time_nanoseconds);
-                }
-            }
-        }
-        (self.held_frames, self.started_ns)
-    }
-
-    pub fn presented_frames(&self) -> f64 {
+    /// Never extrapolate from startup/resume time. Without a fresh timestamp,
+    /// the endpoint counter still accounts for a tail consumed before pause.
+    /// A high-water mark prevents backward steps; a stream reset clears it.
+    pub fn observe(&mut self) -> (f64, Option<(f64, i64)>) {
         if !self.playing || self.base.is_none() {
-            return self.held_frames;
+            return (self.held_frames, None);
         }
-        let (frame, at) = self.anchor();
-        (frame + (current_monotonic_ns() - at) as f64 * f64::from(self.rate) / 1e9)
-            .clamp(0.0, self.written as f64)
+        let timestamp = self.stream.as_ref()
+            .and_then(|stream| stream.0.timestamp(Clockid::Monotonic).ok())
+            .map(|ts| ((ts.frame_position - self.base_frame) as f64, ts.time_nanoseconds));
+        let read_frames = if timestamp.is_some_and(|(_, ns)| ns >= self.started_ns) {
+            self.held_frames
+        } else {
+            self.stream.as_ref().map_or(self.held_frames,
+                |stream| (stream.0.frames_read() - self.base_frame) as f64)
+        };
+        let observed = super::position::observe(self.held_frames, self.rate, self.written,
+            self.started_ns, current_monotonic_ns(), timestamp, read_frames);
+        self.held_frames = observed.0;
+        observed
     }
 }
 
@@ -58,17 +57,17 @@ pub struct AudioClock {
 
 impl Clock for AudioClock {
     fn now(&self) -> Option<Duration> {
-        let state = self.inner.lock();
-        Some(state.base? + Duration::from_secs_f64(state.presented_frames() / f64::from(state.rate)))
+        let mut state = self.inner.lock();
+        Some(state.base? + Duration::from_secs_f64(state.observe().0 / f64::from(state.rate)))
     }
 
     fn monotonic_ns_at(&self, at: Duration) -> Option<i64> {
-        let state = self.inner.lock();
+        let mut state = self.inner.lock();
         let base = state.base?;
         if !state.playing { return None; }
         let desired = (at.as_secs_f64() - base.as_secs_f64()) * f64::from(state.rate);
         if desired > state.written as f64 { return None; }
-        let (frame, ns) = state.anchor();
+        let (frame, ns) = state.observe().1?;
         Some(ns + ((desired - frame) / f64::from(state.rate) * 1e9).round() as i64)
     }
 }
