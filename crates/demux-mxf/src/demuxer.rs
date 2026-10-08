@@ -416,12 +416,14 @@ impl MxfDemuxer {
         let table = self.streams[st].track.as_ref().and_then(|t| self.find_index_table(t.index_sid));
         let next_audio_count = {
             let t = self.streams[st].track.as_ref();
+            // FFmpeg's int64_t sample counts advance with plain (wrapping)
+            // additions; an index can land them anywhere.
             t.map(|t| {
                 if channels <= 0 || bits_per_sample <= 0 || i64::from(channels) * i64::from(bits_per_sample) < 8 {
                     let eu = rescale_q(t.sample_count, tb, inv(t.edit_rate));
-                    self.sample_count_of(st, eu + 1)
+                    self.sample_count_of(st, eu.wrapping_add(1))
                 } else {
-                    t.sample_count + size as i64 / (i64::from(channels) * i64::from(bits_per_sample) / 8)
+                    t.sample_count.wrapping_add(size as i64 / (i64::from(channels) * i64::from(bits_per_sample) / 8))
                 }
             })
         };
@@ -439,7 +441,7 @@ impl MxfDemuxer {
                     _ if t.intra_only => out.0 = Some(t.sample_count),
                     _ => {}
                 }
-                t.sample_count += 1;
+                t.sample_count = t.sample_count.wrapping_add(1);
                 out
             }
             MediaType::Audio => {
@@ -451,7 +453,7 @@ impl MxfDemuxer {
             }
             _ => {
                 let ts = Some(t.sample_count);
-                t.sample_count += 1;
+                t.sample_count = t.sample_count.wrapping_add(1);
                 (ts, ts, Some(1))
             }
         }

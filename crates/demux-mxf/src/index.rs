@@ -154,7 +154,11 @@ pub fn edit_unit_absolute_offset(
     let last_segment = &table.segments[table.segments.len() - 1];
     let mut edit_unit = rescale_q(edit_unit, first_segment.index_edit_rate, edit_rate);
     let index_end = (last_segment.index_start_position as i64).saturating_add(last_segment.index_duration as i64);
-    edit_unit = edit_unit.min(index_end).max(first_segment.index_start_position as i64);
+    // FFMAX of an int64_t and FFmpeg's uint64_t IndexStartPosition compares
+    // unsigned.
+    let clamped = edit_unit.min(index_end);
+    let first_start = first_segment.index_start_position;
+    edit_unit = if clamped as u64 > first_start { clamped } else { first_start as i64 };
     if edit_unit < 0 {
         return Err(Error::unsupported("mxf: negative edit unit"));
     }
@@ -167,9 +171,11 @@ pub fn edit_unit_absolute_offset(
     let mut dir = 0;
     while i >= 0 && i < nb {
         let s = &table.segments[i as usize];
-        let start = s.index_start_position as i64;
-        if start <= edit_unit && edit_unit < start.wrapping_add(s.index_duration as i64) {
-            let mut index = edit_unit - start;
+        // IndexStartPosition and IndexDuration are uint64_t in FFmpeg: the
+        // range test is unsigned and the end wraps; edit_unit >= 0 here.
+        let (start, eu) = (s.index_start_position, edit_unit as u64);
+        if start <= eu && eu < start.wrapping_add(s.index_duration) {
+            let mut index = (eu - start) as i64;
             let mut offset_temp = s.offset;
             if s.edit_unit_byte_count != 0 {
                 let eubc = i64::from(s.edit_unit_byte_count);
@@ -178,8 +184,8 @@ pub fn edit_unit_absolute_offset(
                 }
                 offset_temp += eubc * index;
             } else {
-                if s.nb_index_entries() as i64 == 2 * s.index_duration as i64 + 1 {
-                    index *= 2; // Avid index
+                if s.nb_index_entries() as u64 == s.index_duration.wrapping_mul(2).wrapping_add(1) {
+                    index = index.wrapping_mul(2); // Avid index
                 }
                 if index < 0 || index >= s.nb_index_entries() as i64 {
                     return Err(Error::invalid("mxf: index entry out of range"));
@@ -190,28 +196,30 @@ pub fn edit_unit_absolute_offset(
             let (offset, partition) = absolute_bodysid_offset(partitions, table.body_sid, offset_temp)?;
             return Ok((edit_unit_out, offset, partition));
         } else if dir == 0 {
-            dir = if edit_unit < start { -1 } else { 1 };
+            dir = if eu < start { -1 } else { 1 };
         }
         i += dir;
     }
     Err(Error::invalid("mxf: edit unit not in the index table"))
 }
 
-/// mxf_compute_ptses_fake_index.
+/// mxf_compute_ptses_fake_index: nb_ptses is an int and IndexDuration a
+/// uint64_t in FFmpeg, so its bound compares unsigned and its sums wrap.
 fn compute_ptses_fake_index(table: &mut IndexTable) {
-    let mut nb_ptses: i64 = 0;
+    let mut nb_ptses: i32 = 0;
     for s in &table.segments {
         if s.nb_index_entries() == 0 {
             return; // no TemporalOffsets
         }
-        if s.index_duration as i64 > i32::MAX as i64 - nb_ptses {
+        let d = s.index_duration;
+        if d > (i32::MAX - nb_ptses) as u64 {
             return;
         }
         let n = s.nb_index_entries() as u64;
-        if n != s.index_duration && n != s.index_duration + 1 && n != s.index_duration * 2 + 1 {
+        if n != d && n != d.wrapping_add(1) && n != d.wrapping_mul(2).wrapping_add(1) {
             return;
         }
-        nb_ptses += s.index_duration as i64;
+        nb_ptses += d as i32;
     }
     if nb_ptses <= 0 {
         return;
@@ -226,9 +234,9 @@ fn compute_ptses_fake_index(table: &mut IndexTable) {
     // -max(TemporalOffset) makes DTS <= PTS.
     for s in &table.segments {
         let n_entries = s.nb_index_entries() as u64;
-        let index_delta: usize = if n_entries == 2 * s.index_duration + 1 { 2 } else { 1 };
+        let index_delta: usize = if n_entries == s.index_duration.wrapping_mul(2).wrapping_add(1) { 2 } else { 1 };
         let mut n = s.nb_index_entries();
-        if n_entries == index_delta as u64 * s.index_duration + 1 {
+        if n_entries == (index_delta as u64).wrapping_mul(s.index_duration).wrapping_add(1) {
             // Ignore the last entry: the size of the essence container in Avid.
             n -= 1;
         }
@@ -297,12 +305,14 @@ pub fn compute_index_tables(segments: &[IndexSegment], track_for: impl Fn(i32) -
             }
             s.offset = offset_temp;
             // EditUnitByteCount == 0 for VBR indexes, which use explicit
-            // StreamOffsets.
+            // StreamOffsets. IndexDuration is a uint64_t in FFmpeg: the guard
+            // compares unsigned, so huge durations fail it.
             let eubc = i64::from(s.edit_unit_byte_count);
-            if eubc != 0 && (s.index_duration as i64 > i64::MAX / eubc || eubc * s.index_duration as i64 > i64::MAX - offset_temp) {
+            let product = (eubc as u64).wrapping_mul(s.index_duration);
+            if eubc != 0 && (s.index_duration > (i64::MAX / eubc) as u64 || product > (i64::MAX - offset_temp) as u64) {
                 return Err(Error::invalid("mxf: index segment offsets overflow"));
             }
-            offset_temp = offset_temp.wrapping_add(eubc.wrapping_mul(s.index_duration as i64));
+            offset_temp += product as i64;
             if s.index_duration != 0 {
                 continue;
             }
