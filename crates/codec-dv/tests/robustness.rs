@@ -6,6 +6,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use oxideav_core::{CodecId, CodecParameters, CodecTag, Error, Packet, RuntimeContext, TimeBase};
@@ -41,8 +42,10 @@ fn made(name: &str, args: &[&str]) -> PathBuf {
 }
 
 /// Raw DV of three frames: PAL 4:2:0 with audio, NTSC 4:1:1, DVCPRO50 and
-/// DVCPRO HD 1080i50 with audio.
-fn samples() -> Vec<PathBuf> {
+/// DVCPRO HD 1080i50 with audio. Made once per test binary: the tests run
+/// in parallel and read the same files, so a test making them again would
+/// rewrite a file another test is reading.
+static SAMPLES: LazyLock<Vec<PathBuf>> = LazyLock::new(|| {
     let video = |size: &str, rate: &str| format!("testsrc=size={size}:rate={rate}:duration=0.12");
     let sine = "sine=frequency=1000:sample_rate=48000:duration=0.12";
     vec![
@@ -51,6 +54,10 @@ fn samples() -> Vec<PathBuf> {
         made("dv50.dv", &["-f", "lavfi", "-i", &video("720x576", "25"), "-c:v", "dvvideo", "-pix_fmt", "yuv422p"]),
         made("hd.dv", &["-f", "lavfi", "-i", &video("1440x1080", "25"), "-f", "lavfi", "-i", sine, "-c:v", "dvvideo", "-pix_fmt", "yuv422p", "-c:a", "pcm_s16le", "-ac", "2"]),
     ]
+});
+
+fn samples() -> &'static [PathBuf] {
+    &SAMPLES
 }
 
 /// One damaged copy: bit flips (mostly in the DIF block headers and the
