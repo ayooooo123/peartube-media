@@ -316,6 +316,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-tak"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-tta"
 version = "0.1.0"
 dependencies = [
@@ -396,6 +404,7 @@ dependencies = [
  "codec-speech",
  "codec-speex",
  "codec-svq3",
+ "codec-tak",
  "codec-tta",
  "codec-vp3",
  "codec-vp56",
