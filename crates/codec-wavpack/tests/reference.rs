@@ -29,7 +29,7 @@ fn ffmpeg_pcm(path: &Path, fmt: &str, codec: &str) -> Vec<u8> {
         .output()
         .expect("pinned ffmpeg runs");
     assert!(
-        out.status.success() || !out.stdout.is_empty(),
+        out.status.success(),
         "ffmpeg {path:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -391,17 +391,47 @@ fn demuxer_seek_1s() {
     let mut demuxer =
         codec_wavpack::demuxer::RawWvDemuxer::open(Box::new(file), &ctx.codecs).expect("open demuxer");
 
-    // Seek to 1.0 second (sample 48000 at 48000 Hz)
-    let landed = demuxer.seek_to(0, 48000).expect("seek succeeds");
-    assert_eq!(landed, 48000, "landed pts");
+    // Query pinned ffprobe for the expected 3 packets starting at 1.0s
+    let ffprobe_out = Command::new(pinned_ffprobe())
+        .args([
+            "-v",
+            "error",
+            "-read_intervals",
+            "1.0%+#3",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "packet=pts",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path.to_str().unwrap())
+        .output()
+        .expect("pinned ffprobe runs");
+    assert!(
+        ffprobe_out.status.success(),
+        "ffprobe: {}",
+        String::from_utf8_lossy(&ffprobe_out.stderr)
+    );
+    let expected_pts: Vec<i64> = String::from_utf8_lossy(&ffprobe_out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert_eq!(expected_pts.len(), 3, "expected 3 packet pts from ffprobe");
+
+    let landed = demuxer.seek_to(0, expected_pts[0]).expect("seek succeeds");
+    assert_eq!(landed, expected_pts[0], "landed pts");
 
     let p1 = demuxer.next_packet().expect("packet 1");
     let p2 = demuxer.next_packet().expect("packet 2");
     let p3 = demuxer.next_packet().expect("packet 3");
 
-    assert_eq!(p1.pts, Some(48000), "packet 1 pts");
-    assert_eq!(p2.pts, Some(72000), "packet 2 pts");
-    assert_eq!(p3.pts, Some(96000), "packet 3 pts");
+    assert_eq!(p1.pts, Some(expected_pts[0]), "packet 1 pts");
+    assert_eq!(p2.pts, Some(expected_pts[1]), "packet 2 pts");
+    assert_eq!(p3.pts, Some(expected_pts[2]), "packet 3 pts");
 
-    eprintln!("seek_to 1.0s: successfully landed at 48000, subsequent pts 48000, 72000, 96000");
+    eprintln!(
+        "seek_to 1.0s: successfully landed at {}, subsequent pts {:?}",
+        expected_pts[0], expected_pts
+    );
 }

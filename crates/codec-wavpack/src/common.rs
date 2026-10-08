@@ -126,7 +126,7 @@ pub fn wp_log2(mut val: u32) -> i32 {
         return 256;
     }
     val = val.wrapping_add(val >> 9);
-    let bits = (32 - val.leading_zeros()) as i32;
+    let bits = (32 - (val | 1).leading_zeros()) as i32;
     let table_val = if bits < 9 {
         LOG2_TABLE[((val << (9 - bits)) & 0xFF) as usize] as i32
     } else {

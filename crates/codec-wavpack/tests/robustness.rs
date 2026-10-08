@@ -176,13 +176,7 @@ fn fuzz_demuxer(rel_path: &str, seed: u64, mutations: usize) {
         if let Ok(mut demuxer) =
             codec_wavpack::demuxer::RawWvDemuxer::open(Box::new(cursor), &ctx.codecs)
         {
-            let mut count = 0;
-            while let Ok(_) = demuxer.next_packet() {
-                count += 1;
-                if count > 50 {
-                    break;
-                }
-            }
+            while let Ok(_) = demuxer.next_packet() {}
         }
     }
 

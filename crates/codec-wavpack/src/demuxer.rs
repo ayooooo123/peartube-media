@@ -64,7 +64,7 @@ pub fn parse_header(data: &[u8]) -> Result<WvHeader> {
 
 pub fn wv_probe(probe: &ProbeData) -> ProbeScore {
     let p = probe.buf;
-    if p.len() < 32 {
+    if p.len() <= 32 {
         return 0;
     }
     if &p[..4] == b"wvpk" {
@@ -176,6 +176,11 @@ fn parse_ape_tag(reader: &mut (impl Read + Seek + ?Sized)) -> Result<(Option<u64
     Ok((Some(tag_start), metadata))
 }
 
+const WV_DEMUX_RATES: [i32; 16] = [
+    6000, 8000, 9600, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000,
+    192000, -1,
+];
+
 pub struct RawWvDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
@@ -233,6 +238,9 @@ impl RawWvDemuxer {
         }
 
         demuxer.data_offset = demuxer.pos;
+        if demuxer.chmask != 0 {
+            demuxer.chan = demuxer.chmask.count_ones() as u16;
+        }
 
         let extradata = demuxer.header.version.to_le_bytes().to_vec();
         let mut params = CodecParameters::audio(CodecId::new("wavpack"));
@@ -300,7 +308,7 @@ impl RawWvDemuxer {
         };
         let mut chan = 1 + if (flags & WV_MONO) != 0 { 0 } else { 1 };
         let mut chmask = if (flags & WV_MONO) != 0 { 4 } else { 3 };
-        let mut rate = WV_RATES[((flags >> 23) & 0xF) as usize];
+        let mut rate = WV_DEMUX_RATES[((flags >> 23) & 0xF) as usize];
         self.multichannel = !(self.header.initial && self.header.final_block);
         if self.multichannel {
             chan = self.chan;
@@ -320,18 +328,22 @@ impl RawWvDemuxer {
                 if self.input.read_exact(&mut size_buf).is_err() {
                     break;
                 }
-                let mut size = size_buf[0] as usize;
+                let mut raw_size = size_buf[0] as i32;
                 if (id & WP_IDF_LONG) != 0 {
                     let mut size_hi = [0u8; 2];
                     if self.input.read_exact(&mut size_hi).is_err() {
                         break;
                     }
-                    size |= (u16::from_le_bytes(size_hi) as usize) << 8;
+                    raw_size |= (u16::from_le_bytes(size_hi) as i32) << 8;
                 }
-                size <<= 1;
+                let mut size = raw_size << 1;
                 if (id & WP_IDF_ODD) != 0 {
-                    size = size.saturating_sub(1);
+                    size -= 1;
                 }
+                if size < 0 {
+                    break;
+                }
+                let size = size as usize;
                 let sub_id = id & WP_IDF_MASK;
                 match sub_id {
                     WP_ID_CHANINFO => {
