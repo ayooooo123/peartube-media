@@ -10,7 +10,8 @@
 // - wmavoice is compared with FFmpeg's C path (`-cpuflags 0`, the audio
 //   analogue of contract.md's `-idct simple` rule): FFmpeg's NEON av_tx
 //   codelets round differently, and the 19K sample's postfilter amplifies
-//   that to 82 dB between FFmpeg's own NEON and C decodes. Floor 90 dB.
+//   that to 82 dB between FFmpeg's own NEON and C decodes. Floor 90 dB;
+//   measured: bit-exact (SNR infinite) on 7K, 11K and 19K.
 
 use oxideav_core::{MediaType, ProbeData, RuntimeContext};
 use refcheck::{decode, fate, snr_db};

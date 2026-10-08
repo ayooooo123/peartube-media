@@ -11,7 +11,8 @@
 
 //! The CELP/ACELP float helpers WMA Voice calls. As in FFmpeg's arm64
 //! builds (clang, `-ffp-contract=on`), each `a*b ± c` inside one C
-//! expression is a single fused multiply-add (`mul_add`).
+//! expression is a single fused multiply-add (`mul_add`), except in a
+//! `sum += a[i] * b[i]` loop clang vectorizes (see [`unfused_terms`]).
 
 /// `AMRFixed`: a sparse fixed-codebook vector.
 #[derive(Clone, Copy, Debug, Default)]
@@ -24,11 +25,26 @@ pub struct AmrFixed {
     pub pitch_fac: f32,
 }
 
+/// How many leading terms of a `sum += a[i] * b[i]` loop of `len` terms
+/// FFmpeg 2da55bf's arm64 build (clang, -O3) vectorizes: it multiplies
+/// them four at a time and adds the products one by one in C order, so
+/// each product is rounded before its addition. The remaining terms, and
+/// all of them when `len < 4`, are fused multiply-adds. Read from
+/// `ff_scalarproduct_float_c` and `ff_celp_lp_zero_synthesis_filterf` in
+/// FFmpeg's objects.
+fn unfused_terms(len: usize) -> usize {
+    if len >= 4 { len & !3 } else { 0 }
+}
+
 /// `ff_scalarproduct_float_c`.
 pub fn scalarproduct_float(v1: &[f32], v2: &[f32], len: usize) -> f32 {
+    let split = unfused_terms(len);
     let mut p = 0f32;
-    for (a, b) in v1[..len].iter().zip(&v2[..len]) {
-        p = a.mul_add(*b, p);
+    for i in 0..split {
+        p += v1[i] * v2[i];
+    }
+    for i in split..len {
+        p = v1[i].mul_add(v2[i], p);
     }
     p
 }
@@ -141,7 +157,10 @@ pub fn celp_lp_synthesis_filterf(
 }
 
 /// `ff_celp_lp_zero_synthesis_filterf`: `out[o + n] = in[i0 + n] +
-/// Σ filter_coeffs[i-1] · in[i0 + n - i]`.
+/// Σ filter_coeffs[i-1] · in[i0 + n - i]`. FFmpeg's build vectorizes the
+/// sum over `i` when `out` overlaps neither `in` nor the coefficients, as
+/// in every WMA Voice call: the first [`unfused_terms`] products are
+/// rounded and added in order, the rest fused.
 pub fn celp_lp_zero_synthesis_filterf(
     out: &mut [f32],
     o: usize,
@@ -151,9 +170,13 @@ pub fn celp_lp_zero_synthesis_filterf(
     buffer_length: usize,
     filter_length: usize,
 ) {
+    let split = unfused_terms(filter_length);
     for n in 0..buffer_length {
         let mut v = input[i0 + n];
-        for i in 1..=filter_length {
+        for i in 1..=split {
+            v += filter_coeffs[i - 1] * input[i0 + n - i];
+        }
+        for i in split + 1..=filter_length {
             v = filter_coeffs[i - 1].mul_add(input[i0 + n - i], v);
         }
         out[o + n] = v;
