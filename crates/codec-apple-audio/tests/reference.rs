@@ -89,9 +89,8 @@ fn assert_snr(path: &Path, sample_format: SampleFormat, rate: u32, channels: u16
 }
 
 /// Every sample of `path` equals FFmpeg's, in a layout of `sample_format`,
-/// `rate` and `channels`, and the counts are equal (or, by `slack` samples
-/// per channel, ours is longer: see the CAF ALAC test).
-fn assert_bit_exact(path: &Path, sample_format: SampleFormat, rate: u32, channels: u16, slack: usize) {
+/// `rate` and `channels`, and so does the count.
+fn assert_bit_exact(path: &Path, sample_format: SampleFormat, rate: u32, channels: u16) {
     let theirs = ffmpeg_s32(path);
     let (ours, format) = ours_s32(path);
     let name = path.file_name().unwrap().to_string_lossy();
@@ -101,12 +100,7 @@ fn assert_bit_exact(path: &Path, sample_format: SampleFormat, rate: u32, channel
     if let Some(i) = ours.iter().zip(&theirs).position(|(a, b)| a != b) {
         panic!("{name}: sample {i} (channel {}) is {}, FFmpeg {}", i % channels as usize, ours[i], theirs[i]);
     }
-    assert!(
-        ours.len() >= theirs.len() && ours.len() - theirs.len() <= slack * channels as usize,
-        "{name}: {} samples, FFmpeg {} (slack {slack} per channel)",
-        ours.len(),
-        theirs.len()
-    );
+    assert_eq!(ours.len(), theirs.len(), "{name}: sample count");
 }
 
 /// An ALAC encode by FFmpeg of `source` (input arguments), as FATE's
@@ -127,7 +121,7 @@ fn wav(name: &str) -> String {
 
 #[test]
 fn alac_inside_m4a() {
-    assert_bit_exact(&fate("lossless-audio/inside.m4a"), SampleFormat::S16P, 44100, 2, 0);
+    assert_bit_exact(&fate("lossless-audio/inside.m4a"), SampleFormat::S16P, 44100, 2);
 }
 
 #[test]
@@ -136,12 +130,12 @@ fn alac_remuxed_to_matroska_and_caf() {
     let mkv = generated("inside.mkv", |out| {
         ffmpeg(&["-i", source.to_str().unwrap(), "-map", "0:a", "-c", "copy", "-f", "matroska", out.to_str().unwrap()]);
     });
-    assert_bit_exact(&mkv, SampleFormat::S16P, 44100, 2, 0);
-    // FFmpeg's CAF demuxer drops the packet table's remainder frames (11)
-    // from the last packet, which the ALAC frame already leaves out: ours
-    // keeps the 524277 samples of the MP4, FFmpeg gives 11 fewer, within
-    // one frame (4096); every sample both give is equal.
-    assert_bit_exact(&caf_remux("inside.caf", &source, &["-map", "0:a"]), SampleFormat::S16P, 44100, 2, 4096);
+    assert_bit_exact(&mkv, SampleFormat::S16P, 44100, 2);
+    // FFmpeg's CAF muxer writes the packet table after the audio, and its
+    // demuxer drops the table's 11 remainder frames from the last packet
+    // although the ALAC frame already leaves them out: 524266 samples, 11
+    // fewer than the MP4's. The CAF demuxer does both as FFmpeg does.
+    assert_bit_exact(&caf_remux("inside.caf", &source, &["-map", "0:a"]), SampleFormat::S16P, 44100, 2);
 }
 
 #[test]
@@ -154,7 +148,7 @@ fn alac_16_bit_levels_and_lpc_orders() {
         ("alac-16-lpc-orders.mov", &["-min_prediction_order", "1", "-max_prediction_order", "30"][..]),
     ] {
         let path = alac_encode(name, &["-i", &source], options);
-        assert_bit_exact(&path, SampleFormat::S16P, 44100, 2, 0);
+        assert_bit_exact(&path, SampleFormat::S16P, 44100, 2);
     }
 }
 
@@ -169,7 +163,7 @@ fn alac_24_bit_levels_and_lpc_orders() {
         ("alac-24-lpc-orders.mov", &["-min_prediction_order", "1", "-max_prediction_order", "30"][..]),
     ] {
         let path = alac_encode(name, &["-i", &source], options);
-        assert_bit_exact(&path, SampleFormat::S32P, 192000, 2, 0);
+        assert_bit_exact(&path, SampleFormat::S32P, 192000, 2);
     }
 }
 
@@ -177,7 +171,7 @@ fn alac_24_bit_levels_and_lpc_orders() {
 fn alac_mono_and_six_channels() {
     let source = wav("luckynight_2ch_44kHz_s16.wav");
     let mono = alac_encode("alac-mono.mov", &["-i", &source, "-ac", "1"], &[]);
-    assert_bit_exact(&mono, SampleFormat::S16P, 44100, 1, 0);
+    assert_bit_exact(&mono, SampleFormat::S16P, 44100, 1);
     // Six different signals in ALAC's 6-channel order (5.1, back).
     let six = alac_encode(
         "alac-5.1.mov",
@@ -188,7 +182,7 @@ fn alac_mono_and_six_channels() {
         ],
         &[],
     );
-    assert_bit_exact(&six, SampleFormat::S16P, 44100, 6, 0);
+    assert_bit_exact(&six, SampleFormat::S16P, 44100, 6);
 }
 
 /// MACE: FATE's `fate-qt-mac3-*` and `fate-qt-mac6-*` samples and the
@@ -206,11 +200,11 @@ fn mace_3_and_6_mono_and_stereo() {
         let source = fate(sample);
         let stem = source.file_stem().unwrap().to_str().unwrap().to_string();
         let caf = track_caf(&source);
-        assert_bit_exact(&caf, SampleFormat::S16P, rate, channels, 0);
+        assert_bit_exact(&caf, SampleFormat::S16P, rate, channels);
         let aiff = generated(&format!("{stem}.aiff"), |out| {
             ffmpeg(&["-i", source.to_str().unwrap(), "-map", "0:a", "-c", "copy", "-f", "aiff", out.to_str().unwrap()]);
         });
-        assert_bit_exact(&aiff, SampleFormat::S16P, rate, channels, 0);
+        assert_bit_exact(&aiff, SampleFormat::S16P, rate, channels);
     }
 }
 

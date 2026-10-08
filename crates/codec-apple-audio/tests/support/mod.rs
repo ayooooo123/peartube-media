@@ -61,51 +61,14 @@ pub fn archive(relative: &str) -> PathBuf {
     path
 }
 
-/// FFmpeg's CAF muxer writes the packet table (`pakt`) after the audio
-/// data. Where the packets vary in size the table is their only framing,
-/// and demux-misc reads chunks only up to `data`, as FFmpeg's demuxer does
-/// on input it cannot seek; so for those the table moves in front of the
-/// data. Constant-size packets stay as written: FFmpeg's demuxer counts
-/// them from the data size, which it needs to have read first.
-pub fn pakt_before_data(caf: &[u8]) -> Vec<u8> {
-    let mut chunks = Vec::new();
-    let mut pos = 8; // 'caff', version, flags
-    while pos + 12 <= caf.len() {
-        let size = i64::from_be_bytes(caf[pos + 4..pos + 12].try_into().unwrap());
-        let end = if size < 0 { caf.len() } else { (pos + 12 + size as usize).min(caf.len()) };
-        chunks.push(&caf[pos..end]);
-        pos = end;
-    }
-    // desc: sample rate (8), format id (4), flags (4), bytes per packet
-    // (4), frames per packet (4), ...
-    let desc = chunks.iter().find(|c| &c[..4] == b"desc").expect("a desc chunk");
-    let bytes_per_packet = u32::from_be_bytes(desc[28..32].try_into().unwrap());
-    let frames_per_packet = u32::from_be_bytes(desc[32..36].try_into().unwrap());
-    let data = chunks.iter().position(|c| &c[..4] == b"data").expect("a data chunk");
-    if bytes_per_packet == 0 || frames_per_packet == 0 {
-        if let Some(pakt) = chunks.iter().position(|c| &c[..4] == b"pakt").filter(|&p| p > data) {
-            let moved = chunks.remove(pakt);
-            chunks.insert(data, moved);
-        }
-    }
-    let mut out = caf[..8].to_vec();
-    for chunk in chunks {
-        out.extend_from_slice(chunk);
-    }
-    out
-}
-
-/// `source`'s audio packets remuxed to CAF by FFmpeg (to a file: it writes
-/// the packet table only where it can seek back), then
-/// [`pakt_before_data`].
+/// `source`'s audio packets remuxed to CAF by FFmpeg, to a file: it writes
+/// the packet table, after the audio data, only where it can seek back.
 pub fn caf_remux(name: &str, source: &Path, map: &[&str]) -> PathBuf {
     generated(name, |out| {
         let mut args = vec!["-i", source.to_str().unwrap()];
         args.extend_from_slice(map);
         args.extend_from_slice(&["-c", "copy", "-f", "caf", out.to_str().unwrap()]);
         ffmpeg(&args);
-        let caf = std::fs::read(out).unwrap();
-        std::fs::write(out, pakt_before_data(&caf)).unwrap();
     })
 }
 
