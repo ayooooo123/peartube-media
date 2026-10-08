@@ -1,11 +1,11 @@
-//! Packet equality against FFmpeg 9: every packet's stream, PTS, DTS,
-//! size, keyframe flag and data MD5 must match `ffprobe -show_packets
-//! -show_data_hash md5`. A sample is exact only when every field matches.
+//! Packet equality against the pinned FFmpeg (2da55bf): every packet's
+//! stream, PTS, DTS, size, keyframe flag and data MD5 must match its
+//! `ffprobe -show_packets -show_data_hash md5`. A sample is exact only when
+//! every field matches.
 //!
-//! No known-wrong output is pinned or exempted. Outstanding CodecDelay
-//! differences are an external AudioTrim dependency and keep this test red.
-//! The per-sample diagnostics distinguish that dependency from regressions
-//! in packet counts, payload reconstruction, lacing and video timestamps.
+//! No known-wrong output is pinned or exempted. The per-sample diagnostics
+//! tell regressions in packet counts, payload reconstruction, lacing and
+//! timestamps apart.
 
 use std::path::PathBuf;
 
