@@ -23,6 +23,7 @@ use oxideav_core::{
 /// `AVPROBE_SCORE_EXTENSION + 30` on FFmpeg's 100-point scale.
 const PROBE_SCORE: u8 = 80;
 const ID3V2_HEADER_SIZE: usize = 10;
+const MAX_FRAME_MEMORY: u64 = 256 * 1024 * 1024;
 
 /// `ff_id3v2_match` with the "ID3" magic.
 fn id3v2_match(b: &[u8]) -> bool {
@@ -95,6 +96,10 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     let le16 = |at: usize| u16::from_le_bytes([header[at], header[at + 1]]);
     let le32 = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
     let channels = le16(6);
+    let bytes_per_sample = le16(8).div_ceil(8);
+    if le16(4) > 2 || channels == 0 || channels > 16 || !(1..=3).contains(&bytes_per_sample) {
+        return Err(Error::invalid("tta: invalid format, channels or sample width"));
+    }
     let sample_rate = le32(10) as i32;
     if sample_rate <= 0 || sample_rate > 1_000_000 {
         return Err(Error::invalid("tta: nonsense samplerate"));
@@ -113,13 +118,34 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
         return Err(Error::invalid(format!("tta: totalframes {total_frames} invalid")));
     }
 
+    // Rice unary codes can exceed the PCM size, so that is not a valid
+    // compressed-size limit. Bound the packet by the contract's memory
+    // budget after reserving the seek table and a full decoded frame:
+    // interleaved i32 working samples plus U8, S16 or S32 output.
+    let output_bytes = if bytes_per_sample == 3 { 4 } else { u64::from(bytes_per_sample) };
+    let pcm_bytes = u64::from(frame_size) * u64::from(channels) * (4 + output_bytes);
+    let table_bytes = total_frames * 4;
+    let packet_limit = MAX_FRAME_MEMORY.checked_sub(pcm_bytes)
+        .and_then(|n| n.checked_sub(table_bytes))
+        .ok_or_else(|| Error::invalid("tta: declared frame and seek table exceed the memory budget"))?;
+
     // The seek table: each size read from the file, so a table longer than
     // the file stops at its end instead of being allocated up front.
     let mut sizes = Vec::new();
     let mut entry = [0u8; 4];
     for _ in 0..total_frames {
         input.read_exact(&mut entry).map_err(|_| Error::invalid("tta: truncated seek table"))?;
-        sizes.push(u32::from_le_bytes(entry));
+        let size = u32::from_le_bytes(entry);
+        if u64::from(size) > packet_limit {
+            return Err(Error::invalid("tta: seek-table frame exceeds the memory budget"));
+        }
+        // Grow only as bytes arrive, without rounding beyond the table's
+        // declared size (already charged to the budget).
+        if sizes.len() == sizes.capacity() {
+            let capacity = (sizes.capacity() * 2).max(1024).min(total_frames as usize);
+            sizes.reserve_exact(capacity - sizes.len());
+        }
+        sizes.push(size);
     }
     // The table's CRC (checked only with -err_detect crccheck).
     let mut crc = Vec::with_capacity(4);
@@ -174,8 +200,29 @@ impl Demuxer for TtaDemuxer {
     /// still has.
     fn next_packet(&mut self) -> Result<Packet> {
         let Some(&size) = self.sizes.get(self.current) else { return Err(Error::Eof) };
+        // Sizes were validated at open. Read only that many bytes, growing
+        // on demand without read_to_end's allocation rounding past the cap.
+        let size = size as usize;
         let mut data = Vec::new();
-        (&mut self.input).take(u64::from(size)).read_to_end(&mut data)?;
+        while data.len() < size {
+            let start = data.len();
+            let end = (start + 8192).min(size);
+            if end > data.capacity() {
+                let capacity = (data.capacity() * 2).max(end).min(size);
+                data.reserve_exact(capacity - start);
+            }
+            data.resize(end, 0);
+            match self.input.read(&mut data[start..]) {
+                Ok(n) => {
+                    data.truncate(start + n);
+                    if n == 0 {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => data.truncate(start),
+                Err(e) => return Err(e.into()),
+            }
+        }
         if data.is_empty() && size > 0 {
             return Err(Error::Eof);
         }
@@ -211,3 +258,7 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("tta", "tta");
     reg.register_probe("tta", probe);
 }
+
+#[cfg(test)]
+#[path = "../tests/memory/mod.rs"]
+mod memory;
