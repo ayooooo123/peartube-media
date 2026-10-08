@@ -51,6 +51,80 @@ Release builds compile dependencies and this workspace's cold crates at `opt-lev
 
 Leaving TLS out (rustls, ring and the webpki roots, through `oxideav-http`'s `tls` feature) saves another 0.86 MB raw, 0.54 MB deflated, in the Android `libmain.so`.
 
+### Tracker modules
+
+`codec-tracker` owns both container reading and PCM playback for MOD, S3M,
+XM, IT, MTM, 669, ULT and STM. It is a pure-Rust port of the libopenmpt 0.8.9
+loaders and integer mixer, under BSD-3-Clause with the upstream notices in
+each ported file. It replaces `oxideav-mod` and `oxideav-s3m`; no native
+libopenmpt dependency is linked into the player.
+
+Output follows `openmpt123 --render`: stereo float32 at 48 kHz, eight-tap
+polyphase sinc, default volume ramps, all subsongs, and the 100 ms end fade.
+Internal reads stay at 1,024 frames so caller buffer sizes do not change
+integer volume ramps. `Song::row_start`, `row_at` and `seek_order_row` expose
+order/row positions. The media demuxer snaps seeks to a row and resends the
+module; the decoder replays to that position to retain filter history,
+sample inversion and click-removal state. Seek cost grows with the position.
+
+Limits: 128 MiB input, 512 MiB decoded sample storage, four million pattern
+cells and order-row visit slots, 32,768 visits inside pattern loops, and two
+hours of playback at tick boundaries. Sample-budget exhaustion rejects the
+file. The renderer emits PCM incrementally, not a song-sized PCM allocation.
+
+`corpus/tracker.tsv` pins the OpenMPT player tests, seven ModArchive songs,
+and generated short fixtures. The separate oracle runner compares PCM only:
+WAV timestamps are not deterministic. FFmpeg's module support is absent in
+the pinned FFmpeg build, so the general e2e module row checks playback, not
+audio parity.
+
+Measured against libopenmpt 0.8.9: **247/263 files are bit-exact**, including
+all seven ModArchive songs. By format: MOD 25/25, S3M 21/25, XM 83/83,
+IT 114/126, and MTM/669/ULT/STM 1/1 each. The four smaller formats have only
+generated-fixture coverage, not a broad song corpus.
+
+The runner reports the remaining 16 files as failures and exits 1:
+
+- Four S3M files contain unsupported OPL instruments:
+  `AdlibZeroVolumeNote.s3m`, `NOP.s3m`, `RetrigSlide.s3m` and
+  `TonePortamentoWithAdlibNote.s3m`.
+- Twelve IT files use random swing or random waveforms. All have matching
+  frame counts. The observed SNR values below vary with the oracle's seed.
+  Separate diagnostic copies with only those random controls disabled were
+  bit-exact in all twelve cases; those copies do not count as corpus passes.
+
+| IT case | Random control | Observed SNR (dB) |
+|---|---|---:|
+| `GlobalVolume-Macro.it` | Instrument volume swing | 10.449 |
+| `RandomPan.it` | Instrument pan swing | 1.533 |
+| `RandomWaveform.it` | S53 panbrello | 2.336 |
+| `gxsmp.it` | Instrument volume/pan swing | 26.195 |
+| `gxsmp2.it` | Instrument volume/pan swing | 33.716 |
+| `swing1.it` | Instrument volume swing | 4.998 |
+| `swing3.it` | Instrument volume swing | 4.107 |
+| `swing4.it` | Instrument volume swing | 4.628 |
+| `swing5.it` | Instrument volume swing | 3.166 |
+| `tremolo.it` | S43 tremolo | 20.658 |
+| `vibrato-oldfx.it` | S33 vibrato | 5.769 |
+| `vibrato.it` | S33 vibrato | 5.947 |
+
+Format limits: AdLib/OPL instruments are rejected instead of rendered as
+silence. Fifteen-sample Soundtracker MOD, UNIC, Ogg-compressed XM samples,
+MPTM extensions and external instrument plugins are not implemented.
+Random waveforms and instrument swing use a fixed-seed generator, unlike
+libopenmpt's per-process random seed; independently seeded renders are not
+expected to be bit-exact.
+
+```sh
+export CARGO_TARGET_DIR=/path/to/own-target
+cargo test -j 2 -p codec-tracker --test playback
+TRACKER_CORPUS=/path/to/oracles cargo test -j 2 -p codec-tracker --test playback corpus_mutations -- --ignored
+cargo build --release -j 2 -p codec-tracker --example render
+python3 scripts/check-tracker.py --corpus /path/to/oracles \
+  --renderer "$CARGO_TARGET_DIR/release/examples/render" \
+  --report "$CARGO_TARGET_DIR/tracker-oracle.json"
+```
+
 ### Matroska packet compatibility
 
 The MKV fork follows at most two SeekHeads (one target per other master),

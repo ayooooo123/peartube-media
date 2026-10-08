@@ -163,8 +163,8 @@ run "${V_IN[@]}" "${A_IN[@]}" "${DUR[@]}" -c:v flv1 -pix_fmt yuv420p -c:a libmp3
 run "${V_IN[@]}" "${A_IN[@]}" "${DUR[@]}" $VENC -c:a aac -f nut "$CORPUS_DIR/h264_aac_nut.nut"
 
 # ---------------- 8. Hand-rolled containers ffmpeg cannot write ----------------
-# 8a. ProTracker 4-channel MOD (31 samples, 1 pattern, "M.K.") for audio:mod /
-#     container:midi-adjacent rows. oxideav-mod parses exactly this layout.
+# 8a. ProTracker 4-channel MOD (31 samples, 1 pattern, "M.K.") for audio:mod.
+#     codec-tracker loads and renders it; libopenmpt is the audio oracle.
 python3 - "$CORPUS_DIR/audio_mod.mod" <<'PYEOF'
 import struct, sys
 out = bytearray()

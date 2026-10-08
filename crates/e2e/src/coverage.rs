@@ -151,8 +151,8 @@ fn rule(row: &str) -> Option<Rule> {
         "audio:atrac3" => codec(Audio, &["atrac3"]),
         "audio:atrac3p" => codec(Audio, &["atrac3p", "atrac3plus"]),
         "audio:wavpack" => codec(Audio, &["wavpack"]),
-        // OxideAV's planar-output MOD decoder is the MOD decoder.
-        "audio:mod" => codec(Audio, &["mod", "mod_planar"]),
+        // All tracker formats use the same pure-Rust player.
+        "audio:mod" => codec(Audio, &["mod", "s3m", "xm", "it", "mtm", "669", "ult", "stm"]),
         "audio:tta" => codec(Audio, &["tta"]),
         "audio:ape" => codec(Audio, &["ape"]),
         "audio:cook" => codec(Audio, &["cook"]),
