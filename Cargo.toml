@@ -82,6 +82,71 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# Size, as the app's mobile/Cargo.toml builds libmain.so (keep the two in
+# step). Dependencies and this workspace's cold crates build for size; the
+# code that must keep its speed builds at 3: the decoders that play HD video
+# or sit near PerfAudit's real-time floors, oxideav-core's bit readers,
+# oxideav-pixfmt's RGBA conversion and the engine. Binaries stay at 3: fat LTO
+# optimises the whole program at the final crate's level, and at "s" rustc
+# turns off loop and SLP vectorization for all of it. Workspace crates default
+# to 3 here but are "s" in the app unless listed there: put a new crate in one
+# of the two lists.
+[profile.release.package."*"]
+opt-level = "s"
+[profile.release.package.oxideav-core]
+opt-level = 3
+[profile.release.package.oxideav-pixfmt]
+opt-level = 3
+[profile.release.package.oxideav-h264]
+opt-level = 3
+[profile.release.package.oxideav-h265]
+opt-level = 3
+[profile.release.package.oxideav-av1]
+opt-level = 3
+[profile.release.package.oxideav-vp8]
+opt-level = 3
+[profile.release.package.oxideav-vp9]
+opt-level = 3
+[profile.release.package.oxideav-mpeg12video]
+opt-level = 3
+[profile.release.package.oxideav-mpeg4video]
+opt-level = 3
+[profile.release.package.oxideav-aac]
+opt-level = 3
+[profile.release.package.oxideav-opus]
+opt-level = 3
+[profile.release.package.oxideav-mp3]
+opt-level = 3
+[profile.release.package.oxideav-ac3]
+opt-level = 3
+# Hot workspace crates (player, codec-wmv, codec-dca) keep the default 3.
+[profile.release.package.audio-trim]
+opt-level = "s"
+[profile.release.package.codec-mlp]
+opt-level = "s"
+[profile.release.package.codec-ra]
+opt-level = "s"
+[profile.release.package.codec-rv]
+opt-level = "s"
+[profile.release.package.codec-wma]
+opt-level = "s"
+[profile.release.package.codecs]
+opt-level = "s"
+[profile.release.package.demux-asf]
+opt-level = "s"
+[profile.release.package.demux-misc]
+opt-level = "s"
+[profile.release.package.demux-rm]
+opt-level = "s"
+[profile.release.package.demux-seek-core]
+opt-level = "s"
+[profile.release.package.subs-bitmap]
+opt-level = "s"
+[profile.release.package.subs-cc]
+opt-level = "s"
+[profile.release.package.subs-text]
+opt-level = "s"
+
 # Tests decode real samples; unoptimized codecs make them crawl.
 [profile.dev]
 opt-level = 1
@@ -102,7 +167,7 @@ oxideav-avi = { git = "https://github.com/ayooooo123/oxideav-avi", rev = "b919db
 oxideav-basic = { git = "https://github.com/OxideAV/oxideav-basic", rev = "c44bb55f9f94e18ede7e9267493b0b6776a8e1c4" }
 oxideav-cinepak = { git = "https://github.com/OxideAV/oxideav-cinepak", rev = "4dae215ff7509dfd7e2e7d1bae72128630ccce7d" }
 oxideav-cook = { git = "https://github.com/OxideAV/oxideav-cook", rev = "f8584e427c6f87de24e2f2de124e0242824f7006" }
-oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "d7f2beab2e5f23f8ee2c4a75d3744692c9672abd" }
 oxideav-dirac = { git = "https://github.com/OxideAV/oxideav-dirac", rev = "1315f66f5f222dcafa5594bee401c797e5f5a769" }
 oxideav-dts = { git = "https://github.com/OxideAV/oxideav-dts", rev = "9a7c128366aa4914331825e3b5d40a3d3304c090" }
 oxideav-dvd = { git = "https://github.com/OxideAV/oxideav-dvd", rev = "f237f8c05fb3a70d0d9c7e7c99c56110c570d849" }
