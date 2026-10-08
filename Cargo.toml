@@ -111,17 +111,18 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.oxideav-aac]
 opt-level = 3
-[profile.release.package.oxideav-opus]
-opt-level = 3
 [profile.release.package.oxideav-mp3]
 opt-level = 3
-[profile.release.package.oxideav-ac3]
-opt-level = 3
+# The Opus and AC-3 ports stay "s" (PerfAudit 2026-10-08): Opus 7.1 decodes
+# at 55x real time there under load (80x at 3, 44% fewer instructions),
+# E-AC-3 7.1 at 138x (163x at 3), far above the 10x audio floor.
 # The Ogg demuxer runs per packet: at "s" it costs Opus in Ogg about 0.4%
 # more instructions (16 KB). The Matroska demuxer at 3 changed nothing.
 [profile.release.package.oxideav-ogg]
 opt-level = 3
-# Hot workspace crates (player, codec-wmv, codec-dca) keep the default 3.
+# Hot workspace crates (player, codec-wmv, codec-dca, codec-dv) keep the
+# default 3. DV at "s" decodes DVCPRO HD 1080 at 2.2x real time under load,
+# at the 2x floor for HD; 3 takes 28% fewer instructions.
 [profile.release.package.audio-trim]
 opt-level = "s"
 [profile.release.package.codec-als]
@@ -170,6 +171,20 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.subs-text]
 opt-level = "s"
+[profile.release.package.codec-apple-audio]
+opt-level = "s"
+[profile.release.package.codec-atrac]
+opt-level = "s"
+[profile.release.package.codec-speech]
+opt-level = "s"
+[profile.release.package.codec-speex]
+opt-level = "s"
+[profile.release.package.codec-vp3]
+opt-level = "s"
+[profile.release.package.codec-vp56]
+opt-level = "s"
+[profile.release.package.demux-mxf]
+opt-level = "s"
 
 # Tests decode real samples; unoptimized codecs make them crawl.
 [profile.dev]
@@ -198,7 +213,7 @@ oxideav-flac = { git = "https://github.com/OxideAV/oxideav-flac", rev = "cfcc7c4
 oxideav-flv = { git = "https://github.com/ayooooo123/oxideav-flv", rev = "5b1b6656065c3bea804bc3de3b95970d3286ad3c" }
 oxideav-g711 = { git = "https://github.com/OxideAV/oxideav-g711", rev = "72af018b7c04e8c3aacc6c0b7628cd6e43cde37a" }
 oxideav-h261 = { git = "https://github.com/ayooooo123/oxideav-h261", rev = "0803bf4eb603c9766c01ba89f150259c84c3af7b" }
-oxideav-h263 = { git = "https://github.com/ayooooo123/oxideav-h263", rev = "e7b9b47922e996f41fbd9003e61f0a172b39200d" }
+oxideav-h263 = { git = "https://github.com/ayooooo123/oxideav-h263", rev = "f9a411dc54f8365b4b0355cf3f83e8e8642525d1" }
 oxideav-h264 = { git = "https://github.com/ayooooo123/oxideav-h264", rev = "103743224259f2b8663dc882fa60a18cd95c134a" }
 oxideav-h265 = { git = "https://github.com/ayooooo123/oxideav-h265", rev = "279ecc3f27dc6f4145c5478a0f2388180661e1d1" }
 oxideav-http = { git = "https://github.com/ayooooo123/oxideav-http", rev = "ebbc1911048ee0288c5e76bbc0603d5df989dd3f" }

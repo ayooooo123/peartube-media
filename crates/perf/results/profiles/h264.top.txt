@@ -1,0 +1,65 @@
+total samples (sum of self): 13482
+
+self by function:
+   1728  12.8%  oxideav_h264::reconstruct::deblock_picture::h15d14cc6d3ed71f5
+   1706  12.7%  oxideav_h264::h264_decoder::H264CodecDecoder::reconstruct_slice_into_in_progress::h433710dc9090c1d6
+   1205   8.9%  oxideav_h264::simd::chunked::interpolate_luma::h4a6cdbf20d6f9628
+    952   7.1%  oxideav_h264::deblock::filter_edge::h1b9b3f6278f08daa
+    940   7.0%  oxideav_h264::reconstruct::process_partition::h269c1cca87f8db92
+    926   6.9%  _platform_memmove
+    822   6.1%  oxideav_h264::reconstruct::different_ref_or_mv_luma::hb69abfe43c1d47c2
+    558   4.1%  oxideav_h264::cabac::CabacDecoder::decode_decision::h9f058ece64f19a04
+    536   4.0%  oxideav_h264::simd::chunked::interpolate_chroma::hc899eef23ec64a65
+    324   2.4%  _xzm_free
+    211   1.6%  __findenv_locked
+    192   1.4%  oxideav_h264::transform::inverse_core_4x4::h13fe24a9c7a75e6c
+    189   1.4%  oxideav_h264::transform::inverse_transform_8x8::h89aa380409418928
+    165   1.2%  _platform_memset
+    165   1.2%  _xzm_xzone_malloc
+    151   1.1%  oxideav_h264::macroblock_layer::parse_residual_block_cabac::h90fb2087c567c4c8
+    150   1.1%  oxideav_h264::reconstruct::neighbour_from_block::h9c93ec4514a37651
+    128   0.9%  oxideav_h264::h264_decoder::picture_to_video_frame::pack::h4c45a4dad14eb86d
+    125   0.9%  _xzm_malloc_zone_malloc_type_calloc_entry
+    115   0.9%  oxideav_h264::inter_pred::weighted_pred_explicit::h9775fe37cbfe6587
+    115   0.9%  oxideav_h264::reconstruct::reconstruct_mb_intra::h573eae547e46217d
+    114   0.8%  _free
+    111   0.8%  oxideav_h264::transform::scale_4x4::hddbcf856282c5228
+    109   0.8%  _$LT$oxideav_h264..h264_decoder..BorrowedRefProvider$u20$as$u20$oxideav_h264..ref_store..RefPicProvider$GT$::ref_pic::h09c2464e2a6dab00
+    100   0.7%  oxideav_h264::macroblock_layer::parse_macroblock_dp::h91e895b4593b747e
+     92   0.7%  oxideav_h264::slice_data::parse_slice_data_impl::h4fe44424b07d1f4d
+     88   0.7%  core::ptr::drop_in_place$LT$oxideav_h264..macroblock_layer..Macroblock$GT$::hed2c16f3e2dbcc9f
+     84   0.6%  _malloc_zone_calloc
+     83   0.6%  core::hash::BuildHasher::hash_one::hcb0c44adbfc63a82
+     80   0.6%  oxideav_h264::reconstruct::reconstruct_chroma_intra::h555137399a708e93
+
+self by line:
+   1705  12.6%  oxideav-h264-cc442fe64c464b4c/1037432/src/h264_decoder.rs:1777 oxideav_h264::h264_decoder::H264CodecDecoder::reconstruct_slice_into_in_progress::h433710dc9090c1d6
+    926   6.9%                                           _platform_memmove
+    922   6.8%  oxideav-h264-cc442fe64c464b4c/1037432/src/reconstruct.rs:8258 oxideav_h264::reconstruct::deblock_picture::h15d14cc6d3ed71f5
+    806   6.0%  oxideav-h264-cc442fe64c464b4c/1037432/src/reconstruct.rs:8269 oxideav_h264::reconstruct::deblock_picture::h15d14cc6d3ed71f5
+    426   3.2%  oxideav-h264-cc442fe64c464b4c/1037432/src/simd/chunked.rs:371 oxideav_h264::simd::chunked::interpolate_luma::h4a6cdbf20d6f9628
+    418   3.1%  oxideav-h264-cc442fe64c464b4c/1037432/src/deblock.rs:0 oxideav_h264::deblock::filter_edge::h1b9b3f6278f08daa
+    324   2.4%                                           _xzm_free
+    318   2.4%  oxideav-h264-cc442fe64c464b4c/1037432/src/reconstruct.rs:0 oxideav_h264::reconstruct::different_ref_or_mv_luma::hb69abfe43c1d47c2
+    237   1.8%  oxideav-h264-cc442fe64c464b4c/1037432/src/deblock.rs:400 oxideav_h264::deblock::filter_edge::h1b9b3f6278f08daa
+    211   1.6%                                           __findenv_locked
+    165   1.2%                                           _platform_memset
+    165   1.2%                                           _xzm_xzone_malloc
+    141   1.0%  oxideav-h264-cc442fe64c464b4c/1037432/src/reconstruct.rs:0 oxideav_h264::reconstruct::process_partition::h269c1cca87f8db92
+    141   1.0%  oxideav-h264-cc442fe64c464b4c/1037432/src/cabac.rs:0 oxideav_h264::cabac::CabacDecoder::decode_decision::h9f058ece64f19a04
+    138   1.0%  oxideav-h264-cc442fe64c464b4c/1037432/src/cabac.rs:403 oxideav_h264::cabac::CabacDecoder::decode_decision::h9f058ece64f19a04
+    129   1.0%  oxideav-h264-cc442fe64c464b4c/1037432/src/simd/chunked.rs:697 oxideav_h264::simd::chunked::interpolate_chroma::hc899eef23ec64a65
+    127   0.9%  oxideav-h264-cc442fe64c464b4c/1037432/src/h264_decoder.rs:3227 oxideav_h264::h264_decoder::picture_to_video_frame::pack::h4c45a4dad14eb86d
+    125   0.9%                                           _xzm_malloc_zone_malloc_type_calloc_entry
+    119   0.9%  oxideav-h264-cc442fe64c464b4c/1037432/src/deblock.rs:398 oxideav_h264::deblock::filter_edge::h1b9b3f6278f08daa
+    117   0.9%  oxideav-h264-cc442fe64c464b4c/1037432/src/reconstruct.rs:5110 oxideav_h264::reconstruct::process_partition::h269c1cca87f8db92
+    114   0.8%                                           _free
+    107   0.8%  oxideav-h264-cc442fe64c464b4c/1037432/src/reconstruct.rs:1225 oxideav_h264::reconstruct::reconstruct_mb_intra::h573eae547e46217d
+     97   0.7%  oxideav-h264-cc442fe64c464b4c/1037432/src/simd/chunked.rs:606 oxideav_h264::simd::chunked::interpolate_luma::h4a6cdbf20d6f9628
+     92   0.7%  oxideav-h264-cc442fe64c464b4c/1037432/src/simd/chunked.rs:0 oxideav_h264::simd::chunked::interpolate_luma::h4a6cdbf20d6f9628
+     90   0.7%  oxideav-h264-cc442fe64c464b4c/1037432/src/transform.rs:987 oxideav_h264::transform::inverse_transform_8x8::h89aa380409418928
+     90   0.7%  oxideav-h264-cc442fe64c464b4c/1037432/src/reconstruct.rs:9384 oxideav_h264::reconstruct::different_ref_or_mv_luma::hb69abfe43c1d47c2
+     88   0.7%  /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/core/src/ptr/mod.rs:810 core::ptr::drop_in_place$LT$oxideav_h264..macroblock_layer..Macroblock$GT$::hed2c16f3e2dbcc9f
+     86   0.6%  oxideav-h264-cc442fe64c464b4c/1037432/src/transform.rs:988 oxideav_h264::transform::inverse_transform_8x8::h89aa380409418928
+     84   0.6%                                           _malloc_zone_calloc
+     70   0.5%  oxideav-h264-cc442fe64c464b4c/1037432/src/simd/chunked.rs:703 oxideav_h264::simd::chunked::interpolate_chroma::hc899eef23ec64a65

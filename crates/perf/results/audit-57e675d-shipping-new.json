@@ -1,0 +1,2315 @@
+{
+  "machine": "Apple M1 Pro (8 performance cores), load 36.8",
+  "runs": 3,
+  "max_secs": 0.0,
+  "floors": {
+    "video_above_576": 2.0,
+    "audio": 10.0,
+    "video_sd": 4.0
+  },
+  "results": [
+    {
+      "rows": [
+        "extra:mpeg2 XDCAM MXF"
+      ],
+      "input": "fate:mxf/omneon_8.3.0.0_xdcam_startc_footer.mxf",
+      "path": "/Users/jd/projects/fate-suite/mxf/omneon_8.3.0.0_xdcam_startc_footer.mxf",
+      "kind": "video",
+      "container": "mxf",
+      "codec": "mpeg2video",
+      "decoder": "mpeg2video_sw",
+      "width": 1920,
+      "height": 1088,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 0.72,
+      "decode_secs": 9.354774875,
+      "xrt": 0.07696604243509386,
+      "cpu_xrt": 0.5855324685886264,
+      "instructions": 10351259149,
+      "floor": 2.0,
+      "verdict": "SLOW!",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "",
+        "ours": 0,
+        "ffmpeg": 0,
+        "matched": null,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": false,
+        "error": "panicked: range end index 2075520 out of range for slice of length 2073600"
+      },
+      "runs": [
+        {
+          "wall_secs": 11.856494333,
+          "demux_secs": 0.131515376,
+          "media_secs": 0.72,
+          "xrt": 0.060726212974777455,
+          "cpu_secs": 1.2273309999999924,
+          "cpu_xrt": 0.5866388121867732,
+          "instructions": 10354847706,
+          "cycles": 2414537703,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 18,
+          "samples": 0,
+          "packets": 18,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 9.354774875,
+          "demux_secs": 0.033337998,
+          "media_secs": 0.72,
+          "xrt": 0.07696604243509386,
+          "cpu_secs": 1.2296499999999924,
+          "cpu_xrt": 0.5855324685886264,
+          "instructions": 10351259149,
+          "cycles": 2429902600,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 18,
+          "samples": 0,
+          "packets": 18,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 8.272087875,
+          "demux_secs": 0.057172335,
+          "media_secs": 0.72,
+          "xrt": 0.08703969431659356,
+          "cpu_secs": 1.2398900000000026,
+          "cpu_xrt": 0.580696674705013,
+          "instructions": 10353692162,
+          "cycles": 2411972843,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 18,
+          "samples": 0,
+          "packets": 18,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 36.91845703125,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:h263 4CIF"
+      ],
+      "input": "perf/h263_4cif.avi",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/h263_4cif.avi",
+      "kind": "video",
+      "container": "avi",
+      "codec": "h263",
+      "decoder": "h263_sw",
+      "width": 704,
+      "height": 576,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 20.0,
+      "decode_secs": 23.150230958,
+      "xrt": 0.8639222665330957,
+      "cpu_xrt": 3.9702138674806196,
+      "instructions": 56216408327,
+      "floor": 4.0,
+      "verdict": "SLOW",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "md5 per frame, yuv420p 704x576, FFmpeg 2da55bf -idct simple",
+        "ours": 600,
+        "ffmpeg": 600,
+        "matched": 600,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 20.992912625,
+          "demux_secs": 0.19739072,
+          "media_secs": 20.0,
+          "xrt": 0.9527024837983863,
+          "cpu_secs": 5.162642999999999,
+          "cpu_xrt": 3.873984701247017,
+          "instructions": 56180232464,
+          "cycles": 11778702276,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 600,
+          "samples": 0,
+          "packets": 600,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 24.172242042,
+          "demux_secs": 0.209926338,
+          "media_secs": 20.0,
+          "xrt": 0.8273953225046066,
+          "cpu_secs": 4.909891999999999,
+          "cpu_xrt": 4.073409354014305,
+          "instructions": 56207608053,
+          "cycles": 11837251306,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 600,
+          "samples": 0,
+          "packets": 600,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 23.150230958,
+          "demux_secs": 0.218233957,
+          "media_secs": 20.0,
+          "xrt": 0.8639222665330957,
+          "cpu_secs": 5.037511999999992,
+          "cpu_xrt": 3.9702138674806196,
+          "instructions": 56216408327,
+          "cycles": 11941553130,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 600,
+          "samples": 0,
+          "packets": 600,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 36.904296875,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:dv DVCPRO HD 1080i50"
+      ],
+      "input": "perf/dvcprohd_1080i50.mov",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/dvcprohd_1080i50.mov",
+      "kind": "video",
+      "container": "mov",
+      "codec": "dvvideo",
+      "decoder": "dvvideo_sw",
+      "width": 1440,
+      "height": 1080,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 10.0,
+      "decode_secs": 16.430269041,
+      "xrt": 0.6086327603672257,
+      "cpu_xrt": 2.2036260666927414,
+      "instructions": 38848506264,
+      "floor": 2.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "md5 per frame, yuv422p 1440x1080, FFmpeg 2da55bf -idct simple",
+        "ours": 250,
+        "ffmpeg": 250,
+        "matched": 250,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 16.430269041,
+          "demux_secs": 0.438707161,
+          "media_secs": 10.0,
+          "xrt": 0.6086327603672257,
+          "cpu_secs": 4.812198000000002,
+          "cpu_xrt": 2.078052482462275,
+          "instructions": 38773074624,
+          "cycles": 11288224206,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 250,
+          "samples": 0,
+          "packets": 250,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 17.510321542,
+          "demux_secs": 0.654539753,
+          "media_secs": 10.0,
+          "xrt": 0.5710917401496111,
+          "cpu_secs": 4.482550999999994,
+          "cpu_xrt": 2.230872554489623,
+          "instructions": 38872446786,
+          "cycles": 11511312592,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 250,
+          "samples": 0,
+          "packets": 250,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 16.317324041,
+          "demux_secs": 0.674465741,
+          "media_secs": 10.0,
+          "xrt": 0.612845585150686,
+          "cpu_secs": 4.537975000000003,
+          "cpu_xrt": 2.2036260666927414,
+          "instructions": 38848506264,
+          "cycles": 11447488079,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 250,
+          "samples": 0,
+          "packets": 250,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 31.9423828125,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "video:vp9"
+      ],
+      "input": "gen:vp9_opus.webm",
+      "path": "/Users/jd/projects/peartube-media-corpus/vp9_opus.webm",
+      "kind": "video",
+      "container": "webm",
+      "codec": "vp9",
+      "decoder": "oxideav-vp9",
+      "width": 320,
+      "height": 240,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 6.0,
+      "decode_secs": 4.198014209,
+      "xrt": 1.4292471871907377,
+      "cpu_xrt": 5.530795005692106,
+      "instructions": 8909601150,
+      "floor": 4.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "md5 per frame, yuv420p 320x240, FFmpeg 2da55bf -idct simple",
+        "ours": 150,
+        "ffmpeg": 150,
+        "matched": 150,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 4.218017917,
+          "demux_secs": 0.008783312,
+          "media_secs": 6.0,
+          "xrt": 1.4224690643958684,
+          "cpu_secs": 1.0848350000000009,
+          "cpu_xrt": 5.530795005692106,
+          "instructions": 8909601150,
+          "cycles": 2185108816,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 150,
+          "samples": 0,
+          "packets": 150,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 4.198014209,
+          "demux_secs": 0.006154425,
+          "media_secs": 6.0,
+          "xrt": 1.4292471871907377,
+          "cpu_secs": 1.0902369999999983,
+          "cpu_xrt": 5.503390547192958,
+          "instructions": 8878256131,
+          "cycles": 2134617035,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 150,
+          "samples": 0,
+          "packets": 150,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 3.495933292,
+          "demux_secs": 0.005195585,
+          "media_secs": 6.0,
+          "xrt": 1.7162798883291734,
+          "cpu_secs": 0.9330460000000009,
+          "cpu_xrt": 6.430551119666119,
+          "instructions": 8862448023,
+          "cycles": 2095435930,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 150,
+          "samples": 0,
+          "packets": 150,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 38.75927734375,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:mpeg2 in MXF 576p25"
+      ],
+      "input": "perf/mpeg2_pcm.mxf",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/mpeg2_pcm.mxf",
+      "kind": "video",
+      "container": "mxf",
+      "codec": "mpeg2video",
+      "decoder": "mpeg2video_sw",
+      "width": 720,
+      "height": 576,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 20.0,
+      "decode_secs": 22.385261625,
+      "xrt": 0.8934449967591122,
+      "cpu_xrt": 6.519351063795135,
+      "instructions": 26964254386,
+      "floor": 4.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "md5 per frame, yuv420p 720x576, FFmpeg 2da55bf -idct simple",
+        "ours": 500,
+        "ffmpeg": 500,
+        "matched": 500,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 20.242690791,
+          "demux_secs": 0.430367667,
+          "media_secs": 20.0,
+          "xrt": 0.9880109421466882,
+          "cpu_secs": 2.93189000000001,
+          "cpu_xrt": 6.821538325107672,
+          "instructions": 26980535655,
+          "cycles": 6194531137,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 500,
+          "samples": 0,
+          "packets": 500,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 23.558280542,
+          "demux_secs": 0.394372917,
+          "media_secs": 20.0,
+          "xrt": 0.8489583933913916,
+          "cpu_secs": 3.067789999999988,
+          "cpu_xrt": 6.519351063795135,
+          "instructions": 26964254386,
+          "cycles": 6221914253,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 500,
+          "samples": 0,
+          "packets": 500,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 22.385261625,
+          "demux_secs": 0.306845049,
+          "media_secs": 20.0,
+          "xrt": 0.8934449967591122,
+          "cpu_secs": 3.1137080000000026,
+          "cpu_xrt": 6.423209883521507,
+          "instructions": 26957431440,
+          "cycles": 6172364221,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 500,
+          "samples": 0,
+          "packets": 500,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 31.82568359375,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "video:av1"
+      ],
+      "input": "gen:av1_opus.mkv",
+      "path": "/Users/jd/projects/peartube-media-corpus/av1_opus.mkv",
+      "kind": "video",
+      "container": "matroska",
+      "codec": "av1",
+      "decoder": "av1_sw",
+      "width": 320,
+      "height": 240,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 6.0,
+      "decode_secs": 2.093975792,
+      "xrt": 2.8653626383470625,
+      "cpu_xrt": 8.243683277688461,
+      "instructions": 7125049618,
+      "floor": 4.0,
+      "verdict": "FAIL",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "",
+        "ours": 0,
+        "ffmpeg": 0,
+        "matched": null,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": false,
+        "error": "[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[av1 @ 0x77ac28a80] Your platform doesn't support hardware accelerated AV1 decoding.\n[av1 @ 0x77ac28a80] Failed to get pixel format.\n[av1 @ 0x77ac28a80] Get current frame error\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Error submitting packet to decoder: Function not implemented\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Decode error rate 1 exceeds maximum 0.666667\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Task finished with error: Error number -1145393733 occurred\n[vist#0:0/av1 @ 0x77ac18480] [dec:av1 @ 0x77a800140] Terminating thread with error: Error number -1145393733 occurred\n"
+      },
+      "runs": [
+        {
+          "wall_secs": 2.093975792,
+          "demux_secs": 0.00634593,
+          "media_secs": 6.0,
+          "xrt": 2.8653626383470625,
+          "cpu_secs": 0.6270170000000022,
+          "cpu_xrt": 9.569118540645595,
+          "instructions": 7157664933,
+          "cycles": 1649181534,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 150,
+          "samples": 0,
+          "packets": 150,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 2.266721917,
+          "demux_secs": 0.00284349,
+          "media_secs": 6.0,
+          "xrt": 2.646994302654021,
+          "cpu_secs": 0.8825269999999996,
+          "cpu_xrt": 6.798658851230617,
+          "instructions": 7133009514,
+          "cycles": 1614568859,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 150,
+          "samples": 0,
+          "packets": 150,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 1.803290042,
+          "demux_secs": 0.004437718,
+          "media_secs": 6.0,
+          "xrt": 3.3272517788350324,
+          "cpu_secs": 0.7278300000000009,
+          "cpu_xrt": 8.243683277688461,
+          "instructions": 7125049618,
+          "cycles": 1560973381,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 150,
+          "samples": 0,
+          "packets": 150,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 37.4580078125,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:h263 CIF"
+      ],
+      "input": "perf/h263_cif.avi",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/h263_cif.avi",
+      "kind": "video",
+      "container": "avi",
+      "codec": "h263",
+      "decoder": "h263_sw",
+      "width": 352,
+      "height": 288,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 20.0,
+      "decode_secs": 5.060891209,
+      "xrt": 3.951873133418308,
+      "cpu_xrt": 10.64433343587376,
+      "instructions": 19706064121,
+      "floor": 4.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "md5 per frame, yuv420p 352x288, FFmpeg 2da55bf -idct simple",
+        "ours": 600,
+        "ffmpeg": 600,
+        "matched": 600,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 5.060891209,
+          "demux_secs": 0.04480766,
+          "media_secs": 20.0,
+          "xrt": 3.951873133418308,
+          "cpu_secs": 1.883704999999999,
+          "cpu_xrt": 10.617373739518667,
+          "instructions": 19698759592,
+          "cycles": 4150730019,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 600,
+          "samples": 0,
+          "packets": 600,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 4.743803208,
+          "demux_secs": 0.036678869,
+          "media_secs": 20.0,
+          "xrt": 4.2160264924716495,
+          "cpu_secs": 1.8532280000000014,
+          "cpu_xrt": 10.791980263626485,
+          "instructions": 19707120684,
+          "cycles": 4129529604,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 600,
+          "samples": 0,
+          "packets": 600,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 5.203245917,
+          "demux_secs": 0.061172166,
+          "media_secs": 20.0,
+          "xrt": 3.843754517666784,
+          "cpu_secs": 1.8789339999999974,
+          "cpu_xrt": 10.64433343587376,
+          "instructions": 19706064121,
+          "cycles": 4145070601,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 600,
+          "samples": 0,
+          "packets": 600,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 38.0595703125,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "audio:opus"
+      ],
+      "input": "fate:opus/test-8-7.1.opus-small.ts",
+      "path": "/Users/jd/projects/fate-suite/opus/test-8-7.1.opus-small.ts",
+      "kind": "audio",
+      "container": "mpegts",
+      "codec": "opus",
+      "decoder": "opus_sw",
+      "width": null,
+      "height": null,
+      "channels": 8,
+      "sample_rate": 48000,
+      "media_secs": 10.24,
+      "decode_secs": 0.530597208,
+      "xrt": 19.299008448608348,
+      "cpu_xrt": 48.852164952388655,
+      "instructions": 1808789607,
+      "floor": 10.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "SNR vs FFmpeg 2da55bf f32 -cpuflags 0",
+        "ours": 491520,
+        "ffmpeg": 491520,
+        "matched": null,
+        "snr_db": 140.43112041159628,
+        "pcm_exact": null,
+        "snr_text": "140.43",
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.530597208,
+          "demux_secs": 0.005438801,
+          "media_secs": 10.24,
+          "xrt": 19.299008448608348,
+          "cpu_secs": 0.20961199999999813,
+          "cpu_xrt": 48.852164952388655,
+          "instructions": 1808789607,
+          "cycles": 416747999,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 8,
+          "frames": 512,
+          "samples": 491520,
+          "packets": 512,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.610941084,
+          "demux_secs": 0.020028425,
+          "media_secs": 10.24,
+          "xrt": 16.761026992907222,
+          "cpu_secs": 0.2419020000000014,
+          "cpu_xrt": 42.33119197030178,
+          "instructions": 1806968525,
+          "cycles": 427765881,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 8,
+          "frames": 512,
+          "samples": 491520,
+          "packets": 512,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.463950375,
+          "demux_secs": 0.011763028,
+          "media_secs": 10.24,
+          "xrt": 22.071326055076472,
+          "cpu_secs": 0.20674899999999852,
+          "cpu_xrt": 49.52865551949501,
+          "instructions": 1803847030,
+          "cycles": 421205393,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 8,
+          "frames": 512,
+          "samples": 491520,
+          "packets": 512,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 39.326171875,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:alac stereo"
+      ],
+      "input": "perf/alac_stereo.m4a",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/alac_stereo.m4a",
+      "kind": "audio",
+      "container": "mp4",
+      "codec": "alac",
+      "decoder": "alac_sw",
+      "width": null,
+      "height": null,
+      "channels": 2,
+      "sample_rate": 44100,
+      "media_secs": 30.0,
+      "decode_secs": 0.768021333,
+      "xrt": 39.06141497764881,
+      "cpu_xrt": 156.05493133583167,
+      "instructions": 1403896951,
+      "floor": 10.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "full PCM bytes vs FFmpeg 2da55bf -cpuflags 0",
+        "ours": 1323000,
+        "ffmpeg": 1323000,
+        "matched": null,
+        "snr_db": null,
+        "pcm_exact": true,
+        "snr_text": "inf",
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.768021333,
+          "demux_secs": 0.086322331,
+          "media_secs": 30.0,
+          "xrt": 39.06141497764881,
+          "cpu_secs": 0.19866699999998616,
+          "cpu_xrt": 151.00645804286614,
+          "instructions": 1406091620,
+          "cycles": 421186339,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 323,
+          "samples": 1323000,
+          "packets": 323,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 1.096864333,
+          "demux_secs": 0.009828833,
+          "media_secs": 30.0,
+          "xrt": 27.350693333192737,
+          "cpu_secs": 0.15937900000000127,
+          "cpu_xrt": 188.23056989942063,
+          "instructions": 1402625797,
+          "cycles": 412260045,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 323,
+          "samples": 1323000,
+          "packets": 323,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.668843459,
+          "demux_secs": 0.017725793,
+          "media_secs": 30.0,
+          "xrt": 44.85354472159083,
+          "cpu_secs": 0.1922399999999982,
+          "cpu_xrt": 156.05493133583167,
+          "instructions": 1403896951,
+          "cycles": 414649742,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 323,
+          "samples": 1323000,
+          "packets": 323,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 31.98486328125,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:mp2 stereo MKA"
+      ],
+      "input": "perf/mp2_stereo.mka",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/mp2_stereo.mka",
+      "kind": "audio",
+      "container": "matroska",
+      "codec": "mp2",
+      "decoder": "mp2",
+      "width": null,
+      "height": null,
+      "channels": 2,
+      "sample_rate": 48000,
+      "media_secs": 30.0,
+      "decode_secs": 0.828249834,
+      "xrt": 36.22095504096413,
+      "cpu_xrt": 168.52417760201376,
+      "instructions": 1960337779,
+      "floor": 10.0,
+      "verdict": "FAIL",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "SNR vs FFmpeg 2da55bf f32 -cpuflags 0",
+        "ours": 1440000,
+        "ffmpeg": 1440000,
+        "matched": null,
+        "snr_db": 72.92237295879224,
+        "pcm_exact": null,
+        "snr_text": "72.92",
+        "complete": false,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.828249834,
+          "demux_secs": 0.037562947,
+          "media_secs": 30.0,
+          "xrt": 36.22095504096413,
+          "cpu_secs": 0.1780159999999995,
+          "cpu_xrt": 168.52417760201376,
+          "instructions": 1960337779,
+          "cycles": 415268138,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 1250,
+          "samples": 1440000,
+          "packets": 1250,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.502008583,
+          "demux_secs": 0.015103663,
+          "media_secs": 30.0,
+          "xrt": 59.759934423272604,
+          "cpu_secs": 0.20297799999998745,
+          "cpu_xrt": 147.7992688862924,
+          "instructions": 1952929562,
+          "cycles": 400576198,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 1250,
+          "samples": 1440000,
+          "packets": 1250,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 1.095797917,
+          "demux_secs": 0.091251077,
+          "media_secs": 30.0,
+          "xrt": 27.37731066521091,
+          "cpu_secs": 0.17171599999998932,
+          "cpu_xrt": 174.70707447181314,
+          "instructions": 1959675918,
+          "cycles": 407307081,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 1250,
+          "samples": 1440000,
+          "packets": 1250,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 32.4189453125,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "std:opus stereo"
+      ],
+      "input": "perf/opus_stereo.opus",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/opus_stereo.opus",
+      "kind": "audio",
+      "container": "ogg",
+      "codec": "opus",
+      "decoder": "opus_sw",
+      "width": null,
+      "height": null,
+      "channels": 2,
+      "sample_rate": 48000,
+      "media_secs": 30.0135,
+      "decode_secs": 0.32502875,
+      "xrt": 92.34106213681098,
+      "cpu_xrt": 220.25347110106654,
+      "instructions": 1158300727,
+      "floor": 10.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "SNR vs FFmpeg 2da55bf f32 -cpuflags 0",
+        "ours": 1440000,
+        "ffmpeg": 1440000,
+        "matched": null,
+        "snr_db": 139.43457435684812,
+        "pcm_exact": null,
+        "snr_text": "139.43",
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.27835,
+          "demux_secs": 0.006823305,
+          "media_secs": 30.0135,
+          "xrt": 107.82647745643975,
+          "cpu_secs": 0.1362679999999994,
+          "cpu_xrt": 220.25347110106654,
+          "instructions": 1158300727,
+          "cycles": 281307590,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 1501,
+          "samples": 1440648,
+          "packets": 1501,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.4029875,
+          "demux_secs": 0.007037677,
+          "media_secs": 30.0135,
+          "xrt": 74.47749620025435,
+          "cpu_secs": 0.12014899999999962,
+          "cpu_xrt": 249.80232877510505,
+          "instructions": 1159864596,
+          "cycles": 286148152,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 1501,
+          "samples": 1440648,
+          "packets": 1501,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.32502875,
+          "demux_secs": 0.012289918,
+          "media_secs": 30.0135,
+          "xrt": 92.34106213681098,
+          "cpu_secs": 0.14182000000000095,
+          "cpu_xrt": 211.63094062896488,
+          "instructions": 1158095173,
+          "cycles": 289470214,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 1501,
+          "samples": 1440648,
+          "packets": 1501,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 37.0205078125,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:atrac3 132k OMA"
+      ],
+      "input": "perf/atrac3_132k.oma",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/atrac3_132k.oma",
+      "kind": "audio",
+      "container": "oma",
+      "codec": "atrac3",
+      "decoder": "atrac3",
+      "width": null,
+      "height": null,
+      "channels": 2,
+      "sample_rate": 44100,
+      "media_secs": 3.01859410430839,
+      "decode_secs": 0.010094042,
+      "xrt": 299.04711158408,
+      "cpu_xrt": 402.050360190174,
+      "instructions": 93854410,
+      "floor": 10.0,
+      "verdict": "FAIL",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "",
+        "ours": 0,
+        "ffmpeg": 0,
+        "matched": null,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": false,
+        "error": "panicked: decode: invalid data: atrac3: sound unit id != 0x28"
+      },
+      "runs": [
+        {
+          "wall_secs": 0.010094042,
+          "demux_secs": 0.00008507,
+          "media_secs": 3.01859410430839,
+          "xrt": 299.04711158408,
+          "cpu_secs": 0.0075080000000014024,
+          "cpu_xrt": 402.050360190174,
+          "instructions": 93854410,
+          "cycles": 22078972,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 130,
+          "samples": 133120,
+          "packets": 911,
+          "errors": 781,
+          "first_error": "invalid data: atrac3: sound unit id != 0x28"
+        },
+        {
+          "wall_secs": 0.008744042,
+          "demux_secs": 0.000186317,
+          "media_secs": 3.01859410430839,
+          "xrt": 345.21724670448634,
+          "cpu_secs": 0.007042999999995914,
+          "cpu_xrt": 428.5949317492747,
+          "instructions": 92208847,
+          "cycles": 20511267,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 130,
+          "samples": 133120,
+          "packets": 911,
+          "errors": 781,
+          "first_error": "invalid data: atrac3: sound unit id != 0x28"
+        },
+        {
+          "wall_secs": 0.122067792,
+          "demux_secs": 0.000142129,
+          "media_secs": 3.01859410430839,
+          "xrt": 24.728833501865836,
+          "cpu_secs": 0.009803999999988378,
+          "cpu_xrt": 307.8941354867369,
+          "instructions": 92453740,
+          "cycles": 22060276,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 130,
+          "samples": 133120,
+          "packets": 911,
+          "errors": 781,
+          "first_error": "invalid data: atrac3: sound unit id != 0x28"
+        }
+      ],
+      "load_avg": 31.82568359375,
+      "note": null,
+      "error": "781 decode errors: invalid data: atrac3: sound unit id != 0x28"
+    },
+    {
+      "rows": [
+        "extra:vp6a FLV"
+      ],
+      "input": "fate:flash-vp6/300x180-Scr-f8-056alpha.flv",
+      "path": "/Users/jd/projects/fate-suite/flash-vp6/300x180-Scr-f8-056alpha.flv",
+      "kind": "video",
+      "container": "flv",
+      "codec": "vp6a",
+      "decoder": "vp6a_pear_sw",
+      "width": 300,
+      "height": 180,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 23.25,
+      "decode_secs": 0.970263167,
+      "xrt": 23.962570971221872,
+      "cpu_xrt": 223.6931987646321,
+      "instructions": 798115120,
+      "floor": 4.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "md5 per frame, yuva420p 300x180, FFmpeg 2da55bf -idct simple",
+        "ours": 93,
+        "ffmpeg": 93,
+        "matched": 93,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.952814208,
+          "demux_secs": 0.000625746,
+          "media_secs": 23.25,
+          "xrt": 24.40139935444791,
+          "cpu_secs": 0.11203599999998914,
+          "cpu_xrt": 207.52258202722564,
+          "instructions": 801035362,
+          "cycles": 216240609,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 93,
+          "samples": 0,
+          "packets": 93,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.970263167,
+          "demux_secs": 0.000624042,
+          "media_secs": 23.25,
+          "xrt": 23.962570971221872,
+          "cpu_secs": 0.07954599999997924,
+          "cpu_xrt": 292.2837100546359,
+          "instructions": 798344013,
+          "cycles": 211542767,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 93,
+          "samples": 0,
+          "packets": 93,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 1.790107083,
+          "demux_secs": 0.000475044,
+          "media_secs": 23.25,
+          "xrt": 12.988049832770814,
+          "cpu_secs": 0.10393700000000194,
+          "cpu_xrt": 223.6931987646321,
+          "instructions": 798115120,
+          "cycles": 219822276,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 93,
+          "samples": 0,
+          "packets": 93,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 36.5634765625,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "extra:atrac1"
+      ],
+      "input": "fate:atrac1/chirp_tone_10-16000.aea",
+      "path": "/Users/jd/projects/fate-suite/atrac1/chirp_tone_10-16000.aea",
+      "kind": "audio",
+      "container": "aea",
+      "codec": "atrac1",
+      "decoder": "atrac1",
+      "width": null,
+      "height": null,
+      "channels": 2,
+      "sample_rate": 44100,
+      "media_secs": 11.052698412698414,
+      "decode_secs": 0.070046542,
+      "xrt": 157.7907787753236,
+      "cpu_xrt": 564.4315398171047,
+      "instructions": 262469648,
+      "floor": 10.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "SNR vs FFmpeg 2da55bf f32 -cpuflags 0",
+        "ours": 487424,
+        "ffmpeg": 487424,
+        "matched": null,
+        "snr_db": 137.4267094095833,
+        "pcm_exact": null,
+        "snr_text": "137.43",
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.070046542,
+          "demux_secs": 0.000153924,
+          "media_secs": 11.052698412698414,
+          "xrt": 157.7907787753236,
+          "cpu_secs": 0.021945000000002324,
+          "cpu_xrt": 503.6545186920594,
+          "instructions": 262066935,
+          "cycles": 52712374,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 952,
+          "samples": 487424,
+          "packets": 952,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.307168958,
+          "demux_secs": 0.003103896,
+          "media_secs": 11.052698412698414,
+          "xrt": 35.982471942032674,
+          "cpu_secs": 0.017035000000007017,
+          "cpu_xrt": 648.8229182679108,
+          "instructions": 261488313,
+          "cycles": 50194427,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 952,
+          "samples": 487424,
+          "packets": 952,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.066458958,
+          "demux_secs": 0.00131567,
+          "media_secs": 11.052698412698414,
+          "xrt": 166.30863235469948,
+          "cpu_secs": 0.019581999999999766,
+          "cpu_xrt": 564.4315398171047,
+          "instructions": 262469648,
+          "cycles": 55406140,
+          "capped": false,
+          "sample_rate": 44100,
+          "channels": 2,
+          "frames": 952,
+          "samples": 487424,
+          "packets": 952,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 37.1552734375,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "extra:vp6f FLV"
+      ],
+      "input": "fate:flash-vp6/clip1024.flv",
+      "path": "/Users/jd/projects/fate-suite/flash-vp6/clip1024.flv",
+      "kind": "video",
+      "container": "flv",
+      "codec": "vp6f",
+      "decoder": "vp6f_pear_sw",
+      "width": 112,
+      "height": 80,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": 17.4,
+      "decode_secs": 0.496145125,
+      "xrt": 35.07038389221299,
+      "cpu_xrt": 318.38975297349543,
+      "instructions": 350895515,
+      "floor": 4.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "md5 per frame, yuv420p 112x80, FFmpeg 2da55bf -idct simple",
+        "ours": 174,
+        "ffmpeg": 174,
+        "matched": 174,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": null,
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.226288542,
+          "demux_secs": 0.001104452,
+          "media_secs": 17.4,
+          "xrt": 76.89297852296913,
+          "cpu_secs": 0.0569150000000036,
+          "cpu_xrt": 305.71905473071945,
+          "instructions": 351971895,
+          "cycles": 109996054,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 174,
+          "samples": 0,
+          "packets": 174,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.518121417,
+          "demux_secs": 0.000175632,
+          "media_secs": 17.4,
+          "xrt": 33.582861910531676,
+          "cpu_secs": 0.04456200000001331,
+          "cpu_xrt": 390.46721421827567,
+          "instructions": 349120391,
+          "cycles": 95791202,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 174,
+          "samples": 0,
+          "packets": 174,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.496145125,
+          "demux_secs": 0.000933538,
+          "media_secs": 17.4,
+          "xrt": 35.07038389221299,
+          "cpu_secs": 0.0546499999999952,
+          "cpu_xrt": 318.38975297349543,
+          "instructions": 350895515,
+          "cycles": 98291729,
+          "capped": false,
+          "sample_rate": null,
+          "channels": null,
+          "frames": 174,
+          "samples": 0,
+          "packets": 174,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 36.5634765625,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:dvaudio Ulead WAV"
+      ],
+      "input": "perf/dvaudio_ulead.wav",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/dvaudio_ulead.wav",
+      "kind": "audio",
+      "container": "wav",
+      "codec": "dvaudio",
+      "decoder": "dvaudio_sw",
+      "width": null,
+      "height": null,
+      "channels": 2,
+      "sample_rate": 48000,
+      "media_secs": 20.0,
+      "decode_secs": 0.026070042,
+      "xrt": 767.164088189808,
+      "cpu_xrt": 1659.3379241690086,
+      "instructions": 149070225,
+      "floor": 10.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "SNR vs FFmpeg 2da55bf f32 -cpuflags 0",
+        "ours": 960000,
+        "ffmpeg": 960000,
+        "matched": null,
+        "snr_db": null,
+        "pcm_exact": null,
+        "snr_text": "inf",
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.070843375,
+          "demux_secs": 0.003602249,
+          "media_secs": 20.0,
+          "xrt": 282.31291916851785,
+          "cpu_secs": 0.02083599999998853,
+          "cpu_xrt": 959.8771357271554,
+          "instructions": 155856727,
+          "cycles": 43147554,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 500,
+          "samples": 960000,
+          "packets": 1,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.02546475,
+          "demux_secs": 0.000166666,
+          "media_secs": 20.0,
+          "xrt": 785.3994246949213,
+          "cpu_secs": 0.01205299999999454,
+          "cpu_xrt": 1659.3379241690086,
+          "instructions": 149070225,
+          "cycles": 26514070,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 500,
+          "samples": 960000,
+          "packets": 1,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.026070042,
+          "demux_secs": 0.000185666,
+          "media_secs": 20.0,
+          "xrt": 767.164088189808,
+          "cpu_secs": 0.010381999999992786,
+          "cpu_xrt": 1926.4110961292522,
+          "instructions": 148931120,
+          "cycles": 25989028,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 500,
+          "samples": 960000,
+          "packets": 1,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 31.82568359375,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:pcm in MXF"
+      ],
+      "input": "perf/mpeg2_pcm.mxf",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/mpeg2_pcm.mxf",
+      "kind": "audio",
+      "container": "mxf",
+      "codec": "pcm_s16le",
+      "decoder": "pcm_s16le_sw",
+      "width": null,
+      "height": null,
+      "channels": 2,
+      "sample_rate": 48000,
+      "media_secs": 20.0,
+      "decode_secs": 0.005319792,
+      "xrt": 3759.5454859889255,
+      "cpu_xrt": 5991.6117435601,
+      "instructions": 11746234,
+      "floor": 10.0,
+      "verdict": "ok",
+      "ffmpeg_xrt": null,
+      "check": {
+        "method": "full PCM bytes vs FFmpeg 2da55bf -cpuflags 0",
+        "ours": 960000,
+        "ffmpeg": 960000,
+        "matched": null,
+        "snr_db": null,
+        "pcm_exact": true,
+        "snr_text": "inf",
+        "complete": true,
+        "error": null
+      },
+      "runs": [
+        {
+          "wall_secs": 0.005319792,
+          "demux_secs": 0.00399833,
+          "media_secs": 20.0,
+          "xrt": 3759.5454859889255,
+          "cpu_secs": 0.004183000000011816,
+          "cpu_xrt": 4781.257470701292,
+          "instructions": 13184669,
+          "cycles": 5584670,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 500,
+          "samples": 960000,
+          "packets": 500,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.007496208,
+          "demux_secs": 0.006987403,
+          "media_secs": 20.0,
+          "xrt": 2668.0156153617936,
+          "cpu_secs": 0.0032949999999942747,
+          "cpu_xrt": 6069.802731421776,
+          "instructions": 11618139,
+          "cycles": 5076539,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 500,
+          "samples": 960000,
+          "packets": 500,
+          "errors": 0,
+          "first_error": null
+        },
+        {
+          "wall_secs": 0.004300375,
+          "demux_secs": 0.003651901,
+          "media_secs": 20.0,
+          "xrt": 4650.757201406854,
+          "cpu_secs": 0.003337999999999397,
+          "cpu_xrt": 5991.6117435601,
+          "instructions": 11746234,
+          "cycles": 4916417,
+          "capped": false,
+          "sample_rate": 48000,
+          "channels": 2,
+          "frames": 500,
+          "samples": 960000,
+          "packets": 500,
+          "errors": 0,
+          "first_error": null
+        }
+      ],
+      "load_avg": 36.5634765625,
+      "note": null,
+      "error": null
+    },
+    {
+      "rows": [
+        "new:flv1 480p30"
+      ],
+      "input": "perf/flv1_480p30.flv",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/flv1_480p30.flv",
+      "kind": "video",
+      "container": "flv",
+      "codec": "flv1",
+      "decoder": null,
+      "width": 848,
+      "height": 480,
+      "channels": null,
+      "sample_rate": null,
+      "media_secs": null,
+      "decode_secs": null,
+      "xrt": null,
+      "cpu_xrt": null,
+      "instructions": null,
+      "floor": 4.0,
+      "verdict": "ERROR",
+      "ffmpeg_xrt": null,
+      "check": null,
+      "runs": [],
+      "load_avg": null,
+      "note": null,
+      "error": "no decoder for flv1"
+    },
+    {
+      "rows": [
+        "new:mp2 stereo raw"
+      ],
+      "input": "perf/mp2_stereo.mp2",
+      "path": "/Users/jd/projects/peartube-media-corpus/perf/mp2_stereo.mp2",
+      "kind": "audio",
+      "container": "mp3",
+      "codec": "mp3",
+      "decoder": "mp3",
+      "width": null,
+      "height": null,
+      "channels": 2,
+      "sample_rate": 48000,
+      "media_secs": null,
+      "decode_secs": null,
+      "xrt": null,
+      "cpu_xrt": null,
+      "instructions": null,
+      "floor": 10.0,
+      "verdict": "ERROR",
+      "ffmpeg_xrt": null,
+      "check": null,
+      "runs": [],
+      "load_avg": 32.4189453125,
+      "note": null,
+      "error": "unsupported: oxideav-mp3: decoder requires Layer III (got LayerII)"
+    }
+  ],
+  "workspace_commit": "b2abcfac48adba261ff254533cd52adc8d654ed0",
+  "harness_md5": "7138d95580d1e1f102891a9bdd4f858b",
+  "release": true,
+  "registry": [
+    {
+      "codec": "mlp",
+      "implementation": "mlp_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "truehd",
+      "implementation": "truehd_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "dts",
+      "implementation": "dca_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "rv10",
+      "implementation": "rv10_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "rv20",
+      "implementation": "rv20_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "rv30",
+      "implementation": "rv30_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "rv40",
+      "implementation": "rv40_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vp3",
+      "implementation": "vp3_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vp4",
+      "implementation": "vp4_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "msmpeg4v1",
+      "implementation": "msmpeg4v1_pear_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "msmpeg4v2",
+      "implementation": "msmpeg4v2_pear_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "msmpeg4v3",
+      "implementation": "msmpeg4v3_pear_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wmv1",
+      "implementation": "wmv1_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wmv2",
+      "implementation": "wmv2_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wmv3",
+      "implementation": "wmv3_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vc1",
+      "implementation": "vc1_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wmav1",
+      "implementation": "wmav1_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wmav2",
+      "implementation": "wmav2_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wmapro",
+      "implementation": "wmapro_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wmalossless",
+      "implementation": "wmalossless_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wmavoice",
+      "implementation": "wmavoice_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "alac",
+      "implementation": "alac_sw",
+      "measured_inputs": [
+        "perf/alac_stereo.m4a"
+      ]
+    },
+    {
+      "codec": "qdm2",
+      "implementation": "qdm2_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "qdmc",
+      "implementation": "qdmc_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mace3",
+      "implementation": "mace3_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mace6",
+      "implementation": "mace6_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "atrac1",
+      "implementation": "atrac1",
+      "measured_inputs": [
+        "fate:atrac1/chirp_tone_10-16000.aea"
+      ]
+    },
+    {
+      "codec": "atrac3",
+      "implementation": "atrac3",
+      "measured_inputs": [
+        "perf/atrac3_132k.oma"
+      ]
+    },
+    {
+      "codec": "atrac3al",
+      "implementation": "atrac3al",
+      "measured_inputs": []
+    },
+    {
+      "codec": "atrac3plus",
+      "implementation": "atrac3plus",
+      "measured_inputs": []
+    },
+    {
+      "codec": "atrac3p",
+      "implementation": "atrac3p",
+      "measured_inputs": []
+    },
+    {
+      "codec": "atrac3plusal",
+      "implementation": "atrac3plusal",
+      "measured_inputs": []
+    },
+    {
+      "codec": "atrac3pal",
+      "implementation": "atrac3pal",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wav:guid_E923AABF-CB58-4471-A119-FFFA01E4CE62",
+      "implementation": "wav:guid_E923AABF-CB58-4471-A119-FFFA01E4CE62",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vp5",
+      "implementation": "vp5_pear_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vp6",
+      "implementation": "vp6_pear_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vp6f",
+      "implementation": "vp6f_pear_sw",
+      "measured_inputs": [
+        "fate:flash-vp6/clip1024.flv"
+      ]
+    },
+    {
+      "codec": "vp6a",
+      "implementation": "vp6a_pear_sw",
+      "measured_inputs": [
+        "fate:flash-vp6/300x180-Scr-f8-056alpha.flv"
+      ]
+    },
+    {
+      "codec": "amr_nb",
+      "implementation": "amrnb_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "amr_wb",
+      "implementation": "amrwb_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "qcelp",
+      "implementation": "qcelp_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "speex",
+      "implementation": "speex_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "ra_144",
+      "implementation": "codec-ra_ra_144",
+      "measured_inputs": []
+    },
+    {
+      "codec": "ra_288",
+      "implementation": "codec-ra_ra_288",
+      "measured_inputs": []
+    },
+    {
+      "codec": "ralf",
+      "implementation": "codec-ra_ralf",
+      "measured_inputs": []
+    },
+    {
+      "codec": "cook",
+      "implementation": "codec-ra_cook",
+      "measured_inputs": []
+    },
+    {
+      "codec": "sipr",
+      "implementation": "codec-ra_sipr",
+      "measured_inputs": []
+    },
+    {
+      "codec": "pcm_u8",
+      "implementation": "pcm_u8_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "pcm_s8",
+      "implementation": "pcm_s8_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "pcm_s16le",
+      "implementation": "pcm_s16le_sw",
+      "measured_inputs": [
+        "perf/mpeg2_pcm.mxf"
+      ]
+    },
+    {
+      "codec": "pcm_s24le",
+      "implementation": "pcm_s24le_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "pcm_s32le",
+      "implementation": "pcm_s32le_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "pcm_f32le",
+      "implementation": "pcm_f32le_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "pcm_f64le",
+      "implementation": "pcm_f64le_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin",
+      "implementation": "slin_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin8",
+      "implementation": "slin8_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin16",
+      "implementation": "slin16_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin24",
+      "implementation": "slin24_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin32",
+      "implementation": "slin32_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin44",
+      "implementation": "slin44_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin48",
+      "implementation": "slin48_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin96",
+      "implementation": "slin96_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "slin192",
+      "implementation": "slin192_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "rawvideo",
+      "implementation": "rawvideo_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "ilbm",
+      "implementation": "ilbm_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "av1",
+      "implementation": "av1_sw",
+      "measured_inputs": [
+        "gen:av1_opus.mkv"
+      ]
+    },
+    {
+      "codec": "cinepak",
+      "implementation": "cinepak_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "dirac",
+      "implementation": "dirac_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "h261",
+      "implementation": "h261_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "h263",
+      "implementation": "h263_sw",
+      "measured_inputs": [
+        "perf/h263_cif.avi",
+        "perf/h263_4cif.avi"
+      ]
+    },
+    {
+      "codec": "h263i",
+      "implementation": "h263i_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "h264",
+      "implementation": "h264_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "h265",
+      "implementation": "h265",
+      "measured_inputs": []
+    },
+    {
+      "codec": "hevc",
+      "implementation": "hevc",
+      "measured_inputs": []
+    },
+    {
+      "codec": "indeo3",
+      "implementation": "indeo3_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "indeo5",
+      "implementation": "indeo5_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mjpeg",
+      "implementation": "mjpeg_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mpeg1video",
+      "implementation": "mpeg1video_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mpeg2video",
+      "implementation": "mpeg2video_sw",
+      "measured_inputs": [
+        "perf/mpeg2_pcm.mxf",
+        "fate:mxf/omneon_8.3.0.0_xdcam_startc_footer.mxf"
+      ]
+    },
+    {
+      "codec": "mpeg4video",
+      "implementation": "mpeg4video_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "div3",
+      "implementation": "msmpeg4v3_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "svq1",
+      "implementation": "svq1_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "svq3",
+      "implementation": "svq3_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "theora",
+      "implementation": "theora",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vc2",
+      "implementation": "vc2_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vp8",
+      "implementation": "vp8",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vp9",
+      "implementation": "oxideav-vp9",
+      "measured_inputs": [
+        "gen:vp9_opus.webm"
+      ]
+    },
+    {
+      "codec": "aac",
+      "implementation": "aac",
+      "measured_inputs": []
+    },
+    {
+      "codec": "ac3",
+      "implementation": "ac3_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "eac3",
+      "implementation": "eac3_sw_dec",
+      "measured_inputs": []
+    },
+    {
+      "codec": "adpcm_ms",
+      "implementation": "adpcm_ms_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "adpcm_ima_wav",
+      "implementation": "adpcm_ima_wav_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "adpcm_ima_qt",
+      "implementation": "adpcm_ima_qt_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "adpcm_yamaha",
+      "implementation": "adpcm_yamaha_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "adpcm_yamaha_a",
+      "implementation": "adpcm_yamaha_a_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "adpcm_dialogic",
+      "implementation": "adpcm_dialogic_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "adpcm_g726",
+      "implementation": "adpcm_g726_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "ape",
+      "implementation": "ape_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "flac",
+      "implementation": "flac_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "pcm_mulaw",
+      "implementation": "g711_mulaw_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "ulaw",
+      "implementation": "g711_mulaw_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "g711u",
+      "implementation": "g711_mulaw_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "pcm_alaw",
+      "implementation": "g711_alaw_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "alaw",
+      "implementation": "g711_alaw_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "g711a",
+      "implementation": "g711_alaw_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mod",
+      "implementation": "mod_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mod_planar",
+      "implementation": "mod_sw_planar",
+      "measured_inputs": []
+    },
+    {
+      "codec": "stm",
+      "implementation": "stm_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "xm",
+      "implementation": "xm_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "it",
+      "implementation": "it_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mp1",
+      "implementation": "mp1",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mp2",
+      "implementation": "mp2",
+      "measured_inputs": [
+        "perf/mp2_stereo.mka"
+      ]
+    },
+    {
+      "codec": "mp3",
+      "implementation": "mp3",
+      "measured_inputs": []
+    },
+    {
+      "codec": "musepack",
+      "implementation": "musepack_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "opus",
+      "implementation": "opus_sw",
+      "measured_inputs": [
+        "fate:opus/test-8-7.1.opus-small.ts",
+        "perf/opus_stereo.opus"
+      ]
+    },
+    {
+      "codec": "s3m",
+      "implementation": "s3m_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "s3m_multichannel",
+      "implementation": "s3m_sw_mc",
+      "measured_inputs": []
+    },
+    {
+      "codec": "tta",
+      "implementation": "tta_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "vorbis",
+      "implementation": "vorbis_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wavpack",
+      "implementation": "wavpack_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wma1",
+      "implementation": "oxideav-wma",
+      "measured_inputs": []
+    },
+    {
+      "codec": "wma2",
+      "implementation": "oxideav-wma",
+      "measured_inputs": []
+    },
+    {
+      "codec": "midi",
+      "implementation": "midi_synth",
+      "measured_inputs": []
+    },
+    {
+      "codec": "mpeg4",
+      "implementation": "mpeg4video_sw",
+      "measured_inputs": []
+    },
+    {
+      "codec": "dvvideo",
+      "implementation": "dvvideo_sw",
+      "measured_inputs": [
+        "perf/dvcprohd_1080i50.mov"
+      ]
+    },
+    {
+      "codec": "dvaudio",
+      "implementation": "dvaudio_sw",
+      "measured_inputs": [
+        "perf/dvaudio_ulead.wav"
+      ]
+    }
+  ]
+}

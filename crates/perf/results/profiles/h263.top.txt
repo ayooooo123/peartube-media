@@ -1,0 +1,65 @@
+total samples (sum of self): 9915
+
+self by function:
+   4270  43.1%  oxideav_h263::block::lookup_tcoef_prefix::h87336ab79a585df9
+   2868  28.9%  oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+    455   4.6%  oxideav_h263::motion::motion_compensate_block::hc43013408462fbff
+    343   3.5%  oxideav_h263::idct::idct_8x8::he94502e06b72f902
+    278   2.8%  oxideav_h263::dequant::dequantise_ac::h176e217477bca86a
+    204   2.1%  oxideav_core::bits::BitReader::read_bit::h5bcbcfcec1b378ff
+    187   1.9%  oxideav_h263::block::parse_block::h0cb450ee9fefd838
+    176   1.8%  oxideav_h263::picture::decode_one_macroblock::hffd61b447f4fc5f7
+    164   1.7%  oxideav_h263::macroblock::decode_mvd_component::h1acc45b496d7234e
+    158   1.6%  alloc::vec::from_elem::hcc7f1e25be930013
+    157   1.6%  _platform_memmove
+    143   1.4%  oxideav_h263::reconstruct_inter_block_with_prediction::h2908b3495635f242
+    102   1.0%  oxideav_h263::picture::blit_block::h541918059ecac19e
+     87   0.9%  oxideav_h263::picture::decode_after_picture_header_inner::ha89a32e0ee4e6c43
+     61   0.6%  oxideav_h263::macroblock::parse_macroblock::hfc9ee9b922b98938
+     48   0.5%  madvise
+     25   0.3%  oxideav_h263::picture::predict_mv::h47b7c16888309b05
+     17   0.2%  oxideav_h263::macroblock::decode_cbpy::h3b4d36370e82568c
+     16   0.2%  _$LT$T$u20$as$u20$alloc..vec..spec_from_elem..SpecFromElem$GT$::from_elem::h803768d5f6fee22b
+     15   0.2%  oxideav_h263::reconstruct_intra_block::hd46b3ca01569c24a
+     13   0.1%  oxideav_core::bits::BitReader::read_unary::he1c1ab9f194c9ce9
+     13   0.1%  oxideav_h263::picture::find_next_psc::h6c8e39ebee65468f
+     12   0.1%  oxideav_h263::picture::reconstruct_mv_coded::h749e7dc96b833dd5
+     12   0.1%  oxideav_h263::picture::record_grid::he1390f87063b015c
+     10   0.1%  DYLD-STUB$$memcpy
+     10   0.1%  _xzm_xzone_malloc_freelist_outlined
+      9   0.1%  oxideav_h263::picture::reconstruct_mv_unchecked::hf4e4c427dd22903c
+      9   0.1%  _xzm_segment_group_segment_span_free_coalesce
+      8   0.1%  oxideav_h263::picture::copy_inter_macroblock::hd93c95d3d53ab641
+      6   0.1%  oxideav_core::bits::BitReader::read_u32::h0793dfafa6fdffdc
+
+self by line:
+   2009  20.3%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/block.rs:423 oxideav_h263::block::lookup_tcoef_prefix::h87336ab79a585df9
+   1950  19.7%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/block.rs:415 oxideav_h263::block::lookup_tcoef_prefix::h87336ab79a585df9
+   1795  18.1%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:524 oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+    327   3.3%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:542 oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+    306   3.1%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/idct.rs:53 oxideav_h263::idct::idct_8x8::he94502e06b72f902
+    266   2.7%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:569 oxideav_h263::motion::motion_compensate_block::hc43013408462fbff
+    264   2.7%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/block.rs:425 oxideav_h263::block::lookup_tcoef_prefix::h87336ab79a585df9
+    204   2.1%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:525 oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+    182   1.8%  /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/core/src/cmp.rs:0 oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+    158   1.6%  /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/alloc/src/vec/mod.rs:3677 alloc::vec::from_elem::hcc7f1e25be930013
+    157   1.6%                                           _platform_memmove
+    135   1.4%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/block.rs:224 oxideav_h263::block::parse_block::h0cb450ee9fefd838
+    134   1.4%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/dequant.rs:60 oxideav_h263::dequant::dequantise_ac::h176e217477bca86a
+    120   1.2%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/macroblock.rs:997 oxideav_h263::macroblock::decode_mvd_component::h1acc45b496d7234e
+    112   1.1%  oxideav-core-fe76f981256e63d1/57e5fa9/src/bits.rs:154 oxideav_core::bits::BitReader::read_bit::h5bcbcfcec1b378ff
+     92   0.9%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:532 oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+     82   0.8%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/lib.rs:815 oxideav_h263::reconstruct_inter_block_with_prediction::h2908b3495635f242
+     79   0.8%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:537 oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+     73   0.7%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:519 oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+     69   0.7%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/dequant.rs:61 oxideav_h263::dequant::dequantise_ac::h176e217477bca86a
+     65   0.7%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/picture.rs:0 oxideav_h263::picture::decode_one_macroblock::hffd61b447f4fc5f7
+     61   0.6%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:573 oxideav_h263::motion::motion_compensate_block::hc43013408462fbff
+     59   0.6%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/picture.rs:682 oxideav_h263::picture::blit_block::h541918059ecac19e
+     57   0.6%  /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/core/src/iter/range.rs:0 oxideav_h263::motion::motion_compensate_block::hc43013408462fbff
+     53   0.5%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/motion.rs:0 oxideav_h263::motion::sample_half_pel::h980e2bd7884cfa4a
+     51   0.5%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/dequant.rs:65 oxideav_h263::dequant::dequantise_ac::h176e217477bca86a
+     48   0.5%                                           madvise
+     46   0.5%  oxideav-core-fe76f981256e63d1/57e5fa9/src/bits.rs:155 oxideav_core::bits::BitReader::read_bit::h5bcbcfcec1b378ff
+     36   0.4%  /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/core/src/slice/iter/macros.rs:0 oxideav_h263::block::lookup_tcoef_prefix::h87336ab79a585df9
+     34   0.3%  oxideav-h263-cc1f2eb42cb6ef7e/88189ab/src/lib.rs:817 oxideav_h263::reconstruct_inter_block_with_prediction::h2908b3495635f242

@@ -178,6 +178,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-als"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "oxideav-mp4",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-ape"
 version = "0.1.0"
 dependencies = [
@@ -232,6 +241,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-gsm"
+version = "0.1.0"
+dependencies = [
+ "oxideav-basic",
+ "oxideav-core",
+ "oxideav-mov",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-lpcm"
 version = "0.1.0"
 dependencies = [
@@ -254,9 +273,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-mp1"
+version = "0.1.0"
+dependencies = [
+ "mpegaudiodsp",
+ "oxideav-core",
+ "oxideav-mp3",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-musepack"
 version = "0.1.0"
 dependencies = [
+ "mpegaudiodsp",
  "oxideav-core",
  "refcheck",
 ]
@@ -277,6 +307,14 @@ dependencies = [
  "demux-rm",
  "oxideav-core",
  "oxideav-mkv",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-shorten"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
  "refcheck",
 ]
 
@@ -318,6 +356,22 @@ dependencies = [
  "compcol",
  "oxideav-core",
  "oxideav-mov",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-tak"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-tta"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
  "refcheck",
 ]
 
@@ -380,20 +434,26 @@ dependencies = [
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "codec-als",
  "codec-ape",
  "codec-apple-audio",
  "codec-atrac",
  "codec-dca",
  "codec-dv",
+ "codec-gsm",
  "codec-lpcm",
  "codec-mlp",
+ "codec-mp1",
  "codec-musepack",
  "codec-ra",
  "codec-rv",
+ "codec-shorten",
  "codec-speech",
  "codec-speex",
  "codec-svq1",
  "codec-svq3",
+ "codec-tak",
+ "codec-tta",
  "codec-vp3",
  "codec-vp56",
  "codec-wavpack",
@@ -430,7 +490,6 @@ dependencies = [
  "oxideav-mkv",
  "oxideav-mod",
  "oxideav-mov",
- "oxideav-mp1",
  "oxideav-mp2",
  "oxideav-mp3",
  "oxideav-mp4",
@@ -446,7 +505,6 @@ dependencies = [
  "oxideav-subtitle",
  "oxideav-svq",
  "oxideav-theora",
- "oxideav-tta",
  "oxideav-vc2",
  "oxideav-vorbis",
  "oxideav-vp6",
@@ -728,6 +786,10 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mpegaudiodsp"
+version = "0.1.0"
 
 [[package]]
 name = "ndk"
@@ -1249,7 +1311,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h263"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-h263?rev=e7b9b47922e996f41fbd9003e61f0a172b39200d#e7b9b47922e996f41fbd9003e61f0a172b39200d"
+source = "git+https://github.com/ayooooo123/oxideav-h263?rev=f9a411dc54f8365b4b0355cf3f83e8e8642525d1#f9a411dc54f8365b4b0355cf3f83e8e8642525d1"
 dependencies = [
  "oxideav-core",
 ]
@@ -1351,17 +1413,9 @@ dependencies = [
 [[package]]
 name = "oxideav-mov"
 version = "0.0.6"
-source = "git+https://github.com/ayooooo123/oxideav-mov?rev=3cb57f8548867149753f340f3470c281bec36010#3cb57f8548867149753f340f3470c281bec36010"
+source = "git+https://github.com/ayooooo123/oxideav-mov?rev=d6af48d7db0428583b60ae52b0f2bbc0901d4318#d6af48d7db0428583b60ae52b0f2bbc0901d4318"
 dependencies = [
  "compcol",
- "oxideav-core",
-]
-
-[[package]]
-name = "oxideav-mp1"
-version = "0.0.7"
-source = "git+https://github.com/OxideAV/oxideav-mp1?rev=e01e2d0dfa651f39d5ba05ee3129b7144282dceb#e01e2d0dfa651f39d5ba05ee3129b7144282dceb"
-dependencies = [
  "oxideav-core",
 ]
 
@@ -1376,7 +1430,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mp3"
 version = "0.1.3"
-source = "git+https://github.com/ayooooo123/oxideav-mp3?rev=ba94ce70a7e6ddb37f02713b3ca34ed5b39f7cf0#ba94ce70a7e6ddb37f02713b3ca34ed5b39f7cf0"
+source = "git+https://github.com/ayooooo123/oxideav-mp3?rev=9f353eabd1d7a7980c1fc8b5ef9fa1b5515f5bf4#9f353eabd1d7a7980c1fc8b5ef9fa1b5515f5bf4"
 dependencies = [
  "oxideav-core",
  "oxideav-id3",
@@ -1548,14 +1602,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-tta"
-version = "0.0.4"
-source = "git+https://github.com/OxideAV/oxideav-tta?rev=53432dc2b2de77f0b6de6e55f7e742fbdd11b04f#53432dc2b2de77f0b6de6e55f7e742fbdd11b04f"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
 name = "oxideav-ttf"
 version = "0.1.8"
 source = "git+https://github.com/OxideAV/oxideav-ttf?rev=ecea11566de6c72439c0b3bbdef85926db892cc9#ecea11566de6c72439c0b3bbdef85926db892cc9"
@@ -1640,6 +1686,20 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "perf"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "libc",
+ "md5",
+ "oxideav-core",
+ "refcheck",
+ "serde",
+ "serde_json",
+ "toml",
+]
 
 [[package]]
 name = "player"
