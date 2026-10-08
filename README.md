@@ -78,6 +78,16 @@ cells and order-row visit slots, 32,768 visits inside pattern loops, and two
 hours of playback at tick boundaries. Sample-budget exhaustion rejects the
 file. The renderer emits PCM incrementally, not a song-sized PCM allocation.
 
+S3M pattern loading has a separate work budget: **4 MiB of attempted pattern
+bytes per load**, with **64 KiB of payload recovery plus the two-byte length
+word per pattern**. Each parse is charged even when parapointers repeat or
+overlap. Tokens, operands, row ends and zero-filled EOF recovery count;
+exhaustion rejects the S3M load instead of accepting a partial pattern.
+Incorrect packed lengths remain ignored, as in OpenMPT `Load_s3m.cpp`:
+neither that field nor the next parapointer defines the recovery boundary.
+A dense 64-row, 32-channel pattern needs 12,354 bytes including the length
+word; all 255 such patterns need 3,150,270 bytes, below the aggregate cap.
+
 `corpus/tracker.tsv` pins the OpenMPT player tests, seven ModArchive songs,
 and generated short fixtures. The separate oracle runner compares PCM only:
 WAV timestamps are not deterministic. FFmpeg's module support is absent in

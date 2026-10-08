@@ -63,6 +63,17 @@ fn s3m_tracker_version_and_it_unfiltered_samples_match_openmpt() {
     }
 }
 
+#[test]
+fn s3m_incorrect_packed_lengths_keep_reference_playback() {
+    for length in [0u16, 1, u16::MAX] {
+        let mut data = include_bytes!("fixtures/tone.s3m").to_vec();
+        data[192..194].copy_from_slice(&length.to_le_bytes());
+        let pcm = render(&Song::load(&data).unwrap(), READ_FRAMES);
+        assert_eq!(pcm.len() / 2, 16_320);
+        assert_eq!(pcm_hash(&pcm), "b089395648efde67133b886996ce5d636cd1ab7f94e6fce53064b2d1ae6b68b0");
+    }
+}
+
 
 #[test]
 fn legacy_trackers_render_short_looped_samples() {

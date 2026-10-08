@@ -28,6 +28,13 @@ const TRK_BERO_OLD: u16 = 0x4100;
 const TRK_GRAOUMF: u16 = 0x5447;
 const TRK_NESMUSA: u16 = 0x5700;
 
+// Work counts attempted pattern-byte reads, including the ignored length word
+// and zero-filled EOF recovery. Shared/overlapping parapointers do not make
+// another parse free. A dense 64-row, 32-channel pattern needs only 12,354
+// bytes; all 255 such patterns fit below the aggregate limit.
+const MAX_PATTERN_WORK: usize = (1 << 16) + 2;
+const MAX_MODULE_PATTERN_WORK: usize = 4 << 20;
+
 /// `S3MConvert`.
 pub fn s3m_convert(m: &mut ModCommand, command: u8, param: u8, from_it: bool) {
     m.param = param;
@@ -230,6 +237,11 @@ pub fn probe(data: &[u8]) -> bool {
 
 /// `ReadS3M`.
 pub fn read(data: &[u8]) -> Option<Module> {
+    read_with_work_limits(data, MAX_MODULE_PATTERN_WORK, MAX_PATTERN_WORK)
+}
+
+// Explicit limits keep resource-bound regressions small and deterministic.
+fn read_with_work_limits(data: &[u8], mut work_left: usize, pattern_limit: usize) -> Option<Module> {
     let mut file = Reader::new(data);
     let h = file.read_slice(96)?;
     if !header_ok(h) {
@@ -478,11 +490,26 @@ pub fn read(data: &[u8]) -> Option<Module> {
         if pattern_offsets[pat] == 0 || !file.seek(pattern_offsets[pat] as usize * 16) {
             continue;
         }
+        // OpenMPT ignores incorrect packed lengths (Load_s3m.cpp:652-657).
+        // Bound recovery independently, without trusting the length or the
+        // next parapointer: patterns can share or overlap their source bytes.
+        work_left = work_left.checked_sub(2)?;
+        let mut pattern_work_left = pattern_limit.checked_sub(2)?;
         file.skip(2);
         let mut row = 0usize;
         let mut dummy = ModCommand::default();
         while row < 64 {
+            if work_left == 0 || pattern_work_left == 0 {
+                return None;
+            }
             let info = file.u8();
+            // Charge even inactive-channel tokens, row ends and missing
+            // operands which Reader zero-fills at EOF. No operand is decoded
+            // unless both budgets cover the complete token.
+            let token_work = 1 + 2 * usize::from(info & 0x20 != 0)
+                + usize::from(info & 0x40 != 0) + 2 * usize::from(info & 0x80 != 0);
+            work_left = work_left.checked_sub(token_work)?;
+            pattern_work_left = pattern_work_left.checked_sub(token_work)?;
             if info == 0 {
                 row += 1;
                 continue;
@@ -551,4 +578,67 @@ pub fn read(data: &[u8]) -> Option<Module> {
         }
     }
     Some(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_patterns(second_parapointer: u16) -> Vec<u8> {
+        let mut data = include_bytes!("../tests/fixtures/tone.s3m").to_vec();
+        data[36..38].copy_from_slice(&2u16.to_le_bytes());
+        // The fixture leaves room for another pointer before its sample.
+        data[102..104].copy_from_slice(&second_parapointer.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn s3m_pattern_budget_counts_shared_and_overlapping_regions() {
+        // The first pattern costs 2 header bytes + 70 packed bytes. An alias
+        // repeats that work; offset 13 points into its empty rows (2 + 64).
+        for (pointer, work, second_note) in [(12, 144, NOTE_MIN + 60), (13, 138, NOTE_NONE)] {
+            let data = two_patterns(pointer);
+            let module = read_with_work_limits(&data, work, 72).unwrap();
+            assert_eq!(module.patterns[0].data[0].note, NOTE_MIN + 60);
+            assert_eq!(module.patterns[1].data[0].note, second_note);
+            assert!(
+                read_with_work_limits(&data, work - 1, 72).is_none(),
+                "shared or overlapping pattern work must debit the module budget"
+            );
+        }
+    }
+
+    #[test]
+    fn s3m_pattern_budget_bounds_each_recovery() {
+        let data = include_bytes!("../tests/fixtures/tone.s3m");
+        // Enough aggregate work is not permission for unbounded recovery of
+        // one pattern. Both payload operands and row markers consume work.
+        assert!(read_with_work_limits(data, 144, 71).is_none());
+        let module = read_with_work_limits(data, 144, 72).unwrap();
+        assert_eq!(module.patterns[0].data[0].instr, 1);
+        assert_eq!(module.patterns[0].data[module.num_channels()].command, CMD_PATTERNBREAK);
+    }
+
+    #[test]
+    fn s3m_pattern_budget_counts_zero_filled_eof_reads() {
+        // Retain native recovery at physical EOF: the note token is present,
+        // its two operands are absent, and 64 implicit row ends follow.
+        let data = &include_bytes!("../tests/fixtures/tone.s3m")[..195];
+        let module = read_with_work_limits(data, 69, 69).unwrap();
+        assert_eq!(module.patterns[0].data[0].note, NOTE_MIN + 12);
+        assert!(read_with_work_limits(data, 68, 69).is_none());
+        assert!(read_with_work_limits(data, 69, 68).is_none());
+    }
+
+    #[test]
+    fn s3m_incorrect_lengths_keep_complete_pattern_commands() {
+        for length in [0u16, 1, u16::MAX] {
+            let mut data = include_bytes!("../tests/fixtures/tone.s3m").to_vec();
+            data[192..194].copy_from_slice(&length.to_le_bytes());
+            let module = read_with_work_limits(&data, 72, 72).unwrap();
+            assert_eq!(module.patterns[0].data[0].note, NOTE_MIN + 60);
+            assert_eq!(module.patterns[0].data[0].instr, 1);
+            assert_eq!(module.patterns[0].data[module.num_channels()].command, CMD_PATTERNBREAK);
+        }
+    }
 }
