@@ -236,16 +236,27 @@ ffmpeg -v error -nostdin -y \
   -cluster_size_limit 100000 -cluster_time_limit 200 flash-beep.mkv
 ```
 
-On macOS, `cargo run -p player --example apple_play -- flash-beep.mkv`
-runs the real Player and AppleBackend. Add `--software` to force engine
+On macOS, set `CARGO_TARGET_DIR` to an absolute owned directory, then run
+`sh crates/player/examples/apple_play.sh flash-beep.mkv`. The launcher builds
+with `--locked -j 2`, hard-links the executable into a temporary app bundle,
+and opens it in the foreground through LaunchServices. It prints both native
+output streams and returns the probe's exit status, not `open -W`'s status.
+The app bundle is removed after exit. Launch through this entry point for
+a foreground application lifecycle, not a daemon-launched CLI process.
+Playback starts only after a visible-surface notification, with a five-second
+deadline; no visible surface is a failure, not a skipped readback.
+
+The probe runs the real Player and AppleBackend. Add `--software` to force engine
 decoding or `--transport` for pause/seek. The harness pauses at sample points
 and reads the renderer's displayed pixel buffer, comparing its identifier
 with the audio timebase while inside the media duration. Hardware-compressed
 readback formats (such as Apple's `&8v0`) are converted by VideoToolbox into
 reused linear NV12 storage before CPU inspection; the source is still the
 displayed buffer, not a decoder input frame. No screen capture is used.
-The short probe uses a floating window: an occluded layer can retain a
-stale displayed buffer. Window visibility and renderer state are logged.
+The short probe uses a nonactivating floating panel with hiding on
+deactivation disabled. It can join other applications' window sets and
+full-screen Spaces. An occluded layer can retain a stale displayed buffer.
+Window visibility and renderer state are logged.
 Nil/unreadable readback is a hard failure; renderer queue counts and zero
 accumulated-delay counters alone are not timing proof. These are sampled
 displayed-frame offsets, not a continuous presentation-time distribution.

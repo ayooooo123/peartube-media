@@ -1,5 +1,5 @@
 //! Actual Player/AppleBackend timing smoke; no screen-capture permission.
-//! `cargo run -p player --example apple_play -- clip.mkv [--software] [--transport]`
+//! `sh crates/player/examples/apple_play.sh clip.mkv [--software] [--transport]`
 //! Requires the flash/beep clip with the 8-bit frame identifier stripe.
 //! Live renderer counters are diagnostics, not presentation proof. Once per
 //! second pause and read the actual displayed pixel buffer (AVFoundation
@@ -57,7 +57,7 @@ impl VideoSink for MeasuredVideo {
 
 fn main() {
     use objc2::{MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSWindow, NSWindowStyleMask};
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSPanel, NSWindowStyleMask};
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     let path = std::env::args().nth(1).expect("apple_play clip.mkv [--software] [--transport]");
     let software = std::env::args().any(|a| a == "--software");
@@ -68,34 +68,68 @@ fn main() {
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     app.finishLaunching();
     let frame = CGRect { origin: CGPoint { x: 40.0, y: 40.0 }, size: CGSize { width: 320.0, height: 192.0 } };
-    let window = unsafe { NSWindow::initWithContentRect_styleMask_backing_defer(
-        NSWindow::alloc(mtm), frame, NSWindowStyleMask::Titled, NSBackingStoreType::Buffered, false) };
+    let window = NSPanel::initWithContentRect_styleMask_backing_defer(
+        NSPanel::alloc(mtm), frame, NSWindowStyleMask::Titled | NSWindowStyleMask::NonactivatingPanel,
+        NSBackingStoreType::Buffered, false);
     window.setTitle(&objc2_foundation::NSString::from_str("EngineSync timing"));
     // An occluded layer can retain a stale readback. Keep this short
     // display probe visible while other applications have focus.
-    window.setLevel(objc2_app_kit::NSFloatingWindowLevel);
+    window.setFloatingPanel(true);
+    window.setHidesOnDeactivate(false);
     window.setCollectionBehavior(objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-        | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary);
-    window.makeKeyAndOrderFront(None);
-    // This standalone readback probe needs its window presented; the
-    // cooperative activate() request can leave a CLI-launched app inactive.
-    #[allow(deprecated)]
-    app.activateIgnoringOtherApps(true);
+        | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+        | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications);
     let view = window.contentView().unwrap();
     let native = AppleBackend::new();
     native.set_muted(true);
     unsafe { native.attach(std::ptr::from_ref(&*view).cast_mut().cast()); }
     native.set_frame([0.0, 0.0, 320.0, 192.0]);
     native.video_layer().setFrame(CGRect { origin: CGPoint { x: 0.0, y: 0.0 }, size: frame.size });
+    let (surface_tx, surface_rx) = std::sync::mpsc::sync_channel(1);
+    let surface_changed = block2::RcBlock::new(move |_: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+        let mtm = MainThreadMarker::new().expect("window notification off main thread");
+        let app = NSApplication::sharedApplication(mtm);
+        for window in app.windows().iter() {
+            let visible = window.occlusionState().contains(objc2_app_kit::NSWindowOcclusionState::Visible);
+            eprintln!("APPLE_SURFACE active={} visible={} occlusion={:?} on_active_space={} screen={}",
+                app.isActive(), window.isVisible(), window.occlusionState(),
+                window.isOnActiveSpace(), window.screen().is_some());
+            if visible { let _ = surface_tx.try_send(()); }
+        }
+    });
+    // The callback captures only a Send channel; this window posts on main.
+    let _surface_observer = unsafe {
+        objc2_foundation::NSNotificationCenter::defaultCenter()
+            .addObserverForName_object_queue_usingBlock(
+                Some(objc2_app_kit::NSWindowDidChangeOcclusionStateNotification),
+                Some(&window), None, &surface_changed)
+    };
+    dispatch2::DispatchQueue::main().exec_async(|| {
+        let mtm = MainThreadMarker::new().unwrap();
+        let app = NSApplication::sharedApplication(mtm);
+        for window in app.windows().iter() {
+            window.orderFrontRegardless();
+        }
+    });
     let backend = Arc::new(Measured { native, audio_clock: Mutex::new(None), software });
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            surface_rx.recv_timeout(Duration::from_secs(5))
+                .expect("no visible AppKit surface; launch with apple_play.sh in a graphical session");
             if audio_tail { measure_audio_tail(path, backend) }
             else { measure(path, backend, transport) }
         }));
         if let Err(e) = &result { eprintln!("Apple timing smoke failed: {e:?}"); }
         dispatch2::run_on_main(|_| READBACK.with(|slot| { slot.borrow_mut().take(); }));
-        std::process::exit(if result.is_ok() { 0 } else { 1 });
+        let code = if result.is_ok() { 0 } else { 1 };
+        // LaunchServices' `open -W` status is not the application's exit code.
+        if let Some(path) = std::env::var_os("APPLE_PLAY_EXIT_STATUS") {
+            if let Err(error) = std::fs::write(path, code.to_string()) {
+                eprintln!("Cannot write native probe exit status: {error}");
+                std::process::exit(1);
+            }
+        }
+        std::process::exit(code);
     });
     app.run();
 }
