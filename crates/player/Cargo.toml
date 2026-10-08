@@ -21,8 +21,6 @@ https = ["oxideav-http/tls"]
 audio-trim = { path = "../audio-trim" }
 oxideav-core.workspace = true
 oxideav-http.workspace = true
-oxideav-ass = { workspace = true, features = ["render"] }
-oxideav-subtitle = { workspace = true, features = ["text"] }
 md5 = "0.7"
 libc = "0.2"
 thiserror = "2"
@@ -31,6 +29,7 @@ parking_lot = "0.12"
 subs-cc = { path = "../subs-cc" }
 subs-bitmap = { path = "../subs-bitmap" }
 subs-text = { path = "../subs-text" }
+subs-render = { path = "../subs-render" }
 unicode-bidi = "0.3.18"
 
 [target.'cfg(target_os = "android")'.dependencies]
@@ -56,6 +55,7 @@ objc2-app-kit = "0.3"
 objc2-ui-kit = "0.3"
 
 [dev-dependencies]
+oxideav-subtitle = { workspace = true, features = ["text"] }
 oxideav-mp4.workspace = true
 oxideav-ogg.workspace = true
 oxideav-h264.workspace = true

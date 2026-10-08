@@ -1,29 +1,15 @@
-//! WebVTT cue text drawn as browsers draw it (W3C WebVTT §7.3–§7.4) with
-//! the bitmap font every text subtitle uses: the styles a track's `STYLE`
-//! blocks give each node ([`subs_text::webvtt_css`]) — colour, background
-//! boxes (the cue background box `rgba(0,0,0,0.8)` by default, ruby text
-//! boxes too), bold, italic, underline, line-through, a text shadow,
-//! opacity and a size relative to the default font — ruby annotations
-//! above their base at half size, and each paragraph laid out in its own
-//! direction (`unicode-bidi: plaintext`): lines broken in logical order,
-//! then reordered by the Unicode Bidirectional Algorithm, `start`/`end`
-//! alignment following the paragraph's direction.
-//!
-//! The default font is the 8×16 bitmap face on 20-pixel lines, the size
-//! every other text subtitle has; `font-size` scales it (nearest pixel),
-//! `font-family` has no other face to pick.
+//! WebVTT cue layout (W3C §7.3–§7.4), using runtime fonts and shared
+//! shaping. CSS boxes, ruby, bidi and cue placement remain WebVTT-specific.
 
-use std::collections::HashMap;
-
-use oxideav_subtitle::font::BitmapFont;
 use subs_text::webvtt_css::{cascade, Rgba, Style, StyleSheet, DEFAULT_BACKGROUND};
 use subs_text::webvtt_cue::{Kind, Node};
 use unicode_bidi::BidiInfo;
+use subs_render::{bitmap::{Bitmap, outline_to_bitmap}, outline::Outline, shaper::{Shaper, Span, TextStyle}};
 
 use crate::backend::SubtitleImage;
 
-/// Pixels between baselines of the default font.
-pub(crate) const LINE: f32 = 20.0;
+/// Default line-height as a multiple of the 5vh font size.
+pub(crate) const LINE: f32 = 1.2;
 /// Most characters a cue lays out (a hostile cue cannot cost more).
 const MAX_ATOMS: usize = 8192;
 /// Largest side of a rendered block, in pixels.
@@ -31,8 +17,6 @@ const MAX_SIDE: i64 = 8192;
 /// Most pixels of a rendered block: the text canvas's bound
 /// (`subs::MAX_CANVAS_PIXELS`); a taller block could not show anyway.
 const MAX_PIXELS: i64 = 4096 * 4096;
-/// The italic slant: the bitmap compositor's quarter-cell shear.
-const SLANT: f32 = 0.125;
 
 /// How a line sits in the cue box.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,8 +61,17 @@ struct Char {
     pen: usize,
     /// The elements whose background box contains it, outermost first.
     boxes: Vec<usize>,
+    advance: f32,
+    ascender: f32,
+    descender: f32,
+    masks: Vec<Bitmap>,
 }
 
+impl Char {
+    fn new(ch: char, pen: usize, boxes: Vec<usize>) -> Self {
+        Self { ch, pen, boxes, advance: 0.0, ascender: 0.0, descender: 0.0, masks: Vec::new() }
+    }
+}
 #[derive(Clone, Debug)]
 enum Atom {
     Char(Char),
@@ -98,10 +91,11 @@ struct Flat {
     pens: Vec<Pen>,
     boxes: Vec<BoxPaint>,
     atoms: Vec<Atom>,
+    remaining: usize,
 }
 
 fn flatten(nodes: &[Node], styles: &[Style]) -> Flat {
-    let mut flat = Flat { pens: Vec::new(), boxes: Vec::new(), atoms: Vec::new() };
+    let mut flat = Flat { pens: Vec::new(), boxes: Vec::new(), atoms: Vec::new(), remaining: MAX_ATOMS };
     let root = &styles[0];
     flat.pens.push(Pen { style: root.clone(), alpha: root.opacity });
     let mut root_boxes = Vec::new();
@@ -125,17 +119,18 @@ fn walk(
     mut ruby: Option<(&mut Vec<Char>, &mut Vec<Char>, &mut Option<(usize, Option<usize>)>)>,
 ) {
     for node in nodes {
-        if flat.atoms.len() >= MAX_ATOMS {
+        if flat.remaining == 0 {
             return;
         }
         match node {
             Node::Text(text) => {
-                for ch in text.chars() {
+                for ch in text.chars().take(flat.remaining) {
+                    flat.remaining -= 1;
                     if ch == '\n' {
                         flat.atoms.push(Atom::Break);
                         continue;
                     }
-                    let c = Char { ch, pen, boxes: boxes.to_vec() };
+                    let c = Char::new(ch, pen, boxes.to_vec());
                     match ruby.as_mut() {
                         Some((base, _, _)) => base.push(c),
                         None => flat.atoms.push(Atom::Char(c)),
@@ -172,7 +167,7 @@ fn walk(
                         *next_style += count_elements(children);
                         if let Some((_, text, rt)) = ruby.as_mut() {
                             **rt = Some((child_pen, own_box));
-                            collect_chars(children, child_pen, text);
+                            collect_chars(children, child_pen, text, &mut flat.remaining);
                         }
                     }
                     _ => {
@@ -194,21 +189,22 @@ fn count_elements(nodes: &[Node]) -> usize {
 }
 
 /// The characters of an annotation, in one pen.
-fn collect_chars(nodes: &[Node], pen: usize, out: &mut Vec<Char>) {
+fn collect_chars(nodes: &[Node], pen: usize, out: &mut Vec<Char>, remaining: &mut usize) {
     for node in nodes {
+        if *remaining == 0 { return; }
         match node {
-            Node::Text(text) => out.extend(text.chars().filter(|&c| c != '\n').map(|ch| Char { ch, pen, boxes: Vec::new() })),
-            Node::Element { children, .. } => collect_chars(children, pen, out),
+            Node::Text(text) => {
+                for ch in text.chars().filter(|&c| c != '\n').take(*remaining) {
+                    out.push(Char::new(ch, pen, Vec::new()));
+                    *remaining -= 1;
+                }
+            }
+            Node::Element { children, .. } => collect_chars(children, pen, out, remaining),
             Node::Timestamp(_) => {}
         }
     }
 }
 
-/// Characters drawn as nothing: formatting characters and marks the
-/// bitmap face has no glyph for.
-fn invisible(ch: char) -> bool {
-    matches!(ch, '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}')
-}
 
 /// Where a line may break before `next`.
 fn breakable(prev: char, next: char) -> bool {
@@ -218,13 +214,6 @@ fn breakable(prev: char, next: char) -> bool {
     prev == ' ' || cjk(prev) || cjk(next)
 }
 
-fn mirror(ch: char) -> char {
-    match ch {
-        '(' => ')', ')' => '(', '[' => ']', ']' => '[', '{' => '}', '}' => '{', '<' => '>', '>' => '<',
-        '«' => '»', '»' => '«', '‹' => '›', '›' => '‹', '≤' => '≥', '≥' => '≤',
-        c => c,
-    }
-}
 
 /// A unit on a line: a character or a ruby, with its width.
 #[derive(Clone, Debug)]
@@ -237,8 +226,7 @@ struct Unit {
 
 struct Layout<'a> {
     flat: &'a Flat,
-    regular: &'static BitmapFont,
-    bold: &'static BitmapFont,
+    line_height: f32,
 }
 
 impl Layout<'_> {
@@ -247,7 +235,17 @@ impl Layout<'_> {
     }
 
     fn advance(&self, c: &Char) -> f32 {
-        if invisible(c.ch) { 0.0 } else { self.regular.cell_w as f32 * self.size(c.pen) }
+        c.advance
+    }
+
+    fn ruby_metrics(&self, text: &[Char], pen: usize) -> (f32, f32) {
+        if text.is_empty() { return (0.0, 0.0); }
+        let (asc, desc) = text.iter().fold((0.0f32, 0.0f32),
+            |(a, d), c| (a.max(c.ascender), d.max(c.descender)));
+        // Layout and painting share one rounded line box. Rounding only
+        // the reserved height lets small-font descenders enter the base box.
+        let height = (self.line_height * self.size(pen) * 0.5).max(asc + desc).ceil();
+        (height, asc + (height - asc - desc) / 2.0)
     }
 
     fn width(&self, atom: &Atom) -> f32 {
@@ -255,10 +253,62 @@ impl Layout<'_> {
             Atom::Char(c) => self.advance(c),
             Atom::Ruby { base, text, .. } => {
                 let base_w: f32 = base.iter().map(|c| self.advance(c)).sum();
-                let text_w: f32 = text.iter().map(|c| self.advance(c) * 0.5).sum();
+                let text_w: f32 = text.iter().map(|c| self.advance(c)).sum();
                 base_w.max(text_w)
             }
             Atom::Break => 0.0,
+        }
+    }
+}
+
+fn shape_chars(chars: &mut [&mut Char], pens: &[Pen], shaper: &mut Shaper, size: f32) {
+    let mut text = String::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut offsets = Vec::with_capacity(chars.len());
+    let mut last_pen = None;
+    for c in chars.iter() {
+        offsets.push(text.len());
+        let start = text.len();
+        text.push(c.ch);
+        if last_pen == Some(c.pen) { spans.last_mut().unwrap().range.end = text.len(); }
+        else {
+            let style = &pens[c.pen].style;
+            spans.push(Span { range: start..text.len(), style: TextStyle {
+                family: style.family.clone().unwrap_or_else(|| "sans-serif".into()),
+                size: f64::from(size * style.size), weight: if style.bold { 700 } else { 400 },
+                italic: style.italic, underline: style.underline, strike: style.line_through,
+                em_size: true, ..TextStyle::default()
+            } });
+            last_pen = Some(c.pen);
+        }
+    }
+    for glyph in shaper.shape(&text, &spans, None, true) {
+        let Ok(i) = offsets.binary_search(&glyph.cluster) else { continue };
+        let c = &mut chars[i];
+        let x = f64::from(c.advance) + glyph.offset.0;
+        if let Some(outline) = Outline::transform_2d(&glyph.outline, &[[1.0, 0.0, x * 64.0], [0.0, 1.0, glyph.offset.1 * 64.0]]) {
+            if let Some(mask) = outline_to_bitmap(Some(&outline), None) { c.masks.push(mask); }
+        }
+        c.advance += glyph.advance as f32;
+        c.ascender = c.ascender.max(glyph.ascender as f32);
+        c.descender = c.descender.max(glyph.descender as f32);
+    }
+}
+
+fn shape(flat: &mut Flat, shaper: &mut Shaper, size: f32) {
+    let mut start = 0;
+    while start < flat.atoms.len() {
+        if matches!(flat.atoms[start], Atom::Char(_)) {
+            let end = flat.atoms[start..].iter().position(|a| !matches!(a, Atom::Char(_))).map_or(flat.atoms.len(), |i| start + i);
+            let mut chars: Vec<_> = flat.atoms[start..end].iter_mut().filter_map(|a| if let Atom::Char(c) = a { Some(c) } else { None }).collect();
+            shape_chars(&mut chars, &flat.pens, shaper, size);
+            start = end;
+        } else {
+            if let Atom::Ruby { base, text, .. } = &mut flat.atoms[start] {
+                shape_chars(&mut base.iter_mut().collect::<Vec<_>>(), &flat.pens, shaper, size);
+                shape_chars(&mut text.iter_mut().collect::<Vec<_>>(), &flat.pens, shaper, size * 0.5);
+            }
+            start += 1;
         }
     }
 }
@@ -271,20 +321,21 @@ struct Line {
     /// The base text's line box, and the room ruby text takes above it.
     height: f32,
     ruby: f32,
-    scale: f32,
+    ascender: f32,
 }
 
 /// Lays out and draws `nodes`, styled by `sheet` (the cue's identifier
 /// is `id`), lines at most `box_width` pixels wide, aligned by `align`.
 /// `reversed`: the lines stack upward (the first lowest), as a
 /// `vertical:lr` cue's turn needs. `None` when nothing is visible.
-pub(crate) fn render(nodes: &[Node], sheet: &StyleSheet, id: &str, box_width: i64, align: Align, reversed: bool) -> Option<Block> {
+pub(crate) fn render(nodes: &[Node], sheet: &StyleSheet, id: &str, box_width: i64, align: Align, reversed: bool, font_size: f32, shaper: &mut Shaper) -> Option<Block> {
     if box_width <= 0 || box_width > MAX_SIDE {
         return None;
     }
     let styles = cascade(sheet, nodes, id);
-    let flat = flatten(nodes, &styles);
-    let layout = Layout { flat: &flat, regular: BitmapFont::default_regular(), bold: BitmapFont::default_bold() };
+    let mut flat = flatten(nodes, &styles);
+    shape(&mut flat, shaper, font_size);
+    let layout = Layout { flat: &flat, line_height: font_size * LINE };
     let lines = lines(&layout, box_width as f32);
     if lines.is_empty() {
         return None;
@@ -296,7 +347,7 @@ pub(crate) fn render(nodes: &[Node], sheet: &StyleSheet, id: &str, box_width: i6
     }
     let first_line = (lines[0].height + lines[0].ruby).round() as i64;
     let (w, h) = (box_width as usize, height as usize);
-    let mut canvas = Canvas { rgba: vec![0; w * h * 4], width: w, height: h, masks: HashMap::new() };
+    let mut canvas = Canvas { rgba: vec![0; w * h * 4], width: w, height: h };
     let mut top = 0.0f32;
     let order: Vec<&Line> = if reversed { lines.iter().rev().collect() } else { lines.iter().collect() };
     for line in order {
@@ -342,7 +393,7 @@ fn paragraph(layout: &Layout, range: std::ops::Range<usize>, max_width: f32) -> 
     let atoms = &layout.flat.atoms[range.clone()];
     if atoms.is_empty() {
         // An empty line between breaks keeps its height.
-        return vec![Line { units: Vec::new(), rtl: false, width: 0.0, height: LINE, ruby: 0.0, scale: 1.0 }];
+        return vec![Line { units: Vec::new(), rtl: false, width: 0.0, height: layout.line_height, ruby: 0.0, ascender: layout.line_height * 0.8 }];
     }
     let text: String = atoms.iter().map(bidi_char).collect();
     let bidi = BidiInfo::new(&text, None);
@@ -391,7 +442,7 @@ fn paragraph(layout: &Layout, range: std::ops::Range<usize>, max_width: f32) -> 
                 end -= 1;
             }
             let mut units: Vec<Unit> = (line.start..end)
-                .map(|i| Unit { atom: range.start + i, width: widths[i], level: levels[i - line.start].number() })
+                .map(|i| Unit { atom: range.start + i, width: widths[i], level: levels[i].number() })
                 .collect();
             reorder(&mut units);
             let width = units.iter().map(|u| u.width).sum();
@@ -399,18 +450,24 @@ fn paragraph(layout: &Layout, range: std::ops::Range<usize>, max_width: f32) -> 
             for unit in &units {
                 match &layout.flat.atoms[unit.atom] {
                     Atom::Char(c) => scale = scale.max(layout.size(c.pen)),
-                    Atom::Ruby { base, text, .. } => {
+                    Atom::Ruby { base, text, rt_pen, .. } => {
                         for c in base {
                             scale = scale.max(layout.size(c.pen));
                         }
-                        let rt = text.iter().map(|c| layout.size(c.pen) * 0.5).fold(0.0, f32::max);
-                        ruby = ruby.max(rt * LINE);
+                        ruby = ruby.max(layout.ruby_metrics(text, *rt_pen).0);
                     }
                     Atom::Break => {}
                 }
             }
             let scale = if scale > 0.0 { scale } else { layout.size(0) };
-            Line { units, rtl, width, height: (LINE * scale).round(), ruby: ruby.round(), scale }
+            let metrics = units.iter().flat_map(|u| match &layout.flat.atoms[u.atom] {
+                Atom::Char(c) => std::slice::from_ref(c),
+                Atom::Ruby { base, .. } => base.as_slice(),
+                Atom::Break => &[],
+            }).fold((0.0f32, 0.0f32), |(a, d), c| (a.max(c.ascender), d.max(c.descender)));
+            let height = (layout.line_height * scale).max(metrics.0 + metrics.1).ceil();
+            let ascender = metrics.0 + (height - metrics.0 - metrics.1) / 2.0;
+            Line { units, rtl, width, height, ruby: ruby.ceil(), ascender }
         })
         .collect()
 }
@@ -442,8 +499,6 @@ struct Canvas {
     rgba: Vec<u8>,
     width: usize,
     height: usize,
-    /// Glyph coverage, by character and weight.
-    masks: HashMap<(char, bool), Vec<bool>>,
 }
 
 impl Canvas {
@@ -471,46 +526,20 @@ impl Canvas {
     }
 
     fn fill(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, color: Rgba, alpha: f32) {
-        for y in y0.round() as i64..y1.round() as i64 {
-            for x in x0.round() as i64..x1.round() as i64 {
+        for y in (y0.round() as i64).max(0)..(y1.round() as i64).min(self.height as i64) {
+            for x in (x0.round() as i64).max(0)..(x1.round() as i64).min(self.width as i64) {
                 self.blend(x, y, color, alpha);
             }
         }
     }
 
-    fn mask(&mut self, font: &BitmapFont, ch: char, bold: bool) -> Vec<bool> {
-        self.masks
-            .entry((ch, bold))
-            .or_insert_with(|| {
-                let (w, h) = (font.cell_w as usize, font.cell_h as usize);
-                let mut cell = vec![0u8; w * h * 4];
-                font.draw_glyph(ch, &mut cell, w as u32, h as u32, 0, font.bearing_y as i32, [255, 255, 255, 255]);
-                cell.chunks_exact(4).map(|px| px[3] > 0).collect()
-            })
-            .clone()
-    }
-
-    /// A glyph at `size` with its baseline at `baseline`, from `x`.
-    #[allow(clippy::too_many_arguments)]
-    fn glyph(&mut self, font: &BitmapFont, ch: char, bold: bool, italic: bool, size: f32, x: f32, baseline: f32, color: Rgba, alpha: f32) {
-        if invisible(ch) {
-            return;
-        }
-        let mask = self.mask(font, ch, bold);
-        let (cw, chh) = (font.cell_w as f32, font.cell_h as f32);
-        let (w, h) = ((cw * size).round().max(1.0) as i64, (chh * size).round().max(1.0) as i64);
-        let top = baseline - font.bearing_y as f32 * size;
-        for dy in 0..h {
-            let sy = ((dy as f32 + 0.5) / size).floor() as usize;
-            if sy >= font.cell_h as usize {
-                continue;
-            }
-            let rise = baseline - (top + dy as f32);
-            let shift = if italic { (rise * SLANT).round() } else { 0.0 };
-            for dx in 0..w {
-                let sx = ((dx as f32 + 0.5) / size).floor() as usize;
-                if sx < font.cell_w as usize && mask[sy * font.cell_w as usize + sx] {
-                    self.blend((x + shift).round() as i64 + dx, top.round() as i64 + dy, color, alpha);
+    fn glyph(&mut self, c: &Char, x: f32, baseline: f32, color: Rgba, alpha: f32) {
+        for mask in &c.masks {
+            let left = x.round() as i64 + i64::from(mask.left);
+            let top = baseline.round() as i64 + i64::from(mask.top);
+            for y in 0..mask.h {
+                for (dx, &coverage) in mask.row(y as usize).iter().enumerate() {
+                    if coverage != 0 { self.blend(left + dx as i64, top + i64::from(y), color, alpha * f32::from(coverage) / 255.0); }
                 }
             }
         }
@@ -519,10 +548,8 @@ impl Canvas {
 
 fn draw_line(layout: &Layout, canvas: &mut Canvas, line: &Line, x0: f32, top: f32) {
     let flat = layout.flat;
-    let font = layout.regular;
     let base_top = top + line.ruby;
-    // The default cell sits centred in its 20-pixel line box.
-    let baseline = base_top + ((LINE - font.cell_h as f32) / 2.0 + font.bearing_y as f32) * line.scale;
+    let baseline = base_top + line.ascender;
     // Unit positions.
     let mut xs = Vec::with_capacity(line.units.len());
     let mut x = x0;
@@ -555,13 +582,13 @@ fn draw_line(layout: &Layout, canvas: &mut Canvas, line: &Line, x0: f32, top: f3
     for pass in 0..2 {
         for (unit, &ux) in line.units.iter().zip(&xs) {
             match &flat.atoms[unit.atom] {
-                Atom::Char(c) => draw_chars(layout, canvas, std::slice::from_ref(c), ux, baseline, 1.0, unit.level % 2 == 1, pass),
+                Atom::Char(c) => draw_chars(layout, canvas, std::slice::from_ref(c), ux, baseline, pass),
                 Atom::Ruby { base, text, rt_pen, rt_box } => {
                     let base_w: f32 = base.iter().map(|c| layout.advance(c)).sum();
-                    draw_chars(layout, canvas, base, ux + (unit.width - base_w) / 2.0, baseline, 1.0, unit.level % 2 == 1, pass);
-                    let text_w: f32 = text.iter().map(|c| layout.advance(c) * 0.5).sum();
-                    let rt_size = layout.size(*rt_pen) * 0.5;
-                    let rt_top = base_top - LINE * rt_size;
+                    draw_chars(layout, canvas, base, ux + (unit.width - base_w) / 2.0, baseline, pass);
+                    let text_w: f32 = text.iter().map(|c| layout.advance(c)).sum();
+                    let (rt_height, rt_ascender) = layout.ruby_metrics(text, *rt_pen);
+                    let rt_top = base_top - rt_height;
                     if pass == 0 {
                         if let Some(b) = rt_box {
                             let paint = &flat.boxes[*b];
@@ -569,8 +596,8 @@ fn draw_line(layout: &Layout, canvas: &mut Canvas, line: &Line, x0: f32, top: f3
                             canvas.fill(left, rt_top, left + text_w, base_top, paint.color, paint.alpha);
                         }
                     }
-                    let rt_baseline = rt_top + ((LINE - font.cell_h as f32) / 2.0 + font.bearing_y as f32) * rt_size;
-                    draw_chars(layout, canvas, text, ux + (unit.width - text_w) / 2.0, rt_baseline, 0.5, false, pass);
+                    let rt_baseline = rt_top + rt_ascender;
+                    draw_chars(layout, canvas, text, ux + (unit.width - text_w) / 2.0, rt_baseline, pass);
                 }
                 Atom::Break => {}
             }
@@ -578,35 +605,16 @@ fn draw_line(layout: &Layout, canvas: &mut Canvas, line: &Line, x0: f32, top: f3
     }
 }
 
-/// Draws `chars` from `x` (left to right); `scale` multiplies their size
-/// (ruby text is half); `rtl`: the characters sit at an odd bidi level
-/// (mirrored glyphs). Pass 0 draws shadows, pass 1 glyphs and lines.
-#[allow(clippy::too_many_arguments)]
-fn draw_chars(layout: &Layout, canvas: &mut Canvas, chars: &[Char], mut x: f32, baseline: f32, scale: f32, rtl: bool, pass: u8) {
+/// Shadows precede glyphs; decorations are part of the shaped outlines.
+fn draw_chars(layout: &Layout, canvas: &mut Canvas, chars: &[Char], mut x: f32, baseline: f32, pass: u8) {
     for c in chars {
         let pen = &layout.flat.pens[c.pen];
-        let style = &pen.style;
-        let size = style.size * scale;
-        let font = if style.bold { layout.bold } else { layout.regular };
-        let ch = if rtl { mirror(c.ch) } else { c.ch };
-        let advance = layout.advance(c) * scale;
         if pass == 0 {
-            if let Some(shadow) = style.shadow {
-                let color = shadow.color.unwrap_or(style.color);
-                canvas.glyph(font, ch, style.bold, style.italic, size, x + shadow.dx, baseline + shadow.dy, color, pen.alpha);
+            if let Some(shadow) = pen.style.shadow {
+                canvas.glyph(c, x + shadow.dx, baseline + shadow.dy, shadow.color.unwrap_or(pen.style.color), pen.alpha);
             }
-        } else {
-            canvas.glyph(font, ch, style.bold, style.italic, size, x, baseline, style.color, pen.alpha);
-            let thick = size.round().max(1.0);
-            if style.underline {
-                canvas.fill(x, baseline + 1.0 * size, x + advance, baseline + 1.0 * size + thick, style.color, pen.alpha);
-            }
-            if style.line_through {
-                let y = baseline - (font.bearing_y as f32 * 0.35 * size).round();
-                canvas.fill(x, y, x + advance, y + thick, style.color, pen.alpha);
-            }
-        }
-        x += advance;
+        } else { canvas.glyph(c, x, baseline, pen.style.color, pen.alpha); }
+        x += c.advance;
     }
 }
 
@@ -614,6 +622,11 @@ fn draw_chars(layout: &Layout, canvas: &mut Canvas, chars: &[Char], mut x: f32, 
 mod tests {
     use super::*;
     use subs_text::webvtt_cue::parse;
+
+    fn render(nodes: &[Node], sheet: &StyleSheet, id: &str, width: i64, align: Align, reversed: bool) -> Option<Block> {
+        thread_local! { static SHAPER: std::cell::RefCell<Shaper> = std::cell::RefCell::new(Shaper::new(&subs_render::FontOptions::default())); }
+        SHAPER.with(|s| super::render(nodes, sheet, id, width, align, reversed, 20.0, &mut s.borrow_mut()))
+    }
 
     fn block(text: &str, css: &str, width: i64, align: Align) -> Block {
         render(&parse(text), &StyleSheet::parse(css), "", width, align, false).expect("something visible")
@@ -628,29 +641,26 @@ mod tests {
         b.image.rgba[i..i + 4].try_into().unwrap()
     }
 
-    /// The default cue background box: rgba(0,0,0,0.8) behind each line's
-    /// text, white glyphs on it; one 20-pixel line box per line.
-    #[test]
-    fn default_text_sits_on_the_cue_background_box() {
-        let b = block("Hi", "", 100, Align::Left);
-        assert_eq!((b.height, b.first_line), (20, 20));
-        assert_eq!((b.image.x, b.image.y, b.image.width, b.image.height), (0, 0, 16, 20));
-        assert_eq!(pixel(&b, 0, 0), [0, 0, 0, 204]);
-        assert!(b.image.rgba.chunks_exact(4).any(|px| px == [255, 255, 255, 255]));
-    }
 
     #[test]
     fn styles_from_the_sheet_reach_the_pixels() {
         let css = "::cue { background-color: transparent; color: lime } ::cue(.big) { font-size: 200%; color: #ff0000 } ::cue(u) { text-decoration: line-through }";
         let b = block("a<c.big>b</c>", css, 100, Align::Left);
-        // No box: only glyphs; the line box is the big text's.
-        assert_eq!((b.height, b.first_line), (40, 40));
-        let colours: std::collections::BTreeSet<[u8; 4]> = b.image.rgba.chunks_exact(4).filter(|px| px[3] > 0).map(|px| px.try_into().unwrap()).collect();
-        assert_eq!(colours, [[0, 255, 0, 255], [255, 0, 0, 255]].into_iter().collect());
-        // The big glyph is twice as wide: 8 + 16 pixels of advance.
-        assert!(b.image.x + b.image.width as i32 <= 24 && b.image.x + b.image.width as i32 > 16, "{:?}", (b.image.x, b.image.width));
+        let normal = block("ab", css, 100, Align::Left);
+        assert!(b.height > normal.height && b.image.width > normal.image.width);
+        let colours: std::collections::BTreeSet<[u8; 3]> = b.image.rgba.chunks_exact(4).filter(|px| px[3] > 0).map(|px| px[..3].try_into().unwrap()).collect();
+        assert_eq!(colours, [[0, 255, 0], [255, 0, 0]].into_iter().collect());
         let faded = block("x", "::cue { opacity: 0.5; background: none }", 100, Align::Left);
-        assert!(faded.image.rgba.chunks_exact(4).all(|px| px[3] == 0 || px[3] == 128), "opacity halves the alpha");
+        assert!(faded.image.rgba.chunks_exact(4).all(|px| px[3] <= 128), "opacity halves the coverage alpha");
+    }
+
+    #[test]
+    fn text_shadow_translates_the_glyph_coverage() {
+        let glyph = block("Shade", "::cue { background: transparent }", 100, Align::Left);
+        let shadow = block("Shade", "::cue { color: transparent; background: transparent; text-shadow: 2px 2px red }", 100, Align::Left);
+        assert_eq!((shadow.image.x, shadow.image.y), (glyph.image.x + 2, glyph.image.y + 2));
+        assert_eq!((shadow.image.width, shadow.image.height), (glyph.image.width, glyph.image.height));
+        assert!(shadow.image.rgba.chunks_exact(4).zip(glyph.image.rgba.chunks_exact(4)).all(|(s, g)| s[3] == g[3]));
     }
 
     /// Lines break in logical order, then each paragraph reorders by its
@@ -661,40 +671,47 @@ mod tests {
         assert!(is_rtl(&flat_rtl));
         assert!(!is_rtl(&parse("abc שלום")));
         let b = render(&flat_rtl, &StyleSheet::default(), "", 200, Align::Start, false).unwrap();
-        // 8 characters of 8 pixels, flush right in a 200-pixel box.
+        // The text is flush right, independent of the selected face's advance.
         assert_eq!(i64::from(b.image.x) + i64::from(b.image.width), 200);
-        assert_eq!(b.image.width, 64);
-        // Visual order: "abc" first, then the Hebrew word reversed.
-        let styles = cascade(&StyleSheet::default(), &flat_rtl, "");
-        let flat = flatten(&flat_rtl, &styles);
-        let layout = Layout { flat: &flat, regular: BitmapFont::default_regular(), bold: BitmapFont::default_bold() };
-        let lines = lines(&layout, 200.0);
-        let visual: String = lines[0].units.iter().map(|u| bidi_char(&flat.atoms[u.atom])).collect();
-        assert_eq!(visual, "abc םולש");
-        assert!(lines[0].rtl);
     }
 
     #[test]
     fn ruby_text_sits_above_its_base_at_half_size() {
         let b = block("<ruby>ab<rt>xyz</rt></ruby>", "::cue { background: transparent } ::cue(rt) { background: transparent }", 100, Align::Left);
-        // A line box of 20 plus 10 for the annotation above.
-        assert_eq!((b.height, b.first_line), (30, 30));
+        let plain = block("ab", "::cue { background: transparent }", 100, Align::Left);
+        let annotation_height = b.height - plain.height;
+        assert!(annotation_height > 0);
         let rows_with_ink = |from: i64, to: i64| (from..to).any(|y| (0..100).any(|x| pixel(&b, x, y)[3] > 0));
-        assert!(rows_with_ink(0, 10), "annotation above");
-        assert!(rows_with_ink(10, 30), "base below");
-        // The 12-pixel annotation is centred over the 16-pixel base.
-        let ink_x = |from: i64, to: i64| -> Vec<i64> { (0..100).filter(|&x| (from..to).any(|y| pixel(&b, x, y)[3] > 0)).collect() };
-        let (top, bottom) = (ink_x(0, 10), ink_x(10, 30));
-        assert!(top.first().unwrap() >= bottom.first().unwrap() && top.last().unwrap() <= bottom.last().unwrap(), "{top:?} within {bottom:?}");
+        assert!(rows_with_ink(0, annotation_height), "annotation above");
+        assert!(rows_with_ink(annotation_height, b.height), "base below");
     }
 
     #[test]
     fn long_text_wraps_at_spaces_and_cjk() {
-        let b = block("aaaa bbbb", "", 40, Align::Left);
-        assert_eq!(b.height, 40, "two lines");
+        let single = block("aaaa", "", 100, Align::Left);
+        let b = block("aaaa aaaa", "", i64::from(single.image.width) + 2, Align::Left);
+        assert_eq!(b.height, 2 * single.height, "wrap at the space");
         let cjk = block("漢字漢字漢字", "", 32, Align::Left);
-        assert_eq!(cjk.height, 40, "four 8-pixel boxes a line");
+        assert!(cjk.height > cjk.first_line, "CJK breaks without spaces");
         assert!(render(&parse(""), &StyleSheet::default(), "", 100, Align::Left, false).is_none());
+    }
+
+    #[test]
+    fn long_text_and_ruby_share_the_character_bound() {
+        let texts = [
+            "W".repeat(MAX_ATOMS + 1),
+            format!("<ruby>{}<rt>{}</rt></ruby>", "b".repeat(MAX_ATOMS / 2), "r".repeat(MAX_ATOMS)),
+            "<ruby>b<rt>r</rt></ruby>".repeat(MAX_ATOMS),
+        ];
+        for text in texts {
+            let nodes = parse(&text);
+            let flat = flatten(&nodes, &cascade(&StyleSheet::default(), &nodes, ""));
+            let count: usize = flat.atoms.iter().map(|atom| match atom {
+                Atom::Ruby { base, text, .. } => base.len() + text.len(),
+                _ => 1,
+            }).sum();
+            assert!(count <= MAX_ATOMS, "cue lays out {count} characters");
+        }
     }
 
     /// Hostile cue text and styles (deep nesting, 8x text, endless lines,

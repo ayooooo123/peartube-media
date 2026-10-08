@@ -151,8 +151,7 @@ is not shown. It draws the cue's own text as browsers do: the
 background, weight, style, decoration, shadow, opacity, relative size;
 class, voice, language, identifier and type selectors, descendants),
 right-to-left paragraphs reordered by the Unicode Bidirectional Algorithm,
-and ruby text above its base. The bitmap font has one face, so
-`font-family` changes nothing. `cargo test -p player --test
+and ruby text above its base, using runtime fonts. `cargo test -p player --test
 webvtt_placement --test webvtt_style` checks placement and drawing through
 `.vtt`, FFmpeg's Matroska and WebM remuxes and hand-built MP4s; `cargo
 test -p subs-text --test webvtt_settings` mutates settings, headers, MP4
@@ -167,9 +166,60 @@ SeekPreRoll as `PacketMetadata::audio_trim` for the AudioTrim consumer, which
 lives on another branch.
 
 
+### Runtime fonts and ASS/SSA
+
+`subs-render` uses `ttf-parser` for font outlines, Rustybuzz for shaping,
+`unicode-bidi` for text direction and `ab_glyph_rasterizer` for coverage.
+No TTF/OTF files are bundled. Android reads its system font configuration;
+Apple and Unix builds read platform font directories. ASS embedded fonts
+and Matroska font attachments take precedence. Missing glyphs fall back to
+another face; the old bitmap font is used only when no runtime fonts exist.
+Bitmap subtitles do not trigger system-font discovery.
+
+`PlayerOptions.fonts` accepts `FontOptions { directories, default_family }`.
+`directories: None` selects platform fonts; `Some(paths)` uses only those
+directories and track fonts, including for fallback. WebVTT `font-family`
+now selects real faces, and its default font size is 5% of the video height.
+Cue text and ruby share an 8,192-character layout budget.
+
+ASS/SSA keeps raw events and styles instead of converting them to plain
+text before drawing. The safe Rust libass 0.17.5 port handles positioning,
+movement, fades, transforms, borders, blur, shadows, clipping, drawings,
+karaoke, wrapping and layer/collision placement. Animated events follow
+the playback clock; capture-only playback samples the middle of each cue.
+TTML supports inherited text styles and timing, timed spans, sequential
+containers, frame/tick clocks and standalone document playback through
+the same font renderer. XML entities and DTDs are disabled.
+
+Run `python3 scripts/fetch-subtitle-fonts.py` to install the SHA-256-pinned
+DejaVu 2.37 and Noto Sans Devanagari 2.007 test fonts outside this repository.
+`SUBTITLE_TEST_FONTS` may select another directory holding those same files.
+`cargo test -j 2 -p subs-render` checks every cue in FATE's
+`sub/1ededcbd7b.ass` and `sub/a9-misc.ssa`, plus ten override/shaping cases,
+at two points per event against the system FFmpeg's libass. Both sides
+use the fixed fonts and full-range RGB. Limits: 2 pixels of bounds error,
+8 levels of mean colour error and 20 dB PSNR over the subtitle union crop,
+not the mostly empty video frame. All 106 samples pass; minimum cropped
+PSNR is 33.83 dB for ASS, 23.58 dB for SSA and 25.52 dB for the extra cases.
+This is bounded pixel agreement, not byte-identical rasterization. The
+e2e subtitle rows still compare decoded text and timing with pinned FFmpeg.
+The renderer tests also run 2,000 fixed-seed mutations per ASS override
+and drawing input. `cargo test -j 2 -p subs-text --test ttml` checks TTML
+style inheritance and cue boundaries.
+
+With `ab_glyph_rasterizer 0.1.10`, a stripped arm64 Android/API 29 release
+probe of `Player::open` and the codec registry grows from 13,754,288 to
+14,201,808 bytes against `6f4242f`: +447,520 raw bytes, or +195,173 bytes
+with zlib level 9. Both builds use fat LTO and one codegen unit. This is a
+library comparison, not an APK measurement or device playback check.
+
 ## Licenses
 
 Code in this repository is MIT unless a crate says otherwise. Decoders with no public specification (TrueHD/MLP, several Windows Media and RealMedia codecs, DVD and Blu-ray LPCM in `codec-lpcm`) are ports of FFmpeg's LGPL-2.1-or-later decoders; each such crate is LGPL-2.1-or-later, carries its own LICENSE, and ports only FFmpeg files whose headers say LGPL. The audio-trim producers in the MP4, MP3 and Ogg forks and the FFmpeg-exact ADPCM and G.726 decoders in the ADPCM fork are such ports too; those crates are `MIT AND LGPL-2.1-or-later`, with the ported files marked.
+
+`subs-render` is `MIT AND ISC`; its libass-derived files retain their ISC
+copyright and permission notices. Test-font licenses stay beside the
+external test fonts; those files are not shipped with the player.
 
 ## Verification
 

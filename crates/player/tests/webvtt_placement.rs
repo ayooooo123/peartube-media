@@ -81,8 +81,6 @@ fn shown(path: &Path) -> Vec<Shown> {
     shown
 }
 
-const STEP: i32 = 20;
-
 /// The cues: identifier, timing, settings, text.
 const CUES: [(&str, u32, &str, &str); 7] = [
     ("top", 0, "line:0", "Top line"),
@@ -133,16 +131,16 @@ fn assert_placed(what: &str, shown: &[Shown], regions: bool) {
             2 => assert!((y + h / 2 - 120).abs() <= 1, "{at}"),
             // region:fred (10%,90% anchor, 40% wide, 3 lines): its bottom
             // line, the region's width from 32 (bottom at 216).
-            3 if regions => assert_eq!((x, w, y + h, h), (32, 128, 216, STEP), "{at}"),
+            3 if regions => assert_eq!((x, w, y + h), (32, 128, 216), "{at}"),
             // Without the header: no region, so the default bottom line.
-            3 => assert_eq!((y + h, h), (240, STEP), "{at}"),
+            3 => assert_eq!(y + h, 240, "{at}"),
             // vertical:rl line:0 — a column at the right edge.
             4 => assert!(x + w == 320 && h > w, "{at}"),
             // No settings: the bottom line box, on the canvas's bottom edge
             // (clear of the region box above it).
-            5 => assert_eq!((y + h, h), (240, STEP), "{at}"),
+            5 => assert_eq!(y + h, 240, "{at}"),
             // line:2 — the third line from the top.
-            _ => assert_eq!(y, 2 * STEP, "{at}"),
+            _ => assert_eq!(y, 2 * h, "{at}"),
         }
     }
 }

@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 oxideav-core.workspace = true
 oxideav-subtitle.workspace = true
+roxmltree = "0.20"
 
 [dev-dependencies]
 codecs = { path = "../codecs" }

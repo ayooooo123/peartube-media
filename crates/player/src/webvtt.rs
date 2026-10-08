@@ -57,8 +57,6 @@ impl Rect {
 /// How a cue finds its place on screen when it comes up.
 #[derive(Clone, Debug)]
 pub(crate) enum Layout {
-    /// Where it was rendered (text that is not WebVTT).
-    Fixed,
     /// Snapped to lines: from where it was rendered, moves by `step`
     /// pixels (down for positive) along the line axis until it overlaps
     /// nothing up and stays on the canvas, back in the other direction
@@ -129,6 +127,7 @@ impl CueInfo {
 pub(crate) struct WebVttTrack {
     regions: Vec<Region>,
     sheet: StyleSheet,
+    shaper: std::cell::RefCell<subs_render::shaper::Shaper>,
 }
 
 impl WebVttTrack {
@@ -136,9 +135,18 @@ impl WebVttTrack {
     /// `CodecPrivate` or MP4's sample entry, whose `REGION` blocks define
     /// its regions and `STYLE` blocks its style sheet.
     pub fn new(extradata: &[u8]) -> WebVttTrack {
+        Self::with_fonts(extradata, &subs_render::FontOptions::default())
+    }
+
+    pub fn with_fonts(extradata: &[u8], fonts: &subs_render::FontOptions) -> WebVttTrack {
         let mut regions = header_regions(extradata);
         regions.truncate(MAX_REGIONS);
-        WebVttTrack { regions, sheet: StyleSheet::from_header(header_text(extradata)) }
+        WebVttTrack { regions, sheet: StyleSheet::from_header(header_text(extradata)),
+            shaper: std::cell::RefCell::new(subs_render::shaper::Shaper::new(fonts)) }
+    }
+
+    pub fn add_font(&self, data: std::sync::Arc<[u8]>) {
+        self.shaper.borrow_mut().add_font(data);
     }
 
     /// Each cue `packet` decodes to, in order: an MP4 sample's cue boxes
@@ -177,13 +185,13 @@ impl WebVttTrack {
 }
 
 /// A line box of the default font.
-fn line_height() -> i64 {
-    LINE as i64
+fn line_height(height: u32) -> i64 {
+    (height as f32 * 0.05 * LINE).ceil() as i64
 }
 
 fn region_rect(region: &Region, (cw, ch): (u32, u32)) -> Rect {
     let w = (region.width / 100.0 * f64::from(cw)).round() as i64;
-    let h = i64::from(region.lines).saturating_mul(line_height()).min(i64::from(ch));
+    let h = i64::from(region.lines).saturating_mul(line_height(ch)).min(i64::from(ch));
     let x = (region.viewport_anchor.0 / 100.0 * f64::from(cw) - region.region_anchor.0 * w as f64 / 100.0).round() as i64;
     let y = (region.viewport_anchor.1 / 100.0 * f64::from(ch) - region.region_anchor.1 * h as f64 / 100.0).round() as i64;
     Rect { x, y, w, h }
@@ -216,7 +224,7 @@ pub(crate) fn layout_cue(cue: &SubtitleCue, info: Option<&CueInfo>, track: &WebV
     let settings = &info.settings;
     let rtl = webvtt_text::is_rtl(&info.nodes);
     let align = text_align(settings.align);
-    let render = |width: i64, reversed: bool| webvtt_text::render(&info.nodes, &track.sheet, &info.id, width, align, reversed);
+    let render = |width: i64, reversed: bool| webvtt_text::render(&info.nodes, &track.sheet, &info.id, width, align, reversed, ch as f32 * 0.05, &mut track.shaper.borrow_mut());
     // No line boxes: the cue is not shown (an empty image never is).
     let none = || TextCue { image: NOTHING, layout: Layout::Closest };
 
@@ -362,7 +370,7 @@ pub(crate) fn place(image: &mut SubtitleImage, layout: &Layout, obstacles: &[Rec
     }
     let free = |r: &Rect| r.within(&canvas) && !obstacles.iter().any(|o| o.overlaps(r));
     match layout {
-        Layout::Fixed | Layout::Region(_) => true,
+        Layout::Region(_) => true,
         Layout::Snap { step, vertical } => {
             let specified = (image.x, image.y);
             let mut step = *step;
@@ -532,6 +540,8 @@ mod tests {
     const H: i64 = 360;
     const CANVAS: Rect = Rect { x: 0, y: 0, w: W, h: H };
 
+    fn line_height() -> i64 { super::line_height(H as u32) }
+
     fn cue() -> SubtitleCue {
         SubtitleCue { start_us: 0, end_us: 1_000_000, style_ref: None, positioning: None, segments: Vec::new() }
     }
@@ -551,7 +561,7 @@ mod tests {
 
     #[test]
     fn snapped_lines_count_from_the_top_or_the_bottom() {
-        let step = line_height();
+        let step = placed("top", "line:0").h;
         assert_eq!(placed("top", "line:0").y, 0);
         assert_eq!(placed("third", "line:2").y, 2 * step);
         // Line -1 starts a line height above the bottom.
@@ -605,13 +615,14 @@ mod tests {
         // the leftmost line box (§7.2: line -1, growing left).
         let rl = placed("vertical text", "vertical:rl");
         assert!(rl.h > rl.w, "{rl:?}");
-        assert_eq!((rl.x, rl.w), (0, line_height()));
+        assert_eq!(rl.x, 0);
+        assert_eq!(rl.w, placed("vertical text", "line:0").h);
         // FATE's "Title Wrap": lr, line 0 (left edge), 20% down, 60% tall.
         let lr = placed("Some time ago in a rather distant place....", "vertical:lr line:0 position:20% size:60% align:start");
         assert_eq!(lr.x, 0);
         assert!(lr.y == H / 5 && lr.y + lr.h <= H / 5 + H * 3 / 5, "{lr:?}");
-        // Two lines growing right: the first line is the leftmost column.
-        assert_eq!(lr.w, 2 * line_height());
+        // Wrapped columns grow right from the left edge.
+        assert!(lr.w > rl.w && lr.w % rl.w == 0);
         // rl, line 0: the right edge.
         let right = placed("x", "vertical:rl line:0");
         assert_eq!(right.x + right.w, W);
@@ -623,7 +634,7 @@ mod tests {
         let TextCue { image: mut second, .. } = laid("second", "line:-1", b"");
         assert!(place(&mut first, &layout, &[], CANVAS));
         assert!(place(&mut second, &layout, &[Rect::of(&first)], CANVAS));
-        assert_eq!(i64::from(second.y), i64::from(first.y) - line_height());
+        assert_eq!(second.y + second.height as i32, first.y);
         // With no free line left, the cue is not shown.
         let TextCue { mut image, layout } = laid("third", "line:-1", b"");
         assert!(!place(&mut image, &layout, &[CANVAS], CANVAS));
@@ -659,16 +670,18 @@ mod tests {
         assert_eq!(images[0].rgba[right_end..right_end + 4], DEFAULT_BACKGROUND);
         assert_eq!(images[0].rgba[..4], [0, 0, 0, 244]);
         // The latest is lowest, at the region's bottom.
-        assert_eq!((i64::from(images[1].y), i64::from(images[0].y)), (rect.y + line_height(), rect.y));
+        assert_eq!(i64::from(images[1].y) + i64::from(images[1].height), rect.y + rect.h);
+        assert_eq!(images[0].y + images[0].height as i32, images[1].y);
         // A third line pushes the first out of the two-line region.
         let images = stack_region(&[&a, &b, &c], 0);
         assert_eq!(images[0].width, 0);
         assert!(images[1].width > 0 && images[2].width > 0);
-        // Half a line into a scroll: the newest is half below the box.
-        let images = stack_region(&[&a, &b, &c], line_height() / 2);
-        assert_eq!(i64::from(images[2].height), line_height() / 2);
-        assert_eq!(i64::from(images[1].y), rect.y + line_height() / 2);
-        assert_eq!(images[0].height as i64, line_height() / 2);
+        // Half a cue into a scroll: the newest is half below the box.
+        let lift = c.block_height / 2;
+        let images = stack_region(&[&a, &b, &c], lift);
+        assert_eq!(i64::from(images[2].height), c.block_height - lift);
+        assert_eq!(images[1].y + images[1].height as i32, images[2].y);
+        assert!(images.iter().filter(|i| i.width > 0).all(|i| Rect::of(i).within(&rect)));
     }
 
     /// `lines:0`: the region box has no height, so its cues show nothing

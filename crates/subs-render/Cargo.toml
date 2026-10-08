@@ -1,0 +1,22 @@
+[package]
+name = "subs-render"
+description = "Text subtitle rendering: platform fonts, shaping and libass's ASS renderer, ported to safe Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT AND ISC"
+publish = false
+
+[dependencies]
+ab_glyph_rasterizer = "0.1.10"
+rustybuzz = "0.20.1"
+ttf-parser = "0.25.1"
+roxmltree = "0.20"
+unicode-bidi = "0.3.18"
+unicode-linebreak = "0.1.5"
+unicode-script = "0.5.8"
+oxideav-subtitle = { workspace = true, features = ["text"] }
+
+[dev-dependencies]
+refcheck = { path = "../refcheck" }
+sha2 = "0.10"

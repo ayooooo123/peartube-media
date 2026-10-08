@@ -1,6 +1,7 @@
 //! PearTube's media player: plays an HTTP stream URL through OxideAV's
 //! demuxers and decoders and a platform [`backend::Backend`].
 
+mod ass;
 pub mod annexb;
 pub mod backend;
 pub mod subtitle_compose;
@@ -15,6 +16,7 @@ mod webvtt_text;
 
 pub use engine::{Event, OpenError, Player, PlayerOptions, State, Track, TrackKind, CAPTIONS_608, CAPTIONS_708};
 pub use headless::{AudioCapture, Capture, Headless, SubtitleCapture, VideoCapture};
+pub use subs_render::FontOptions;
 
 #[cfg(target_os = "android")]
 pub mod android;

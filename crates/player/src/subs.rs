@@ -1,8 +1,8 @@
 //! Subtitle pipeline: packets → cues → `SubtitleSink::show` on the clock.
 //!
-//! Text/ASS cues render through the oxideav-subtitle compositor, cropped to
-//! their visible pixels, and stay up from their start to their end,
-//! overlapping cues together. Bitmap subtitles (PGS, DVB, VobSub, ...)
+//! Text uses runtime fonts; ASS retains its event data and renders on the
+//! clock, including animation and collision placement. WebVTT keeps W3C
+//! cue layout. Bitmap subtitles (PGS, DVB, VobSub, ...)
 //! decode to display states: an RGBA canvas the size of the subtitle plane,
 //! shown from its pts until its [`VideoFrame::display_duration`] runs out
 //! or, without one, until the next frame of the stream replaces it (a blank
@@ -84,11 +84,7 @@ pub fn render_text_cue(
     video_width: u32,
     video_height: u32,
 ) -> SubtitleImage {
-    let (w, h) = text_space(video_width, video_height);
-    let (w, h) = (w as usize, h as usize);
-    let comp = oxideav_subtitle::compositor::Compositor::new(w as u32, h as u32);
-    let rgba = comp.render(cue);
-    visible(&rgba, w * 4, w, h).unwrap_or(SubtitleImage { x: 0, y: 0, width: 0, height: 0, rgba: Vec::new() })
+    crate::ass::render_cue(cue, text_space(video_width, video_height))
 }
 
 /// The visible (non-transparent) pixels of a `width x height` RGBA plane
@@ -189,6 +185,7 @@ impl Cue {
         match &self.content {
             Content::Text(text) => text.image.rgba.len() + region_bytes(&text.layout),
             Content::Bitmap(state) => state.image.as_ref().map_or(0, |image| image.rgba.len()),
+            Content::Ass(event) => event.text.len() + event.name.len() + event.effect.len(),
         }
     }
 }
@@ -202,6 +199,8 @@ fn region_bytes(layout: &Layout) -> usize {
 }
 
 enum Content {
+    /// An ASS event, still unrendered so animation follows the clock.
+    Ass(subs_render::track::Event),
     /// A text cue on a video-sized canvas; it shares the screen with the
     /// text cues it overlaps.
     Text(TextCue),
@@ -232,11 +231,12 @@ fn decoded_cue(
                 let image = (image.width > 0).then_some(image);
                 return Some(Cue { start, end, content: Content::Bitmap(BitmapCue { canvas_width, canvas_height, image }) });
             }
-            let text = match vtt {
-                Some((track, info)) => layout_cue(&cue, info, track, text_space(width, height)),
-                None => TextCue { image: render_text_cue(&cue, width, height), layout: Layout::Fixed },
-            };
-            Some(Cue { start, end: Some(end), content: Content::Text(text) })
+            if let Some((track, info)) = vtt {
+                let text = layout_cue(&cue, info, track, text_space(width, height));
+                Some(Cue { start, end: Some(end), content: Content::Text(text) })
+            } else {
+                Some(Cue { start, end: Some(end), content: Content::Ass(crate::ass::event(&cue)) })
+            }
         }
         Frame::Video(vf) => {
             let start = media_time(vf.pts.or(packet.pts).unwrap_or(0), time_base);
@@ -292,6 +292,9 @@ struct OnScreen {
     /// is drawn for.
     slides: Vec<Slide>,
     now: Duration,
+    ass: Option<subs_render::Track>,
+    ass_image: Option<SubtitleImage>,
+    ass_frame: Option<Duration>,
 }
 
 impl OnScreen {
@@ -306,12 +309,13 @@ impl OnScreen {
     /// When the next thing on screen goes.
     fn next_end(&self) -> Option<Duration> {
         let bitmap = self.bitmap.as_ref().and_then(|(_, end)| *end);
-        self.text_up.iter().map(|up| up.end).chain(bitmap).min()
+        let ass = self.ass.iter().flat_map(|t| &t.events).map(|e| Duration::from_millis(e.start.saturating_add(e.duration).max(0) as u64));
+        self.text_up.iter().map(|up| up.end).chain(bitmap).chain(ass).min()
     }
 
     /// When a scroll under way is next redrawn: a frame on, or its end.
     fn next_frame(&self) -> Option<Duration> {
-        self.slides.iter().map(|s| (self.now + SLIDE_FRAME).min(s.start + SCROLL).max(self.now + Duration::from_millis(1))).min()
+        self.slides.iter().map(|s| (self.now + SLIDE_FRAME).min(s.start + SCROLL).max(self.now + Duration::from_millis(1))).chain(self.ass_frame).min()
     }
 
     /// Moves the scrolls under way on to `now`; true when anything moved.
@@ -326,6 +330,10 @@ impl OnScreen {
 
     /// Takes down everything that goes at or before `at`.
     fn expire(&mut self, at: Duration) {
+        if let Some(track) = &mut self.ass {
+            let ms = at.as_millis().min(i64::MAX as u128) as i64;
+            track.events.retain(|e| e.start.saturating_add(e.duration) > ms);
+        }
         self.now = self.now.max(at);
         if self.bitmap.as_ref().is_some_and(|(_, end)| end.is_some_and(|end| end <= at)) {
             self.bitmap = None;
@@ -350,7 +358,6 @@ impl OnScreen {
     /// the empty image every text cue without pixels shows as.
     fn alone(&self, text: &TextCue) -> Option<SubtitleImage> {
         match &text.layout {
-            Layout::Fixed => Some(text.image.clone()),
             Layout::Region(slot) => stack_region(&[slot], 0).pop().filter(|image| image.width > 0),
             _ if text.image.width == 0 => Some(text.image.clone()),
             layout => {
@@ -363,10 +370,15 @@ impl OnScreen {
     fn put(&mut self, cue: Cue) {
         self.now = self.now.max(cue.start);
         match cue.content {
+            Content::Ass(event) => {
+                self.bitmap = None;
+                let track = self.ass.get_or_insert_with(crate::ass::default_track);
+                if track.events.len() >= MAX_TEXT_UP { track.events.remove(0); }
+                track.events.push(event);
+            }
             Content::Text(TextCue { mut image, layout }) => {
                 self.bitmap = None;
                 let region = match layout {
-                    Layout::Fixed => None,
                     Layout::Region(slot) => {
                         // A scrolling region with lines up moves them up to
                         // make room (§7.1: a 0.433 s transition of its top),
@@ -411,6 +423,9 @@ impl OnScreen {
                 self.text.clear();
                 self.text_up.clear();
                 self.slides.clear();
+                if let Some(track) = &mut self.ass { track.flush_events(); }
+                self.ass_image = None;
+                self.ass_frame = None;
                 // A blank state has already cleared the screen; its own
                 // nominal duration must not delay EOF or schedule a second
                 // clear (DVB attaches its page timeout to blank states too).
@@ -444,11 +459,21 @@ impl OnScreen {
         }
     }
 
+    fn render_ass(&mut self, now: Duration) {
+        let Some(track) = &mut self.ass else { return };
+        let frame = crate::ass::render(track, now.as_millis().min(i64::MAX as u128) as i64, self.canvas);
+        self.ass_frame = frame.animated.then(|| now.saturating_add(SLIDE_FRAME));
+        self.ass_image = (frame.image.width > 0).then(|| crate::ass::image(frame.image));
+    }
+
     fn clear(&mut self) {
         self.text.clear();
         self.text_up.clear();
         self.bitmap = None;
         self.slides.clear();
+        if let Some(track) = &mut self.ass { track.flush_events(); }
+        self.ass_image = None;
+        self.ass_frame = None;
     }
 }
 
@@ -511,6 +536,10 @@ impl Screen {
                 let images = state.image.as_ref().map(std::slice::from_ref).unwrap_or_default();
                 self.put(images, state.canvas_width, state.canvas_height);
             }
+            None if on.ass.is_some() => {
+                let images = on.ass_image.as_ref().map(std::slice::from_ref).unwrap_or_default();
+                self.put(images, self.video_width, self.video_height);
+            }
             None if self.has_clipped(on) => {
                 // A region's cue clipped to nothing is not shown.
                 let images: Vec<SubtitleImage> = on
@@ -572,6 +601,9 @@ pub(crate) struct SubtitlePipeline {
     /// A WebVTT track's placement context: its cues are laid out per their
     /// settings and regions.
     pub(crate) webvtt: Option<WebVttTrack>,
+    pub(crate) ass: Option<subs_render::Track>,
+    pub(crate) fonts: subs_render::FontOptions,
+    pub(crate) attachments: Vec<Arc<[u8]>>,
 }
 
 impl SubtitlePipeline {
@@ -648,6 +680,9 @@ impl SubtitlePipeline {
                 Ok(Ok(frame)) => frame,
                 _ => break,
             };
+            // Keep the registered decoder lifecycle and its cue observers.
+            // ASS drawing uses the raw event below, not this plain-text view.
+            if self.ass.is_some() { continue; }
             let vtt = self.webvtt.as_ref().map(|track| (track, cues.get(index)));
             let cue = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 decoded_cue(frame, packet, self.time_base, w, h, vtt)
@@ -661,11 +696,27 @@ impl SubtitlePipeline {
                 pending.insert(at, cue);
             }
         }
+        if let Some(track) = &mut self.ass {
+            let start = self.time_base.rescale(packet.pts.unwrap_or(0), TimeBase::new(1, 1000));
+            let duration = self.time_base.rescale(packet.duration.unwrap_or(0), TimeBase::new(1, 1000));
+            track.prune_events(start);
+            let first = track.events.len();
+            let data = subs_text::text_common::decode_subtitle_text(&packet.data);
+            track.process_chunk(data.as_bytes(), start, duration);
+            for event in &track.events[first..] {
+                let cue = Cue { start: Duration::from_millis(event.start.max(0) as u64),
+                    end: Some(Duration::from_millis(event.start.saturating_add(event.duration).max(0) as u64)),
+                    content: Content::Ass(event.clone()) };
+                let at = pending.partition_point(|queued| queued.start <= cue.start);
+                pending.insert(at, cue);
+            }
+        }
     }
 
     /// After a seek: the decoder starts over (`reset`, as FFmpeg flushes a
     /// subtitle decoder; a fresh one if that fails).
     fn restart_decoder(&mut self) -> bool {
+        if let Some(track) = &mut self.ass { track.flush_events(); }
         let decoder = &mut self.decoder;
         if let Ok(Ok(())) = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.reset())) {
             return true;
@@ -694,6 +745,7 @@ impl SubtitlePipeline {
 /// it clears at the lane's end. It also ends when the player stops or a
 /// selection switch sets `retired`, clearing the screen.
 pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn SubtitleSink>) {
+    crate::ass::configure(&pipe.fonts, std::mem::take(&mut pipe.attachments));
     let (video_width, video_height) = text_space(pipe.video_width, pipe.video_height);
     let mut screen = Screen {
         sink,
@@ -704,6 +756,7 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
     let canvas = (video_width, video_height);
     let regions = pipe.webvtt.as_ref().map_or_else(Vec::new, |track| track.region_rects(canvas));
     let mut on = OnScreen::new(canvas, regions);
+    on.ass = pipe.ass.clone();
     let mut pending: VecDeque<Cue> = VecDeque::new();
     let mut seen_seek = (pipe.seek_generation)();
     let mut eof = false;
@@ -738,6 +791,19 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
                 Woke::Other => {}
             }
             while let Some(cue) = pending.pop_front() {
+                if let Content::Ass(event) = cue.content {
+                    let track = on.ass.get_or_insert_with(crate::ass::default_track);
+                    track.flush_events();
+                    // A representative frame inside the cue, not its fully
+                    // transparent fade-in boundary. Realtime uses the clock.
+                    let at = event.start.saturating_add(event.duration / 2);
+                    track.events.push(event);
+                    let image = crate::ass::image(crate::ass::render(track, at, canvas).image);
+                    screen.put(std::slice::from_ref(&image), video_width, video_height);
+                    screen.clear();
+                    track.flush_events();
+                    continue;
+                }
                 if let Content::Text(text) = &cue.content {
                     if let Some(image) = on.alone(text) {
                         screen.put(std::slice::from_ref(&image), screen.video_width, screen.video_height);
@@ -759,7 +825,9 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
         if let Some(now) = now {
             // A scroll under way moves on even when nothing comes or goes.
             let moved = on.animate(now);
-            if advance(&mut on, &mut pending, now) || moved {
+            let due = on.ass_frame.is_some_and(|at| now >= at);
+            if advance(&mut on, &mut pending, now) || moved || due {
+                on.render_ass(now);
                 screen.show(&on);
             }
         }
@@ -938,7 +1006,7 @@ mod tests {
         };
         on.put(cue("first", 9, b""));
         on.put(cue("second", 9, b""));
-        assert_eq!(on.text[1].y, on.text[0].y - 20);
+        assert_eq!(on.text[1].y + on.text[1].height as i32, on.text[0].y);
 
         on.put(cue("older", 3, b"region:r align:left"));
         on.put(cue("newer", 1, b"region:r align:left"));
@@ -967,23 +1035,25 @@ mod tests {
             let info = CueInfo { settings: CueSettings::parse(b"region:s", &regions), id: String::new(), nodes: subs_text::webvtt_cue::parse(text) };
             decoded_cue(Frame::Subtitle(cue), &packet, packet.time_base, 320, 240, Some((&track, Some(&info)))).unwrap()
         };
-        // The region's two lines are rows 80..120; its first cue sits on
-        // the bottom line, at once.
+        // The first cue rests at the bottom of the region without a slide.
         on.put(cue("one", 1000));
-        assert_eq!((on.text[0].y, on.slides.len()), (100, 0));
+        let (bottom, step) = (120, on.text[0].height as i32);
+        assert_eq!((on.text[0].y, on.slides.len()), (bottom - step, 0));
         assert_eq!(on.next_frame(), None);
         on.put(cue("two", 2000));
         // At the start the old line has not moved and the new one is
         // below the box (clipped to nothing).
-        assert_eq!((on.text[0].y, on.text[1].width), (100, 0));
+        assert_eq!((on.text[0].y, on.text[1].width), (bottom - step, 0));
         assert_eq!(on.next_frame(), Some(Duration::from_millis(2033)));
         // Half way, `ease` has done about 80% of the move.
         on.animate(Duration::from_millis(2000 + 433 / 2));
-        assert_eq!(on.text[0].y, 100 - 16);
-        assert_eq!(on.text[1].y, 120 - 16);
-        // At the end both rest on their lines and the scroll stops.
+        assert!(on.text[0].y > bottom - 2 * step && on.text[0].y < bottom - step);
+        assert!(on.text[1].y > bottom - step && on.text[1].y < bottom);
+        // At the end the stack is clipped to the region; font metrics may
+        // make two line boxes taller than its two 6vh region lines.
         on.animate(Duration::from_millis(2433));
-        assert_eq!((on.text[0].y, on.text[1].y, on.text[1].height), (80, 100, 20));
+        assert_eq!(on.text[0].y, (bottom - 2 * step).max(on.regions[0].y as i32));
+        assert_eq!((on.text[1].y, on.text[1].height), (bottom - step, step as u32));
         assert!(on.slides.is_empty() && on.next_frame().is_none());
     }
 }
