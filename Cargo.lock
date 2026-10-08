@@ -1180,7 +1180,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h263"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-h263?rev=88189ab8c65491d366345bdb1ab3124b9589e784#88189ab8c65491d366345bdb1ab3124b9589e784"
+source = "git+https://github.com/ayooooo123/oxideav-h263?rev=f9a411dc54f8365b4b0355cf3f83e8e8642525d1#f9a411dc54f8365b4b0355cf3f83e8e8642525d1"
 dependencies = [
  "oxideav-core",
 ]
