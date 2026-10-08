@@ -107,11 +107,11 @@ fn key_flags(name: &str, message: &[u8]) -> (bool, bool) {
     stream.extend(nal(0x41, &[0xE0, 0x00]));
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("demux-misc-units-{}-{name}.h264", std::process::id()));
     std::fs::write(&path, &stream).unwrap();
-    let out = std::process::Command::new("ffprobe")
+    let out = std::process::Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-f", "h264", "-show_entries", "packet=flags", "-of", "csv=p=0"])
         .arg(&path)
         .output()
-        .expect("ffprobe must be on PATH");
+        .expect("the pinned ffprobe runs");
     let _ = std::fs::remove_file(&path);
     let flags = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_eq!(flags.lines().count(), 1, "{name}: FFmpeg's one access unit: {flags:?}");

@@ -49,7 +49,7 @@ fn fixture(dir: &Path, name: &str, input: &Input, mkvmerge: &[&str]) -> PathBuf 
     let source = match input {
         Input::Sine(rate, encoder, ext) => {
             let source = dir.join(format!("{name}.{ext}"));
-            run(Command::new("ffmpeg")
+            run(Command::new(refcheck::system_ffmpeg())
                 .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi"])
                 .arg("-i").arg(format!("sine=frequency=440:sample_rate={rate}:duration=2"))
                 .args(["-ac", "2"]).args(*encoder).arg(&source));
@@ -67,7 +67,7 @@ fn fixture(dir: &Path, name: &str, input: &Input, mkvmerge: &[&str]) -> PathBuf 
 /// Whether FFmpeg reads laced Blocks from `path`: consecutive packets
 /// from one Block share its position.
 fn laced(path: &Path) -> bool {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_entries", "packet=pos", "-of", "csv=p=0"])
         .arg(path)
         .output()

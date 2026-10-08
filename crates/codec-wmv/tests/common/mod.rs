@@ -14,7 +14,7 @@ pub fn encoded_sample(name: &str, size: &str, codec_args: &[&str]) -> PathBuf {
     let mut args = vec!["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", &src, "-frames:v", "40"];
     args.extend_from_slice(codec_args);
     args.extend_from_slice(&["-flags", "+bitexact", "-fflags", "+bitexact", out.to_str().unwrap()]);
-    let st = std::process::Command::new("ffmpeg").args(&args).status().expect("ffmpeg must be on PATH");
+    let st = std::process::Command::new(refcheck::system_ffmpeg()).args(&args).status().expect("the fixture FFmpeg runs");
     assert!(st.success(), "ffmpeg encode of {name} failed");
     out
 }

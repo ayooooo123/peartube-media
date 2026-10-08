@@ -1,5 +1,5 @@
-//! Reference tests against FFmpeg 2da55bf (`$FFMPEG_SRC/ffmpeg` and
-//! `ffprobe`, default ~/projects/ffmpeg-src), on every FATE sample its
+//! Reference tests against FFmpeg 2da55bf (`refcheck::pinned_ffmpeg` and
+//! `refcheck::pinned_ffprobe`), on every FATE sample its
 //! makefiles name for these codecs and demuxers (amrnb.mak, amrwb.mak,
 //! voice.mak, demux.mak), and on a raw AMR-WB remux FFmpeg makes:
 //!
@@ -13,7 +13,7 @@
 mod support;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use oxideav_core::{Demuxer, Error, MediaType, RuntimeContext, SampleFormat, TimeBase};
 use refcheck::{decode, fate, interleaved_f32, Registrar};
@@ -23,18 +23,11 @@ use support::{raw_amr_wb, run};
 const REGISTRARS: [Registrar; 4] =
     [codec_speech::register, oxideav_mov::registry::register, oxideav_mp4::__oxideav_entry, demux_misc::register];
 
-fn ffmpeg_src() -> PathBuf {
-    std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
-}
-
-
 /// FFmpeg 2da55bf's decode of the first audio stream through its C code,
 /// as interleaved f32.
 fn ffmpeg_f32(path: &Path) -> Vec<f32> {
     let args = ["-nostdin", "-cpuflags", "0", "-i", path.to_str().unwrap(), "-map", "0:a:0", "-f", "f32le", "-c:a", "pcm_f32le", "-"];
-    run(&ffmpeg_src().join("ffmpeg"), &args).chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+    run(&refcheck::pinned_ffmpeg(), &args).chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
 }
 
 
@@ -138,7 +131,7 @@ fn ours(demuxer: &mut dyn Demuxer, to: TimeBase) -> Vec<Pkt> {
 /// FFmpeg 2da55bf's ffprobe: the codec, the stream time base and every
 /// packet.
 fn ffprobe(path: &Path) -> (String, TimeBase, Vec<Pkt>) {
-    let out = run(&ffmpeg_src().join("ffprobe"), &[
+    let out = run(&refcheck::pinned_ffprobe(), &[
         "-show_data_hash",
         "md5",
         "-show_entries",

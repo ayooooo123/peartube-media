@@ -44,8 +44,11 @@ const PASSING: &[(&str, f64)] = &[
     // transform at block switches).
     ("aac/ap05_48.mp4", 135.091059),
     // HE-AAC v1 (SBR), stereo and 5.1, dual-rate and 96 kHz-core.
-    ("aac/al_sbr_cm_48_2.mp4", 133.293771),
-    ("aac/al_sbr_cm_48_5.1.mp4", 129.292669),
+    // al_sbr_cm_48_2 and al_sbr_cm_48_5.1 are 132.837847 and 129.001008 dB
+    // from FFmpeg 2da55bf (133.793770 and 129.792666 from 9.0.2, where these
+    // floors were first set); each floor is that less 0.5 dB.
+    ("aac/al_sbr_cm_48_2.mp4", 132.337847),
+    ("aac/al_sbr_cm_48_5.1.mp4", 128.501008),
     ("aac/al_sbr_sr_48_2_fsaac48.mp4", 136.0),
     // HE-AAC v2 (SBR + PS): explicit, implicit and backward-compatible
     // signalling over MP4, 3GP and ADTS.
@@ -179,7 +182,7 @@ fn reference_usac_loudness_targets() {
         ("aac/usac/Ext_2_c1_Ln_0x03.mp4", -31, "aac/usac/Ext_2_c1_Ln_0x03__Lou-31.s16", 139.325931),
     ] {
         let (ours, path, channels) = check_aac::decoded_usac_target(rel, target);
-        let reference = std::process::Command::new("ffmpeg")
+        let reference = std::process::Command::new(refcheck::pinned_ffmpeg())
             .args(["-v", "error", "-nostdin", "-target_level", &target.to_string(), "-i"])
             .arg(&path)
             .args(["-map", "0:a:0", "-f", "f32le", "-c:a", "pcm_f32le", "-"])

@@ -4,7 +4,7 @@
 //! bounded by the INDX entries, landing on the last such packet at or
 //! before the target. After each seek the first packets of the seek
 //! stream equal `ffprobe -read_intervals TARGET%+#N` of the port's ffprobe
-//! (FFMPEG_SRC): size, payload, key flag and pts. The other streams are
+//! (`refcheck::pinned_ffprobe`): size, payload, key flag and pts. The other streams are
 //! not compared: FFmpeg keeps the audio deinterleaver across a seek, so
 //! their first frames depend on what was read before it. RealAudio (.ra)
 //! files cannot seek in FFmpeg either. Then mutated copies are seeked.
@@ -15,16 +15,6 @@ use std::process::Command;
 
 use oxideav_core::{Error, MediaType, RuntimeContext, TimeBase};
 use refcheck::fate;
-
-fn port_ffprobe() -> PathBuf {
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(&std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    let bin = src.join("ffprobe");
-    let out = Command::new(&bin).arg("-version").output().expect("build ffprobe in FFMPEG_SRC");
-    assert!(String::from_utf8_lossy(&out.stdout).contains("2da55bf"), "seek oracle must be FFmpeg 2da55bf");
-    bin
-}
 
 #[derive(Debug, PartialEq)]
 struct Pkt {
@@ -37,7 +27,7 @@ struct Pkt {
 /// The `ffprobe -read_intervals` run: its exit status and, per stream,
 /// the packets it printed after seeking `path` to `target` seconds.
 fn ffprobe_after(path: &Path, target: &str, n: usize) -> (bool, HashMap<u32, Vec<Pkt>>) {
-    let out = Command::new(port_ffprobe())
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-read_intervals", &format!("{target}%+#{n}"), "-show_data_hash", "md5"])
         .args(["-show_entries", "packet=stream_index,pts,size,flags,data_hash", "-of", "compact"])
         .arg(path)
@@ -182,7 +172,7 @@ fn ffprobe_packets(path: &Path, intervals: &str) -> Vec<(u32, Pkt)> {
     if !intervals.is_empty() {
         args.extend(["-read_intervals", intervals]);
     }
-    let out = Command::new(port_ffprobe())
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(args)
         .args(["-show_data_hash", "md5", "-show_entries", "packet=stream_index,pts,size,flags,data_hash", "-of", "compact"])
         .arg(path)

@@ -1,6 +1,6 @@
 //! Real Opus/MLP decoder regressions and pinned-FFmpeg gapless counts. The
 //! oracle and the fixtures come from the FFmpeg the ports follow (2da55bf,
-//! `$FFMPEG_SRC/ffmpeg`, default ~/projects/ffmpeg-src), not from PATH.
+//! `refcheck::pinned_ffmpeg`), not from PATH.
 
 use std::{path::{Path, PathBuf}, process::Command, sync::Arc, time::Duration};
 use oxideav_core::MediaType;
@@ -19,18 +19,8 @@ impl Drop for Fixture {
     fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
 }
 
-fn ffmpeg_src() -> PathBuf {
-    std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
-}
-
-fn pinned_ffmpeg() -> PathBuf {
-    ffmpeg_src().join("ffmpeg")
-}
-
 fn ffmpeg(args: &[&str], path: &Path) {
-    let out = Command::new(pinned_ffmpeg()).args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
+    let out = Command::new(refcheck::pinned_ffmpeg()).args(["-nostdin", "-hide_banner", "-loglevel", "error", "-y"])
         .args(args).arg(path).output().unwrap();
     assert!(out.status.success(), "FFmpeg fixture: {}", String::from_utf8_lossy(&out.stderr));
 }
@@ -74,7 +64,7 @@ fn opus(pre_skip: u16, packet_samples: u32, packets: u32) -> Fixture {
 }
 
 fn exact_length(path: &Path, expected: usize) {
-    let ff = refcheck::ffmpeg_src_audio_f32(path, 0);
+    let ff = refcheck::ffmpeg_audio_f32(path, 0);
     let (played, channels) = play(path, None);
     let decoded = refcheck::decode(path, &[codecs::register_all], MediaType::Audio, 0);
     let kept = refcheck::interleaved_f32(&decoded);
@@ -103,7 +93,7 @@ fn opus_in_container(ext: &str) {
 /// `-seek_timestamp 1` makes `at` a media time, as `Player::seek` takes
 /// it, instead of an offset from the input's start time.
 fn ffmpeg_from(path: &Path, at: Duration) -> Vec<f32> {
-    let out = Command::new(pinned_ffmpeg())
+    let out = Command::new(refcheck::pinned_ffmpeg())
         .args(["-nostdin", "-v", "error", "-seek_timestamp", "1", "-ss", &format!("{:.6}", at.as_secs_f64()), "-i"])
         .arg(path)
         .args(["-map", "0:a:0", "-f", "f32le", "-c:a", "pcm_f32le", "-"])
@@ -187,7 +177,7 @@ fn vorbis_in_webm_plays_ffmpegs_samples() {
         "-c:a", "vorbis", "-strict", "-2"], &output.0);
     exact_length(&output.0, 144_000);
     let (played, channels) = play(&output.0, None);
-    let snr = snr_at(&refcheck::ffmpeg_src_audio_f32(&output.0, 0), &played, channels, 0, 0);
+    let snr = snr_at(&refcheck::ffmpeg_audio_f32(&output.0, 0), &played, channels, 0, 0);
     assert!(snr >= 90.0, "Vorbis in WebM is {snr:.1} dB from FFmpeg's samples");
 }
 
@@ -208,7 +198,7 @@ fn long_major_sync_seek(codec: &str) {
         }
         assert_eq!(&majors[..2], &[0, 128], "major syncs must be 128 access units apart");
         // The long major-sync interval deliberately defeats raw probing.
-        let oracle = Command::new(pinned_ffmpeg())
+        let oracle = Command::new(refcheck::pinned_ffmpeg())
             .args(["-nostdin", "-v", "error", "-f", codec, "-i", input.0.to_str().unwrap(),
                 "-f", "f32le", "-c:a", "pcm_f32le", "-"]).output().unwrap();
         assert!(oracle.status.success(), "{}", String::from_utf8_lossy(&oracle.stderr));
@@ -257,7 +247,7 @@ fn side_data(text: &str, scale: (i64, i64), all: bool) -> Vec<(i64, u32, u32)> {
 /// The packets with a trim in an FFmpeg FATE side-data reference of a
 /// 44.1 kHz MP3 (the mp3 demuxer's 1/14112000 time base), in samples.
 fn fate_side_data(reference: &str) -> Vec<(i64, u32, u32)> {
-    let text = std::fs::read_to_string(ffmpeg_src().join("tests/ref/fate").join(reference)).unwrap();
+    let text = std::fs::read_to_string(refcheck::ffmpeg_src().join("tests/ref/fate").join(reference)).unwrap();
     side_data(&text, (44100, 14_112_000), false)
 }
 
@@ -299,7 +289,7 @@ fn ogg_opus_packets_have_ffprobes_pts_and_trims() {
     // Every packet: pts (the start less the pre-skip), the first packet's
     // pre-skip and the last one's end padding, all in 1/48000.
     let path = refcheck::fate("ogg/intro-partial.opus");
-    let out = Command::new(ffmpeg_src().join("ffprobe"))
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "packet=pts:packet_side_data", "-of", "compact"])
         .arg(&path).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

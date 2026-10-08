@@ -15,14 +15,14 @@ fn tmp(name: &str) -> PathBuf {
 /// FFmpeg-made raw DV with a 1 kHz tone, 48 kHz stereo.
 fn raw_dv(name: &str, size: &str, rate: &str, pix_fmt: &str) -> Vec<u8> {
     let path = tmp(name);
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i"])
         .arg(format!("testsrc=size={size}:rate={rate}:duration=1"))
         .args(["-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=1"])
         .args(["-c:v", "dvvideo", "-pix_fmt", pix_fmt, "-c:a", "pcm_s16le", "-ac", "2", "-f", "dv"])
         .arg(&path)
         .output()
-        .expect("ffmpeg on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
     let data = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);
@@ -63,11 +63,11 @@ fn ulead_wav(name: &str, dv: &[u8], frame_size: usize, sequences: usize, tag: u1
 
 fn check(path: &Path) {
     let name = path.display().to_string();
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "dvaudio", "{name}: FFmpeg decodes it as dvaudio");
     let decoded = refcheck::decode(path, &[codec_dv::register, oxideav_basic::__oxideav_entry], MediaType::Audio, 0);
     assert_eq!(decoded.params.codec_id.as_str(), "dvaudio", "{name}: resolved to dvaudio");

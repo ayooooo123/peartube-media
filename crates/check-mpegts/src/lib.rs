@@ -69,9 +69,9 @@ impl std::fmt::Display for Pkt {
     }
 }
 
-/// `ffprobe`'s packets for `path`; `args` go before the input.
+/// The pinned `ffprobe`'s packets for `path`; `args` go before the input.
 pub fn ffprobe_packets(path: &Path, args: &[&str]) -> Vec<Pkt> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_data_hash", "md5"])
         .args(["-show_entries", "packet=stream_index,pts,dts,duration,size,flags,data_hash"])
         .args(["-of", "compact=p=0"])
@@ -110,10 +110,10 @@ pub fn ffprobe_packets(path: &Path, args: &[&str]) -> Vec<Pkt> {
         .collect()
 }
 
-/// `ffprobe`'s streams for `path`: each stream's `key=value` fields from
-/// `-show_entries stream=<entries>`.
+/// The pinned `ffprobe`'s streams for `path`: each stream's `key=value`
+/// fields from `-show_entries stream=<entries>`.
 pub fn ffprobe_streams(path: &Path, entries: &str) -> Vec<BTreeMap<String, String>> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_entries", &format!("stream={entries}"), "-of", "compact=p=0"])
         .arg(path)
         .output()

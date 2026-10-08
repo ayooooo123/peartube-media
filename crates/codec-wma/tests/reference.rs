@@ -1,5 +1,6 @@
 // Reference tests: decode the FATE WMA family samples through this crate's
-// decoders + the ASF demuxer and compare with FFmpeg.
+// decoders + the ASF demuxer and compare with FFmpeg 2da55bf
+// (`refcheck::pinned_ffmpeg`).
 //
 // - wmalossless is integer/lossless: the interleaved PCM stream must be
 //   bit-exact with FFmpeg's `-f s16le` / `-f s24le` output (the same hash
@@ -9,8 +10,7 @@
 // - wmavoice is compared with FFmpeg's C path (`-cpuflags 0`, the audio
 //   analogue of contract.md's `-idct simple` rule): FFmpeg's NEON av_tx
 //   codelets round differently, and the 19K sample's postfilter amplifies
-//   that to 82 dB between FFmpeg's own NEON and C decodes. Floor 90 dB;
-//   measured: bit-exact (SNR infinite) on 7K, 11K and 19K.
+//   that to 82 dB between FFmpeg's own NEON and C decodes. Floor 90 dB.
 
 use oxideav_core::{MediaType, ProbeData, RuntimeContext};
 use refcheck::{decode, fate, snr_db};
@@ -34,12 +34,12 @@ fn ffmpeg_f32(path: &std::path::Path, nth: usize) -> Vec<f32> {
 /// FFmpeg's interleaved f32 decode of stream `0:a:nth` through its C code
 /// only (`-cpuflags 0`).
 fn ffmpeg_f32_c_path(path: &std::path::Path, nth: usize) -> Vec<f32> {
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-cpuflags", "0", "-i"])
         .arg(path)
         .args(["-map", &format!("0:a:{nth}"), "-f", "f32le", "-c:a", "pcm_f32le", "-"])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     assert!(out.status.success(), "ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr));
     out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
@@ -47,12 +47,12 @@ fn ffmpeg_f32_c_path(path: &std::path::Path, nth: usize) -> Vec<f32> {
 /// FFmpeg's PCM md5 of stream `0:a:nth` at `bytes` bytes per sample.
 fn ffmpeg_pcm_md5(path: &std::path::Path, bytes: usize) -> String {
     let fmt = if bytes == 4 { "s32le" } else if bytes == 3 { "s24le" } else { "s16le" };
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg failed: {}",
@@ -117,12 +117,12 @@ fn wmalossless_luckynight_bit_exact() {
     let target_bytes = target_frames * bytes_per_frame;
     assert!(ours.len() >= target_bytes, "must decode at least 209 frames");
     let ff_209 = {
-        let out = std::process::Command::new("ffmpeg")
+        let out = std::process::Command::new(refcheck::pinned_ffmpeg())
             .args(["-v", "error", "-nostdin", "-i"])
             .arg(&path)
             .args(["-map", "0:a:0", "-f", "s16le", "-c:a", "pcm_s16le", "-frames", "209", "-af", "aresample", "-"])
             .output()
-            .expect("ffmpeg must be on PATH");
+            .expect("the pinned FFmpeg runs");
         refcheck::md5_hex(&out.stdout)
     };
     assert_eq!(refcheck::md5_hex(&ours[..target_bytes]), ff_209, "pcm md5 differs from FFmpeg for 209 frames");
@@ -131,12 +131,12 @@ fn wmalossless_luckynight_bit_exact() {
 /// Our PCM byte count for a full decode, for the frame-limited comparisons.
 fn ffmpeg_pcm_len(path: &std::path::Path, bytes: usize) -> usize {
     let fmt = if bytes == 4 { "s32le" } else if bytes == 3 { "s24le" } else { "s16le" };
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     out.stdout.len()
 }
 

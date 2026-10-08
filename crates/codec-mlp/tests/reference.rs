@@ -28,12 +28,12 @@ fn pcm_bytes(decoded: &refcheck::Decoded) -> Vec<u8> {
 /// (`-f s32le` when `bytes` is 4, `-f s16le` when 2).
 fn ffmpeg_pcm_md5(path: &std::path::Path, bytes: usize) -> String {
     let fmt = if bytes == 4 { "s32le" } else { "s16le" };
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg failed: {}",
@@ -45,12 +45,12 @@ fn ffmpeg_pcm_md5(path: &std::path::Path, bytes: usize) -> String {
 /// FFmpeg's decoded PCM byte count for stream `0:a:0`.
 fn ffmpeg_pcm_len(path: &std::path::Path, bytes: usize) -> usize {
     let fmt = if bytes == 4 { "s32le" } else { "s16le" };
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(path)
         .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     out.stdout.len()
 }
 

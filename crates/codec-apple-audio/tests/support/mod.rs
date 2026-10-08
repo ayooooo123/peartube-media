@@ -30,19 +30,9 @@ pub fn run(binary: &Path, args: &[&str]) -> Vec<u8> {
     out.stdout
 }
 
-/// The `ffmpeg` on PATH: encodes and remuxes the generated inputs.
+/// `refcheck::system_ffmpeg`: encodes and remuxes the generated inputs.
 pub fn ffmpeg(args: &[&str]) -> Vec<u8> {
-    run(Path::new("ffmpeg"), args)
-}
-
-/// `name` (`ffmpeg`, `ffprobe`) of the FFmpeg 2da55bf build the decoders
-/// and the MOV packet grouping port: `$FFMPEG_SRC/<name>`, default
-/// ~/projects/ffmpeg-src.
-pub fn pinned(name: &str) -> PathBuf {
-    std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
-        .join(name)
+    run(&refcheck::system_ffmpeg(), args)
 }
 
 /// `name` in the persistent test scratch directory, made by `make` (given

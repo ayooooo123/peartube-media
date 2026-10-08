@@ -23,11 +23,11 @@ struct Pkt {
 
 /// (codec name, media type, time base) per stream, as ffprobe names them.
 fn ffprobe_streams(path: &Path) -> Vec<(String, String, String)> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_entries", "stream=codec_name,codec_type,time_base", "-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}", path.display());
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -40,12 +40,12 @@ fn ffprobe_streams(path: &Path) -> Vec<(String, String, String)> {
 }
 
 fn ffprobe_packets(path: &Path) -> Vec<Pkt> {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-show_data_hash", "md5"])
         .args(["-show_entries", "packet=stream_index,pts,dts,duration,size,flags,data_hash", "-of", "compact"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}", path.display());
     let num = |v: Option<&&str>| v.and_then(|v| v.parse::<i64>().ok());
     String::from_utf8_lossy(&out.stdout)

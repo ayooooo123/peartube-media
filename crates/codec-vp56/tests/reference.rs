@@ -86,11 +86,11 @@ fn ea(ctx: &mut RuntimeContext) {
 
 /// FFmpeg's pixel format and size for stream `0:v:0`.
 fn ffprobe_video(path: &Path) -> (String, usize, usize) {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,pix_fmt", "-of", "csv=p=0"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     let text = String::from_utf8_lossy(&out.stdout);
     let f: Vec<&str> = text.lines().next().expect("a video stream").split(',').collect();
     (f[2].to_string(), f[0].parse().unwrap(), f[1].parse().unwrap())
@@ -158,13 +158,13 @@ fn check(path: &Path, registrars: &[Registrar], input_args: &[&str]) {
 #[test]
 fn vp5_in_avi() {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("codec-vp56-{}-potter.avi", std::process::id()));
-    let out = Command::new("ffmpeg")
+    let out = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-i"])
         .arg(fate("vp5/potter512-400-partial.avi"))
         .args(["-map", "0:v", "-c", "copy"])
         .arg(&path)
         .output()
-        .expect("ffmpeg on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     check(&path, &[codec_vp56::register, avi], &[]);
     let _ = std::fs::remove_file(&path);

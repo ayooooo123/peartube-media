@@ -61,8 +61,8 @@ impl Drop for Scratch {
     }
 }
 
-fn ffmpeg(args: &[&str]) -> String {
-    let out = Command::new("ffmpeg").args(["-v", "error", "-nostdin", "-y"]).args(args).output().expect("ffmpeg on PATH");
+fn ffmpeg(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> String {
+    let out = Command::new(program).args(["-v", "error", "-nostdin", "-y"]).args(args).output().expect("run ffmpeg");
     assert!(out.status.success(), "ffmpeg {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap()
 }
@@ -73,7 +73,7 @@ fn ffmpeg(args: &[&str]) -> String {
 fn captioned(scratch: &Scratch, container: &str) -> PathBuf {
     let path = scratch.file(&format!("captions.{container}"));
     let source = refcheck::fate("sub/Closedcaption_rollup.m2v");
-    ffmpeg(&[
+    ffmpeg(refcheck::system_ffmpeg(), &[
         "-i", source.to_str().unwrap(), "-an", "-vf", "scale=160:96", "-c:v", "libx264", "-preset", "veryfast",
         "-bf", "3", "-a53cc", "1", path.to_str().unwrap(),
     ]);
@@ -83,11 +83,11 @@ fn captioned(scratch: &Scratch, container: &str) -> PathBuf {
 /// When `path`'s video ends, in seconds: its last packet's time plus its
 /// duration, as ffprobe reads them.
 fn video_end(path: &Path) -> f64 {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"])
         .arg(path)
         .output()
-        .expect("ffprobe on PATH");
+        .expect("the pinned ffprobe runs");
     assert!(out.status.success(), "ffprobe {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout)
         .unwrap()
@@ -103,7 +103,7 @@ fn video_end(path: &Path) -> f64 {
 /// (centiseconds) and whether it shows text (anything but blanks once the
 /// `{...}` overrides, `\N` and `\h` are out).
 fn ffmpeg_events(path: &Path) -> Vec<(i64, bool)> {
-    let ass = ffmpeg(&[
+    let ass = ffmpeg(refcheck::pinned_ffmpeg(), &[
         "-copyts", "-real_time", "1", "-f", "lavfi", "-i", &format!("movie={}[out0+subcc]", path.to_str().unwrap()),
         "-map", "0:s", "-c:s", "ass", "-f", "ass", "-",
     ]);

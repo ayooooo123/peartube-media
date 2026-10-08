@@ -52,12 +52,12 @@ fn generated(name: &str, args: &[&str]) -> Vec<u8> {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("demux-misc-seek-allowance");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{}-{name}", std::process::id()));
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y"])
         .args(args)
         .arg(&path)
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the fixture FFmpeg runs");
     assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
     let data = std::fs::read(&path).unwrap();
     let _ = std::fs::remove_file(&path);

@@ -58,11 +58,11 @@ fn ff_md5s(path: &std::path::Path, pix_fmt: &str) -> Vec<String> {
 }
 
 fn ff_run(args: &[&str]) -> Vec<u8> {
-    let out = std::process::Command::new("ffmpeg")
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
         .args(["-v", "error", "-nostdin"])
         .args(args)
         .output()
-        .expect("ffmpeg must be on PATH");
+        .expect("the pinned FFmpeg runs");
     assert!(
         out.status.success(),
         "ffmpeg {args:?}: {}",

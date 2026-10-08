@@ -34,7 +34,7 @@ fn played(path: &Path) -> (Vec<String>, Option<(u32, u32)>) {
 
 /// FFmpeg's frame size for the first video stream of `path`.
 fn ffmpeg_size(path: &Path) -> (u32, u32) {
-    let out = Command::new("ffprobe")
+    let out = Command::new(refcheck::pinned_ffprobe())
         .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0"])
         .arg(path)
         .output()
@@ -90,7 +90,7 @@ fn picture_offset() {
 #[test]
 fn libtheora() {
     let path = std::env::temp_dir().join(format!("ogg-theora-{}.ogv", std::process::id()));
-    let status = Command::new("ffmpeg")
+    let status = Command::new(refcheck::system_ffmpeg())
         .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=176x144:rate=25", "-t", "2",
             "-c:v", "libtheora", "-q:v", "6"])
         .arg(&path)
