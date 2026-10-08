@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -13,6 +14,7 @@ use oxideav_core::{
 };
 
 mod captions;
+mod entry;
 
 pub use captions::{CAPTIONS_608, CAPTIONS_708};
 
@@ -897,6 +899,7 @@ fn run_player_pipeline(
         video_thread: None,
         audio_thread: None,
         sub_thread: None,
+        replay: VecDeque::new(),
     };
     let video_stream = find_stream(&streams, current_video);
     let audio_stream = find_stream(&streams, current_audio);
@@ -1195,6 +1198,22 @@ struct Run<'a> {
     video_thread: Option<PipelineThread>,
     audio_thread: Option<PipelineThread>,
     sub_thread: Option<PipelineThread>,
+    /// What the demuxer read while a seek looked for its entry point
+    /// (`enter_video`), handed on before anything newer.
+    replay: VecDeque<Read>,
+}
+
+/// One demuxer read: the packet and its metadata, the read's error, or the
+/// demuxer's panic.
+type Read = std::thread::Result<oxideav_core::Result<QueuedPacket>>;
+
+/// Reads the demuxer's next packet with its metadata, catching a panic.
+fn read_packet(demuxer: &mut dyn Demuxer) -> Read {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let packet = demuxer.next_packet()?;
+        let metadata = demuxer.packet_metadata();
+        Ok::<_, oxideav_core::Error>(QueuedPacket { packet, metadata })
+    }))
 }
 
 fn run_demux_loop(run: &mut Run<'_>) {
@@ -1271,11 +1290,10 @@ fn run_demux_loop(run: &mut Run<'_>) {
             continue;
         }
 
-        let packet_res = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let packet = run.demuxer.next_packet()?;
-            let metadata = run.demuxer.packet_metadata();
-            Ok::<_, oxideav_core::Error>(QueuedPacket { packet, metadata })
-        }));
+        let packet_res = match run.replay.pop_front() {
+            Some(read) => read,
+            None => read_packet(run.demuxer),
+        };
         match packet_res {
             Ok(Ok(packet)) => {
                 let stream_id = packet.packet.stream_index;
@@ -1357,18 +1375,102 @@ fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool)
     run.video_lane.clear_for_seek(generation);
     run.audio_lane.clear_for_seek(generation);
     run.sub_lane.clear_for_seek(generation);
+    run.replay.clear();
     *eof = false;
     shared.demux_seeked(generation);
 
-    let res = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        run.demuxer.seek_to(seek_stream, ticks)
-    }));
-    match res {
-        Ok(Ok(_)) | Ok(Err(_)) => {}
+    if seek(run, seek_stream, ticks) && Some(seek_stream) == run.current_video {
+        enter_video(run, seek_stream, target.as_secs_f64(), ticks);
+    }
+}
+
+/// `Demuxer::seek_to`; false when it failed. A panic is the playback's
+/// error.
+fn seek(run: &mut Run<'_>, stream: u32, ticks: i64) -> bool {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| run.demuxer.seek_to(stream, ticks))) {
+        Ok(Ok(_)) => true,
+        Ok(Err(_)) => false,
         Err(_) => {
-            set_error(shared, "demuxer panicked during seek".into());
+            set_error(run.shared, "demuxer panicked during seek".into());
+            false
         }
     }
+}
+
+/// After the demuxer landed for a seek to `target` (seconds; `ticks` in the
+/// video stream's time base): when the video's first random-access picture
+/// there depends on earlier pictures (`entry`), seeks to the random-access
+/// point before it, until one a decoder can start from or `LOOKBACK_SECS`
+/// before the target. The reads go to `Run::replay`; the video pipeline
+/// drops the pictures before the target as after any seek.
+fn enter_video(run: &mut Run<'_>, video: u32, target: f64, ticks: i64) {
+    let streams = run.streams;
+    let Some(stream) = streams.iter().find(|s| s.index == video) else { return };
+    if !entry::checked(&stream.params) {
+        return;
+    }
+    let (params, tb) = (&stream.params, stream.time_base);
+    let mut entered: Option<i64> = None;
+    loop {
+        let Some((pts, kind)) = read_to_random_access(run, video, params) else { return };
+        let Some(pts) = pts else { return };
+        if kind == entry::Entry::Refresh || tb.seconds_of(pts) <= target - entry::LOOKBACK_SECS {
+            return;
+        }
+        match entered {
+            // As far back as the demuxer goes.
+            Some(e) if pts == e => return,
+            // The demuxer went forward instead: back where the seek landed
+            // first.
+            Some(e) if pts > e => {
+                run.replay.clear();
+                seek(run, video, ticks);
+                return;
+            }
+            _ => {}
+        }
+        entered = Some(pts);
+        run.replay.clear();
+        if !seek(run, video, pts - 1) {
+            run.replay.clear();
+            seek(run, video, ticks);
+            return;
+        }
+    }
+}
+
+/// Reads at most this many packets, holding at most a video lane's bytes,
+/// past a seek's landing looking for the video's first random-access
+/// packet.
+const ENTRY_READ_LIMIT: usize = 4096;
+
+/// Reads on, into `Run::replay`, to the first random-access packet of
+/// stream `video`: its pts and what decoding from it gives. `None` when the
+/// reads ended or reached `ENTRY_READ_LIMIT` packets or `VIDEO_MAX_BYTES`
+/// first.
+fn read_to_random_access(run: &mut Run<'_>, video: u32, params: &CodecParameters) -> Option<(Option<i64>, entry::Entry)> {
+    let mut bytes = 0usize;
+    for _ in 0..ENTRY_READ_LIMIT {
+        let read = read_packet(run.demuxer);
+        let found = match &read {
+            Ok(Ok(q)) if q.packet.stream_index == video && (q.packet.flags.keyframe || q.metadata.container_keyframe) => {
+                Some((q.packet.pts, entry::entry(params, &q.packet.data)))
+            }
+            Ok(Ok(q)) => {
+                bytes += q.packet.data.len();
+                None
+            }
+            _ => {
+                run.replay.push_back(read);
+                return None;
+            }
+        };
+        run.replay.push_back(read);
+        if found.is_some() || bytes > VIDEO_MAX_BYTES {
+            return found;
+        }
+    }
+    None
 }
 
 /// `select_audio` / `select_subtitle` took effect: retire the replaced
@@ -2245,6 +2347,9 @@ fn run_video_thread(
                 }
             }
         } else if let Some(decoder) = sw_decoder.as_mut() {
+            if skips_before_target(&shared, &stream, &packet, shown_seek) {
+                continue;
+            }
             let send_res =
                 std::panic::catch_unwind(AssertUnwindSafe(|| decoder.send_packet(&packet)));
             match send_res {
@@ -2365,6 +2470,18 @@ fn before_seek_target(shared: &SharedState, pts_secs: f64, seen_seek: u64, shown
     }
     *shown_seek = seen_seek;
     false
+}
+
+/// Whether `packet` holds a picture `before_seek_target` would drop once
+/// decoded and that no other picture predicts from
+/// (`entry::non_reference`): such a picture is not decoded at all, so the
+/// pictures a seek decodes before its target cost less.
+fn skips_before_target(shared: &SharedState, stream: &StreamInfo, packet: &Packet, shown_seek: u64) -> bool {
+    let Some(pts) = packet.pts else { return false };
+    let Some(seek) = *shared.active_seek.lock() else { return false };
+    seek.generation > shown_seek
+        && stream.time_base.seconds_of(pts) < seek.target
+        && entry::non_reference(&stream.params, &packet.data)
 }
 
 /// Applies the clock's run state to a video sink when it changed.
