@@ -171,6 +171,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-atrac"
+version = "0.1.0"
+dependencies = [
+ "check-decoders",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-dca"
 version = "0.1.0"
 dependencies = [
@@ -252,6 +261,7 @@ name = "codecs"
 version = "0.1.0"
 dependencies = [
  "codec-apple-audio",
+ "codec-atrac",
  "codec-dca",
  "codec-dv",
  "codec-mlp",

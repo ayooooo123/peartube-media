@@ -1,0 +1,14 @@
+[package]
+name = "codec-atrac"
+description = "ATRAC1, ATRAC3 (AL) and ATRAC3+ (AL) audio decoders and the AEA and OMA demuxers, ported from FFmpeg 2da55bf"
+version.workspace = true
+edition.workspace = true
+license = "LGPL-2.1-or-later"
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+check-decoders = { path = "../check-decoders" }

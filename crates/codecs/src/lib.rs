@@ -30,6 +30,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_wma::lib_registration::register_codecs,
         // ALAC, QDM2, QDMC, MACE 3:1 and 6:1.
         codec_apple_audio::register_codecs,
+        // ATRAC1, ATRAC3 (AL) and ATRAC3+ (AL).
+        codec_atrac::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -111,6 +113,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_wmv::demuxers::register_containers,
         subs_text::register_containers,
         subs_bitmap::register_containers,
+        // AEA (MD STUDIO) and OMA (Sony OpenMG).
+        codec_atrac::register_containers,
     ] {
         register(&mut ctx.containers);
     }
