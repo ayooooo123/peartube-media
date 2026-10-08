@@ -1,7 +1,8 @@
-//! Theora in Ogg plays every frame as FFmpeg decodes it: FATE's Theora
+//! Video in Ogg plays every frame as FFmpeg decodes it. Theora: FATE's
 //! samples (a picture region inside the coded frame, picture offsets, empty
 //! packets that repeat the previous frame) and a libtheora file FFmpeg
-//! writes. The oracle is FFmpeg's `framemd5` in yuv420p.
+//! writes. VP8: FATE's `OVP80` file. The oracle is FFmpeg's `framemd5` in
+//! yuv420p.
 
 use std::{path::Path, process::Command, sync::Arc, time::Duration};
 
@@ -84,6 +85,12 @@ fn empty_packets() {
 #[test]
 fn picture_offset() {
     plays_like_ffmpeg(&refcheck::fate("vp3/offset_test.ogv"));
+}
+
+/// VP8 in Ogg (FFmpeg's `oggparsevp8.c` mapping).
+#[test]
+fn vp8() {
+    plays_like_ffmpeg(&refcheck::fate("ogg/videotest.ogv"));
 }
 
 /// What FFmpeg's libtheora encoder writes.
