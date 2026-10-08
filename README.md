@@ -75,6 +75,9 @@ Changing the bank takes effect on the next Player open.
 Inputs are capped at 16 MiB of SMF data, 128 tracks, 262,144 events,
 4,096 events per 64-sample block and 24 hours of playback. SF2 files
 are capped at 256 MiB, with separate metadata, zone and scan limits.
+Modulator destinations are checked at their full 16-bit width before
+narrowing or admission. Out-of-range preset, instrument and default
+records are ignored without replacing valid modulators.
 The synth has 256 voices; decoder frames contain at most 1,024 samples
 per channel. Seeking replays from the song's only random-access point,
 its beginning.
@@ -102,6 +105,8 @@ FluidSynth's file player does not support those two forms.
 The suite also checks reset, the missing-bank Player error and all three
 extensions through the Player. Two deterministic mutation checks exercise
 2,000 damaged MIDI inputs and 2,000 damaged SF2 inputs.
+Three active-modulator regressions check destination boundaries in
+preset, instrument and default records and preserve valid-modulator PCM.
 The standalone Player render of FluidSynth's upstream MIDI fixture gives
 244,096 stereo frames, matching the CLI's frame count at 138.102 dB.
 

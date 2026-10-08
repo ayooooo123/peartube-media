@@ -920,6 +920,8 @@ fn mod_source(sf_source: u16) -> (u8, u8, bool) {
 fn import_mods(sfmods: &[SfMod]) -> Vec<Mod> {
     sfmods
         .iter()
+        // Check the on-disk u16 before narrowing or duplicate admission.
+        .filter(|m| usize::from(m.dest) < generator::LAST)
         .map(|m| {
             let mut amount = f64::from(m.amount);
             let (src1, flags1, ok1) = mod_source(m.src);
