@@ -156,7 +156,8 @@ impl AudioSink for AppleAudioSink {
         }
         // SAFETY: Create-rule function returned +1.
         self.format_desc = Some(unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw as *mut _)) });
-        self.flush();
+        // Queued samples retain their own format description. Only an
+        // explicit seek/reset flush may discard them or replace their anchor.
         Ok(())
     }
 
