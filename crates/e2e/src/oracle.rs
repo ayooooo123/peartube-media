@@ -34,6 +34,10 @@ pub struct FfStream {
     /// Cover art: FFmpeg lists it as a video stream, OxideAV as an attached
     /// picture of the container.
     pub attached_pic: bool,
+    /// Not one of the file's streams: the closed captions of its video, as
+    /// FFmpeg's `movie` source reads them over the file (its `subcc`
+    /// output, stream 1 beside the video).
+    pub subcc: bool,
 }
 
 impl FfStream {
@@ -41,6 +45,49 @@ impl FfStream {
     pub fn map(&self) -> String {
         format!("0:{}", self.index)
     }
+
+    /// The closed captions of the file's video, an EIA-608 subtitle stream
+    /// (FFmpeg decodes no CEA-708).
+    pub fn subcc() -> FfStream {
+        FfStream {
+            index: 1,
+            codec_type: "subtitle".into(),
+            codec_name: "eia_608".into(),
+            codec_tag: String::new(),
+            sample_fmt: None,
+            sample_rate: None,
+            channels: None,
+            attached_pic: false,
+            subcc: true,
+        }
+    }
+}
+
+/// `s` as a filter option value in a filtergraph: escaped for the option
+/// value, then for the graph (FFmpeg's two escaping levels).
+fn lavfi_escape(s: &str) -> String {
+    let escape = |s: &str, special: &[char]| {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            if special.contains(&c) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    };
+    escape(&escape(s, &['\\', '\'', ':']), &['\\', '\'', '[', ']', ',', ';'])
+}
+
+/// The arguments that open `ff`'s input: the file, or FFmpeg's `movie`
+/// source over it for its closed captions.
+fn input(path: &Path, ff: &FfStream) -> Result<Vec<String>, String> {
+    let p = path_arg(path)?;
+    Ok(if ff.subcc {
+        vec!["-f".into(), "lavfi".into(), "-i".into(), format!("movie={}[out0+subcc]", lavfi_escape(&p))]
+    } else {
+        vec!["-i".into(), p]
+    })
 }
 
 /// Every stream of `path`, in FFmpeg's order.
@@ -70,6 +117,7 @@ pub fn streams(path: &Path) -> Result<Vec<FfStream>, String> {
             sample_rate: s["sample_rate"].as_str().and_then(|r| r.parse().ok()),
             channels: s["channels"].as_u64().map(|c| c as u16),
             attached_pic: s["disposition"]["attached_pic"].as_u64() == Some(1),
+            subcc: false,
         })
         .collect())
 }
@@ -243,11 +291,12 @@ pub fn audio_frames(path: &Path, ff: &FfStream) -> Result<Vec<AudioFrameInfo>, S
         .collect()
 }
 
-/// Whether FFmpeg decodes stream `map` without error: a `decodes` policy is
+/// Whether FFmpeg decodes stream `ff` without error: a `decodes` policy is
 /// only for streams FFmpeg cannot produce a reference for.
-pub fn decodes(path: &Path, map: &str) -> bool {
-    let Ok(p) = path_arg(path) else { return false };
-    tool::ffmpeg(&strings(&["-i", &p, "-map", map, "-f", "null", "-"]), TIMEOUT).is_ok()
+pub fn decodes(path: &Path, ff: &FfStream) -> bool {
+    let Ok(mut args) = input(path, ff) else { return false };
+    args.extend(strings(&["-map", &ff.map(), "-f", "null", "-"]));
+    tool::ffmpeg(&args, TIMEOUT).is_ok()
 }
 
 /// One cue of FFmpeg's decode, as its `srt` encoder writes it.
@@ -258,11 +307,15 @@ pub struct SrtCue {
     pub body: String,
 }
 
-/// FFmpeg's decode of the text subtitle stream `map`, re-encoded as SubRip:
-/// every cue's timing (to the millisecond) and body, in order.
-pub fn subtitle_srt(path: &Path, map: &str) -> Result<Vec<SrtCue>, String> {
-    let p = path_arg(path)?;
-    let out = tool::ffmpeg(&strings(&["-i", &p, "-map", map, "-c:s", "srt", "-f", "srt", "-"]), TIMEOUT)?;
+/// FFmpeg's decode of the text subtitle stream `ff`, re-encoded as SubRip:
+/// every cue's timing (to the millisecond) and body, in order. EIA-608
+/// decodes in real time mode (`-real_time 1`), as the player shows
+/// captions: each screen as it changes, up until the next.
+pub fn subtitle_srt(path: &Path, ff: &FfStream) -> Result<Vec<SrtCue>, String> {
+    let mut args = if ff.codec_name == "eia_608" { strings(&["-real_time", "1"]) } else { Vec::new() };
+    args.extend(input(path, ff)?);
+    args.extend(strings(&["-map", &ff.map(), "-c:s", "srt", "-f", "srt", "-"]));
+    let out = tool::ffmpeg(&args, TIMEOUT)?;
     Ok(parse_srt(&String::from_utf8_lossy(&out)))
 }
 

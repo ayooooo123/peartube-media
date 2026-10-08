@@ -429,6 +429,23 @@ fn source_io<T>(state: &mut MutexGuard<'_, RingState>, call: impl FnOnce() -> T)
     out
 }
 
+/// The program stream (`.sub`) of a VobSub index (`.idx`): the same URL,
+/// its extension swapped as FFmpeg's vobsub demuxer swaps it (`IDX`
+/// becomes `SUB`, any other case `sub`). An HTTP URL keeps its query and
+/// fragment. `None` when `url` names no `.idx`.
+pub fn vobsub_stream_url(url: &str) -> Option<String> {
+    let http = url.starts_with("http://") || url.starts_with("https://");
+    let end = if http { url.find(['?', '#']).unwrap_or(url.len()) } else { url.len() };
+    let (path, rest) = url.split_at(end);
+    let at = path.len().checked_sub(4)?;
+    let ext = path.get(at..)?;
+    if !ext.eq_ignore_ascii_case(".idx") {
+        return None;
+    }
+    let sub = if ext == ".IDX" { ".SUB" } else { ".sub" };
+    Some(format!("{}{sub}{rest}", &path[..at]))
+}
+
 /// Opens a URL (http, https with the `https` feature, or file) with
 /// read-ahead ring buffering.
 pub fn open_source(url: &str) -> std::io::Result<ReadAheadSource> {

@@ -28,9 +28,9 @@ use super::{notify_changed, QueuedPacket, Run, Track, TrackKind};
 
 /// Stream index of the EIA-608 caption track (field 1 or 2, the first seen,
 /// as FFmpeg's decoder picks it). Above any demuxed index (at most 64).
-pub(super) const CAPTIONS_608: u32 = 0x1_0000;
+pub const CAPTIONS_608: u32 = 0x1_0000;
 /// Stream index of the CEA-708 caption track (service 1).
-pub(super) const CAPTIONS_708: u32 = 0x1_0001;
+pub const CAPTIONS_708: u32 = 0x1_0001;
 
 /// The caption streams of `video`, the video stream that will play, are
 /// added to `streams` when its codec can carry A/53 captions.
@@ -111,13 +111,11 @@ fn selected_captions(run: &Run<'_>) -> Option<u32> {
     run.current_subtitle.filter(|s| *s == CAPTIONS_608 || *s == CAPTIONS_708)
 }
 
-/// Lists the caption tracks whose service `triplets` carry, once each:
-/// valid non-padding EIA-608 pairs (cc_type 0/1), CEA-708 data (2/3).
+/// Lists the caption tracks whose service `triplets` carry, once each
+/// ([`subs_cc::Services`]).
 fn list_tracks(run: &Run<'_>, triplets: &[[u8; 3]]) {
-    let valid = |t: &&[u8; 3]| t[0] & 0x04 != 0;
-    let has_608 = triplets.iter().filter(valid).any(|t| t[0] & 0x03 < 2 && (t[1] & 0x7f != 0 || t[2] & 0x7f != 0));
-    let has_708 = triplets.iter().filter(valid).any(|t| t[0] & 0x03 >= 2);
-    if !has_608 && !has_708 {
+    let services = subs_cc::Services::of(triplets);
+    if !services.eia608 && !services.cea708 {
         return;
     }
     let shared = run.shared;
@@ -125,8 +123,8 @@ fn list_tracks(run: &Run<'_>, triplets: &[[u8; 3]]) {
     {
         let mut state = shared.state.lock();
         for (present, index, codec, title) in [
-            (has_608, CAPTIONS_608, subs_cc::eia608::CODEC_ID, "Closed captions (EIA-608)"),
-            (has_708, CAPTIONS_708, subs_cc::cea708::CODEC_ID, "Closed captions (CEA-708 service 1)"),
+            (services.eia608, CAPTIONS_608, subs_cc::eia608::CODEC_ID, "Closed captions (EIA-608)"),
+            (services.cea708, CAPTIONS_708, subs_cc::cea708::CODEC_ID, "Closed captions (CEA-708 service 1)"),
         ] {
             if present && !state.tracks.iter().any(|t| t.stream == index) {
                 state.tracks.push(Track {
