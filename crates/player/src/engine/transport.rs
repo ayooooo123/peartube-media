@@ -356,6 +356,15 @@ impl SharedState {
         self.wake_clock_waiters();
     }
 
+    /// Compressed video still needs input before it can release the clock.
+    /// Nonvideo lanes may exceed their duration bound during this hold, but
+    /// never their byte bounds: audio is retained until it can play.
+    pub(super) fn video_priming(&self) -> bool {
+        let t = self.transport.lock();
+        let video = &t.pipes[Pipe::Video as usize];
+        video.live > 0 && video.requires_picture && video.primed != Some(t.seek_gen)
+    }
+
     /// Waits until `pipe` has output ready for seek generation `generation`
     /// (`pipe_primed`) or `until` passes. False when the player stopped, the
     /// pipeline was retired or a newer seek superseded the wait.

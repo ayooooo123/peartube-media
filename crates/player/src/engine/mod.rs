@@ -104,8 +104,8 @@ pub enum TrackKind {
     Subtitle,
 }
 
-/// Queue bounds: packets are held back by both media duration and bytes.
-/// (duration, video bytes, audio bytes, subtitle bytes)
+/// Queue bounds: duration paces normal playback; bytes also bound priming,
+/// when nonvideo must wait for a reordered picture without blocking input.
 const QUEUE_MAX_SECS: f64 = 2.0;
 const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -1279,9 +1279,9 @@ fn run_demux_loop(run: &mut Run<'_>) {
             }
         }
 
-        // Bounded queues: wait while a lane is full. Nothing more can be
-        // queued until the clock moves, so a buffering hold lets go as soon
-        // as the pipelines have output.
+        // Keep byte bounds during priming, but let nonvideo queue past the
+        // normal duration limit so a held audio output cannot strand the
+        // video decoder before it has enough input to release the clock.
         let now_full = !eof && lanes_full(run);
         if now_full != full {
             full = now_full;
@@ -1373,13 +1373,14 @@ fn run_demux_loop(run: &mut Run<'_>) {
 }
 
 fn lanes_full(run: &Run<'_>) -> bool {
-    let full = |lane: &Lane, tb: TimeBase, max_bytes: usize| {
+    let priming = run.shared.video_priming();
+    let full = |lane: &Lane, tb: TimeBase, max_bytes: usize, pace: bool| {
         let (secs, bytes) = lane.queued(tb);
-        secs >= QUEUE_MAX_SECS || bytes >= max_bytes
+        bytes >= max_bytes || (pace && secs >= QUEUE_MAX_SECS)
     };
-    full(run.video_lane, run.video_tb, VIDEO_MAX_BYTES)
-        || full(run.audio_lane, run.audio_tb, AUDIO_MAX_BYTES)
-        || full(run.sub_lane, run.sub_tb, SUB_MAX_BYTES)
+    full(run.video_lane, run.video_tb, VIDEO_MAX_BYTES, true)
+        || full(run.audio_lane, run.audio_tb, AUDIO_MAX_BYTES, !priming)
+        || full(run.sub_lane, run.sub_tb, SUB_MAX_BYTES, !priming)
 }
 
 fn do_seek(run: &mut Run<'_>, target: Duration, generation: u64, eof: &mut bool) {
@@ -2231,7 +2232,7 @@ fn run_video_thread(
     let mut entered: Option<u64> = None;
     let mut presenting = Duration::ZERO;
     let mut recovering: Option<entry::Recovery> = None;
-    let mut ready_by = Instant::now();
+    let mut ready_by = Instant::now() + READY_TIMEOUT;
     let mut sw_decoder: Option<Box<dyn Decoder>> = None;
     // What the frame sink was last opened with (see `sync_frame_format`).
     let mut frame_format: Option<CodecParameters> = None;
@@ -2308,9 +2309,20 @@ fn run_video_thread(
             }
             need_keyframe = true;
             consecutive_errors = 0;
+            if compressed {
+                first.arm(seen_seek);
+                ready_by = Instant::now() + READY_TIMEOUT;
+            }
         }
 
-        let woken = || quit() || Some(shared.running()) != sink_running;
+        if compressed && !first.reported(seen_seek) && Instant::now() >= ready_by {
+            set_error(&shared, "platform video decoder produced no presentable picture before the seek deadline".into());
+            return;
+        }
+        // Lane::pop checks this wake condition even with no input. A hard
+        // queue bound or a stalled source must not hide the picture deadline.
+        let woken = || quit() || Some(shared.running()) != sink_running
+            || (compressed && !first.reported(seen_seek) && Instant::now() >= ready_by);
         let report = |dry| shared.pipe_starved(Pipe::Video, dry);
         let QueuedPacket { packet, metadata } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
@@ -2345,8 +2357,15 @@ fn run_video_thread(
                 if compressed {
                     while !quit() && shared.seek_gen.load(Ordering::SeqCst) == seen_seek {
                         sync_video_sink(&mut *sink, &shared, &mut sink_running);
-                        if !matches!(sink.finish(), Err(SinkError::WouldBlock)) { break; }
-                        if !first.reported(seen_seek) && last_end > presenting && Instant::now() >= ready_by {
+                        match sink.finish() {
+                            Ok(()) => break,
+                            Err(SinkError::WouldBlock) => {}
+                            Err(error) => {
+                                set_error(&shared, format!("platform video decoder failed while draining: {error}"));
+                                return;
+                            }
+                        }
+                        if !first.reported(seen_seek) && Instant::now() >= ready_by {
                             set_error(&shared, "platform video decoder stalled while draining".into());
                             return;
                         }
@@ -2361,6 +2380,19 @@ fn run_video_thread(
                         if quit() { return; }
                         continue;
                     }
+                }
+                if shared.seek_gen.load(Ordering::SeqCst) != seen_seek { continue; }
+                let empty = if compressed {
+                    !first.reported(seen_seek)
+                } else {
+                    primed != Some(seen_seek)
+                };
+                if empty {
+                    // EOF before recovery, no pictures, or a seek beyond
+                    // the video end: retire this pipeline, not a fake
+                    // PictureReady report. Dropping Live releases the hold
+                    // so actual audio can play and drain.
+                    break;
                 }
                 if realtime {
                     // Timestamped renderers still own queued frames at EOF.
@@ -2417,8 +2449,6 @@ fn run_video_thread(
                 recovering = None;
                 presenting = show_from(&shared, seen_seek).unwrap_or(pts);
                 sink.present_from(presenting);
-                first.arm(seen_seek);
-                ready_by = Instant::now() + READY_TIMEOUT;
             }
             if entered != Some(seen_seek) && random_access {
                 entered = Some(seen_seek);

@@ -29,12 +29,13 @@ struct Platform {
     observed: Arc<(Mutex<Observed>, Condvar)>,
     paced: bool,
     gate: bool,
+    reorder_depth: usize,
 }
 
 impl Platform {
-    fn new(paced: bool, gate: bool) -> Arc<Self> {
+    fn new(paced: bool, gate: bool, reorder_depth: usize) -> Arc<Self> {
         Arc::new(Self { audio: Headless::new(), observed: Arc::new((Mutex::new(Observed::default()), Condvar::new())),
-            paced, gate })
+            paced, gate, reorder_depth })
     }
 }
 
@@ -43,7 +44,7 @@ impl Backend for Platform {
     fn subtitles(&self) -> Box<dyn SubtitleSink> { self.audio.subtitles() }
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
         Box::new(PlatformVideo { clock, observed: self.observed.clone(), paced: self.paced,
-            gate: self.gate, ready: None, epoch: 0,
+            gate: self.gate, reorder_depth: self.reorder_depth, ready: None, epoch: 0,
             state: Arc::new((Mutex::new(DecodeState::default()), Condvar::new())), worker: None })
     }
 }
@@ -67,6 +68,7 @@ struct PlatformVideo {
     epoch: u64,
     paced: bool,
     gate: bool,
+    reorder_depth: usize,
 }
 
 impl PlatformVideo {
@@ -76,6 +78,7 @@ impl PlatformVideo {
         let ready = self.ready.clone().unwrap();
         let clock = self.clock.clone();
         let (epoch, paced, gate) = (self.epoch, self.paced, self.gate);
+        let reorder_depth = self.reorder_depth;
         self.worker = Some(std::thread::spawn(move || {
             let mut reorder = Vec::new();
             loop {
@@ -86,7 +89,7 @@ impl PlatformVideo {
                 if s.stop { return; }
                 if let Some(input) = s.input.pop_front() { reorder.push(input); }
                 let draining = s.eof && s.input.is_empty();
-                if reorder.len() <= 4 && !draining { continue; }
+                if reorder.len() <= reorder_depth && !draining { continue; }
                 if reorder.is_empty() {
                     s.done = true;
                     state.1.notify_all();
@@ -182,8 +185,8 @@ fn open(path: &Path, backend: Arc<Platform>) -> (Player, std::sync::mpsc::Receiv
     (player, rx)
 }
 
-fn ended(player: &Player, rx: &std::sync::mpsc::Receiver<Event>) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn ended(player: &Player, rx: &std::sync::mpsc::Receiver<Event>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     loop {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Event::Ended) => return,
@@ -201,7 +204,7 @@ fn clock_waits_for_decoded_target_not_for_compressed_input() {
         "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=8", "-c:v", "libx264", "-preset", "medium",
         "-x264-params", "keyint=50:min-keyint=50:scenecut=0:open-gop=1:ref=3:bframes=2",
         "-bsf:v", "filter_units=remove_types=6", "-c:a", "pcm_s16le", "-f", "matroska"], &path);
-    let backend = Platform::new(true, true);
+    let backend = Platform::new(true, true, 4);
     let (player, rx) = open(&path, backend.clone());
     let deadline = Instant::now() + Duration::from_secs(15);
     while player.state().position < Duration::from_millis(400) {
@@ -227,7 +230,7 @@ fn clock_waits_for_decoded_target_not_for_compressed_input() {
     assert_eq!(held.position, Duration::from_secs(4));
     backend.observed.0.lock().release = true;
     backend.observed.1.notify_all();
-    ended(&player, &rx);
+    ended(&player, &rx, Duration::from_secs(30));
     drop(player);
     let seen = backend.observed.0.lock();
     let epoch = seen.shown.last().unwrap().0;
@@ -249,14 +252,14 @@ fn compressed_start_and_seek_hide_partial_recovery_pictures() {
     // Both native sinks filter decoded output. Include a seek with no
     // earlier recovery point available, as well as playback from the start.
     for seek in [None, Some(start + Duration::from_millis(120))] {
-        let backend = Platform::new(false, false);
+        let backend = Platform::new(false, false, 4);
         let (player, rx) = open(&cut, backend.clone());
         if let Some(target) = seek {
             player.pause();
             player.seek(target);
             player.play();
         }
-        ended(&player, &rx);
+        ended(&player, &rx, Duration::from_secs(30));
         drop(player);
         let seen = backend.observed.0.lock();
         let epoch = seen.shown.last().unwrap().0;
@@ -269,4 +272,101 @@ fn compressed_start_and_seek_hide_partial_recovery_pictures() {
         assert!(seen.ready.iter().filter(|r| r.0 == epoch).all(|r| r.1 >= expected[0]), "partial picture released the clock");
         eprintln!("compressed recovery: seek={seek:?}, {} frames from {:?}", shown.len(), shown[0]);
     }
+}
+
+fn audio_drained(backend: &Headless, expected: &[f32]) {
+    let capture = backend.capture();
+    let audio = &capture.audio[0];
+    assert_eq!(audio.pcm, expected, "queued audio was lost or changed");
+    let mut heard = 0;
+    for &(from, to, _) in &audio.played {
+        assert_eq!(from, heard, "audio playback skipped or repeated samples");
+        heard = to;
+    }
+    // The engine's audio-end tolerance is 5 ms, including timestamp rounding.
+    let slack = (audio.sample_rate as usize / 200 + 1) * usize::from(audio.channels);
+    assert!(heard + slack >= expected.len(), "audio ended early: {heard}/{}", expected.len());
+    eprintln!("audio: {} exact samples, {heard} heard", expected.len());
+}
+
+#[test]
+fn priming_low_fps_retains_audio_while_feeding_reordered_video() {
+    let path = fixture::tmp("compressed_low_fps.mkv");
+    fixture::encode(&["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=1:duration=18",
+        "-f", "lavfi", "-i", "sine=sample_rate=8000:duration=18",
+        "-c:v", "libx264", "-preset", "ultrafast", "-x264-params", "keyint=30:bframes=0",
+        "-c:a", "pcm_s16le", "-f", "matroska"], &path);
+    let expected = refcheck::ffmpeg_audio_f32(&path, 0);
+    let backend = Platform::new(true, false, 16);
+    backend.audio.set_audio_speed(4.0);
+    let (player, rx) = open(&path, backend.clone());
+    ended(&player, &rx, Duration::from_secs(12));
+    drop(player);
+    let seen = backend.observed.0.lock();
+    let pts: Vec<_> = seen.shown.iter().map(|s| s.1).collect();
+    assert_eq!(pts, (0..18).map(Duration::from_secs).collect::<Vec<_>>());
+    assert_eq!(seen.ready[0].2, Duration::ZERO, "audio ran before decoded output");
+    drop(seen);
+    audio_drained(&backend.audio, &expected);
+}
+
+#[test]
+fn priming_byte_limit_still_reaches_the_input_wait_deadline() {
+    // Finite 9.2 MB PCM exceeds the 8 MiB audio lane bound before the
+    // decoder's seventeenth picture. The empty video lane must time out.
+    let path = fixture::tmp("compressed_priming_byte_limit.mkv");
+    fixture::encode(&["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=1/4:duration=24",
+        "-f", "lavfi", "-i", "sine=sample_rate=192000:duration=24",
+        "-c:v", "libx264", "-preset", "ultrafast", "-x264-params", "keyint=30:bframes=0",
+        "-c:a", "pcm_s16le", "-f", "matroska"], &path);
+    let backend = Platform::new(true, false, 16);
+    let (player, rx) = open(&path, backend.clone());
+    let start = Instant::now();
+    let watchdog = start + Duration::from_secs(8);
+    let error = loop {
+        match rx.recv_timeout(watchdog.saturating_duration_since(Instant::now())) {
+            Ok(Event::Error(error)) => break error,
+            Ok(Event::Ended) => panic!("unprimed decoder reached a successful end"),
+            Ok(Event::Changed) => {}
+            Err(error) => panic!("input wait missed its deadline: {error}: {:?}", player.state()),
+        }
+    };
+    assert!(start.elapsed() >= Duration::from_secs(5), "unexpected early error: {error}");
+    assert_eq!(player.state().position, Duration::ZERO);
+    assert!(backend.observed.0.lock().ready.is_empty());
+    eprintln!("bounded priming error after {:?}: {error}", start.elapsed());
+}
+
+#[test]
+fn eof_before_recovery_retires_empty_video_and_drains_audio() {
+    let (_, cut) = fixture::intra_refresh("short_compressed_recovery");
+    let path = fixture::tmp("short_compressed_recovery.mkv");
+    fixture::encode(&["-i", cut.to_str().unwrap(),
+        "-f", "lavfi", "-i", "sine=sample_rate=48000:duration=0.32",
+        "-map", "0:v:0", "-map", "1:a:0", "-t", "0.32",
+        "-c:v", "copy", "-c:a", "pcm_s16le", "-f", "matroska"], &path);
+    let (_, packets) = fixture::video_stream(&path);
+    assert!(!packets.is_empty(), "fixture must contain incomplete recovery pictures");
+    assert!(fixture::reference_pts(&path).is_empty(), "fixture must end before recovery");
+    let expected = refcheck::ffmpeg_audio_f32(&path, 0);
+    assert_eq!(expected.len(), 15360);
+    let backend = Platform::new(true, false, 4);
+    let (player, rx) = open(&path, backend.clone());
+    ended(&player, &rx, Duration::from_secs(8));
+    drop(player);
+    let seen = backend.observed.0.lock();
+    assert!(seen.shown.is_empty(), "partial recovery picture was displayed");
+    assert!(seen.ready.is_empty(), "empty video reported a decoded picture");
+    assert_eq!(seen.hidden.len(), packets.len(), "compressed decoder did not drain");
+    drop(seen);
+    audio_drained(&backend.audio, &expected);
+
+    let backend = Headless::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), Arc::new(codecs::context()),
+        PlayerOptions::default(), move |event| { let _ = tx.send(event); });
+    ended(&player, &rx, Duration::from_secs(8));
+    drop(player);
+    assert!(backend.capture().video.iter().all(|video| video.frame_md5.is_empty()));
+    audio_drained(&backend, &expected);
 }
