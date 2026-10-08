@@ -11,7 +11,7 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 |Path|Purpose|
 |---|---|
 |`crates/player`|The engine: source, demux, decoder choice, clock, sync, seek, tracks, and the platform backends (Android, Apple, headless)|
-|`crates/codecs`|`register_all`: local replacement decoders register before OxideAV (`first_decoder` uses registration order, not capability priority); replacement container factories register last because they replace entries by name|
+|`crates/codecs`|`register_all`: local replacement decoders register before OxideAV (`first_decoder` uses registration order, not capability priority); replacement container factories register last because they replace entries by name. Decode-only: it turns on `oxideav-core`'s `decode-only` feature, so no OxideAV encoder or muxer is registered|
 |`crates/codec-*`|Decoders and demuxers OxideAV lacks. Same shape as an OxideAV crate: implement `oxideav_core::Decoder` / `Demuxer`, export `register(&mut RuntimeContext)`|
 |`crates/e2e`|Corpus runner: plays every corpus file through the headless backend and checks it against FFmpeg; writes `target/e2e/codecs.json`|
 
@@ -44,6 +44,10 @@ let state = player.state(); // position, duration, playing, buffering, ended, er
 ## Dependencies on OxideAV
 
 OxideAV crates are used at pinned git revisions; their crates.io releases lag their repositories. When a crate needs a fix, it is forked to `ayooooo123/oxideav-<name>` and `[patch.crates-io]` points the whole dependency graph at the fork. Fixes go upstream where OxideAV's clean-room rule allows.
+
+The player never encodes or muxes. `crates/codecs` turns on the core fork's `decode-only` feature: `CodecInfo::encoder` and `ContainerRegistry::register_muxer` drop their factories, so nothing references OxideAV's encoders and muxers and LTO removes them (Android `libmain.so`: 27.3 MB to 21.0 MB stripped, 13.2 MB to 9.9 MB deflated in the APK).
+
+Release builds compile dependencies and this workspace's cold crates at `opt-level = "s"` and the code that must keep its speed at 3: the H.264, HEVC, AV1, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, VC-1/WMV (`codec-wmv`), AAC, Opus, MP3, AC-3 and DTS (`codec-dca`) decoders, `oxideav-core` (bit readers), `oxideav-pixfmt` (RGBA conversion of software frames), the Ogg demuxer (it runs per packet; at `"s"` Opus in Ogg took about 0.4% more instructions) and `player`. Binaries stay at 3: fat LTO optimises the whole program at the final crate's level, and at `"s"` rustc turns loop and SLP vectorization off for all of it. The app's `mobile/Cargo.toml` carries the same lists (there every dependency not named is `"s"`; here a workspace crate not named is 3), so a new crate goes on one of them in both files. This saves another 1.5 MB raw, 1.1 MB deflated.
 
 ### Matroska packet compatibility
 

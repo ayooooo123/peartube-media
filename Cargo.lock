@@ -1097,7 +1097,7 @@ dependencies = [
 [[package]]
 name = "oxideav-core"
 version = "0.1.37"
-source = "git+https://github.com/ayooooo123/oxideav-core?rev=96094a916d8b9f2695f70bb0d53e5956b8a79847#96094a916d8b9f2695f70bb0d53e5956b8a79847"
+source = "git+https://github.com/ayooooo123/oxideav-core?rev=57e5fa9cbf9eda25e4b992391c121a306f78cac4#57e5fa9cbf9eda25e4b992391c121a306f78cac4"
 dependencies = [
  "bytemuck",
  "serde_json",
