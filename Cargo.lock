@@ -117,6 +117,7 @@ version = "0.1.0"
 dependencies = [
  "codecs",
  "oxideav-core",
+ "player",
  "refcheck",
 ]
 

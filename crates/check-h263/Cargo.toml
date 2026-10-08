@@ -16,3 +16,5 @@ refcheck.workspace = true
 # The player's registry, with the fork under test (pinned in the
 # workspace [patch.crates-io]) and the AVI and MOV demuxers.
 codecs = { path = "../codecs" }
+# The Intel archive files played with their audio (tests/player.rs).
+player = { path = "../player" }
