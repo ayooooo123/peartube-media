@@ -1259,7 +1259,7 @@ dependencies = [
 [[package]]
 name = "oxideav-h264"
 version = "0.1.8"
-source = "git+https://github.com/ayooooo123/oxideav-h264?rev=6063d322c798b560ac1891fa1109901d30abd6a6#6063d322c798b560ac1891fa1109901d30abd6a6"
+source = "git+https://github.com/ayooooo123/oxideav-h264?rev=43d67829f2b00846f791d4e5aaf5c3065afb0708#43d67829f2b00846f791d4e5aaf5c3065afb0708"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",
