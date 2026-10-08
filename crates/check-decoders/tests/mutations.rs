@@ -2,8 +2,8 @@
 //! of FFmpeg's packets of FATE samples go through the decoders, which
 //! must return errors, never panic (fixed seed, 2,000 mutants each).
 
-use check_decoders::{decode_packets, ffmpeg_packets};
-use oxideav_core::{CodecId, CodecParameters, Packet, SampleFormat};
+use check_decoders::{decode_packets, ffmpeg_packets, pinned_ffmpeg_packets};
+use oxideav_core::{CodecId, CodecParameters, Frame, Packet, SampleFormat};
 
 /// xorshift64*: a fixed sequence, so a failure reproduces.
 struct Rng(u64);
@@ -68,5 +68,30 @@ fn h264_recovery_survives_truncated_and_flipped_packets() {
     params.options.insert("video_delay", "1");
     for mutant in mutants(&packets, 2_000, 0x6832_3634) {
         let _ = decode_packets(&[oxideav_h264::register], &params, &mutant);
+    }
+}
+
+#[test]
+fn ac3_survives_truncated_and_flipped_packets() {
+    // AC-3 5.1 with coupling and block switching; E-AC-3 5.1 with
+    // spectral extension; E-AC-3 7.1 with dependent substreams.
+    for (sample, codec, seed) in [
+        ("ac3/monsters_inc_5.1_448_small.ac3", "ac3", 0x6163_3301),
+        ("eac3/csi_miami_5.1_256_spx_small.eac3", "eac3", 0x6563_3302),
+        ("eac3/the_great_wall_7.1.eac3", "eac3", 0x6563_3303),
+    ] {
+        let path = refcheck::fate(sample);
+        let packets: Vec<Packet> = pinned_ffmpeg_packets(&path, "a:0").into_iter().take(12).collect();
+        let params = CodecParameters::audio(CodecId::new(codec));
+        for mutant in mutants(&packets, 2_000, seed) {
+            let (decoded, _) = decode_packets(&[oxideav_ac3::register], &params, &mutant);
+            // Every decode call consumes input, and a frame is at most 6
+            // blocks of 16 channels.
+            assert!(decoded.frames.len() <= mutant.iter().map(|p| p.data.len()).sum::<usize>());
+            for frame in &decoded.frames {
+                let Frame::Audio(audio) = frame else { panic!("{sample}: not an audio frame") };
+                assert!(audio.samples <= 1536 && audio.data.len() <= 16, "{sample}: {} x {}", audio.samples, audio.data.len());
+            }
+        }
     }
 }
