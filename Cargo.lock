@@ -112,13 +112,13 @@ dependencies = [
 name = "check-decoders"
 version = "0.1.0"
 dependencies = [
+ "codec-mp2",
  "codecs",
  "demux-misc",
  "oxideav-ac3",
  "oxideav-core",
  "oxideav-h264",
  "oxideav-mkv",
- "oxideav-mp2",
  "oxideav-mpegts",
  "oxideav-ogg",
  "oxideav-opus",
@@ -250,6 +250,16 @@ dependencies = [
  "oxideav-mkv",
  "oxideav-mp4",
  "oxideav-mpegts",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-mp2"
+version = "0.1.0"
+dependencies = [
+ "mpegaudiodsp",
+ "oxideav-core",
+ "oxideav-mp2",
  "refcheck",
 ]
 
@@ -387,6 +397,7 @@ dependencies = [
  "codec-dv",
  "codec-lpcm",
  "codec-mlp",
+ "codec-mp2",
  "codec-musepack",
  "codec-ra",
  "codec-rv",
@@ -431,7 +442,6 @@ dependencies = [
  "oxideav-mod",
  "oxideav-mov",
  "oxideav-mp1",
- "oxideav-mp2",
  "oxideav-mp3",
  "oxideav-mp4",
  "oxideav-mpeg12video",
@@ -728,6 +738,10 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mpegaudiodsp"
+version = "0.1.0"
 
 [[package]]
 name = "ndk"
@@ -1368,7 +1382,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mp2"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-mp2?rev=946a2d11133ec4d287b61143a402ccbde8cb3993#946a2d11133ec4d287b61143a402ccbde8cb3993"
+source = "git+https://github.com/ayooooo123/oxideav-mp2?rev=503367c83790c2e6d9d41cc545bee26ea70d21b0#503367c83790c2e6d9d41cc545bee26ea70d21b0"
 dependencies = [
  "oxideav-core",
 ]
@@ -1376,7 +1390,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mp3"
 version = "0.1.3"
-source = "git+https://github.com/ayooooo123/oxideav-mp3?rev=ba94ce70a7e6ddb37f02713b3ca34ed5b39f7cf0#ba94ce70a7e6ddb37f02713b3ca34ed5b39f7cf0"
+source = "git+https://github.com/ayooooo123/oxideav-mp3?rev=9f353eabd1d7a7980c1fc8b5ef9fa1b5515f5bf4#9f353eabd1d7a7980c1fc8b5ef9fa1b5515f5bf4"
 dependencies = [
  "oxideav-core",
  "oxideav-id3",

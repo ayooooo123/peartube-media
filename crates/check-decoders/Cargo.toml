@@ -16,7 +16,7 @@ demux-misc = { path = "../demux-misc" }
 codecs = { path = "../codecs" }
 # The forks under test (pinned in the workspace [patch.crates-io]).
 oxideav-h264.workspace = true
-oxideav-mp2.workspace = true
+codec-mp2 = { path = "../codec-mp2" }
 oxideav-ac3.workspace = true
 oxideav-opus.workspace = true
 # Containers the Opus tests read through, as the player does.

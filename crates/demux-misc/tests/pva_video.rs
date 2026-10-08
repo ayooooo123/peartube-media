@@ -65,13 +65,12 @@ fn pva_and_grouped_mp2_in_wav_keep_every_sample() {
     for (path, pcm) in [(&pva, &pva_pcm), (&wav, &wav_pcm)] {
         let reference = refcheck::ffmpeg_audio_f32(path, 0);
         assert_eq!(pcm.len(), reference.len(), "{}: FFmpeg sample count", path.display());
-        let delta: Vec<i32> = pcm.iter().zip(reference).map(|(&a, b)| ((a - b) * 32768.0) as i32).collect();
-        let max = delta.iter().map(|v| v.abs()).max().unwrap();
-        let different = delta.iter().filter(|&&v| v != 0).count();
-        // The existing floating synthesis is not FFmpeg's fixed-point MP2
-        // implementation. Record its separate fidelity gap; this regression
-        // proves framing/count and does not claim byte-identical PCM.
-        eprintln!("{}: samples/channel=96768; differing samples={different}; max delta={max} LSB", path.display());
-        assert!(max <= 1, "packet reconstruction must not introduce garbled audio");
+        let different = pcm.iter().zip(&reference).filter(|(a, b)| a != b).count();
+        let snr = refcheck::snr_db(&reference, pcm, 0);
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| ((*s * 32768.0) as i16).to_le_bytes()).collect();
+        let reference_bytes: Vec<u8> = reference.iter().flat_map(|s| ((*s * 32768.0) as i16).to_le_bytes()).collect();
+        eprintln!("{}: samples/channel=96768; differing samples={different}; SNR={snr} dB; md5={}; reference={}",
+            path.display(), refcheck::md5_hex(&bytes), refcheck::md5_hex(&reference_bytes));
+        assert_eq!(different, 0, "MP2 must be bit-exact, not merely within one LSB");
     }
 }

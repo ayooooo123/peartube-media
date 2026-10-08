@@ -80,10 +80,19 @@ output, eight clean/damaged/truncated I/P/B TS cases, and 2000 fixed-seed
 slice mutations with bounded draining and reset. Actual headless Player
 smoke passes PVA, its MP2-in-WAV remux and all eight TS cases.
 
-Remaining limits: MP2's floating synthesis is not FFmpeg's fixed-point
-decoder; PVA and its WAV remux each differ at 48,421 of 193,536 interleaved
-samples, by at most 1 LSB. This is not PCM-bit-exact acceptance and the
-corpus's strict audio policies are unchanged. Field pictures and
+`codec-mp2` registers the MP2 fork's Q23 requantizer with the unchanged shared
+`mpegaudiodsp::MpaSynth`, also used by Layer I and Musepack. This replaces
+floating synthesis and independent final rounding with FFmpeg 2da55bf's integer
+DCT/window and channel-major carried remainder. PVA and WAV each produce
+**96,768 samples/channel, zero differing samples, SNR +infinity**, with S16 PCM
+MD5 `24ffcf28111244799ea597d8d3e19b64`, including actual Player output.
+`codec-mp2`'s reference test covers 13 rate/mode/CRC cases with whole, 997-byte
+and 3-byte input chunks and reset; `check-decoders` also checks both truncated
+MP2 tracks byte-for-byte, including the final tails. Strict corpus policies
+and floors are unchanged. The standalone ISO floating and explicit multichannel
+extension APIs remain separate and are not claimed bit-exact.
+
+Remaining limits: free-format MP2 needs complete-frame packets. Field pictures and
 4:2:2 / 4:4:4 retain the previous reconstruction/error behavior, without the
 new concealment port. The PVA seek check still excludes parsed audio at
 18979.75 s, where FFmpeg's parser/discovery read-ahead produces a different

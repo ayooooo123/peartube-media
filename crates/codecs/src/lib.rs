@@ -97,7 +97,7 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_g711::__oxideav_entry,
         oxideav_mod::__oxideav_entry,
         oxideav_mp1::__oxideav_entry,
-        oxideav_mp2::__oxideav_entry,
+        codec_mp2::register,
         oxideav_mp3::__oxideav_entry,
         oxideav_opus::__oxideav_entry,
         oxideav_s3m::__oxideav_entry,
