@@ -501,6 +501,8 @@ dependencies = [
  "refcheck",
  "serde",
  "serde_json",
+ "subs-bitmap",
+ "subs-cc",
  "toml",
 ]
 

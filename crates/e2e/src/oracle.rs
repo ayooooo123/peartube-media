@@ -314,11 +314,17 @@ pub struct SrtCue {
 }
 
 /// FFmpeg's decode of the text subtitle stream `ff`, re-encoded as SubRip:
-/// every cue's timing (to the millisecond) and body, in order. EIA-608
-/// decodes in real time mode (`-real_time 1`), as the player shows
-/// captions: each screen as it changes, up until the next.
+/// every cue's timing (to the millisecond) and body, in order. The times
+/// are the stream's own (`-copyts`), as the player times cues: otherwise
+/// FFmpeg subtracts the input's start (the `subcc` output of a video that
+/// starts at 0.1 s comes out 0.1 s early). EIA-608 decodes in real time
+/// mode (`-real_time 1`), as the player shows captions: each screen as it
+/// changes, up until the next.
 pub fn subtitle_srt(path: &Path, ff: &FfStream) -> Result<Vec<SrtCue>, String> {
-    let mut args = if ff.codec_name == "eia_608" { strings(&["-real_time", "1"]) } else { Vec::new() };
+    let mut args = strings(&["-copyts"]);
+    if ff.codec_name == "eia_608" {
+        args.extend(strings(&["-real_time", "1"]));
+    }
     args.extend(input(path, ff)?);
     args.extend(strings(&["-map", &ff.map(), "-c:s", "srt", "-f", "srt", "-"]));
     let out = tool::ffmpeg(&args, TIMEOUT)?;
@@ -433,9 +439,27 @@ mod tests {
 
     #[test]
     fn subtitle_srt_reads_ffmpegs_decoded_cues() {
-        let cues = subtitle_srt(&refcheck::fate("sub/SubRip_capability_tester.srt"), "0:0").unwrap();
+        let path = refcheck::fate("sub/SubRip_capability_tester.srt");
+        let cues = subtitle_srt(&path, &streams(&path).unwrap()[0]).unwrap();
         assert!(cues.len() > 10, "{}", cues.len());
         assert!(cues.iter().all(|c| c.timing.contains(" --> ")));
+    }
+
+    /// The closed captions of a file come through FFmpeg's `movie` source
+    /// in real time mode, whatever characters its path holds that the
+    /// filtergraph syntax gives meaning to: every event lasts until the
+    /// next (`UINT32_MAX` ms), the first at the FATE sample's 1.068 s (its
+    /// video starts at 0.1 s).
+    #[test]
+    fn subcc_reads_captions_of_paths_lavfi_must_escape() {
+        let dir = std::env::temp_dir().join(format!("e2e-subcc-{}", std::process::id())).join("we ird:d's[1],x;y\\z");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cc.m2v");
+        std::fs::copy(refcheck::fate("sub/Closedcaption_rollup.m2v"), &path).unwrap();
+        let cues = subtitle_srt(&path, &FfStream::subcc()).unwrap();
+        assert_eq!(cues, subtitle_srt(&refcheck::fate("sub/Closedcaption_rollup.m2v"), &FfStream::subcc()).unwrap());
+        assert_eq!(cues.first().map(|c| c.timing.as_str()), Some("00:00:01,068 --> 1193:02:48,363"));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]

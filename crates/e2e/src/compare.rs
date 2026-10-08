@@ -215,7 +215,8 @@ pub fn shown_all(cues: &[Cue], shown: usize) -> Result<(), String> {
 /// override blocks (`{...}`) removed, each line trimmed, empty lines
 /// dropped. Markup conventions differ between renderers (`#0000FF` against
 /// FFmpeg's `#0000ff`, ASS styles FFmpeg's `srt` encoder turns into `<font>`
-/// tags), the words on screen do not.
+/// tags), the words on screen do not. FFmpeg's `srt` encoder leaves an ASS
+/// hard space as `\h`: it counts as the no-break space it stands for.
 pub fn plain_text(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     let mut chars = body.chars().peekable();
@@ -239,7 +240,7 @@ pub fn plain_text(body: &str) -> String {
             None => out.push(c),
         }
     }
-    out.replace("\r\n", "\n")
+    out.replace("\r\n", "\n").replace("\\h", "\u{a0}")
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -489,6 +490,9 @@ mod tests {
         assert_eq!(plain_text("{\\an8}<b>top</b>\n second "), "top\nsecond");
         assert_eq!(plain_text("a < b"), "a < b");
         assert_eq!(plain_text("[SIZE]20"), "[SIZE]20");
+        // FFmpeg's SubRip of a caption: hard spaces as `\h`, ours U+00A0.
+        assert_eq!(plain_text("\\h\\hDONNA\\hEIS"), plain_text("\u{a0}\u{a0}DONNA\u{a0}EIS"));
+        assert_eq!(plain_text("\\h\\hDONNA\\hEIS"), "DONNA\u{a0}EIS");
     }
 
     #[test]
@@ -500,18 +504,26 @@ mod tests {
 
     /// Captions are display states up until the next: FFmpeg's real time
     /// EIA-608 events end `UINT32_MAX` ms after their start. The first
-    /// event is FATE Closedcaption_rollup.m2v's (a picture at 0.967633 s),
-    /// as `ffmpeg -real_time 1 ... -c:s srt` writes it; the second, an
-    /// emptied screen, puts nothing up.
+    /// event is FATE Closedcaption_rollup.m2v's (a picture at 1.067733 s),
+    /// as `ffmpeg -copyts -real_time 1 ... -c:s srt` writes it; the second,
+    /// an emptied screen, puts nothing up; the third has the body of FATE
+    /// witch.scc's first event, whose hard spaces FFmpeg writes as `\h`.
     #[test]
     fn caption_states_compare_with_ffmpegs_real_time_events() {
         let state = |us: i64, body: &str| Cue::Text { start_us: us, end_us: i64::MAX, text: body.into(), state: true };
-        let reference = [srt("00:00:00,968 --> 1193:02:48,263", "<font face=\"Monospace\">{\\an7}(<i> inaudibl</i></font>"), srt("00:00:01,168 --> 1193:02:48,463", "")];
-        let ours = [state(967_633, "(<i> inaudibl</i>"), state(1_167_833, "")];
-        assert!(text_cues(&ours, 1, &reference).is_ok());
-        assert!(text_cues(&ours, 2, &reference).unwrap_err().contains("showed 2 of the 1"));
-        let late = [state(968_633, "(<i> inaudibl</i>"), state(1_167_833, "")];
-        assert!(text_cues(&late, 1, &reference).unwrap_err().contains("cue 0"));
+        let reference = [
+            srt("00:00:01,068 --> 1193:02:48,363", "<font face=\"Monospace\">{\\an7}(</font>"),
+            srt("00:00:01,268 --> 1193:02:48,563", ""),
+            srt(
+                "00:00:02,000 --> 1193:02:49,295",
+                "<font face=\"Monospace\"></font><font face=\"Monospace\">{\\an7}♪<i> PIES IESU DOMINE, \n</i>\\hDONNA EIS REQUIEM ♪</font>",
+            ),
+        ];
+        let ours = [state(1_067_733, "("), state(1_267_933, ""), state(2_000_000, "♪<i> PIES IESU DOMINE, </i>\n\u{a0}DONNA EIS REQUIEM ♪")];
+        assert!(text_cues(&ours, 2, &reference).is_ok());
+        assert!(text_cues(&ours, 3, &reference).unwrap_err().contains("showed 3 of the 2"));
+        let late = [state(1_068_733, "("), state(1_267_933, ""), state(2_000_000, "♪<i> PIES IESU DOMINE, </i>\n\u{a0}DONNA EIS REQUIEM ♪")];
+        assert!(text_cues(&late, 2, &reference).unwrap_err().contains("cue 0"));
     }
 
     #[test]
