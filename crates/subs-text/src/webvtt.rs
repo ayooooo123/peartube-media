@@ -25,17 +25,27 @@
 //! Ported to safe Rust from FFmpeg at commit 2da55bf (LGPL-2.1-or-later —
 //! headers verified):
 //! - `libavformat/webvttdec.c` — probe, one packet per cue block holding the
-//!   cue text, timing from the cue's timing line (identifier and settings
-//!   are dropped); header, `STYLE`, `REGION` and `NOTE` blocks skipped;
+//!   cue text, timing from the cue's timing line, and the cue identifier and
+//!   settings as the packet's side data (here [`PacketMetadata::webvtt`]);
+//!   `NOTE` blocks skipped. FFmpeg also drops the `WEBVTT`, `STYLE` and
+//!   `REGION` blocks; here they become the stream's extradata, the header
+//!   WebM's `CodecPrivate` and MP4's `vttC` carry, so a renderer can place
+//!   cues in their regions;
 //! - `libavcodec/webvttdec.c` — `<b> <i> <u>` to ASS, other tags (`<v>`,
 //!   `<c>`, …) hidden, entities and inline cue timestamps (`{\kf}`).
 //!
 //! Matroska/WebM WebVTT blocks carry the same cue text with container
-//! timing, so one decoder serves both.
+//! timing, so one decoder serves both. MP4 `wvtt` samples (ISO/IEC
+//! 14496-30), which FFmpeg cannot read, hold their cues in boxes:
+//! [`mp4_sample_cues`] unpacks them, and the decoder decodes each cue's text.
+
+use std::collections::VecDeque;
+use std::ops::Range;
+use std::sync::Arc;
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, Decoder, Demuxer, Error, MediaType, Packet, ProbeData,
-    ProbeScore, ReadSeek, Result, StreamInfo, TimeBase, MAX_PROBE_SCORE,
+    CodecId, CodecParameters, CodecResolver, Decoder, Demuxer, Error, Frame, MediaType, Packet, PacketMetadata, ProbeData,
+    ProbeScore, ReadSeek, Result, StreamInfo, TimeBase, WebVttMetadata, MAX_PROBE_SCORE,
 };
 
 use crate::ass_text::{ffmpeg_default_header, AssEvent, AssEventDecoder, EventSource};
@@ -81,9 +91,11 @@ fn read_ts(s: &[u8]) -> Option<i64> {
 }
 
 /// `webvtt_read_header` over a whole decoded file. A cue block without
-/// valid timing ends the file, as in FFmpeg.
-pub(crate) fn demux_webvtt(text: &[u8]) -> SubtitleQueue {
+/// valid timing ends the file, as in FFmpeg. Also returns the header: the
+/// `WEBVTT`, `STYLE` and `REGION` blocks, separated by blank lines.
+pub(crate) fn demux_webvtt(text: &[u8]) -> (SubtitleQueue, Vec<u8>) {
     let mut q = SubtitleQueue::default();
+    let mut header = Vec::new();
     let mut reader = TextReader::new(text);
     let mut cue = Vec::new();
     loop {
@@ -94,12 +106,20 @@ pub(crate) fn demux_webvtt(text: &[u8]) -> SubtitleQueue {
         let pos = reader.pos();
         let p: &[u8] = &cue;
         if [&b"WEBVTT"[..], b"STYLE", b"REGION", b"NOTE"].iter().any(|h| p.starts_with(h)) {
+            if !p.starts_with(b"NOTE") {
+                if !header.is_empty() {
+                    header.extend_from_slice(b"\n\n");
+                }
+                header.extend_from_slice(crate::scan::c_str(p));
+            }
             continue;
         }
         let first_line = &p[..crate::scan::strcspn(p, b"\r\n")];
         let mut i = 0;
+        let mut identifier: &[u8] = &[];
         if !first_line.windows(3).any(|w| w == b"-->") {
             // A cue identifier line.
+            identifier = first_line;
             i = first_line.len();
             if p.get(i) == Some(&b'\r') {
                 i += 1;
@@ -120,7 +140,9 @@ pub(crate) fn demux_webvtt(text: &[u8]) -> SubtitleQueue {
         while matches!(p.get(i), Some(b' ' | b'\t')) {
             i += 1;
         }
+        let settings_start = i;
         i += crate::scan::strcspn(&p[i..], b"\r\n");
+        let settings = &p[settings_start..i];
         if p.get(i) == Some(&b'\r') {
             i += 1;
         }
@@ -128,25 +150,127 @@ pub(crate) fn demux_webvtt(text: &[u8]) -> SubtitleQueue {
             i += 1;
         }
         match q.insert(crate::scan::c_str(&p[i..]), false) {
-            Some(event) => (event.pos, event.pts, event.duration) = (pos, start, end.wrapping_sub(start)),
+            Some(event) => {
+                (event.pos, event.pts, event.duration) = (pos, start, end.wrapping_sub(start));
+                // FFmpeg attaches each as side data when it is not empty.
+                if !identifier.is_empty() || !settings.is_empty() {
+                    event.webvtt = Some(Arc::new(WebVttMetadata {
+                        identifier: identifier.to_vec(),
+                        settings: settings.to_vec(),
+                    }));
+                }
+            }
             None => break,
         }
     }
-    q
+    (q, header)
 }
 
 /// Opens a standalone WebVTT file.
 pub fn open_demuxer(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let raw = read_input(&mut *input, "WebVTT")?;
     let time_base = TimeBase::new(1, 1000);
-    let packets = demux_webvtt(&decode_text(&raw)).finalize(time_base);
+    let (queue, header) = demux_webvtt(&decode_text(&raw));
+    let (packets, metadata) = queue.finalize_with_metadata(time_base).into_iter().unzip();
     let mut params = CodecParameters::subtitle(CodecId::new(CODEC_ID));
     params.media_type = MediaType::Subtitle;
-    Ok(Box::new(TextSubtitleDemuxer {
-        format_name: CONTAINER_NAME,
-        streams: [StreamInfo { index: 0, time_base, duration: None, start_time: Some(0), params }],
-        packets,
+    params.extradata = header;
+    Ok(Box::new(WebVttDemuxer {
+        inner: TextSubtitleDemuxer {
+            format_name: CONTAINER_NAME,
+            streams: [StreamInfo { index: 0, time_base, duration: None, start_time: Some(0), params }],
+            packets,
+        },
+        metadata,
+        current: PacketMetadata::default(),
     }))
+}
+
+/// [`TextSubtitleDemuxer`] with each packet's cue identifier and settings.
+struct WebVttDemuxer {
+    inner: TextSubtitleDemuxer,
+    metadata: VecDeque<PacketMetadata>,
+    current: PacketMetadata,
+}
+
+impl Demuxer for WebVttDemuxer {
+    fn format_name(&self) -> &str {
+        self.inner.format_name()
+    }
+
+    fn streams(&self) -> &[StreamInfo] {
+        self.inner.streams()
+    }
+
+    fn next_packet(&mut self) -> Result<Packet> {
+        let packet = self.inner.next_packet()?;
+        self.current = self.metadata.pop_front().unwrap_or_default();
+        Ok(packet)
+    }
+
+    fn packet_metadata(&self) -> PacketMetadata {
+        self.current.clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MP4 (ISO/IEC 14496-30) samples
+// ---------------------------------------------------------------------------
+
+/// One ISO BMFF box inside `data`: its type, body and where the next starts.
+pub(crate) struct BoxAt {
+    pub(crate) kind: [u8; 4],
+    pub(crate) body: Range<usize>,
+    pub(crate) end: usize,
+}
+
+/// The box at `at`, or `None` when its header or body does not fit.
+pub(crate) fn box_at(data: &[u8], at: usize) -> Option<BoxAt> {
+    let head = data.get(at..at.checked_add(8)?)?;
+    let size = u32::from_be_bytes(head[..4].try_into().ok()?) as u64;
+    let kind: [u8; 4] = head[4..8].try_into().ok()?;
+    let (header, size) = match size {
+        0 => (8, (data.len() - at) as u64),
+        1 => (16, u64::from_be_bytes(data.get(at + 8..at + 16)?.try_into().ok()?)),
+        n => (8, n),
+    };
+    if size < header as u64 || size > (data.len() - at) as u64 {
+        return None;
+    }
+    let end = at + size as usize;
+    Some(BoxAt { kind, body: at + header..end, end })
+}
+
+/// The cues of one MP4 `wvtt` sample: each `vttc` box's `payl` text with
+/// its `iden` identifier and `sttg` settings; none for a `vtte` (no cue
+/// active) or `vtta` (a comment). `None` when `data` is not such a sample:
+/// cue text never starts with a box header, whose size begins with NUL.
+pub fn mp4_sample_cues(data: &[u8]) -> Option<Vec<(Vec<u8>, WebVttMetadata)>> {
+    if !matches!(&box_at(data, 0)?.kind, b"vttc" | b"vtte" | b"vtta") {
+        return None;
+    }
+    let mut cues = Vec::new();
+    let mut at = 0;
+    while let Some(cue) = box_at(data, at) {
+        if &cue.kind == b"vttc" {
+            let body = &data[cue.body];
+            let (mut text, mut metadata) = (Vec::new(), WebVttMetadata::default());
+            let mut inner = 0;
+            while let Some(field) = box_at(body, inner) {
+                let value = body[field.body.clone()].to_vec();
+                match &field.kind {
+                    b"payl" => text = value,
+                    b"iden" => metadata.identifier = value,
+                    b"sttg" => metadata.settings = value,
+                    _ => {}
+                }
+                inner = field.end;
+            }
+            cues.push((text, metadata));
+        }
+        at = cue.end;
+    }
+    Some(cues)
 }
 
 // ---------------------------------------------------------------------------
@@ -292,18 +416,57 @@ impl EventSource for WebVtt {
     }
 }
 
-/// The `webvtt` decoder: cue text, timing from the packet.
+/// The `webvtt` decoder: cue text, timing from the packet. A packet in the
+/// MP4 sample format decodes as each of its cues' text, with the sample's
+/// timing.
+struct WebVttDecoder(AssEventDecoder<WebVtt>);
+
+impl Decoder for WebVttDecoder {
+    fn codec_id(&self) -> &CodecId {
+        self.0.codec_id()
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        let Some(cues) = mp4_sample_cues(&packet.data) else { return self.0.send_packet(packet) };
+        for (text, _) in cues {
+            self.0.send_packet(&Packet {
+                stream_index: packet.stream_index,
+                time_base: packet.time_base,
+                pts: packet.pts,
+                dts: packet.dts,
+                duration: packet.duration,
+                flags: packet.flags,
+                data: text,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        self.0.receive_frame()
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.0.flush()
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.0.reset()
+    }
+}
+
+/// Makes the `webvtt` decoder.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     if params.codec_id.as_str() != CODEC_ID {
         return Err(Error::unsupported(format!("not a WebVTT codec id: {}", params.codec_id)));
     }
-    Ok(Box::new(AssEventDecoder::new(params.codec_id.clone(), ffmpeg_default_header(), WebVtt)))
+    Ok(Box::new(WebVttDecoder(AssEventDecoder::new(params.codec_id.clone(), ffmpeg_default_header(), WebVtt))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::{Frame, Segment};
+    use oxideav_core::Segment;
 
     #[test]
     fn cue_text_converts_like_ffmpeg() {
@@ -315,12 +478,54 @@ mod tests {
         assert_eq!(ass("cut <here"), "cut ");
     }
 
+    /// The cue identifier and settings ride along as metadata (FFmpeg's
+    /// side data); the `WEBVTT`, `STYLE` and `REGION` blocks become the
+    /// header, `NOTE`s go.
     #[test]
-    fn blocks_become_cues_with_identifier_and_settings_dropped() {
-        let file = b"WEBVTT\n\nNOTE x\n\n123\n00:01.000 --> 00:02.500 align:end\nhello\nworld\n\n00:00:03.000 --> 00:00:04.000\n\nbad --> timing\n\n00:05.000 --> 00:06.000\nlost\n";
-        let packets: Vec<_> = demux_webvtt(file).finalize(TimeBase::new(1, 1000)).into_iter()
-            .map(|p| (p.pts.unwrap(), p.duration.unwrap(), String::from_utf8(p.data).unwrap())).collect();
-        assert_eq!(packets, vec![(1000, 1500, "hello\nworld".to_string()), (3000, 1000, String::new())]);
+    fn blocks_become_cues_with_identifier_and_settings_kept_aside() {
+        let file = b"WEBVTT\n\nREGION\nid:r1\n\nNOTE x\n\n123\n00:01.000 --> 00:02.500 align:end line:10%\nhello\nworld\n\n00:00:03.000 --> 00:00:04.000\n\nbad --> timing\n\n00:05.000 --> 00:06.000\nlost\n";
+        let (queue, header) = demux_webvtt(file);
+        assert_eq!(header, b"WEBVTT\n\nREGION\nid:r1");
+        let packets: Vec<_> = queue.finalize_with_metadata(TimeBase::new(1, 1000)).into_iter()
+            .map(|(p, m)| {
+                let side = m.webvtt.map(|w| (String::from_utf8(w.identifier.clone()).unwrap(), String::from_utf8(w.settings.clone()).unwrap()));
+                (p.pts.unwrap(), p.duration.unwrap(), String::from_utf8(p.data).unwrap(), side)
+            })
+            .collect();
+        assert_eq!(packets, vec![
+            (1000, 1500, "hello\nworld".to_string(), Some(("123".to_string(), "align:end line:10%".to_string()))),
+            (3000, 1000, String::new(), None),
+        ]);
+    }
+
+    fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        [&(8 + body.len() as u32).to_be_bytes()[..], kind, body].concat()
+    }
+
+    /// ISO/IEC 14496-30: a sample holds `vttc` cue boxes (`iden`, `sttg`,
+    /// `payl`), or a `vtte` box while no cue is active.
+    #[test]
+    fn mp4_samples_unpack_into_cues() {
+        let cue = |iden: &[u8], sttg: &[u8], payl: &[u8]| {
+            mp4_box(b"vttc", &[mp4_box(b"iden", iden), mp4_box(b"sttg", sttg), mp4_box(b"payl", payl)].concat())
+        };
+        let sample = [cue(b"a", b"line:0", b"<i>one</i>"), mp4_box(b"vtta", b"comment"), cue(b"", b"", b"two")].concat();
+        let cues = mp4_sample_cues(&sample).unwrap();
+        let flat: Vec<_> = cues.iter().map(|(t, m)| (t.as_slice(), m.identifier.as_slice(), m.settings.as_slice())).collect();
+        assert_eq!(flat, [(&b"<i>one</i>"[..], &b"a"[..], &b"line:0"[..]), (b"two", b"", b"")]);
+        assert_eq!(mp4_sample_cues(&mp4_box(b"vtte", b"")).unwrap().len(), 0);
+        // Cue text is never a box.
+        assert!(mp4_sample_cues(b"plain text").is_none());
+        assert!(mp4_sample_cues(&mp4_box(b"payl", b"x")).is_none());
+
+        let mut decoder = make_decoder(&CodecParameters::subtitle(CodecId::new(CODEC_ID))).unwrap();
+        decoder.send_packet(&Packet::new(0, TimeBase::new(1, 1000), sample).with_pts(2000).with_duration(500)).unwrap();
+        let mut texts = Vec::new();
+        while let Ok(Frame::Subtitle(cue)) = decoder.receive_frame() {
+            assert_eq!((cue.start_us, cue.end_us), (2_000_000, 2_500_000));
+            texts.push(format!("{:?}", cue.segments));
+        }
+        assert_eq!(texts, [format!("{:?}", [Segment::Italic(vec![Segment::Text("one".into())])]), format!("{:?}", [Segment::Text("two".into())])]);
     }
 
     #[test]

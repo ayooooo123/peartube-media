@@ -1669,6 +1669,7 @@ dependencies = [
  "refcheck",
  "subs-bitmap",
  "subs-cc",
+ "subs-text",
  "thiserror 2.0.21",
 ]
 

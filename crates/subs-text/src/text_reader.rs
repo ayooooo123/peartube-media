@@ -36,8 +36,9 @@
 
 use std::collections::VecDeque;
 use std::io::Read;
+use std::sync::Arc;
 
-use oxideav_core::{Error, Packet, ReadSeek, Result, TimeBase};
+use oxideav_core::{Error, Packet, PacketMetadata, ReadSeek, Result, TimeBase, WebVttMetadata};
 
 use crate::text_common::{MAX_CUES, MAX_FILE_BYTES};
 
@@ -188,6 +189,9 @@ pub(crate) struct QueuedEvent {
     pub pos: i64,
     pub duration: i64,
     pub data: Vec<u8>,
+    /// The cue identifier and settings FFmpeg's WebVTT demuxer attaches as
+    /// side data (`AV_PKT_DATA_WEBVTT_IDENTIFIER` / `_SETTINGS`).
+    pub webvtt: Option<Arc<WebVttMetadata>>,
 }
 
 /// `FFDemuxSubtitlesQueue` (one stream, `SUB_SORT_TS_POS`).
@@ -213,7 +217,7 @@ impl SubtitleQueue {
         if self.events.len() >= MAX_CUES {
             return None;
         }
-        self.events.push(QueuedEvent { pts: 0, pos: -1, duration: -1, data: event.to_vec() });
+        self.events.push(QueuedEvent { pts: 0, pos: -1, duration: -1, data: event.to_vec(), webvtt: None });
         self.events.last_mut()
     }
 
@@ -228,7 +232,13 @@ impl SubtitleQueue {
 
     /// `ff_subtitles_queue_finalize` followed by the packets
     /// `ff_subtitles_queue_read_packet` hands out.
-    pub fn finalize(mut self, time_base: TimeBase) -> VecDeque<Packet> {
+    pub fn finalize(self, time_base: TimeBase) -> VecDeque<Packet> {
+        self.finalize_with_metadata(time_base).into_iter().map(|(packet, _)| packet).collect()
+    }
+
+    /// [`Self::finalize`], each packet with its side data as packet
+    /// metadata.
+    pub fn finalize_with_metadata(mut self, time_base: TimeBase) -> VecDeque<(Packet, PacketMetadata)> {
         self.events.sort_by(|a, b| a.pts.cmp(&b.pts).then(a.pos.cmp(&b.pos)));
         for i in 0..self.events.len().saturating_sub(1) {
             let next = self.events[i + 1].pts;
@@ -250,7 +260,9 @@ impl SubtitleQueue {
                 packet.dts = Some(e.pts);
                 packet.duration = Some(e.duration);
                 packet.flags.keyframe = true;
-                packet
+                let mut metadata = PacketMetadata::default();
+                metadata.webvtt = e.webvtt;
+                (packet, metadata)
             })
             .collect()
     }

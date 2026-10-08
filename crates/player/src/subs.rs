@@ -16,12 +16,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use oxideav_core::{Decoder, Frame, Packet, TimeBase, VideoFrame};
+use oxideav_core::{Decoder, Frame, Packet, PacketMetadata, TimeBase, VideoFrame};
 use parking_lot::Condvar;
 
 use crate::backend::{Clock, SubtitleImage, SubtitleSink};
 use crate::clock::current_monotonic_ns;
 use crate::engine::Lane;
+use crate::webvtt::{layout_cue, place, stack_region, Layout, Rect, RegionSlot, TextCue, WebVttTrack};
+use subs_text::webvtt_settings::CueSettings;
 
 /// Longest the pipeline waits without looking at the clock again. The lane
 /// wakes it on everything that matters (a packet, a seek, the clock starting
@@ -108,6 +110,11 @@ fn visible(data: &[u8], stride: usize, width: usize, height: usize) -> Option<Su
     })
 }
 
+/// [`visible`] of a tightly packed `width x height` RGBA plane.
+pub(crate) fn visible_image(rgba: &[u8], width: usize, height: usize) -> Option<SubtitleImage> {
+    visible(rgba, width * 4, width, height)
+}
+
 /// One bitmap display state, as the sink gets it.
 #[derive(Clone, Debug)]
 pub struct BitmapCue {
@@ -168,35 +175,56 @@ impl Cue {
     /// Bytes of the bitmap it holds.
     fn bytes(&self) -> usize {
         match &self.content {
-            Content::Text(image) => image.rgba.len(),
+            Content::Text(text) => text.image.rgba.len() + region_bytes(&text.layout),
             Content::Bitmap(state) => state.image.as_ref().map_or(0, |image| image.rgba.len()),
         }
+    }
+}
+
+/// Bytes of the lines a region cue keeps to restack them.
+fn region_bytes(layout: &Layout) -> usize {
+    match layout {
+        Layout::Region(slot) => slot.block.rgba.len(),
+        _ => 0,
     }
 }
 
 enum Content {
     /// A text cue on a video-sized canvas; it shares the screen with the
     /// text cues it overlaps.
-    Text(SubtitleImage),
+    Text(TextCue),
     /// A bitmap display state: it replaces whatever is up.
     Bitmap(BitmapCue),
 }
 
-fn decoded_cue(frame: Frame, packet: &Packet, time_base: TimeBase, width: u32, height: u32) -> Option<Cue> {
+/// What a decoded `frame` puts on screen. `vtt` is a WebVTT track's
+/// placement context and the cue's settings.
+fn decoded_cue(
+    frame: Frame,
+    packet: &Packet,
+    time_base: TimeBase,
+    width: u32,
+    height: u32,
+    vtt: Option<(&WebVttTrack, Option<&CueSettings>)>,
+) -> Option<Cue> {
     match frame {
         Frame::Subtitle(cue) => {
             let start = Duration::from_micros(cue.start_us.max(0) as u64);
             let end = Duration::from_micros(cue.end_us.max(cue.start_us).max(0) as u64);
-            let image = render_text_cue(&cue, width, height);
             if cue.style_ref.as_deref() == Some(subs_cc::STATE_STYLE) {
                 // A caption screen: a display state, up until the next one
                 // replaces it (or its end), as bitmap states are.
+                let image = render_text_cue(&cue, width, height);
                 let (canvas_width, canvas_height) = text_space(width, height);
                 let end = (cue.end_us != i64::MAX).then_some(end);
                 let image = (image.width > 0).then_some(image);
                 return Some(Cue { start, end, content: Content::Bitmap(BitmapCue { canvas_width, canvas_height, image }) });
             }
-            Some(Cue { start, end: Some(end), content: Content::Text(image) })
+            let text = match vtt {
+                Some((track, settings)) => layout_cue(&cue, settings, track, text_space(width, height)),
+                None => TextCue { image: render_text_cue(&cue, width, height), layout: Layout::Fixed },
+            };
+            Some(Cue { start, end: Some(end), content: Content::Text(text) })
         }
         Frame::Video(vf) => {
             let start = media_time(vf.pts.or(packet.pts).unwrap_or(0), time_base);
@@ -208,22 +236,42 @@ fn decoded_cue(frame: Frame, packet: &Packet, time_base: TimeBase, width: u32, h
     }
 }
 
+/// A text cue up: when it goes, and, in a region, what it is stacked
+/// from.
+struct TextUp {
+    end: Duration,
+    region: Option<RegionSlot>,
+}
+
 /// What is on screen: text cues, or one bitmap state (a stream carries one
 /// kind; a cue of the other kind replaces everything up).
 #[derive(Default)]
 struct OnScreen {
+    /// The text cues up, as shown: a WebVTT cue where it was placed, a
+    /// region's cue clipped to its region (possibly to nothing).
     text: Vec<SubtitleImage>,
-    /// When each of `text` goes.
-    text_ends: Vec<Duration>,
+    /// For each of `text`, when it goes and its region.
+    text_up: Vec<TextUp>,
     /// The bitmap state and when it goes, if it has an end.
     bitmap: Option<(BitmapCue, Option<Duration>)>,
+    /// The text canvas, and the region boxes WebVTT cues keep off.
+    canvas: (u32, u32),
+    regions: Vec<Rect>,
 }
 
 impl OnScreen {
+    fn new(canvas: (u32, u32), regions: Vec<Rect>) -> OnScreen {
+        OnScreen { canvas, regions, ..OnScreen::default() }
+    }
+
+    fn canvas_rect(&self) -> Rect {
+        Rect { x: 0, y: 0, w: i64::from(self.canvas.0), h: i64::from(self.canvas.1) }
+    }
+
     /// When the next thing on screen goes.
     fn next_end(&self) -> Option<Duration> {
         let bitmap = self.bitmap.as_ref().and_then(|(_, end)| *end);
-        self.text_ends.iter().copied().chain(bitmap).min()
+        self.text_up.iter().map(|up| up.end).chain(bitmap).min()
     }
 
     /// Takes down everything that goes at or before `at`.
@@ -231,35 +279,73 @@ impl OnScreen {
         if self.bitmap.as_ref().is_some_and(|(_, end)| end.is_some_and(|end| end <= at)) {
             self.bitmap = None;
         }
+        let before = self.text.len();
         let mut i = 0;
         while i < self.text.len() {
-            if self.text_ends[i] <= at {
+            if self.text_up[i].end <= at {
                 self.text.remove(i);
-                self.text_ends.remove(i);
+                self.text_up.remove(i);
             } else {
                 i += 1;
+            }
+        }
+        if self.text.len() != before {
+            self.restack();
+        }
+    }
+
+    /// A text cue shown on its own (no other cue up), where it goes;
+    /// `None` when it is not shown. A cue with nothing visible shows as
+    /// the empty image every text cue without pixels shows as.
+    fn alone(&self, text: &TextCue) -> Option<SubtitleImage> {
+        match &text.layout {
+            Layout::Fixed => Some(text.image.clone()),
+            Layout::Region(slot) => stack_region(&[slot]).pop().filter(|image| image.width > 0),
+            _ if text.image.width == 0 => Some(text.image.clone()),
+            layout => {
+                let mut image = text.image.clone();
+                place(&mut image, layout, &self.regions, self.canvas_rect()).then_some(image)
             }
         }
     }
 
     fn put(&mut self, cue: Cue) {
         match cue.content {
-            Content::Text(image) => {
+            Content::Text(TextCue { mut image, layout }) => {
                 self.bitmap = None;
+                let region = match layout {
+                    Layout::Fixed => None,
+                    Layout::Region(slot) => Some(slot),
+                    layout => {
+                        // Off the regions and the cues up, as they were
+                        // placed (§7.1: a cue shown keeps its boxes).
+                        let mut obstacles = self.regions.clone();
+                        let up = self.text.iter().zip(&self.text_up);
+                        obstacles.extend(up.filter(|(image, up)| up.region.is_none() && image.width > 0).map(|(image, _)| Rect::of(image)));
+                        if !place(&mut image, &layout, &obstacles, self.canvas_rect()) {
+                            return;
+                        }
+                        None
+                    }
+                };
                 self.text.push(image);
-                self.text_ends.push(cue.end.unwrap_or(cue.start));
+                self.text_up.push(TextUp { end: cue.end.unwrap_or(cue.start), region });
                 // Past MAX_TEXT_UP*, the earliest up go first. Text renders
                 // within MAX_CANVAS_PIXELS (`text_space`), so a cue alone
                 // never outgrows the bytes.
-                let mut bytes: usize = self.text.iter().map(|image| image.rgba.len()).sum();
-                while !self.text.is_empty() && (self.text.len() > MAX_TEXT_UP || bytes > MAX_TEXT_UP_BYTES) {
-                    bytes -= self.text.remove(0).rgba.len();
-                    self.text_ends.remove(0);
+                let bytes = |on: &OnScreen| {
+                    let regions: usize = on.text_up.iter().filter_map(|up| up.region.as_ref()).map(|slot| slot.block.rgba.len()).sum();
+                    on.text.iter().map(|image| image.rgba.len()).sum::<usize>() + regions
+                };
+                while !self.text.is_empty() && (self.text.len() > MAX_TEXT_UP || bytes(self) > MAX_TEXT_UP_BYTES) {
+                    self.text.remove(0);
+                    self.text_up.remove(0);
                 }
+                self.restack();
             }
             Content::Bitmap(state) => {
                 self.text.clear();
-                self.text_ends.clear();
+                self.text_up.clear();
                 // A blank state has already cleared the screen; its own
                 // nominal duration must not delay EOF or schedule a second
                 // clear (DVB attaches its page timeout to blank states too).
@@ -269,8 +355,30 @@ impl OnScreen {
         }
     }
 
+    /// Stacks each region's cues again (§7.1: from the region's bottom,
+    /// the latest lowest, clipped to the region).
+    fn restack(&mut self) {
+        let (text, text_up) = (&mut self.text, &self.text_up);
+        let mut regions: Vec<usize> = text_up.iter().filter_map(|up| up.region.as_ref().map(|slot| slot.region)).collect();
+        regions.sort_unstable();
+        regions.dedup();
+        for region in regions {
+            let members: Vec<(usize, &RegionSlot)> = text_up
+                .iter()
+                .enumerate()
+                .filter_map(|(i, up)| up.region.as_ref().filter(|slot| slot.region == region).map(|slot| (i, slot)))
+                .collect();
+            let slots: Vec<&RegionSlot> = members.iter().map(|&(_, slot)| slot).collect();
+            for ((i, _), image) in members.iter().zip(stack_region(&slots)) {
+                text[*i] = image;
+            }
+        }
+    }
+
     fn clear(&mut self) {
-        *self = OnScreen::default();
+        self.text.clear();
+        self.text_up.clear();
+        self.bitmap = None;
     }
 }
 
@@ -333,8 +441,24 @@ impl Screen {
                 let images = state.image.as_ref().map(std::slice::from_ref).unwrap_or_default();
                 self.put(images, state.canvas_width, state.canvas_height);
             }
+            None if self.has_clipped(on) => {
+                // A region's cue clipped to nothing is not shown.
+                let images: Vec<SubtitleImage> = on
+                    .text
+                    .iter()
+                    .zip(&on.text_up)
+                    .filter(|(image, up)| up.region.is_none() || image.width > 0)
+                    .map(|(image, _)| image.clone())
+                    .collect();
+                self.put(&images, self.video_width, self.video_height);
+            }
             None => self.put(&on.text, self.video_width, self.video_height),
         }
+    }
+
+    /// A region's cue up is clipped to nothing.
+    fn has_clipped(&self, on: &OnScreen) -> bool {
+        on.text.iter().zip(&on.text_up).any(|(image, up)| up.region.is_some() && image.width == 0)
     }
 
     fn clear(&mut self) {
@@ -344,7 +468,7 @@ impl Screen {
 
 /// What woke a wait on the lane.
 enum Woke {
-    Packet(Packet),
+    Packet(Packet, PacketMetadata),
     /// The demuxer's end marker.
     Eof,
     /// Anything else: the awaited time came, a seek, a retire, the player
@@ -375,6 +499,9 @@ pub(crate) struct SubtitlePipeline {
     pub(crate) beside_media: Box<dyn Fn() -> bool + Send>,
     pub(crate) stopped: Arc<AtomicBool>,
     pub(crate) retired: Arc<AtomicBool>,
+    /// A WebVTT track's placement context: its cues are laid out per their
+    /// settings and regions.
+    pub(crate) webvtt: Option<WebVttTrack>,
 }
 
 impl SubtitlePipeline {
@@ -399,10 +526,10 @@ impl SubtitlePipeline {
                     return Woke::Eof;
                 }
                 Some(_) => {
-                    let packet = q.remove(0).packet;
+                    let queued = q.remove(0);
                     drop(q);
                     self.demux_cv.notify_one();
-                    return Woke::Packet(packet);
+                    return Woke::Packet(queued.packet, queued.metadata);
                 }
                 None => {}
             }
@@ -433,22 +560,27 @@ impl SubtitlePipeline {
     }
 
     /// Decodes `packet` under `catch_unwind` (a panicking subtitle decoder
-    /// drops the cue, never the playback) and queues its cues.
-    fn decode(&mut self, packet: &Packet, pending: &mut VecDeque<Cue>) {
+    /// drops the cue, never the playback) and queues its cues, each laid
+    /// out per its WebVTT settings (from `metadata`, or the MP4 sample).
+    fn decode(&mut self, packet: &Packet, metadata: &PacketMetadata, pending: &mut VecDeque<Cue>) {
         let decoder = &mut self.decoder;
         match std::panic::catch_unwind(AssertUnwindSafe(|| decoder.send_packet(packet))) {
             Ok(Ok(())) => {}
             _ => return,
         }
+        let settings = self.webvtt.as_ref().map_or_else(Vec::new, |track| {
+            std::panic::catch_unwind(AssertUnwindSafe(|| track.packet_settings(packet, metadata))).unwrap_or_default()
+        });
         let (w, h) = (self.video_width.max(320), self.video_height.max(240));
-        loop {
+        for index in 0.. {
             let decoder = &mut self.decoder;
             let frame = match std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame())) {
                 Ok(Ok(frame)) => frame,
                 _ => break,
             };
+            let vtt = self.webvtt.as_ref().map(|track| (track, settings.get(index).and_then(Option::as_ref)));
             let cue = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                decoded_cue(frame, packet, self.time_base, w, h)
+                decoded_cue(frame, packet, self.time_base, w, h, vtt)
             }));
             if let Ok(Some(cue)) = cue {
                 // Cues come up by start time, as VLC picks subpictures by
@@ -499,7 +631,9 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
         video_height,
         shown: false,
     };
-    let mut on = OnScreen::default();
+    let canvas = (video_width, video_height);
+    let regions = pipe.webvtt.as_ref().map_or_else(Vec::new, |track| track.region_rects(canvas));
+    let mut on = OnScreen::new(canvas, regions);
     let mut pending: VecDeque<Cue> = VecDeque::new();
     let mut seen_seek = (pipe.seek_generation)();
     let mut eof = false;
@@ -529,14 +663,16 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
                 return;
             }
             match pipe.wait(None, true, seen_seek) {
-                Woke::Packet(packet) => pipe.decode(&packet, &mut pending),
+                Woke::Packet(packet, metadata) => pipe.decode(&packet, &metadata, &mut pending),
                 Woke::Eof => eof = true,
                 Woke::Other => {}
             }
             while let Some(cue) = pending.pop_front() {
-                if let Content::Text(image) = &cue.content {
-                    screen.put(std::slice::from_ref(image), screen.video_width, screen.video_height);
-                    screen.clear();
+                if let Content::Text(text) = &cue.content {
+                    if let Some(image) = on.alone(text) {
+                        screen.put(std::slice::from_ref(&image), screen.video_width, screen.video_height);
+                        screen.clear();
+                    }
                     continue;
                 }
                 if on.next_end().is_some_and(|end| end <= cue.start) {
@@ -576,8 +712,8 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
             return;
         }
         match pipe.wait(next, take, seen_seek) {
-            Woke::Packet(packet) => {
-                pipe.decode(&packet, &mut pending);
+            Woke::Packet(packet, metadata) => {
+                pipe.decode(&packet, &metadata, &mut pending);
                 bound(&mut pending);
             }
             Woke::Eof => eof = true,
@@ -591,7 +727,7 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::VideoPlane;
+    use oxideav_core::{Segment, SubtitleCue, VideoPlane};
 
     fn bitmap(pts: i64, duration: Option<Duration>, visible: bool) -> VideoFrame {
         let mut frame = VideoFrame {
@@ -614,7 +750,7 @@ mod tests {
             flags: Default::default(),
             data: Vec::new(),
         };
-        decoded_cue(Frame::Video(frame), &packet, packet.time_base, 320, 240).unwrap()
+        decoded_cue(Frame::Video(frame), &packet, packet.time_base, 320, 240, None).unwrap()
     }
 
     #[test]
@@ -710,5 +846,38 @@ mod tests {
                 assert_eq!((width, height), want, "{video:?}");
             }
         }
+    }
+
+    /// WebVTT cues up together: snapped cues stack a line apart, and a
+    /// region shows its newest lines, the older back when the newest goes.
+    #[test]
+    fn webvtt_cues_up_together_stack_and_regions_restack() {
+        let header = b"WEBVTT\n\nREGION\nid:r width:50% lines:1 regionanchor:0%,100% viewportanchor:0%,50%\n";
+        let track = WebVttTrack::new(header);
+        let regions = subs_text::webvtt_settings::header_regions(header);
+        let canvas = text_space(320, 240);
+        let mut on = OnScreen::new(canvas, track.region_rects(canvas));
+        let packet = Packet::new(0, TimeBase::new(1, 1000), Vec::new());
+        let cue = |text: &str, end_s: u64, settings: Option<&CueSettings>| {
+            let cue = SubtitleCue { start_us: 0, end_us: end_s as i64 * 1_000_000, style_ref: None, positioning: None, segments: vec![Segment::Text(text.into())] };
+            decoded_cue(Frame::Subtitle(cue), &packet, packet.time_base, 320, 240, Some((&track, settings))).unwrap()
+        };
+        on.put(cue("first", 9, None));
+        on.put(cue("second", 9, None));
+        assert_eq!(on.text[1].y, on.text[0].y - 20);
+
+        let in_region = CueSettings::parse(b"region:r align:left", &regions);
+        on.put(cue("older", 3, Some(&in_region)));
+        on.put(cue("newer", 1, Some(&in_region)));
+        // One line: the newer shows, the older is scrolled out.
+        assert_eq!(on.text[2].width, 0);
+        assert!(on.text[3].width > 0);
+        let newer_bottom = on.text[3].y + on.text[3].height as i32;
+        on.expire(Duration::from_secs(1));
+        assert_eq!(on.text.len(), 3);
+        assert!(on.text[2].width > 0);
+        // Back on the region's line: the same line box, so the same bottom
+        // (neither word has a descender; their tops differ by ascenders).
+        assert_eq!(on.text[2].y + on.text[2].height as i32, newer_bottom);
     }
 }

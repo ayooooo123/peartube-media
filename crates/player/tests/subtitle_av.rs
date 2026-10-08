@@ -293,19 +293,22 @@ fn selecting_a_subtitle_keeps_the_default_audio_track() {
 }
 
 /// Text cues each get their own image: a flood of 80 cues starting 40 ms
-/// apart, all up until 4.2 s, over 1080p video. At most 64 are up at once
-/// (the earliest go first); the video and audio play on; the flood comes
-/// down at its end; two later cues that overlap are shown together; a seek
-/// in the middle of the flood clears it.
+/// apart, all up until 4.2 s, over 1920x1440 video. WebVTT cues without
+/// settings take a line each, the latest highest (W3C WebVTT §7.2), and a
+/// cue with no free line is not shown; 1440 rows hold some 70 of the
+/// compositor's 20-pixel lines (1080 rows hold 54), more than the bound.
+/// At most 64 are up at once (the earliest go first); the video and audio
+/// play on; the flood comes down at its end; two later cues that overlap
+/// are shown together; a seek in the middle of the flood clears it.
 #[test]
-fn overlapping_text_cues_stay_bounded_beside_1080p_video() {
+fn overlapping_text_cues_stay_bounded_beside_1440p_video() {
     let scratch = Scratch::new();
     let cues = scratch.file("flood.srt");
     let mut timing: Vec<(u32, u32)> = (0..80).map(|i| (200 + 40 * i, 4200)).collect();
     timing.extend([(4600, 5300), (4800, 5500)]);
     srt(&cues, &timing);
     let mkv = scratch.file("flood.mkv");
-    movie(&mkv, 6, Some(("color=c=0x204060:size=1920x1080:rate=5", "5")), &[440], &[&cues]);
+    movie(&mkv, 6, Some(("color=c=0x204060:size=1920x1440:rate=5", "5")), &[440], &[&cues]);
     let path = scratch.file("flood.ptscript");
     scripted::write(&path, &mkv, Mode::Unseekable);
     let bounded = |shows: &[Shown]| {
@@ -316,7 +319,7 @@ fn overlapping_text_cues_stay_bounded_beside_1080p_video() {
 
     let (player, backend) = play(&path, 2);
     let state = wait_until(&player, Duration::from_secs(60), "playback end", |state| state.ended);
-    assert_audio_and_video_complete(&mkv, &backend, &state, Some(30), "1080p flood");
+    assert_audio_and_video_complete(&mkv, &backend, &state, Some(30), "1440p flood");
     let shows = backend.watch.shows.lock().clone();
     bounded(&shows);
     assert!(shows.iter().any(|show| show.images == 64), "the flood reaches the bound: {:?}", shows.iter().map(|s| s.images).max());

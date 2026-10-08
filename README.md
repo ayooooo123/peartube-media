@@ -136,9 +136,19 @@ decoder (the FFmpeg port standalone `.vtt` files use), timed by the packet.
 `Demuxer::packet_metadata().webvtt` replaces the typed-only accessor and
 preserves each cue's identifier/settings through lacing and seeks. The
 accessor clears before the next read/seek, including errors and EOF;
-previously captured owned snapshots remain valid.
-**WebVTT settings/layout still need consumer rendering integration**; cue
-text and timing work, but exposing side data alone is not end-to-end support.
+previously captured owned snapshots remain valid. Standalone `.vtt` files
+give each cue the same metadata (FFmpeg's side data) and their `WEBVTT`,
+`STYLE` and `REGION` blocks as extradata. MP4 `wvtt` samples (ISO/IEC
+14496-30, which FFmpeg does not read) decode from their `vttc` boxes. The
+player places WebVTT cues as W3C WebVTT section 7 does: the line (snapped to
+lines or a percentage, with its alignment), position, size and alignment,
+vertical cues, regions from the header, and the moves that keep cues off
+each other; a cue with no room is not shown. `cargo test -p player --test
+webvtt_placement` checks placement through `.vtt`, FFmpeg's Matroska and
+WebM remuxes and a hand-built MP4; `cargo test -p subs-text --test
+webvtt_settings` mutates settings, headers and MP4 samples at least 2000
+times each. CSS from `STYLE` blocks, right-to-left text and ruby are not
+rendered.
 
 `cargo test -p check-mkv -p player --no-fail-fast` compares packet fields
 directly with FFmpeg 9, checks incremental reads and malformed input, and

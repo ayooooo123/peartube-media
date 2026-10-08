@@ -1098,6 +1098,10 @@ fn spawn_subtitles(
         };
         let ctx = Arc::clone(&shared.ctx);
         let (seeks, members) = (Arc::clone(&shared), Arc::clone(&shared));
+        // WebVTT cues are placed per their settings and the regions the
+        // stream's header (extradata) defines.
+        let webvtt = (params.codec_id.as_str() == subs_text::webvtt::CODEC_ID)
+            .then(|| crate::webvtt::WebVttTrack::new(&params.extradata));
         let pipeline = SubtitlePipeline {
             decoder,
             new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
@@ -1115,6 +1119,7 @@ fn spawn_subtitles(
             beside_media: Box::new(move || members.beside_media.load(Ordering::SeqCst)),
             stopped: shared.stopped.clone(),
             retired,
+            webvtt,
         };
         run_subtitle_loop(pipeline, sink);
     })
