@@ -50,7 +50,6 @@ oxideav-mod.workspace = true
 oxideav-mp1.workspace = true
 oxideav-mp2.workspace = true
 oxideav-mp3.workspace = true
-oxideav-musepack.workspace = true
 oxideav-opus.workspace = true
 oxideav-s3m.workspace = true
 oxideav-speex.workspace = true
@@ -82,6 +81,7 @@ codec-vp56 = { path = "../codec-vp56" }
 codec-speex = { path = "../codec-speex" }
 codec-ape = { path = "../codec-ape" }
 codec-wavpack = { path = "../codec-wavpack" }
+codec-musepack = { path = "../codec-musepack" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

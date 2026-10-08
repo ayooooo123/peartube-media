@@ -351,6 +351,7 @@ dependencies = [
  "codec-dca",
  "codec-dv",
  "codec-mlp",
+ "codec-musepack",
  "codec-ra",
  "codec-rv",
  "codec-speech",
@@ -399,7 +400,6 @@ dependencies = [
  "oxideav-mpeg4video",
  "oxideav-mpegts",
  "oxideav-msmpeg4",
- "oxideav-musepack",
  "oxideav-ogg",
  "oxideav-opus",
  "oxideav-s3m",
@@ -1371,14 +1371,6 @@ dependencies = [
 name = "oxideav-msmpeg4"
 version = "0.0.10"
 source = "git+https://github.com/ayooooo123/oxideav-msmpeg4?rev=def8962c09aa5d339dada2d2308c61186a67e074#def8962c09aa5d339dada2d2308c61186a67e074"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
-name = "oxideav-musepack"
-version = "0.0.4"
-source = "git+https://github.com/OxideAV/oxideav-musepack?rev=c60b07708683e0e25c6e0007bffbb887e03876f7#c60b07708683e0e25c6e0007bffbb887e03876f7"
 dependencies = [
  "oxideav-core",
 ]

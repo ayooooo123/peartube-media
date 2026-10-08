@@ -59,7 +59,6 @@ oxideav-mod = "*"
 oxideav-mp1 = "*"
 oxideav-mp2 = "*"
 oxideav-mp3 = "*"
-oxideav-musepack = "*"
 oxideav-opus = "*"
 oxideav-s3m = "*"
 oxideav-speex = "*"
@@ -124,11 +123,17 @@ opt-level = 3
 # Hot workspace crates (player, codec-wmv, codec-dca) keep the default 3.
 [profile.release.package.audio-trim]
 opt-level = "s"
+[profile.release.package.codec-ape]
+opt-level = "s"
 [profile.release.package.codec-mlp]
+opt-level = "s"
+[profile.release.package.codec-musepack]
 opt-level = "s"
 [profile.release.package.codec-ra]
 opt-level = "s"
 [profile.release.package.codec-rv]
+opt-level = "s"
+[profile.release.package.codec-wavpack]
 opt-level = "s"
 [profile.release.package.codec-wma]
 opt-level = "s"
@@ -197,7 +202,6 @@ oxideav-mpeg12video = { git = "https://github.com/ayooooo123/oxideav-mpeg12video
 oxideav-mpeg4video = { git = "https://github.com/ayooooo123/oxideav-mpeg4video", rev = "a759321b87caef26a340186f04a86c8f4060ec15" }
 oxideav-mpegts = { git = "https://github.com/ayooooo123/oxideav-mpegts", rev = "cae69e3c911a830b07e8e35b1b88e26f2e842b62" }
 oxideav-msmpeg4 = { git = "https://github.com/ayooooo123/oxideav-msmpeg4", rev = "def8962c09aa5d339dada2d2308c61186a67e074" }
-oxideav-musepack = { git = "https://github.com/OxideAV/oxideav-musepack", rev = "c60b07708683e0e25c6e0007bffbb887e03876f7" }
 oxideav-ogg = { git = "https://github.com/ayooooo123/oxideav-ogg", rev = "0f651ce5b48fef181dfb5100495aef978d42ac3f" }
 oxideav-opus = { git = "https://github.com/ayooooo123/oxideav-opus", rev = "6a27d5bd7ec3081eadc527cb610336b7d6d2f32e" }
 oxideav-otf = { git = "https://github.com/OxideAV/oxideav-otf", rev = "554299a740ce7236bf2c5e751bb7df5befd52dd0" }
