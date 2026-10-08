@@ -272,6 +272,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-svq3"
+version = "0.1.0"
+dependencies = [
+ "compcol",
+ "oxideav-core",
+ "oxideav-mov",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-vp3"
 version = "0.1.0"
 dependencies = [
@@ -329,6 +339,7 @@ dependencies = [
  "codec-rv",
  "codec-speech",
  "codec-speex",
+ "codec-svq3",
  "codec-vp3",
  "codec-vp56",
  "codec-wma",
