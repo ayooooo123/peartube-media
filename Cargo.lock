@@ -1312,7 +1312,7 @@ dependencies = [
 [[package]]
 name = "oxideav-indeo"
 version = "0.0.1"
-source = "git+https://github.com/ayooooo123/oxideav-indeo?rev=fafc8fa7bb089f743b841cb0d1229c0763612d93#fafc8fa7bb089f743b841cb0d1229c0763612d93"
+source = "git+https://github.com/ayooooo123/oxideav-indeo?rev=34d5d899b74bd4add72e0572813458bd9fa9a853#34d5d899b74bd4add72e0572813458bd9fa9a853"
 dependencies = [
  "oxideav-core",
 ]

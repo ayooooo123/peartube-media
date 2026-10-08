@@ -133,3 +133,12 @@ fn h261_frames_equal_ffmpegs() {
         ("CIF, low quality".into(), cif("h261-cif-q20.avi", &["-q:v", "20"])),
     ]);
 }
+
+/// FATE's Indeo 3 samples (iv32/), in FFmpeg's native 4:1:0.
+#[test]
+fn indeo3_frames_equal_ffmpegs() {
+    run(vec![
+        ("iv32/OPENINGH.avi".into(), refcheck::fate("iv32/OPENINGH.avi")),
+        ("iv32/cubes.mov".into(), refcheck::fate("iv32/cubes.mov")),
+    ]);
+}
