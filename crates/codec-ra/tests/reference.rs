@@ -31,6 +31,9 @@ fn check_audio(sample: &str, min_snr: f64, max_slack: usize) {
     );
 }
 
+/// Bit-exact to the end. The file's last packet is cut (137 of 240 bytes):
+/// FFmpeg's demuxer hands over the 137 bytes, flagged corrupt, its decoder
+/// decodes 6 frames and refuses the 17-byte rest; nothing is zero-filled.
 #[test]
 fn test_ra144_rm() {
     let path = fate("real/ra3_in_rm_file.rm");
@@ -42,11 +45,8 @@ fn test_ra144_rm() {
     );
     let got = interleaved_f32(&decoded);
     let ref_samples = ffmpeg_audio_f32(&path, 0);
-    println!("got len: {}, ref len: {}", got.len(), ref_samples.len());
-    let prefix = 453 * 1920; // 869760 samples (first 453 packets before corrupt EOF packet)
-    let snr = snr_db(&ref_samples[..prefix], &got[..prefix], 0);
-    println!("SNR over {prefix} valid samples: {snr:.2} dB");
-    assert_eq!(snr, f64::INFINITY, "ra144 must be bit-exact on valid packets");
+    assert_eq!(got.len(), ref_samples.len(), "453 whole packets and 6 frames of the cut one");
+    assert_eq!(snr_db(&ref_samples, &got, 0), f64::INFINITY, "ra144 must be bit-exact");
 }
 
 #[test]
