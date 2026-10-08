@@ -78,7 +78,6 @@ const DELAY_FRAMES: i64 = 32;
 #[derive(Clone, Copy, Debug, Default)]
 struct MpcFrame {
     pos: u64,
-    _size: usize,
     skip: i32,
 }
 
@@ -137,13 +136,7 @@ pub fn open_mpc(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Re
         duration: Some(fcount as i64),
         start_time: Some(0),
     };
-
-    let frames = if fcount > 0 && fcount < 10_000_000 {
-        vec![MpcFrame::default(); fcount as usize]
-    } else {
-        Vec::new()
-    };
-
+    let frames = Vec::new();
     Ok(Box::new(MpcDemuxer {
         input,
         stream,
@@ -210,12 +203,11 @@ impl Demuxer for MpcDemuxer {
             return Err(Error::invalid("mpc: packet too large"));
         }
 
-        if cur as usize == self.frames_noted && (cur as usize) < self.frames.len() {
-            self.frames[cur as usize] = MpcFrame {
+        if cur as usize == self.frames_noted {
+            self.frames.push(MpcFrame {
                 pos,
-                _size: size,
                 skip: curbits - 20,
-            };
+            });
             self.frames_noted += 1;
         }
 
@@ -241,7 +233,7 @@ impl Demuxer for MpcDemuxer {
     }
 
     fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
-        let mut target = (pts - DELAY_FRAMES).max(0);
+        let mut target = pts.saturating_sub(DELAY_FRAMES).max(0);
         if target >= self.fcount as i64 && self.fcount != 0 {
             return Err(Error::invalid("mpc: seek target out of range"));
         }
@@ -418,10 +410,9 @@ pub fn open_mpc8(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> R
         }
     }
 
-    if tag != TAG_STREAMHDR {
-        return Err(Error::invalid("mpc8: stream header not found"));
+    if tag != TAG_STREAMHDR || payload_size < 0 {
+        return Err(Error::invalid("mpc8: stream header not found or invalid chunk length"));
     }
-
     let sh_pos = input.stream_position()?;
     input.seek(SeekFrom::Current(4))?; // CRC
     let mut ver_buf = [0u8; 1];
@@ -454,7 +445,7 @@ pub fn open_mpc8(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> R
     }
 
     let apetag_start = parse_ape_tag(&mut input).ok().flatten();
-    input.seek(SeekFrom::Start(sh_pos + payload_size as u64))?;
+    input.seek(SeekFrom::Start(sh_pos + payload_size.max(0) as u64))?;
     loop {
         let chunk_pos = input.stream_position()?;
         if apetag_start.is_some_and(|end| chunk_pos >= end) {
@@ -531,7 +522,7 @@ fn parse_seek_table(buf: &[u8], header_pos: u64, entries: &mut Vec<IndexEntry>) 
         if (t & 1) != 0 {
             t = -(t & !1);
         }
-        let pos = ((t >> 1) as i64).wrapping_add((ppos[0] * 2).wrapping_sub(ppos[1]) as i64) as u64;
+        let pos = (ppos[0].wrapping_mul(2).wrapping_sub(ppos[1])).wrapping_add((t >> 1) as u64);
         let ts = (i as i64) << seekd;
         entries.push(IndexEntry { pos, timestamp: ts });
         ppos[1] = ppos[0];
@@ -568,7 +559,18 @@ impl Demuxer for Mpc8Demuxer {
 
             if tag == TAG_AUDIOPACKET {
                 let mut data = vec![0u8; size as usize];
-                self.input.read_exact(&mut data)?;
+                let mut read = 0;
+                while read < data.len() {
+                    match self.input.read(&mut data[read..]) {
+                        Ok(0) => break,
+                        Ok(n) => read += n,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                if read == 0 {
+                    return Err(Error::Eof);
+                }
+                data.truncate(read);
                 let mut pkt = Packet::new(0, self.stream.time_base, data);
                 pkt.pts = Some(self.pts);
                 pkt.dts = Some(self.pts);

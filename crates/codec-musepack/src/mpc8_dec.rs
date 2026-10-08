@@ -140,7 +140,7 @@ impl Mpc8Decoder {
             return Err(Error::unsupported("mpc8: multichannel unsupported"));
         }
         let mss = gb.get_bits1() != 0;
-        let frames = 1usize << (gb.get_bits(3) * 2);
+        let frames = 1usize << ((gb.get_bits(3) & 3) * 2);
 
         Ok(Self {
             synth: MpaSynth::new(),
@@ -436,8 +436,9 @@ impl Decoder for Mpc8Decoder {
         let mut gb = BitReader::new(&packet.data, packet.data.len());
         self.cur_frame = 0;
 
-        for _ in 0..self.frames {
-            if !self.decode_one_frame(&mut gb, packet.pts)? {
+        let mut pts = packet.pts;
+        for _ in 0..self.frames.min(64) {
+            if !self.decode_one_frame(&mut gb, pts.take())? {
                 break;
             }
             if gb.bits_left() < 8 {
@@ -454,10 +455,6 @@ impl Decoder for Mpc8Decoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.bands = [Band::default(); BANDS];
-        self.cur_frame = 0;
-        self.last_bits_used = 0;
-        self.queue.clear();
         Ok(())
     }
 

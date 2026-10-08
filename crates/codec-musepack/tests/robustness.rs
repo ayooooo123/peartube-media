@@ -110,9 +110,6 @@ fn test_mpc7_decoder_robustness() {
     let mut packets = Vec::new();
     while let Ok(pkt) = demuxer.next_packet() {
         packets.push(pkt);
-        if packets.len() >= 20 {
-            break;
-        }
     }
     assert!(!packets.is_empty());
 
@@ -179,13 +176,7 @@ fn test_mpc_demuxer_robustness() {
         let mutated = mutate(&mut rng, &orig_bytes);
         let cursor = Box::new(Cursor::new(mutated));
         if let Ok(mut dmx) = codec_musepack::open_mpc(cursor, &oxideav_core::NullCodecResolver) {
-            let mut count = 0;
-            while let Ok(_pkt) = dmx.next_packet() {
-                count += 1;
-                if count >= 100 {
-                    break;
-                }
-            }
+            while dmx.next_packet().is_ok() {}
         }
     }
 }
@@ -194,20 +185,12 @@ fn test_mpc_demuxer_robustness() {
 fn test_mpc8_demuxer_robustness() {
     let path = fate("musepack/inside-mp8.mpc");
     let orig_bytes = std::fs::read(&path).expect("read file");
-
     let mut rng = Rng::new(0x4D50_4338_0000_0004);
-
     for _ in 0..2000 {
         let mutated = mutate(&mut rng, &orig_bytes);
         let cursor = Box::new(Cursor::new(mutated));
         if let Ok(mut dmx) = codec_musepack::open_mpc8(cursor, &oxideav_core::NullCodecResolver) {
-            let mut count = 0;
-            while let Ok(_pkt) = dmx.next_packet() {
-                count += 1;
-                if count >= 50 {
-                    break;
-                }
-            }
+            while dmx.next_packet().is_ok() {}
         }
     }
 }

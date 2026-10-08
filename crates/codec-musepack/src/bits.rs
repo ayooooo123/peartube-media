@@ -136,7 +136,7 @@ impl<'a> BitReader<'a> {
     }
 
     pub fn mpc8_dec_base(&mut self, k: usize, n: usize) -> u32 {
-        if k == 0 || k > 16 || n == 0 || n > 32 {
+        if k == 0 || k > 16 || n == 0 || n > 33 {
             return 0;
         }
         let raw_len = MPC8_CNK_LEN[k - 1][n - 1];
@@ -211,5 +211,26 @@ pub fn bswap_buf(dst: &mut [u8], src: &[u8]) {
         let chunk = &src[i * 4..i * 4 + 4];
         let swapped = [chunk[3], chunk[2], chunk[1], chunk[0]];
         dst[i * 4..i * 4 + 4].copy_from_slice(&swapped);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mpc8_dec_base_n33() {
+        // n == 33 corresponds to maxbands == 31: mpc8_get_mod_golomb(32) -> mpc8_dec_base(1, 33)
+        // MPC8_CNK_LEN[0][32] is 6.
+        let data = [0b1010_1010, 0b1111_0000];
+        let mut gb = BitReader::new(&data, data.len());
+        let code = gb.mpc8_dec_base(1, 33);
+        // With the fix, bits are consumed from the stream.
+        assert!(gb.bits_count() > 0, "bits must be consumed for n == 33");
+        assert!(code > 0, "code must be decoded for n == 33");
+
+        let mut gb2 = BitReader::new(&data, data.len());
+        let golomb = gb2.mpc8_get_mod_golomb(32);
+        assert_eq!(code, golomb);
     }
 }

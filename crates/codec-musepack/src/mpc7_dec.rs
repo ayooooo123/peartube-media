@@ -318,11 +318,17 @@ impl Decoder for Mpc7Decoder {
             dequantize_and_synth(&mut self.synth, &bands, dequant_mb, &q, &mut out_slices, 2);
         }
 
-        let nb_samples = if last_frame && self.lastframelen > 0 {
+        let nb_samples = if last_frame {
             self.lastframelen.min(MPC_FRAME_SIZE)
         } else {
             MPC_FRAME_SIZE
         };
+
+        let bits_used = gb.bits_count() as usize;
+        let bits_avail = payload_len * 8;
+        if !last_frame && (bits_avail < bits_used || bits_used + 32 <= bits_avail) {
+            return Err(Error::invalid("mpc7: bit counts mismatch"));
+        }
 
         if self.frames_to_skip > 0 {
             self.frames_to_skip -= 1;
@@ -352,9 +358,6 @@ impl Decoder for Mpc7Decoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.old_dscf = [[0; BANDS]; 2];
-        self.frames_to_skip = 32;
-        self.queue.clear();
         Ok(())
     }
 
@@ -362,7 +365,7 @@ impl Decoder for Mpc7Decoder {
         self.synth.reset();
         self.rnd = Lfg::new();
         self.old_dscf = [[0; BANDS]; 2];
-        self.frames_to_skip = 0;
+        self.frames_to_skip = 32;
         self.queue.clear();
         Ok(())
     }
