@@ -548,7 +548,9 @@ impl Module {
             if s.has_sample_data() {
                 s.precompute_loops(it_ping_pong);
             } else {
-                s.n_length = 0;
+                // FM voices have no PCM allocation; a nonzero logical length
+                // keeps their note/effect state active in the tick processor.
+                s.n_length = u32::from(s.u_flags & CHN_ADLIB != 0);
                 s.n_loop_start = 0;
                 s.n_loop_end = 0;
                 s.n_sustain_start = 0;

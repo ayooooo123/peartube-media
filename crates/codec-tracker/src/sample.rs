@@ -68,6 +68,7 @@ pub struct ModSample {
     pub n_vib_depth: u8,
     pub n_vib_rate: u8,
     pub cues: [SmpLength; 9],
+    pub adlib: [u8; 12],
     pub name: String,
 }
 
@@ -92,6 +93,7 @@ impl Default for ModSample {
             n_vib_depth: 0,
             n_vib_rate: 0,
             cues: [MAX_SAMPLE_LENGTH; 9],
+            adlib: [0; 12],
             name: String::new(),
         };
         s.initialize(MOD_TYPE_NONE);
@@ -108,6 +110,7 @@ impl ModSample {
 
     /// `ModSample::Initialize`.
     pub fn initialize(&mut self, mod_type: u32) {
+        self.adlib = [0; 12];
         self.data = SampleData::None;
         self.n_length = 0;
         self.n_loop_start = 0;
@@ -148,6 +151,9 @@ impl ModSample {
 
     pub fn has_sample_data(&self) -> bool {
         !matches!(self.data, SampleData::None) && self.n_length != 0
+    }
+    pub fn has_playback_source(&self) -> bool {
+        self.has_sample_data() || self.u_flags & CHN_ADLIB != 0
     }
     pub fn elementary_sample_size(&self) -> u32 {
         if self.u_flags & CHN_16BIT != 0 {

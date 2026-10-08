@@ -27,6 +27,8 @@ mod load_s3m;
 mod load_xm;
 mod midimacro;
 mod mixer;
+mod opal;
+mod opl;
 mod player;
 mod registry;
 mod render;
@@ -112,9 +114,9 @@ fn load(data: &[u8]) -> Option<(Format, Module)> {
                 if io::sample_budget_exceeded() {
                     return None;
                 }
-                // There is no OPL synthesizer in this crate. Refuse AdLib
-                // instruments rather than return silent replacement audio.
-                if m.samples.iter().any(|s| s.u_flags & defs::CHN_ADLIB != 0) {
+                // MPTM OPL patches and external samples are outside the IT
+                // loader's supported subset. S3M melodic FM patches are read.
+                if format != Format::S3m && m.samples.iter().any(|s| s.u_flags & defs::CHN_ADLIB != 0) {
                     return None;
                 }
                 // A short pattern can be referenced by thousands of orders.

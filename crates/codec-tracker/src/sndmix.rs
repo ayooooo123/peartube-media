@@ -158,6 +158,9 @@ impl Player {
                         }
                         for i in 0..self.ps.chn.len() {
                             let mut c = std::mem::take(&mut self.ps.chn[i]);
+                            if c.has(CHN_ADLIB) {
+                                if let Some(opl) = &mut self.opl { opl.note_cut(i, true); }
+                            }
                             c.reset(RESET_SET_POS_FULL, &self.m, i, CHN_SYNCMUTE);
                             self.ps.chn[i] = c;
                         }
@@ -1286,11 +1289,17 @@ impl Player {
                 self.ps.chn[nchn].n_real_pan = 128;
             }
 
-            self.handle_note_change_filter(nchn);
+            let cutoff = self.handle_note_change_filter(nchn);
+            if cutoff >= 0 && self.ps.chn[nchn].has(CHN_ADLIB) {
+                if let Some(opl) = &mut self.opl { opl.volume(nchn, cutoff as u8, true); }
+            }
             self.process_macro_on_channel(nchn);
 
             if sample_playing {
-                self.process_pitch_filter_envelope(nchn, &mut period);
+                let cutoff = self.process_pitch_filter_envelope(nchn, &mut period);
+                if cutoff >= 0 && self.ps.chn[nchn].has(CHN_ADLIB) {
+                    if let Some(opl) = &mut self.opl { opl.volume(nchn, (cutoff / 4) as u8, true); }
+                }
             }
 
             {
@@ -1320,12 +1329,31 @@ impl Player {
                     }
                     period = m.min_period;
                 }
-                let (mut ninc, _freq) = self.channel_increment(&self.ps.chn[nchn], period as u32, period_frac);
+                let (mut ninc, freq) = self.channel_increment(&self.ps.chn[nchn], period as u32, period_frac);
                 ninc.mul_div(self.freq_factor, 65536);
                 if ninc.is_zero() {
                     ninc = SamplePosition::new(0, 1);
                 }
                 self.ps.chn[nchn].increment = ninc;
+                let chn = &mut self.ps.chn[nchn];
+                if chn.dw_flags & (CHN_ADLIB | CHN_MUTE | CHN_SYNCMUTE) == CHN_ADLIB {
+                    if let Some(opl) = &mut self.opl {
+                        let process = m.behaviour(kOPLFlexibleNoteOff) || !chn.has(CHN_NOTEFADE) || m.mod_type == MOD_TYPE_S3M;
+                        if process && !(m.mod_type == MOD_TYPE_S3M && chn.has(CHN_KEYOFF)) {
+                            let pitch = muldivr_unsigned(freq, 261625, 8363 << FREQ_FRACBITS);
+                            let pitch = muldivr_unsigned(pitch, self.freq_factor, 65536);
+                            let key_off = chn.has(CHN_KEYOFF) || (chn.has(CHN_NOTEFADE) && chn.n_fade_out_vol == 0);
+                            if !m.behaviour(kOPLNoteStopWith0Hz) || !key_off {
+                                opl.frequency(nchn, pitch, key_off, m.behaviour(kOPLBeatingOscillators));
+                            }
+                        }
+                        if process {
+                            let vol = chn.n_calc_volume as u32 * chn.n_global_vol as u32 * chn.n_ins_vol as u32;
+                            opl.volume(nchn, muldivr_unsigned(vol, 63, 1 << 26) as u8, false);
+                            chn.n_real_pan = opl.pan(nchn, chn.n_real_pan) * 128 + 128;
+                        }
+                    }
+                }
             }
 
             {
@@ -1418,7 +1446,7 @@ impl Player {
                 if nchn >= nc && !(chn.n_volume != 0 && chn.n_global_vol != 0 && chn.n_ins_vol != 0) {
                     chn.n_length = 0;
                 }
-            } else {
+            } else if !self.ps.chn[nchn].has(CHN_ADLIB) {
                 let chn = &mut self.ps.chn[nchn];
                 chn.right_vol = 0;
                 chn.left_vol = 0;
@@ -1536,6 +1564,9 @@ impl Player {
             }
             let chunk = MIXBUFFERSIZE.min(self.ps.buffer_count as usize).min(to_render);
             self.create_stereo_mix(chunk, false);
+            if let Some(opl) = &mut self.opl {
+                opl.mix(&mut self.mix_buffer[..chunk * 2], self.m.vsti_volume);
+            }
             if self.m.play_config.global_volume_applies_to_master {
                 self.process_global_volume(chunk);
             }
@@ -1561,6 +1592,9 @@ impl Player {
         while self.ps.buffer_count > 0 {
             let chunk = MIXBUFFERSIZE.min(self.ps.buffer_count as usize);
             self.create_stereo_mix(chunk, true);
+            if let Some(opl) = &mut self.opl {
+                opl.mix(&mut self.mix_buffer[..chunk * 2], self.m.vsti_volume);
+            }
             if self.m.play_config.global_volume_applies_to_master {
                 self.process_global_volume(chunk);
             }

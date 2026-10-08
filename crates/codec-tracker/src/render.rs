@@ -6,7 +6,7 @@
 
 use crate::defs::{FADESONGDELAY, OrderIndex, RowIndex};
 use crate::length::{self, RowPos};
-use crate::player::{MixerSettings, Player};
+use crate::player::{DEFAULT_SEED, MixerSettings, Player, Prng};
 use crate::sndfile::Module;
 use crate::Format;
 
@@ -25,6 +25,7 @@ pub struct Song {
     format: Format,
     module: Module,
     song_frames: u64,
+    seed: u32,
 }
 
 impl Song {
@@ -32,7 +33,16 @@ impl Song {
     pub fn load(data: &[u8]) -> Option<Song> {
         let (format, module) = crate::load(data)?;
         let song_frames = length::walk_rows(&module, |_| true);
-        Some(Song { format, module, song_frames })
+        Some(Song { format, module, song_frames, seed: DEFAULT_SEED })
+    }
+
+    /// Selects the initial state of libopenmpt's MSVC LCG for randomized
+    /// tracker effects. Pattern and instrument data are unchanged. Every
+    /// renderer, including a seek, replays this seed from the song's start.
+    /// The default is `0x1234_5678`; libopenmpt normally seeds from entropy.
+    pub fn with_seed(mut self, seed: u32) -> Self {
+        self.seed = seed;
+        self
     }
 
     pub fn format(&self) -> Format {
@@ -79,7 +89,8 @@ impl Song {
     /// Starts at an exact output frame. Replaying the mixer preserves
     /// filter history, sample inversion and click-removal state on seeks.
     pub fn renderer_at(&self, frame: u64) -> Renderer {
-        let player = Player::new(self.module.clone(), MixerSettings::default());
+        let mut player = Player::new(self.module.clone(), MixerSettings::default());
+        player.prng = Prng::new(self.seed);
         let mut renderer = Renderer {
             player,
             pos: 0,

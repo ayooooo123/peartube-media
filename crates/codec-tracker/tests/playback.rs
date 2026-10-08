@@ -2,12 +2,50 @@ use codec_tracker::{READ_FRAMES, Song};
 use oxideav_core::{CodecRegistry, ContainerRegistry, Error, Frame};
 use std::io::Cursor;
 
+fn pcm_hash(pcm: &[f32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for sample in pcm { hash.update(sample.to_le_bytes()); }
+    format!("{:x}", hash.finalize())
+}
+
 #[test]
-fn adlib_instruments_are_rejected_instead_of_rendered_silent() {
-    let mut bytes = include_bytes!("fixtures/tone.s3m").to_vec();
-    bytes[112] = 2;
-    bytes[188..192].copy_from_slice(b"SCRI");
-    assert!(Song::load(&bytes).is_none());
+fn adlib_pitch_volume_retrigger_note_cut_and_seek_match_openmpt() {
+    let song = Song::load(include_bytes!("fixtures/fm-events.s3m")).unwrap();
+    let output = render(&song, 137);
+    // Stock openmpt123 0.8.9: melodic two-operator FM, with volume zero,
+    // portamento, retrigger/volume slide, hard pan and delayed note cut.
+    assert_eq!(output.len() / 2, 73_920);
+    assert!(output[..11_520].iter().step_by(2).any(|v| v.abs() > 0.01));
+    assert!(output[1..11_520].iter().step_by(2).all(|&v| v == 0.0));
+    assert_eq!(pcm_hash(&output), include_str!("fixtures/fm-events.sha256").trim());
+    assert_eq!(render(&song, READ_FRAMES), output);
+    for frame in [5760, 40320, 54721] {
+        let mut sought = song.renderer_at(frame);
+        let mut pcm = [0.0; READ_FRAMES * 2];
+        assert_eq!(sought.read(&mut pcm), READ_FRAMES);
+        assert_eq!(pcm.as_slice(), &output[frame as usize * 2..frame as usize * 2 + pcm.len()]);
+    }
+}
+
+#[test]
+fn random_effect_seeds_and_seek_match_native_event_mixing() {
+    let bytes = include_bytes!("fixtures/random-effects.it");
+    // Golden hashes use the unchanged libopenmpt 0.8.9 mixer with its native
+    // PRNG seeded through scripts/tracker-seeded-oracle.cpp. No random effect
+    // controls are removed. Zero and u32::MAX exercise wrapping seed setup.
+    for golden in include_str!("fixtures/random-effects.sha256").lines() {
+        let (seed, expected) = golden.split_once(' ').unwrap();
+        let song = Song::load(bytes).unwrap().with_seed(seed.parse().unwrap());
+        let output = render(&song, 137);
+        assert_eq!(output.len() / 2, 50_880);
+        assert_eq!(pcm_hash(&output), expected, "seed={seed}");
+        assert_eq!(render(&song, READ_FRAMES), output);
+        let mut sought = song.renderer_at(12345);
+        let mut pcm = [0.0; READ_FRAMES * 2];
+        assert_eq!(sought.read(&mut pcm), READ_FRAMES);
+        assert_eq!(pcm.as_slice(), &output[24690..24690 + pcm.len()]);
+    }
 }
 
 #[test]

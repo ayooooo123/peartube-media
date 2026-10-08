@@ -183,8 +183,7 @@ impl S3mSampleHeader<'_> {
                 s.u_flags = 0;
             }
         } else if t == 2 {
-            // Preserve the instrument kind so the outer loader can reject
-            // it explicitly; PCM sample decoding cannot synthesize OPL.
+            s.adlib.copy_from_slice(&self.0[16..28]);
             s.u_flags |= CHN_ADLIB;
             s.u_flags &= !(CHN_16BIT | CHN_STEREO);
         }

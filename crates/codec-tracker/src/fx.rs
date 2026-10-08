@@ -1657,7 +1657,8 @@ impl Player {
             }
             let note = self.ps.chn[nchn].n_new_note as u32;
             let old_period = self.ps.chn[nchn].n_period;
-            if note >= NOTE_MIN as u32 && note <= NOTE_MAX as u32 && self.ps.chn[nchn].n_length != 0 && t != MOD_TYPE_S3M {
+            let opl_retrig = self.ps.chn[nchn].has(CHN_ADLIB) && self.m.behaviour(kOPLRealRetrig);
+            if note >= NOTE_MIN as u32 && note <= NOTE_MAX as u32 && self.ps.chn[nchn].n_length != 0 && (t != MOD_TYPE_S3M || opl_retrig) {
                 self.check_nna(nchn, 0, note as i32, true);
             }
             let mut reset_env = false;
@@ -1682,9 +1683,9 @@ impl Player {
             if t == MOD_TYPE_S3M {
                 self.ps.chn[nchn].prev_note_offset = 0;
             }
-            let it_s3m_style = self.m.behaviour(kITRetrigger) || (t == MOD_TYPE_S3M && self.ps.chn[nchn].n_length != 0);
+            let it_s3m_style = self.m.behaviour(kITRetrigger) || (t == MOD_TYPE_S3M && self.ps.chn[nchn].n_length != 0 && !opl_retrig);
             let flags = self.ps.flags;
-            self.m.note_change(flags, &mut self.prng, &mut self.ps.chn[nchn], note as i32, it_s3m_style, reset_env, false);
+            self.m.note_change(flags, &mut self.prng, &mut self.ps.chn[nchn], note as i32, it_s3m_style, reset_env, false, self.opl.as_deref_mut(), nchn);
             let m = &self.m;
             let num_instruments = m.num_instruments;
             let chn = &mut self.ps.chn[nchn];
@@ -1795,7 +1796,10 @@ impl Player {
                 }
                 chn.n_restore_cutoff_on_new_note = 0;
                 let reset = !chn.has(CHN_FILTER);
-                m.setup_channel_filter(freq, chn, reset, 256);
+                let cutoff = m.setup_channel_filter(freq, chn, reset, 256);
+                if cutoff >= 0 && chn.has(CHN_ADLIB) {
+                    if let Some(opl) = &mut self.opl { opl.volume(nchn, (cutoff / 4) as u8, true); }
+                }
             } else if code == 0x01 && !extended && param < 0x80 {
                 if !is_smooth {
                     chn.n_resonance = param;
@@ -1811,6 +1815,16 @@ impl Player {
                 let reset = !chn.has(CHN_FILTER);
                 m.setup_channel_filter(freq, chn, reset, 256);
             }
+        }
+    }
+
+    fn patch_opl(&mut self, channel: usize, force: bool) {
+        let chn = &self.ps.chn[channel];
+        if chn.has(CHN_MUTE | CHN_SYNCMUTE) { return; }
+        let Some(sample) = chn.p_mod_sample.map(|s| &self.m.samples[s as usize]) else { return; };
+        if sample.u_flags & CHN_ADLIB == 0 { return; }
+        if let Some(opl) = &mut self.opl {
+            if force || !opl.is_active(channel) { opl.patch(channel, &sample.adlib); }
         }
     }
 
@@ -2039,7 +2053,7 @@ impl Player {
                         let m = &self.m;
                         let smp = &m.samples[os as usize];
                         let chn = &mut self.ps.chn[nchn];
-                        if smp.u_flags & SMP_NODEFAULTVOLUME == 0 && (t != MOD_TYPE_S3M || smp.has_sample_data()) {
+                        if smp.u_flags & SMP_NODEFAULTVOLUME == 0 && (t != MOD_TYPE_S3M || smp.has_playback_source()) {
                             chn.n_volume = smp.n_volume as i32;
                             chn.set(CHN_FASTVOLRAMP);
                         }
@@ -2148,6 +2162,7 @@ impl Player {
                     } else if m.behaviour(kMODSampleSwap) && !chn.is_sample_playing() {
                         chn.position = SamplePosition(0);
                     }
+                    self.patch_opl(nchn, true);
                 }
 
                 if note != NOTE_NONE {
@@ -2166,6 +2181,7 @@ impl Player {
                         chn.swap_sample_index = 0;
                         chn.n_new_ins = 0;
                     }
+                    self.patch_opl(nchn, instr_change);
                     let flags = self.ps.flags;
                     self.m.note_change(
                         flags,
@@ -2175,6 +2191,8 @@ impl Player {
                         b_porta,
                         t & (MOD_TYPE_XM | MOD_TYPE_MT2) == 0,
                         false,
+                        self.opl.as_deref_mut(),
+                        nchn,
                     );
                     let chn = &mut self.ps.chn[nchn];
                     if continue_note {
@@ -2185,6 +2203,14 @@ impl Player {
                         chn.reset_envelopes();
                         chn.n_auto_vib_depth = 0;
                         chn.n_auto_vib_pos = 0;
+                    }
+                    if chn.has(CHN_ADLIB)
+                        && (note == NOTE_NOTECUT || note == NOTE_KEYOFF || (note == NOTE_FADE && !self.m.behaviour(kOPLFlexibleNoteOff)))
+                    {
+                        if let Some(opl) = &mut self.opl {
+                            if self.m.behaviour(kOPLNoteStopWith0Hz) { opl.frequency(nchn, 0, true, false); }
+                            opl.note_off(nchn);
+                        }
                     }
                 }
 

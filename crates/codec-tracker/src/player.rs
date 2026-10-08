@@ -16,26 +16,30 @@ use crate::rowvisitor::RowVisitor;
 use crate::sndfile::{Module, PlayState};
 use crate::tables::*;
 
-/// Deterministic stand-in for libopenmpt's randomly seeded `mpt::fast_prng`.
+/// libopenmpt's `mpt::fast_prng` (`lcg_msvc`), including its constructor
+/// pre-step and the low-bit extraction in `mpt::random<int8/int, 7>`.
 #[derive(Clone, Debug)]
-pub struct Prng(pub u32);
+pub struct Prng(u32);
+
+pub const DEFAULT_SEED: u32 = 0x1234_5678;
 
 impl Prng {
-    pub fn next_u32(&mut self) -> u32 {
-        // xorshift32
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.0 = x;
-        x
+    pub fn new(seed: u32) -> Self {
+        Self(seed.wrapping_mul(214013).wrapping_add(2531011))
     }
+
+    fn next_15(&mut self) -> u16 {
+        let value = ((self.0 >> 16) & 0x7FFF) as u16;
+        self.0 = self.0.wrapping_mul(214013).wrapping_add(2531011);
+        value
+    }
+
     pub fn next_i8(&mut self) -> i8 {
-        (self.next_u32() >> 24) as u8 as i8
+        self.next_15() as i8
     }
-    /// `mpt::random<int, 7>`: 0..=127.
+
     pub fn bits7(&mut self) -> i32 {
-        (self.next_u32() >> 25) as i32
+        (self.next_15() & 127) as i32
     }
 }
 
@@ -88,6 +92,7 @@ pub struct Player {
     pub dry_r_ofs: i32,
     pub mix_buffer: Vec<i32>,
     pub prng: Prng,
+    pub opl: Option<Box<crate::opl::Opl>>,
     pub repeat_count: i32,
     pub is_rendering: bool,
     pub freq_factor: u32,
@@ -101,6 +106,8 @@ impl Player {
     pub fn new(mut m: Module, settings: MixerSettings) -> Self {
         m.song_flags |= SONG_PLAYALLSONGS;
         let visited = RowVisitor::new(&m);
+        let opl = m.samples.iter().any(|s| s.u_flags & CHN_ADLIB != 0)
+            .then(|| Box::new(crate::opl::Opl::new(settings.mixing_freq)));
         let mut p = Player {
             m,
             ps: PlayState::default(),
@@ -111,7 +118,8 @@ impl Player {
             dry_l_ofs: 0,
             dry_r_ofs: 0,
             mix_buffer: vec![0; MIXBUFFERSIZE * 2],
-            prng: Prng(0x1234_5678),
+            prng: Prng::new(DEFAULT_SEED),
+            opl,
             repeat_count: 0,
             is_rendering: false,
             freq_factor: 65536,
@@ -135,6 +143,7 @@ impl Player {
 
     /// `ResetPlayPos`.
     pub fn reset_play_pos(&mut self) {
+        if let Some(opl) = &mut self.opl { opl.reset(); }
         for i in 0..self.ps.chn.len() {
             let mut c = std::mem::take(&mut self.ps.chn[i]);
             c.reset(crate::channel::RESET_SET_POS_FULL, &self.m, i, CHN_SYNCMUTE);
@@ -437,6 +446,8 @@ impl Module {
         mut b_porta: bool,
         b_reset_env: bool,
         b_manual: bool,
+        opl: Option<&mut crate::opl::Opl>,
+        channel: usize,
     ) {
         if note < NOTE_MIN as i32 {
             return;
@@ -694,6 +705,15 @@ impl Module {
             }
             chn.right_vol = 0;
             chn.left_vol = 0;
+            if chn.has(CHN_ADLIB) {
+                if let Some(opl) = opl {
+                    if self.behaviour(kOPLNoteOffOnNoteChange) {
+                        opl.note_off(channel);
+                    } else if self.behaviour(kOPLNoteStopWith0Hz) {
+                        opl.frequency(channel, 0, true, false);
+                    }
+                }
+            }
         }
         if b_manual {
             chn.reset_flag(CHN_MUTE);
@@ -808,7 +828,7 @@ impl Player {
         }
         let ins_ref = p_ins.and_then(|i| m.instrument(i as u32));
         // Update Volume
-        if b_upd_vol && (t & (MOD_TYPE_MOD | MOD_TYPE_S3M) == 0 || p_smp.is_some_and(|s| m.samples[s as usize].has_sample_data())) {
+        if b_upd_vol && (t & (MOD_TYPE_MOD | MOD_TYPE_S3M) == 0 || p_smp.is_some_and(|s| m.samples[s as usize].has_playback_source())) {
             if let Some(s) = p_smp {
                 let s = &m.samples[s as usize];
                 if s.u_flags & SMP_NODEFAULTVOLUME == 0 {
@@ -824,7 +844,7 @@ impl Player {
                 if m.behaviour(kMODSampleSwap) {
                     chn.n_fine_tune = s.n_fine_tune as i16;
                 }
-                if t == MOD_TYPE_S3M && s.has_sample_data() {
+                if t == MOD_TYPE_S3M && s.has_playback_source() {
                     chn.n_c5_speed = s.n_c5_speed as i32;
                 }
             }
@@ -1055,6 +1075,10 @@ impl Player {
             if src.has(CHN_MUTE) {
                 return CHANNELINDEX_INVALID;
             }
+            if src.has(CHN_ADLIB) {
+                if let Some(opl) = &mut self.opl { opl.note_cut(nchn, false); }
+                return CHANNELINDEX_INVALID;
+            }
             if src.n_length == 0 || (src.right_vol | src.left_vol) == 0 {
                 return CHANNELINDEX_INVALID;
             }
@@ -1227,6 +1251,9 @@ impl Player {
                 chn.n_volume = 0;
             }
             chn.set(CHN_FASTVOLRAMP);
+            if chn.has(CHN_ADLIB) {
+                if let Some(opl) = &mut self.opl { opl.note_cut(nchn, false); }
+            }
         }
     }
 
