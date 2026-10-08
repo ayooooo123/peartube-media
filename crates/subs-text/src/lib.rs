@@ -4,7 +4,7 @@
 //! |---------|------------|-----------------------------------------------------|---------------------------|
 //! | SubRip  | `subrip`   | `.srt`; Matroska `S_TEXT/UTF8`                      | FFmpeg `srtdec.c` (both), `htmlsubtitles.c` (LGPL-2.1-or-later, ported) |
 //! | ASS/SSA | `ass`, `ssa` | `.ass`/`.ssa`; Matroska `S_TEXT/ASS` / `S_TEXT/SSA` | FFmpeg `assdec.c` (both), `ass_split.c` (LGPL-2.1-or-later, ported) |
-//! | WebVTT  | `webvtt`   | `.vtt`; Matroska / WebM WebVTT tracks; MP4 `wvtt`   | FFmpeg `webvttdec.c` (both) (LGPL-2.1-or-later, ported); cue settings and regions from the W3C WebVTT spec (clean-room, [`webvtt_settings`]) |
+//! | WebVTT  | `webvtt`   | `.vtt`; Matroska / WebM WebVTT tracks; MP4 `wvtt`   | FFmpeg `webvttdec.c` (both) (LGPL-2.1-or-later, ported); cue settings, regions, cue text and `STYLE` CSS from the W3C WebVTT spec (clean-room, [`webvtt_settings`], [`webvtt_cue`], [`webvtt_css`]) |
 //! | MicroDVD| `microdvd` | `.sub`                                              | FFmpeg `microdvddec.c` (both) (LGPL-2.1-or-later, ported) |
 //! | SubViewer 2 | `subviewer2` | `.sub`                                       | FFmpeg `subviewerdec.c` (both) (LGPL-2.1-or-later, ported) |
 //! | mov_text| `mov_text` | MP4 sample entries `tx3g` / `text`                  | FFmpeg `movtextdec.c` (LGPL-2.1-or-later, ported) |
@@ -44,6 +44,8 @@ mod text_reader;
 pub mod usf;
 pub mod vplayer;
 pub mod webvtt;
+pub mod webvtt_css;
+pub mod webvtt_cue;
 pub mod webvtt_settings;
 pub mod xml;
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, MediaType};

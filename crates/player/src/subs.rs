@@ -22,8 +22,7 @@ use parking_lot::Condvar;
 use crate::backend::{Clock, SubtitleImage, SubtitleSink};
 use crate::clock::current_monotonic_ns;
 use crate::engine::Lane;
-use crate::webvtt::{layout_cue, place, stack_region, Layout, Rect, RegionSlot, TextCue, WebVttTrack};
-use subs_text::webvtt_settings::CueSettings;
+use crate::webvtt::{ease, layout_cue, place, stack_region, CueInfo, Layout, Rect, RegionSlot, TextCue, WebVttTrack, SCROLL};
 
 /// Longest the pipeline waits without looking at the clock again. The lane
 /// wakes it on everything that matters (a packet, a seek, the clock starting
@@ -62,6 +61,19 @@ pub fn text_space(video_width: u32, video_height: u32) -> (u32, u32) {
     let width = ((width as f64 * scale) as u64).clamp(1, max);
     let height = ((height as f64 * scale) as u64).clamp(1, max / width);
     (width as u32, height as u32)
+}
+
+/// A WebVTT cue's `text` as the player draws it with no settings and no
+/// style sheet, alone on the text canvas of a `video_width x
+/// video_height` video: its default line box on the canvas's bottom
+/// (an empty image when nothing is visible).
+pub fn render_webvtt_text(text: &str, video_width: u32, video_height: u32) -> SubtitleImage {
+    let canvas = text_space(video_width, video_height);
+    let track = WebVttTrack::new(b"");
+    let info = CueInfo { settings: Default::default(), id: String::new(), nodes: subs_text::webvtt_cue::parse(text) };
+    let cue = oxideav_core::SubtitleCue { start_us: 0, end_us: 0, style_ref: None, positioning: None, segments: Vec::new() };
+    let laid = layout_cue(&cue, Some(&info), &track, canvas);
+    OnScreen::new(canvas, Vec::new()).alone(&laid).unwrap_or(SubtitleImage { x: 0, y: 0, width: 0, height: 0, rgba: Vec::new() })
 }
 
 /// Renders one text/ASS cue on a canvas of `text_space(video_width,
@@ -198,14 +210,14 @@ enum Content {
 }
 
 /// What a decoded `frame` puts on screen. `vtt` is a WebVTT track's
-/// placement context and the cue's settings.
+/// placement context and what its packet says of the cue.
 fn decoded_cue(
     frame: Frame,
     packet: &Packet,
     time_base: TimeBase,
     width: u32,
     height: u32,
-    vtt: Option<(&WebVttTrack, Option<&CueSettings>)>,
+    vtt: Option<(&WebVttTrack, Option<&CueInfo>)>,
 ) -> Option<Cue> {
     match frame {
         Frame::Subtitle(cue) => {
@@ -221,7 +233,7 @@ fn decoded_cue(
                 return Some(Cue { start, end, content: Content::Bitmap(BitmapCue { canvas_width, canvas_height, image }) });
             }
             let text = match vtt {
-                Some((track, settings)) => layout_cue(&cue, settings, track, text_space(width, height)),
+                Some((track, info)) => layout_cue(&cue, info, track, text_space(width, height)),
                 None => TextCue { image: render_text_cue(&cue, width, height), layout: Layout::Fixed },
             };
             Some(Cue { start, end: Some(end), content: Content::Text(text) })
@@ -243,6 +255,25 @@ struct TextUp {
     region: Option<RegionSlot>,
 }
 
+/// A scrolling region moving its lines up: since `start`, from `from`
+/// pixels below their resting place.
+struct Slide {
+    region: usize,
+    start: Duration,
+    from: i64,
+}
+
+impl Slide {
+    /// How far below their resting place the lines are at `now`.
+    fn lift(&self, now: Duration) -> i64 {
+        let t = now.saturating_sub(self.start).as_secs_f64() / SCROLL.as_secs_f64();
+        (self.from as f64 * (1.0 - ease(t))).round() as i64
+    }
+}
+
+/// How often a scroll under way is redrawn.
+const SLIDE_FRAME: Duration = Duration::from_millis(33);
+
 /// What is on screen: text cues, or one bitmap state (a stream carries one
 /// kind; a cue of the other kind replaces everything up).
 #[derive(Default)]
@@ -257,6 +288,10 @@ struct OnScreen {
     /// The text canvas, and the region boxes WebVTT cues keep off.
     canvas: (u32, u32),
     regions: Vec<Rect>,
+    /// Scrolling regions moving their lines up, and the time the screen
+    /// is drawn for.
+    slides: Vec<Slide>,
+    now: Duration,
 }
 
 impl OnScreen {
@@ -274,8 +309,24 @@ impl OnScreen {
         self.text_up.iter().map(|up| up.end).chain(bitmap).min()
     }
 
+    /// When a scroll under way is next redrawn: a frame on, or its end.
+    fn next_frame(&self) -> Option<Duration> {
+        self.slides.iter().map(|s| (self.now + SLIDE_FRAME).min(s.start + SCROLL).max(self.now + Duration::from_millis(1))).min()
+    }
+
+    /// Moves the scrolls under way on to `now`; true when anything moved.
+    fn animate(&mut self, now: Duration) -> bool {
+        if self.slides.is_empty() {
+            return false;
+        }
+        self.now = now;
+        self.restack();
+        true
+    }
+
     /// Takes down everything that goes at or before `at`.
     fn expire(&mut self, at: Duration) {
+        self.now = self.now.max(at);
         if self.bitmap.as_ref().is_some_and(|(_, end)| end.is_some_and(|end| end <= at)) {
             self.bitmap = None;
         }
@@ -300,7 +351,7 @@ impl OnScreen {
     fn alone(&self, text: &TextCue) -> Option<SubtitleImage> {
         match &text.layout {
             Layout::Fixed => Some(text.image.clone()),
-            Layout::Region(slot) => stack_region(&[slot]).pop().filter(|image| image.width > 0),
+            Layout::Region(slot) => stack_region(&[slot], 0).pop().filter(|image| image.width > 0),
             _ if text.image.width == 0 => Some(text.image.clone()),
             layout => {
                 let mut image = text.image.clone();
@@ -310,12 +361,25 @@ impl OnScreen {
     }
 
     fn put(&mut self, cue: Cue) {
+        self.now = self.now.max(cue.start);
         match cue.content {
             Content::Text(TextCue { mut image, layout }) => {
                 self.bitmap = None;
                 let region = match layout {
                     Layout::Fixed => None,
-                    Layout::Region(slot) => Some(slot),
+                    Layout::Region(slot) => {
+                        // A scrolling region with lines up moves them up to
+                        // make room (§7.1: a 0.433 s transition of its top),
+                        // carrying on from a scroll under way.
+                        let up = self.text_up.iter().any(|up| up.region.as_ref().is_some_and(|s| s.region == slot.region));
+                        if slot.scroll_up && up {
+                            let now = self.now;
+                            let left = self.slides.iter().find(|s| s.region == slot.region).map_or(0, |s| s.lift(now));
+                            self.slides.retain(|s| s.region != slot.region);
+                            self.slides.push(Slide { region: slot.region, start: now, from: left + slot.block_height });
+                        }
+                        Some(slot)
+                    }
                     layout => {
                         // Off the regions and the cues up, as they were
                         // placed (§7.1: a cue shown keeps its boxes).
@@ -346,6 +410,7 @@ impl OnScreen {
             Content::Bitmap(state) => {
                 self.text.clear();
                 self.text_up.clear();
+                self.slides.clear();
                 // A blank state has already cleared the screen; its own
                 // nominal duration must not delay EOF or schedule a second
                 // clear (DVB attaches its page timeout to blank states too).
@@ -356,9 +421,12 @@ impl OnScreen {
     }
 
     /// Stacks each region's cues again (§7.1: from the region's bottom,
-    /// the latest lowest, clipped to the region).
+    /// the latest lowest, clipped to the region), a scroll under way
+    /// where one is; a finished scroll ends.
     fn restack(&mut self) {
-        let (text, text_up) = (&mut self.text, &self.text_up);
+        let now = self.now;
+        self.slides.retain(|s| now < s.start + SCROLL);
+        let (text, text_up, slides) = (&mut self.text, &self.text_up, &self.slides);
         let mut regions: Vec<usize> = text_up.iter().filter_map(|up| up.region.as_ref().map(|slot| slot.region)).collect();
         regions.sort_unstable();
         regions.dedup();
@@ -369,7 +437,8 @@ impl OnScreen {
                 .filter_map(|(i, up)| up.region.as_ref().filter(|slot| slot.region == region).map(|slot| (i, slot)))
                 .collect();
             let slots: Vec<&RegionSlot> = members.iter().map(|&(_, slot)| slot).collect();
-            for ((i, _), image) in members.iter().zip(stack_region(&slots)) {
+            let lift = slides.iter().find(|s| s.region == region).map_or(0, |s| s.lift(now));
+            for ((i, _), image) in members.iter().zip(stack_region(&slots, lift)) {
                 text[*i] = image;
             }
         }
@@ -379,6 +448,7 @@ impl OnScreen {
         self.text.clear();
         self.text_up.clear();
         self.bitmap = None;
+        self.slides.clear();
     }
 }
 
@@ -568,8 +638,8 @@ impl SubtitlePipeline {
             Ok(Ok(())) => {}
             _ => return,
         }
-        let settings = self.webvtt.as_ref().map_or_else(Vec::new, |track| {
-            std::panic::catch_unwind(AssertUnwindSafe(|| track.packet_settings(packet, metadata))).unwrap_or_default()
+        let cues = self.webvtt.as_ref().map_or_else(Vec::new, |track| {
+            std::panic::catch_unwind(AssertUnwindSafe(|| track.packet_cues(packet, metadata))).unwrap_or_default()
         });
         let (w, h) = (self.video_width.max(320), self.video_height.max(240));
         for index in 0.. {
@@ -578,7 +648,7 @@ impl SubtitlePipeline {
                 Ok(Ok(frame)) => frame,
                 _ => break,
             };
-            let vtt = self.webvtt.as_ref().map(|track| (track, settings.get(index).and_then(Option::as_ref)));
+            let vtt = self.webvtt.as_ref().map(|track| (track, cues.get(index)));
             let cue = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 decoded_cue(frame, packet, self.time_base, w, h, vtt)
             }));
@@ -687,11 +757,13 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
 
         let now = pipe.clock.now();
         if let Some(now) = now {
-            if advance(&mut on, &mut pending, now) {
+            // A scroll under way moves on even when nothing comes or goes.
+            let moved = on.animate(now);
+            if advance(&mut on, &mut pending, now) || moved {
                 screen.show(&on);
             }
         }
-        let next = on.next_end().into_iter().chain(pending.front().map(|cue| cue.start)).min();
+        let next = on.next_end().into_iter().chain(pending.front().map(|cue| cue.start)).chain(on.next_frame()).min();
         // Alone, this lane bounds the demuxer's read-ahead: it takes the
         // next packet only once every decoded cue is up. Behind video or
         // audio, which bound the read-ahead themselves, it drains whatever
@@ -727,7 +799,8 @@ pub(crate) fn run_subtitle_loop(mut pipe: SubtitlePipeline, sink: Box<dyn Subtit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::{Segment, SubtitleCue, VideoPlane};
+    use oxideav_core::{SubtitleCue, VideoPlane};
+    use subs_text::webvtt_settings::CueSettings;
 
     fn bitmap(pts: i64, duration: Option<Duration>, visible: bool) -> VideoFrame {
         let mut frame = VideoFrame {
@@ -858,26 +931,59 @@ mod tests {
         let canvas = text_space(320, 240);
         let mut on = OnScreen::new(canvas, track.region_rects(canvas));
         let packet = Packet::new(0, TimeBase::new(1, 1000), Vec::new());
-        let cue = |text: &str, end_s: u64, settings: Option<&CueSettings>| {
-            let cue = SubtitleCue { start_us: 0, end_us: end_s as i64 * 1_000_000, style_ref: None, positioning: None, segments: vec![Segment::Text(text.into())] };
-            decoded_cue(Frame::Subtitle(cue), &packet, packet.time_base, 320, 240, Some((&track, settings))).unwrap()
+        let cue = |text: &str, end_s: u64, settings: &[u8]| {
+            let cue = SubtitleCue { start_us: 0, end_us: end_s as i64 * 1_000_000, style_ref: None, positioning: None, segments: Vec::new() };
+            let info = CueInfo { settings: CueSettings::parse(settings, &regions), id: String::new(), nodes: subs_text::webvtt_cue::parse(text) };
+            decoded_cue(Frame::Subtitle(cue), &packet, packet.time_base, 320, 240, Some((&track, Some(&info)))).unwrap()
         };
-        on.put(cue("first", 9, None));
-        on.put(cue("second", 9, None));
+        on.put(cue("first", 9, b""));
+        on.put(cue("second", 9, b""));
         assert_eq!(on.text[1].y, on.text[0].y - 20);
 
-        let in_region = CueSettings::parse(b"region:r align:left", &regions);
-        on.put(cue("older", 3, Some(&in_region)));
-        on.put(cue("newer", 1, Some(&in_region)));
-        // One line: the newer shows, the older is scrolled out.
+        on.put(cue("older", 3, b"region:r align:left"));
+        on.put(cue("newer", 1, b"region:r align:left"));
+        // One line: the newer shows, the older is pushed out.
         assert_eq!(on.text[2].width, 0);
         assert!(on.text[3].width > 0);
-        let newer_bottom = on.text[3].y + on.text[3].height as i32;
+        let newer = (on.text[3].y, on.text[3].height);
         on.expire(Duration::from_secs(1));
         assert_eq!(on.text.len(), 3);
-        assert!(on.text[2].width > 0);
-        // Back on the region's line: the same line box, so the same bottom
-        // (neither word has a descender; their tops differ by ascenders).
-        assert_eq!(on.text[2].y + on.text[2].height as i32, newer_bottom);
+        // Back on the region's line, a full-width line box like the newer.
+        assert_eq!((on.text[2].y, on.text[2].height), newer);
+    }
+
+    /// A scrolling region moves its lines up over 0.433 s with CSS's
+    /// `ease` as a cue joins (§7.1); its first cue comes up in place.
+    #[test]
+    fn a_scrolling_region_moves_its_lines_up() {
+        let header = b"WEBVTT\n\nREGION\nid:s width:50% lines:2 regionanchor:0%,100% viewportanchor:0%,50% scroll:up\n";
+        let track = WebVttTrack::new(header);
+        let regions = subs_text::webvtt_settings::header_regions(header);
+        let canvas = text_space(320, 240);
+        let mut on = OnScreen::new(canvas, track.region_rects(canvas));
+        let packet = Packet::new(0, TimeBase::new(1, 1000), Vec::new());
+        let cue = |text: &str, start_ms: u64| {
+            let cue = SubtitleCue { start_us: start_ms as i64 * 1000, end_us: 9_000_000, style_ref: None, positioning: None, segments: Vec::new() };
+            let info = CueInfo { settings: CueSettings::parse(b"region:s", &regions), id: String::new(), nodes: subs_text::webvtt_cue::parse(text) };
+            decoded_cue(Frame::Subtitle(cue), &packet, packet.time_base, 320, 240, Some((&track, Some(&info)))).unwrap()
+        };
+        // The region's two lines are rows 80..120; its first cue sits on
+        // the bottom line, at once.
+        on.put(cue("one", 1000));
+        assert_eq!((on.text[0].y, on.slides.len()), (100, 0));
+        assert_eq!(on.next_frame(), None);
+        on.put(cue("two", 2000));
+        // At the start the old line has not moved and the new one is
+        // below the box (clipped to nothing).
+        assert_eq!((on.text[0].y, on.text[1].width), (100, 0));
+        assert_eq!(on.next_frame(), Some(Duration::from_millis(2033)));
+        // Half way, `ease` has done about 80% of the move.
+        on.animate(Duration::from_millis(2000 + 433 / 2));
+        assert_eq!(on.text[0].y, 100 - 16);
+        assert_eq!(on.text[1].y, 120 - 16);
+        // At the end both rest on their lines and the scroll stops.
+        on.animate(Duration::from_millis(2433));
+        assert_eq!((on.text[0].y, on.text[1].y, on.text[1].height), (80, 100, 20));
+        assert!(on.slides.is_empty() && on.next_frame().is_none());
     }
 }

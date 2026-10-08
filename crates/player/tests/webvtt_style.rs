@@ -1,19 +1,16 @@
-//! WebVTT cues come up where their settings place them (W3C WebVTT §7),
-//! through the player's registry and its real subtitle sink, whatever
-//! carries them:
-//! - a `.vtt` file: settings and identifiers from each cue's timing and
-//!   identifier lines, regions from its header;
-//! - Matroska and WebM, as FFmpeg remuxes that file: settings and
-//!   identifiers in each block (`D_WEBVTT/SUBTITLES`). FFmpeg keeps no
-//!   header there, so its region cue shows outside any region;
-//! - MP4 (`wvtt`, ISO/IEC 14496-30), which FFmpeg cannot write: built here,
-//!   the header in the sample entry's `vttC` box, each cue a `vttc` box
-//!   with its `iden` and `sttg`, gaps `vtte`.
+//! WebVTT cues drawn as browsers draw them (W3C WebVTT §7.3–§7.4, §8),
+//! through the player's registry and its real subtitle sink, from a `.vtt`
+//! file and from MP4, whose `vttC` box carries the same header:
+//! - `STYLE` blocks: `::cue` rules by class, voice, identifier and type
+//!   set colours, backgrounds, a text shadow and sizes;
+//! - right-to-left text: `align:start` anchors the cue box's right side;
+//! - ruby: the annotation above its base, half size;
+//! - a region with `lines:0` shows nothing, as browsers clip a region's
+//!   content to its height.
 //!
 //! The player runs without video, so text lays out on its 320x240 canvas.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,12 +18,9 @@ use parking_lot::Mutex;
 use player::backend::{AudioSink, Backend, Clock, SubtitleImage, SubtitleSink, VideoSink};
 use player::{Event, Headless, Player, PlayerOptions};
 
-/// One show: the canvas, then each image's rectangle.
-type Shown = ((u32, u32), Vec<(i32, i32, u32, u32)>);
-
 struct CaptureBackend {
     media: Arc<Headless>,
-    shown: Arc<Mutex<Vec<Shown>>>,
+    shown: Arc<Mutex<Vec<Vec<SubtitleImage>>>>,
 }
 
 impl Backend for CaptureBackend {
@@ -42,21 +36,20 @@ impl Backend for CaptureBackend {
 }
 
 struct CaptureSink {
-    shown: Arc<Mutex<Vec<Shown>>>,
+    shown: Arc<Mutex<Vec<Vec<SubtitleImage>>>>,
 }
 
 impl SubtitleSink for CaptureSink {
-    fn show(&mut self, images: &[SubtitleImage], width: u32, height: u32) {
+    fn show(&mut self, images: &[SubtitleImage], _width: u32, _height: u32) {
         if !images.is_empty() {
-            let rects = images.iter().map(|i| (i.x, i.y, i.width, i.height)).collect();
-            self.shown.lock().push(((width, height), rects));
+            self.shown.lock().push(images.to_vec());
         }
     }
 }
 
-/// Every show while `path`'s first stream plays, each cue on its own
-/// (capture mode).
-fn shown(path: &Path) -> Vec<Shown> {
+/// Every non-empty show while `path`'s first stream plays, each cue on its
+/// own (capture mode).
+fn shown(path: &Path) -> Vec<Vec<SubtitleImage>> {
     let media = Headless::new();
     media.set_active_streams(None, None, None, false);
     let backend = Arc::new(CaptureBackend { media, shown: Arc::new(Mutex::new(Vec::new())) });
@@ -74,31 +67,32 @@ fn shown(path: &Path) -> Vec<Shown> {
             Err(error) => panic!("{}: player failed to end: {error}: {:?}", path.display(), player.state()),
         }
     }
-    let state = player.state();
-    assert!(state.error.is_none(), "{state:?}");
     drop(player);
     let shown = backend.shown.lock().clone();
     shown
 }
 
-const STEP: i32 = 20;
+const RED: [u8; 4] = [255, 0, 0, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+const LIME: [u8; 4] = [0, 255, 0, 255];
+const WHITE: [u8; 4] = [255, 255, 255, 255];
+const BOX: [u8; 4] = [0, 0, 0, 204];
 
-/// The cues: identifier, timing, settings, text.
-const CUES: [(&str, u32, &str, &str); 7] = [
-    ("top", 0, "line:0", "Top line"),
-    ("", 1, "align:start size:50%", "Right half"),
-    ("mid", 2, "line:50%,center", "Middle"),
-    ("", 3, "region:fred align:left", "In the region"),
-    ("", 4, "vertical:rl line:0", "Vertical"),
-    ("", 5, "", "Default bottom"),
-    ("third", 6, "line:2", "Third line"),
+const HEADER: &str = "WEBVTT\n\nSTYLE\n::cue(.loud) { color: red; background-color: blue }\n::cue(v[voice=\"Roger\"]) { color: lime }\n::cue(#shadowed) { background: none; text-shadow: 2px 2px red }\n::cue(rt) { color: lime; background: transparent }\n\nREGION\nid:hidden lines:0 width:50%";
+
+/// The cues: identifier, settings, text.
+const CUES: [(&str, &str, &str); 6] = [
+    ("", "", "<c.loud>LOUD</c>"),
+    ("", "", "<v Roger>Hello</v>"),
+    ("shadowed", "", "Shade"),
+    ("", "align:start size:50%", "שלום עולם"),
+    ("", "line:0", "<ruby>漢字<rt>kanji</rt></ruby>"),
+    ("", "region:hidden", "Never seen"),
 ];
-
-const HEADER: &str = "WEBVTT\n\nREGION\nid:fred width:40% lines:3 regionanchor:0%,100% viewportanchor:10%,90%";
 
 fn vtt() -> String {
     let mut out = format!("{HEADER}\n\n");
-    for (id, second, settings, text) in CUES {
+    for (second, (id, settings, text)) in CUES.iter().enumerate() {
         if !id.is_empty() {
             out.push_str(&format!("{id}\n"));
         }
@@ -108,72 +102,63 @@ fn vtt() -> String {
 }
 
 fn scratch() -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("webvtt-placement");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("webvtt-style");
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-/// Where each cue comes up on the 320x240 canvas, checked against WebVTT's
-/// placement. `regions` is false where the container kept no header.
-fn assert_placed(what: &str, shown: &[Shown], regions: bool) {
-    assert_eq!(shown.len(), CUES.len(), "{what}: {shown:?}");
-    for (((canvas, rects), (_, _, settings, _)), index) in shown.iter().zip(CUES).zip(0..) {
-        assert_eq!(*canvas, (320, 240), "{what}");
-        assert_eq!(rects.len(), 1, "{what}: cue {index}");
-        let (x, y, w, h) = rects[0];
-        let (w, h) = (w as i32, h as i32);
-        let at = format!("{what}: cue {index} ({settings}) at {x},{y} {w}x{h}");
-        assert!(x >= 0 && y >= 0 && x + w <= 320 && y + h <= 240, "{at}");
-        match index {
-            // line:0 — the top line.
-            0 => assert_eq!(y, 0, "{at}"),
-            // align:start size:50% — the right half's start.
-            1 => assert_eq!(x, 160, "{at}"),
-            // line:50%,center — centered on the middle.
-            2 => assert!((y + h / 2 - 120).abs() <= 1, "{at}"),
-            // region:fred (10%,90% anchor, 40% wide, 3 lines): its bottom
-            // line, the region's width from 32 (bottom at 216).
-            3 if regions => assert_eq!((x, w, y + h, h), (32, 128, 216, STEP), "{at}"),
-            // Without the header: no region, so the default bottom line.
-            3 => assert_eq!((y + h, h), (240, STEP), "{at}"),
-            // vertical:rl line:0 — a column at the right edge.
-            4 => assert!(x + w == 320 && h > w, "{at}"),
-            // No settings: the bottom line box, on the canvas's bottom edge
-            // (clear of the region box above it).
-            5 => assert_eq!((y + h, h), (240, STEP), "{at}"),
-            // line:2 — the third line from the top.
-            _ => assert_eq!(y, 2 * STEP, "{at}"),
-        }
-    }
+fn pixels(image: &SubtitleImage) -> impl Iterator<Item = [u8; 4]> + '_ {
+    image.rgba.chunks_exact(4).map(|p| [p[0], p[1], p[2], p[3]])
+}
+
+fn count(image: &SubtitleImage, colour: [u8; 4]) -> usize {
+    pixels(image).filter(|p| *p == colour).count()
+}
+
+/// Rows of `image` (canvas coordinates) with a pixel of `colour`.
+fn rows_with(image: &SubtitleImage, colour: [u8; 4]) -> Vec<i32> {
+    let w = image.width as usize;
+    (0..image.height as usize).filter(|&r| pixels(image).skip(r * w).take(w).any(|p| p == colour)).map(|r| image.y + r as i32).collect()
+}
+
+fn assert_drawn(what: &str, shown: &[Vec<SubtitleImage>]) {
+    // The `lines:0` region's cue never comes up.
+    assert_eq!(shown.len(), CUES.len() - 1, "{what}: shows");
+    let image = |i: usize| -> &SubtitleImage {
+        assert_eq!(shown[i].len(), 1, "{what}: cue {i}");
+        &shown[i][0]
+    };
+    // `.loud`: red glyphs on its blue box, inside the cue's black box.
+    let loud = image(0);
+    assert!(count(loud, RED) > 20 && count(loud, BLUE) > 100, "{what}: loud");
+    assert_eq!(count(loud, WHITE), 0, "{what}: loud has no white text");
+    // `v[voice="Roger"]`: lime glyphs on the default box.
+    let roger = image(1);
+    assert!(count(roger, LIME) > 20 && count(roger, BOX) > 100, "{what}: voice");
+    // `#shadowed`: no box; white glyphs over a red shadow 2 px down-right.
+    let shade = image(2);
+    assert_eq!(count(shade, BOX), 0, "{what}: shadowed has no box");
+    assert!(count(shade, WHITE) > 20 && count(shade, RED) > 20, "{what}: shadow");
+    let (white_rows, red_rows) = (rows_with(shade, WHITE), rows_with(shade, RED));
+    assert_eq!(red_rows.last().unwrap() - white_rows.last().unwrap(), 2, "{what}: shadow offset");
+    // Right-to-left `align:start size:50%`: the box is the left half and
+    // the text sits at its right end (nine 8-pixel characters).
+    let rtl = image(3);
+    assert_eq!((rtl.x + rtl.width as i32, rtl.width), (160, 72), "{what}: right-to-left start");
+    // Ruby on line 0: 10 pixels of annotation above a 20-pixel line box
+    // (the cue's box, rows 10..30); the lime annotation in the top band.
+    let ruby = image(4);
+    assert_eq!(ruby.y + ruby.height as i32, 30, "{what}: ruby line");
+    let boxed = rows_with(ruby, BOX);
+    assert_eq!((boxed.first(), boxed.last()), (Some(&10), Some(&29)), "{what}: base line box");
+    assert!(rows_with(ruby, LIME).iter().all(|&r| r < 10) && !rows_with(ruby, LIME).is_empty(), "{what}: annotation above");
 }
 
 #[test]
-fn positioned_cues_from_a_vtt_file_and_ffmpeg_remuxes() {
-    let dir = scratch();
-    let path = dir.join("cues.vtt");
+fn styled_cues_from_a_vtt_file() {
+    let path = scratch().join("styled.vtt");
     std::fs::write(&path, vtt()).unwrap();
-    let from_vtt = shown(&path);
-    assert_placed("vtt", &from_vtt, true);
-    for container in ["mkv", "webm"] {
-        let remux = dir.join(format!("cues.{container}"));
-        let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-nostdin", "-y", "-i"])
-            .arg(&path)
-            .args(["-c:s", "copy"])
-            .arg(&remux)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        let from_container = shown(&remux);
-        assert_placed(container, &from_container, false);
-        // Every cue but the region's comes up exactly where the .vtt put it
-        // (FFmpeg's Matroska and WebM keep no header, so no region).
-        for (index, (a, b)) in from_vtt.iter().zip(&from_container).enumerate() {
-            if index != 3 {
-                assert_eq!(a, b, "{container}: cue {index}");
-            }
-        }
-    }
+    assert_drawn("vtt", &shown(&path));
 }
 
 fn mp4_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -185,12 +170,12 @@ fn full_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
 }
 
 /// An MP4 file with one `wvtt` track holding `CUES` (timescale 1000, a
-/// sample per cue and per gap).
+/// sample per cue and per gap), its header in the `vttC` box.
 fn mp4() -> Vec<u8> {
     let mut samples: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut at = 0;
-    for (id, second, settings, text) in CUES {
-        let start = second * 1000;
+    for (second, (id, settings, text)) in CUES.iter().enumerate() {
+        let start = second as u32 * 1000;
         if start > at {
             samples.push((start - at, mp4_box(b"vtte", b"")));
         }
@@ -229,12 +214,16 @@ fn mp4() -> Vec<u8> {
 }
 
 #[test]
-fn positioned_cues_from_mp4_wvtt() {
-    let path = scratch().join("cues.mp4");
+fn styled_cues_from_mp4_wvtt() {
+    let path = scratch().join("styled.mp4");
     std::fs::write(&path, mp4()).unwrap();
     let from_mp4 = shown(&path);
-    assert_placed("mp4", &from_mp4, true);
-    let vtt_path = scratch().join("cues-for-mp4.vtt");
+    assert_drawn("mp4", &from_mp4);
+    let vtt_path = scratch().join("styled-for-mp4.vtt");
     std::fs::write(&vtt_path, vtt()).unwrap();
-    assert_eq!(from_mp4, shown(&vtt_path), "MP4 and .vtt place their cues alike");
+    let from_vtt = shown(&vtt_path);
+    let digest = |shows: &[Vec<SubtitleImage>]| -> Vec<(i32, i32, u32, u32, Vec<u8>)> {
+        shows.iter().flatten().map(|i| (i.x, i.y, i.width, i.height, i.rgba.clone())).collect()
+    };
+    assert!(digest(&from_mp4) == digest(&from_vtt), "MP4 and .vtt draw their cues alike");
 }

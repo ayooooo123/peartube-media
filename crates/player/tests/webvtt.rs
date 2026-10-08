@@ -1,5 +1,6 @@
 //! The WebM subtitle track must resolve through the player's registry, retain
-//! FFmpeg's text and cue timing, and reach the actual subtitle sink.
+//! FFmpeg's text and cue timing, and reach the actual subtitle sink, drawn
+//! as WebVTT cues are (each FFmpeg cue's text on its default line).
 use std::{path::PathBuf, process::Command, sync::Arc, time::Duration};
 use parking_lot::Mutex;
 use oxideav_core::{Frame, MediaType};
@@ -79,9 +80,20 @@ fn generated_webvtt_matches_ffmpeg_and_reaches_player_sink() {
     assert_eq!(track.codec, "webvtt");
     drop(player);
     let shown = backend.cues.lock();
+    // FFmpeg's WebVTT cue payloads: the lines after each timing line.
+    let text = String::from_utf8(output.stdout.clone()).unwrap();
+    let payloads: Vec<String> = text
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut lines = block.lines().skip_while(|l| !l.contains("-->"));
+            lines.next()?;
+            Some(lines.collect::<Vec<_>>().join("\n"))
+        })
+        .collect();
+    assert_eq!(payloads.len(), reference.cues.len());
     assert_eq!(shown.len(), reference.cues.len());
-    for ((width, height, actual), expected) in shown.iter().zip(&reference.cues) {
-        let expected_image = player::subs::render_text_cue(expected, *width, *height);
-        assert_eq!(*actual, vec![signature(&expected_image)], "player rendered different cue text");
+    for ((width, height, actual), payload) in shown.iter().zip(&payloads) {
+        let expected_image = player::subs::render_webvtt_text(payload, *width, *height);
+        assert_eq!(*actual, vec![signature(&expected_image)], "player rendered different cue text: {payload:?}");
     }
 }

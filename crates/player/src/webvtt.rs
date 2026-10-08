@@ -1,28 +1,35 @@
-//! WebVTT cue placement, as W3C WebVTT §7 lays cues out
+//! WebVTT cue layout, as W3C WebVTT §7 lays cues out
 //! (<https://www.w3.org/TR/webvtt1/>): the cue box from the cue's size,
-//! position and alignment (§7.2), its line (snapped to lines, or a
-//! percentage, with the line alignment), vertical cues (`vertical:rl` /
-//! `lr`), cues in regions stacked from the region's bottom (§7.1), and the
-//! moves that keep a cue off the cues and regions already shown.
+//! position and alignment (§7.2; `start`/`end` follow the cue text's
+//! direction), its line (snapped to lines, or a percentage, with the line
+//! alignment), vertical cues (`vertical:rl` / `lr`), cues in regions
+//! (§7.1: on the region's `rgba(0,0,0,0.8)` box, stacked from its bottom,
+//! clipped to its `lines`, scrolled up over 0.433 s with CSS's `ease` when
+//! the region scrolls), and the moves that keep a cue off the cues and
+//! regions already shown.
 //!
-//! The text itself is the compositor's (bitmap font, outlined, no
-//! background box), as for every text subtitle: a cue box here is the
-//! cue's visible pixels, and a line is the compositor's line height.
-//! Vertical text is the horizontal rendering turned a quarter clockwise,
-//! as browsers set Latin text in vertical writing modes. A cue without
-//! settings keeps the compositor's bottom placement, which is where the
-//! specification's last line puts it.
+//! The text is the cue's own (§6.4 nodes, from the packet), drawn with
+//! the track's `STYLE` sheet by [`crate::webvtt_text`]. Vertical text is
+//! the horizontal rendering turned a quarter clockwise, as browsers set
+//! Latin text in vertical writing modes. A region's line is the default
+//! font's 20-pixel line box (§7.1's 6vh assumes the 5vh cue font this
+//! renderer does not scale to).
 
-use oxideav_core::{CuePosition, Packet, PacketMetadata, SubtitleCue, TextAlign};
-use oxideav_subtitle::compositor::Compositor;
-use oxideav_subtitle::font::BitmapFont;
-use subs_text::webvtt_settings::{header_regions, CueAlign, CueSettings, LineAlign, PositionAlign, Region, Vertical};
+use std::time::Duration;
+
+use oxideav_core::{Packet, PacketMetadata, Segment, SubtitleCue};
+use subs_text::webvtt_css::{StyleSheet, DEFAULT_BACKGROUND};
+use subs_text::webvtt_cue::Node;
+use subs_text::webvtt_settings::{header_regions, header_text, CueAlign, CueSettings, LineAlign, PositionAlign, Region, Vertical};
 
 use crate::backend::SubtitleImage;
+use crate::webvtt_text::{self, Align, LINE};
 
 /// Regions of a track considered at most (each is an obstacle for every
 /// cue placed).
 const MAX_REGIONS: usize = 64;
+/// How long a scrolling region takes to move its lines up (§7.1).
+pub(crate) const SCROLL: Duration = Duration::from_millis(433);
 
 /// A rectangle on the text canvas, in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,12 +77,16 @@ pub(crate) enum Layout {
 pub(crate) struct RegionSlot {
     /// The region's index in the track.
     pub region: usize,
-    /// The region box on the canvas; cues outside it are clipped.
+    /// The region box on the canvas at its full `lines`; cues outside it
+    /// are clipped.
     pub rect: Rect,
-    /// The cue's lines: `x` on the canvas, `y` from the top of its block.
+    /// The cue's lines on the region's background, the region's width:
+    /// `x` on the canvas, `y` from the top of the block.
     pub block: SubtitleImage,
-    /// The block's height: its lines times the line height.
+    /// The block's height: its line boxes'.
     pub block_height: i64,
+    /// The region scrolls (`scroll:up`): its lines move up as cues join.
+    pub scroll_up: bool,
 }
 
 /// A decoded text cue, rendered, and how it is placed.
@@ -84,36 +95,80 @@ pub(crate) struct TextCue {
     pub layout: Layout,
 }
 
-/// What a WebVTT track places its cues with.
+/// What the player knows of a WebVTT cue when it decodes it: its
+/// settings, its identifier and its text.
+#[derive(Clone, Debug)]
+pub(crate) struct CueInfo {
+    pub settings: CueSettings,
+    pub id: String,
+    pub nodes: Vec<Node>,
+}
+
+impl CueInfo {
+    /// A cue the packet did not describe: the decoder's text, no settings.
+    fn from_decoded(cue: &SubtitleCue) -> CueInfo {
+        fn walk(segments: &[Segment], out: &mut String) {
+            for s in segments {
+                match s {
+                    Segment::Text(t) | Segment::Raw(t) => out.push_str(t),
+                    Segment::LineBreak => out.push('\n'),
+                    Segment::Bold(c) | Segment::Italic(c) | Segment::Underline(c) | Segment::Strike(c) => walk(c, out),
+                    Segment::Color { children, .. } | Segment::Font { children, .. } | Segment::Voice { children, .. }
+                    | Segment::Class { children, .. } | Segment::Karaoke { children, .. } => walk(children, out),
+                    Segment::Timestamp { .. } => {}
+                }
+            }
+        }
+        let mut text = String::new();
+        walk(&cue.segments, &mut text);
+        CueInfo { settings: CueSettings::default(), id: String::new(), nodes: vec![Node::Text(text)] }
+    }
+}
+
+/// What a WebVTT track places and styles its cues with.
 pub(crate) struct WebVttTrack {
     regions: Vec<Region>,
+    sheet: StyleSheet,
 }
 
 impl WebVttTrack {
     /// From the stream's extradata: the file header, WebM's
     /// `CodecPrivate` or MP4's sample entry, whose `REGION` blocks define
-    /// its regions.
+    /// its regions and `STYLE` blocks its style sheet.
     pub fn new(extradata: &[u8]) -> WebVttTrack {
         let mut regions = header_regions(extradata);
         regions.truncate(MAX_REGIONS);
-        WebVttTrack { regions }
+        WebVttTrack { regions, sheet: StyleSheet::from_header(header_text(extradata)) }
     }
 
-    /// The settings of each cue `packet` decodes to, in order: an MP4
-    /// sample's cue boxes (each with text, as the decoder decodes them),
-    /// or the packet's own (Matroska, WebM, `.vtt`).
-    pub fn packet_settings(&self, packet: &Packet, metadata: &PacketMetadata) -> Vec<Option<CueSettings>> {
+    /// Each cue `packet` decodes to, in order: an MP4 sample's cue boxes
+    /// (each with text, as the decoder decodes them), or the packet's own
+    /// text with its metadata's settings (Matroska, WebM, `.vtt`).
+    pub fn packet_cues(&self, packet: &Packet, metadata: &PacketMetadata) -> Vec<CueInfo> {
         let parse = |settings: &[u8]| CueSettings::parse(settings, &self.regions);
+        // The text up to its first NUL, its character set decided for the
+        // cue alone, as the decoder reads it.
+        let text = |bytes: &[u8]| {
+            let until_nul = bytes.split(|&b| b == 0).next().unwrap_or_default();
+            subs_text::webvtt_cue::parse(&subs_text::text_common::decode_subtitle_text(until_nul))
+        };
         match subs_text::webvtt::mp4_sample_cues(&packet.data) {
-            Some(cues) => cues.iter().filter(|(text, _)| !text.is_empty()).map(|(_, m)| Some(parse(&m.settings))).collect(),
-            None => vec![metadata.webvtt.as_ref().map(|m| parse(&m.settings))],
+            Some(cues) => cues
+                .iter()
+                .filter(|(payload, _)| !payload.is_empty())
+                .map(|(payload, m)| CueInfo { settings: parse(&m.settings), id: String::from_utf8_lossy(&m.identifier).into_owned(), nodes: text(payload) })
+                .collect(),
+            None => {
+                let (settings, id) = metadata.webvtt.as_ref().map_or_else(Default::default, |m| (parse(&m.settings), String::from_utf8_lossy(&m.identifier).into_owned()));
+                vec![CueInfo { settings, id, nodes: text(&packet.data) }]
+            }
         }
     }
 
-    /// The region boxes on a `canvas`-sized text canvas: every region is
-    /// on screen, with or without cues (§7.1).
+    /// The region boxes on a `canvas`-sized text canvas that cues keep
+    /// off: a region is on screen with or without cues (§7.1).
     pub fn region_rects(&self, canvas: (u32, u32)) -> Vec<Rect> {
-        self.regions.iter().map(|r| region_rect(r, canvas)).collect()
+        self.regions.iter().map(|r| region_rect(r, canvas)).filter(|r| r.h > 0).collect()
     }
 
     fn region_index(&self, region: &Region) -> Option<usize> {
@@ -121,91 +176,94 @@ impl WebVttTrack {
     }
 }
 
-/// The compositor's line height: a line box.
+/// A line box of the default font.
 fn line_height() -> i64 {
-    let comp = Compositor::new(1, 1);
-    i64::from(comp.line_height_px.max(BitmapFont::default_regular().cell_h))
+    LINE as i64
 }
 
 fn region_rect(region: &Region, (cw, ch): (u32, u32)) -> Rect {
     let w = (region.width / 100.0 * f64::from(cw)).round() as i64;
-    let h = i64::from(region.lines).saturating_mul(line_height());
+    let h = i64::from(region.lines).saturating_mul(line_height()).min(i64::from(ch));
     let x = (region.viewport_anchor.0 / 100.0 * f64::from(cw) - region.region_anchor.0 * w as f64 / 100.0).round() as i64;
     let y = (region.viewport_anchor.1 / 100.0 * f64::from(ch) - region.region_anchor.1 * h as f64 / 100.0).round() as i64;
     Rect { x, y, w, h }
 }
 
-fn text_align(align: CueAlign) -> TextAlign {
+fn text_align(align: CueAlign) -> Align {
     match align {
-        CueAlign::Start => TextAlign::Start,
-        CueAlign::Center => TextAlign::Center,
-        CueAlign::End => TextAlign::End,
-        CueAlign::Left => TextAlign::Left,
-        CueAlign::Right => TextAlign::Right,
+        CueAlign::Start => Align::Start,
+        CueAlign::Center => Align::Center,
+        CueAlign::End => Align::End,
+        CueAlign::Left => Align::Left,
+        CueAlign::Right => Align::Right,
     }
 }
 
 const NOTHING: SubtitleImage = SubtitleImage { x: 0, y: 0, width: 0, height: 0, rgba: Vec::new() };
 
-/// `cue` laid out on a `canvas`-sized text canvas per `settings` (`None`:
-/// the cue has none).
-pub(crate) fn layout_cue(cue: &SubtitleCue, settings: Option<&CueSettings>, track: &WebVttTrack, canvas: (u32, u32)) -> TextCue {
-    let (cw, ch) = canvas;
-    let Some(settings) = settings.filter(|s| **s != CueSettings::default()) else {
-        // The compositor's bottom line: snapped like the specification's
-        // last line, moving up off cues already shown.
-        let image = render(cue, i64::from(cw), i64::from(ch)).unwrap_or(NOTHING);
-        return TextCue { image, layout: Layout::Snap { step: -line_height(), vertical: Vertical::Horizontal } };
+/// A decoded WebVTT `cue` laid out on a `canvas`-sized text canvas, per
+/// `info` (`None`: the packet did not describe it).
+pub(crate) fn layout_cue(cue: &SubtitleCue, info: Option<&CueInfo>, track: &WebVttTrack, canvas: (u32, u32)) -> TextCue {
+    let fallback;
+    let info = match info {
+        Some(info) => info,
+        None => {
+            fallback = CueInfo::from_decoded(cue);
+            &fallback
+        }
     };
-    let step = line_height();
-    let mut cue = cue.clone();
-    cue.positioning = Some(CuePosition { align: text_align(settings.align), ..CuePosition::default() });
+    let (cw, ch) = canvas;
+    let settings = &info.settings;
+    let rtl = webvtt_text::is_rtl(&info.nodes);
+    let align = text_align(settings.align);
+    let render = |width: i64, reversed: bool| webvtt_text::render(&info.nodes, &track.sheet, &info.id, width, align, reversed);
+    // No line boxes: the cue is not shown (an empty image never is).
+    let none = || TextCue { image: NOTHING, layout: Layout::Closest };
 
     if let Some(index) = settings.region.as_ref().and_then(|r| track.region_index(r)) {
         let region = &track.regions[index];
         let rect = region_rect(region, canvas);
-        // No line boxes: the cue is not shown (an empty image never is).
-        let Some(mut block) = render(&cue, rect.w, i64::from(ch)) else { return TextCue { image: NOTHING, layout: Layout::Closest } };
+        let Some(block) = render(rect.w, false) else { return none() };
         // §7.1: the offset is the computed position of the region width,
         // less the region width as the position alignment says, as a
         // percentage of the region width.
         let mut offset = settings.computed_position() * region.width / 100.0;
-        match settings.computed_position_align() {
+        match settings.computed_position_align(rtl) {
             PositionAlign::Center => offset -= region.width / 2.0,
             PositionAlign::LineRight => offset -= region.width,
             _ => {}
         }
-        let lines = (i64::from(block.height) + step - 1) / step;
-        let block_height = lines * step;
-        block.x = clamp_i32(rect.x + i64::from(block.x) + (offset / 100.0 * rect.w as f64).round() as i64);
-        block.y = clamp_i32(block_height - i64::from(block.height));
-        let slot = RegionSlot { region: index, rect, block, block_height };
+        let left = (offset / 100.0 * rect.w as f64).round() as i64;
+        let Some(image) = on_region_box(&block.image, rect.w, block.height, left) else { return none() };
+        let image = SubtitleImage { x: clamp_i32(rect.x), ..image };
+        let slot = RegionSlot { region: index, rect, block: image, block_height: block.height, scroll_up: region.scroll_up };
         return TextCue { image: NOTHING, layout: Layout::Region(slot) };
     }
 
-    let size = settings.computed_size();
-    let start = settings.box_start();
+    let size = settings.computed_size(rtl);
+    let start = settings.box_start(rtl);
     let horizontal = settings.vertical == Vertical::Horizontal;
     // The cue box: `size` of the width (horizontal) or height (vertical).
-    let (extent, along) = if horizontal { (cw, ch) } else { (ch, ch) };
+    let extent = if horizontal { cw } else { ch };
     let box_len = (size / 100.0 * f64::from(extent)).round() as i64;
     let box_start = (start / 100.0 * f64::from(extent)).round() as i64;
-    let Some(rendered) = render(&cue, box_len, i64::from(along)) else { return TextCue { image: NOTHING, layout: Layout::Closest } };
-    let mut image = match settings.vertical {
-        Vertical::Horizontal => rendered,
-        Vertical::GrowingLeft => rotate_cw(&rendered),
-        Vertical::GrowingRight => rotate_cw(&reverse_lines(&cue, box_len, i64::from(along))),
-    };
-    let (w, h) = (i64::from(image.width), i64::from(image.height));
-    // Along the line: the box start, plus where the text sits in the box
-    // (horizontal x becomes vertical y).
-    if horizontal {
-        image.x = clamp_i32(box_start + i64::from(image.x));
+    let Some(block) = render(box_len, settings.vertical == Vertical::GrowingRight) else { return none() };
+    let step = block.first_line.max(1);
+    // The image, where it sits along the line axis within the cue box,
+    // and across it within the block (`across` long).
+    let across = block.height;
+    let (mut image, offset_along, offset_across) = if horizontal {
+        let (x, y) = (i64::from(block.image.x), i64::from(block.image.y));
+        (block.image, x, y)
     } else {
-        image.y = clamp_i32(box_start + i64::from(image.x));
-    }
+        // A quarter turn clockwise: a point (x, y) of the lines lands at
+        // (across - 1 - y, x).
+        let x = across - i64::from(block.image.y) - i64::from(block.image.height);
+        let y = i64::from(block.image.x);
+        (turn_cw(&block.image), y, x)
+    };
     let line = settings.computed_line();
-    let layout = if settings.snap_to_lines {
+    let (layout, block_pos) = if settings.snap_to_lines {
         let mut line = (line + 0.5).floor().clamp(-1e9, 1e9) as i64;
         let full = if horizontal { i64::from(ch) } else { i64::from(cw) };
         if settings.vertical == Vertical::GrowingLeft {
@@ -214,33 +272,29 @@ pub(crate) fn layout_cue(cue: &SubtitleCue, settings: Option<&CueSettings>, trac
         let mut position = step.saturating_mul(line);
         let mut step = step;
         if settings.vertical == Vertical::GrowingLeft {
-            position = position - w + step;
+            position = position - across + step;
         }
         if line < 0 {
             position = position.saturating_add(full);
             step = -step;
         }
-        if horizontal {
-            image.y = clamp_i32(position);
-        } else {
-            image.x = clamp_i32(position);
-        }
-        Layout::Snap { step, vertical: settings.vertical }
+        (Layout::Snap { step, vertical: settings.vertical }, position)
     } else {
-        let (dimension, length) = if horizontal { (i64::from(ch), h) } else { (i64::from(cw), w) };
+        let dimension = if horizontal { i64::from(ch) } else { i64::from(cw) };
         let mut at = (line / 100.0 * dimension as f64).round() as i64;
         match settings.line_align {
-            LineAlign::Center => at -= length / 2,
-            LineAlign::End => at -= length,
+            LineAlign::Center => at -= across / 2,
+            LineAlign::End => at -= across,
             LineAlign::Start => {}
         }
-        if horizontal {
-            image.y = clamp_i32(at);
-        } else {
-            image.x = clamp_i32(at);
-        }
-        Layout::Closest
+        (Layout::Closest, at)
     };
+    let (along, across_at) = (box_start.saturating_add(offset_along), block_pos.saturating_add(offset_across));
+    if horizontal {
+        (image.x, image.y) = (clamp_i32(along), clamp_i32(across_at));
+    } else {
+        (image.x, image.y) = (clamp_i32(across_at), clamp_i32(along));
+    }
     TextCue { image, layout }
 }
 
@@ -248,56 +302,45 @@ fn clamp_i32(v: i64) -> i32 {
     v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
-/// The cue's lines wrapped at `width` on a `width x height` canvas,
-/// cropped to its visible pixels; `None` when nothing is visible (no line
-/// boxes: the cue is not shown).
-fn render(cue: &SubtitleCue, width: i64, height: i64) -> Option<SubtitleImage> {
-    let (width, height) = (u32::try_from(width).ok()?, u32::try_from(height).ok()?);
-    if width == 0 || height == 0 {
+/// `lines` (`x`/`y` within its block, shifted `left` pixels) over the
+/// region's background, `width` wide and `height` tall (§7.4: a region
+/// box is `rgba(0,0,0,0.8)`); `None` when the region has no width.
+fn on_region_box(lines: &SubtitleImage, width: i64, height: i64, left: i64) -> Option<SubtitleImage> {
+    if width <= 0 || height <= 0 || width > 8192 || height > 8192 {
         return None;
     }
-    let rgba = Compositor::new(width, height).render(cue);
-    crate::subs::visible_image(&rgba, width as usize, height as usize)
-}
-
-/// [`render`] with the order of the lines reversed (the first line
-/// last): before a quarter turn clockwise, the lines of `vertical:lr`
-/// then run left to right. The compositor sets lines a line height apart
-/// from its bottom margin; each line's pixels stay within its band.
-fn reverse_lines(cue: &SubtitleCue, width: i64, height: i64) -> SubtitleImage {
-    let Some(rendered) = render(cue, width, height) else { return NOTHING };
-    let comp = Compositor::new(1, 1);
-    let font = BitmapFont::default_regular();
-    let step = line_height();
-    let outline = i64::from(comp.outline_px.min(2));
-    let below = i64::from(font.cell_h - font.bearing_y.min(font.cell_h));
-    let last_baseline = (height - i64::from(comp.bottom_margin_px) - below).max(0);
-    // Bands run up from just under the last line's glyphs.
-    let bottom = last_baseline + below + outline;
-    let top = i64::from(rendered.y);
-    let bands = ((bottom - top + step - 1) / step).max(1);
-    let (w, row_bytes) = (rendered.width as usize, rendered.width as usize * 4);
-    let mut rgba = vec![0u8; bands as usize * step as usize * row_bytes];
-    for band in 0..bands {
-        // Band `band` from the top moves to `bands - 1 - band`.
-        let src_top = bottom - (bands - band) * step;
-        let dst_top = (bands - 1 - band) * step;
-        for r in 0..step {
-            let src_row = src_top + r - top;
-            if src_row < 0 || src_row >= i64::from(rendered.height) {
+    let (w, h) = (width as usize, height as usize);
+    let mut rgba: Vec<u8> = DEFAULT_BACKGROUND.iter().copied().cycle().take(w * h * 4).collect();
+    for row in 0..lines.height as usize {
+        for col in 0..lines.width as usize {
+            let (x, y) = (i64::from(lines.x) + left + col as i64, i64::from(lines.y) + row as i64);
+            if x < 0 || y < 0 || x >= width || y >= height {
                 continue;
             }
-            let src = &rendered.rgba[src_row as usize * row_bytes..][..row_bytes];
-            rgba[(dst_top + r) as usize * row_bytes..][..row_bytes].copy_from_slice(src);
+            let s = (row * lines.width as usize + col) * 4;
+            let d = (y as usize * w + x as usize) * 4;
+            over(&mut rgba[d..d + 4], &lines.rgba[s..s + 4]);
         }
     }
-    let reordered = crate::subs::visible_image(&rgba, w, bands as usize * step as usize).unwrap_or(NOTHING);
-    SubtitleImage { x: rendered.x + reordered.x, y: 0, ..reordered }
+    Some(SubtitleImage { x: 0, y: 0, width: w as u32, height: h as u32, rgba })
+}
+
+/// Straight-alpha `src` over `dst`.
+fn over(dst: &mut [u8], src: &[u8]) {
+    let (sa, da) = (u32::from(src[3]), u32::from(dst[3]));
+    if sa == 0 {
+        return;
+    }
+    let out = sa + da * (255 - sa) / 255;
+    for c in 0..3 {
+        dst[c] = ((u32::from(src[c]) * sa + u32::from(dst[c]) * da * (255 - sa) / 255) / out).min(255) as u8;
+    }
+    dst[3] = out.min(255) as u8;
 }
 
 /// `image` turned a quarter clockwise: its rows become columns, the first
-/// row the rightmost. Its `x` (where the text sits along the line) stays.
-fn rotate_cw(image: &SubtitleImage) -> SubtitleImage {
+/// row the rightmost.
+fn turn_cw(image: &SubtitleImage) -> SubtitleImage {
     let (w, h) = (image.width as usize, image.height as usize);
     let mut rgba = vec![0u8; w * h * 4];
     for y in 0..h {
@@ -308,7 +351,7 @@ fn rotate_cw(image: &SubtitleImage) -> SubtitleImage {
             rgba[dst..dst + 4].copy_from_slice(&image.rgba[src..src + 4]);
         }
     }
-    SubtitleImage { x: image.x, y: 0, width: image.height, height: image.width, rgba }
+    SubtitleImage { x: 0, y: 0, width: image.height, height: image.width, rgba }
 }
 
 /// Moves `image` per `layout` off `obstacles` within `canvas` (§7.2
@@ -415,13 +458,40 @@ pub(crate) fn place(image: &mut SubtitleImage, layout: &Layout, obstacles: &[Rec
     }
 }
 
+/// CSS's `ease` timing function, `cubic-bezier(0.25, 0.1, 0.25, 1)`: the
+/// progress of a transition `t` (0..=1) of the way through its time.
+pub(crate) fn ease(t: f64) -> f64 {
+    if t <= 0.0 {
+        return 0.0;
+    }
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let (x1, y1, x2, y2) = (0.25, 0.1, 0.25, 1.0);
+    let bezier = |p1: f64, p2: f64, s: f64| 3.0 * p1 * s * (1.0 - s).powi(2) + 3.0 * p2 * s * s * (1.0 - s) + s.powi(3);
+    // x(s) is increasing: bisect for the s whose x is t.
+    let (mut lo, mut hi) = (0.0, 1.0);
+    for _ in 0..40 {
+        let mid = (lo + hi) / 2.0;
+        if bezier(x1, x2, mid) < t {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    bezier(y1, y2, (lo + hi) / 2.0)
+}
+
 /// The cues of one region, in the order they came up, stacked from the
-/// region's bottom (the latest lowest) and clipped to the region box.
-pub(crate) fn stack_region(slots: &[&RegionSlot]) -> Vec<SubtitleImage> {
+/// region's bottom (the latest lowest), `lift` pixels below their resting
+/// place (a scroll under way), and clipped to the region box. The region
+/// box is as tall as its lines; `lines:0` shows nothing, as browsers clip
+/// the region's content to its height.
+pub(crate) fn stack_region(slots: &[&RegionSlot], lift: i64) -> Vec<SubtitleImage> {
     let Some(first) = slots.first() else { return Vec::new() };
     let rect = first.rect;
     let total: i64 = slots.iter().map(|s| s.block_height).sum();
-    let mut top = rect.y + rect.h - total;
+    let mut top = rect.y + rect.h - total + lift;
     slots
         .iter()
         .map(|slot| {
@@ -439,7 +509,7 @@ fn clip(image: &mut SubtitleImage, rect: Rect) {
     let (x0, y0) = (r.x.max(rect.x), r.y.max(rect.y));
     let (x1, y1) = ((r.x + r.w).min(rect.x + rect.w), (r.y + r.h).min(rect.y + rect.h));
     if x0 >= x1 || y0 >= y1 {
-        *image = SubtitleImage { x: 0, y: 0, width: 0, height: 0, rgba: Vec::new() };
+        *image = NOTHING;
         return;
     }
     if (x0, y0, x1, y1) == (r.x, r.y, r.x + r.w, r.y + r.h) {
@@ -457,20 +527,19 @@ fn clip(image: &mut SubtitleImage, rect: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::Segment;
 
     const W: i64 = 640;
     const H: i64 = 360;
     const CANVAS: Rect = Rect { x: 0, y: 0, w: W, h: H };
 
-    fn cue(text: &str) -> SubtitleCue {
-        SubtitleCue { start_us: 0, end_us: 1_000_000, style_ref: None, positioning: None, segments: vec![Segment::Text(text.into())] }
+    fn cue() -> SubtitleCue {
+        SubtitleCue { start_us: 0, end_us: 1_000_000, style_ref: None, positioning: None, segments: Vec::new() }
     }
 
     fn laid(text: &str, settings: &str, header: &[u8]) -> TextCue {
         let track = WebVttTrack::new(header);
-        let settings = CueSettings::parse(settings.as_bytes(), &track.regions);
-        layout_cue(&cue(text), Some(&settings), &track, (W as u32, H as u32))
+        let info = CueInfo { settings: CueSettings::parse(settings.as_bytes(), &track.regions), id: String::new(), nodes: subs_text::webvtt_cue::parse(text) };
+        layout_cue(&cue(), Some(&info), &track, (W as u32, H as u32))
     }
 
     /// `text` with `settings`, placed alone on the canvas.
@@ -488,6 +557,8 @@ mod tests {
         // Line -1 starts a line height above the bottom.
         let last = placed("last", "line:-1");
         assert_eq!(last.y, H - step);
+        // No settings: the last line too (the computed line is -1).
+        assert_eq!(placed("plain", "").y, H - step);
         // A cue past the bottom moves up until it fits.
         assert!(placed("long", "line:1000").within(&CANVAS));
     }
@@ -503,30 +574,44 @@ mod tests {
 
     #[test]
     fn size_position_and_alignment_set_the_cue_box() {
-        // align:start, size:50%: a box over the right half, text at its
-        // start (auto position 50%, line-left).
+        // align:start, size:50%: a box over the right half, the text (on
+        // its background box) at the box's start.
         let right = placed("right half", "align:start size:50%");
-        assert!(right.x >= W / 2 && right.x <= W / 2 + 10 && right.x + right.w <= W, "{right:?}");
+        assert_eq!(right.x, W / 2);
         // align:end: the left half, text at its end.
         let left = placed("left half", "align:end size:50%");
-        assert!(left.x + left.w <= W / 2 && left.x + left.w >= W / 2 - 10, "{left:?}");
+        assert_eq!(left.x + left.w, W / 2);
         // position:10% line-left: the box starts at 10%.
-        let at = placed("at ten", "position:10%,line-left align:left");
-        assert!(at.x >= W / 10 && at.x <= W / 10 + 10, "{at:?}");
+        assert_eq!(placed("at ten", "position:10%,line-left align:left").x, W / 10);
+    }
+
+    /// `start` and `end` anchor by the text's direction (§3: the computed
+    /// position alignment), and the line follows it inside the box.
+    #[test]
+    fn right_to_left_text_turns_start_and_end_around() {
+        // RTL `start`, size 50%: auto position 50%, line-right: the box is
+        // the left half, the text flush with its right edge.
+        let rtl_start = placed("שלום", "align:start size:50%");
+        assert_eq!(rtl_start.x + rtl_start.w, W / 2);
+        let rtl_end = placed("שלום", "align:end size:50%");
+        assert_eq!(rtl_end.x, W / 2);
+        // `left` does not depend on direction.
+        assert_eq!(placed("שלום", "align:left size:50% position:0%").x, 0);
     }
 
     #[test]
     fn vertical_cues_turn_and_take_their_line_across() {
         // vertical:rl, line auto: the last line of a right-to-left stack,
-        // the leftmost line box (§7.2: line -1, growing left); the glyphs
-        // stand at the right of that box.
+        // the leftmost line box (§7.2: line -1, growing left).
         let rl = placed("vertical text", "vertical:rl");
         assert!(rl.h > rl.w, "{rl:?}");
-        assert!(rl.x >= 0 && rl.x + rl.w == line_height(), "{rl:?}");
+        assert_eq!((rl.x, rl.w), (0, line_height()));
         // FATE's "Title Wrap": lr, line 0 (left edge), 20% down, 60% tall.
         let lr = placed("Some time ago in a rather distant place....", "vertical:lr line:0 position:20% size:60% align:start");
         assert_eq!(lr.x, 0);
-        assert!(lr.y >= H / 5 && lr.y <= H / 5 + 10 && lr.y + lr.h <= H / 5 + H * 3 / 5, "{lr:?}");
+        assert!(lr.y == H / 5 && lr.y + lr.h <= H / 5 + H * 3 / 5, "{lr:?}");
+        // Two lines growing right: the first line is the leftmost column.
+        assert_eq!(lr.w, 2 * line_height());
         // rl, line 0: the right edge.
         let right = placed("x", "vertical:rl line:0");
         assert_eq!(right.x + right.w, W);
@@ -534,16 +619,14 @@ mod tests {
 
     #[test]
     fn snapped_cues_stack_off_the_cues_up() {
-        let TextCue { image: first, layout } = laid("first", "line:-1", b"");
+        let TextCue { image: mut first, layout } = laid("first", "line:-1", b"");
         let TextCue { image: mut second, .. } = laid("second", "line:-1", b"");
-        let mut first = first;
         assert!(place(&mut first, &layout, &[], CANVAS));
         assert!(place(&mut second, &layout, &[Rect::of(&first)], CANVAS));
         assert_eq!(i64::from(second.y), i64::from(first.y) - line_height());
         // With no free line left, the cue is not shown.
-        let full = [CANVAS];
         let TextCue { mut image, layout } = laid("third", "line:-1", b"");
-        assert!(!place(&mut image, &layout, &full, CANVAS));
+        assert!(!place(&mut image, &layout, &[CANVAS], CANVAS));
     }
 
     #[test]
@@ -558,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn region_cues_stack_from_the_region_bottom() {
+    fn region_cues_stack_on_the_region_box() {
         let header = b"WEBVTT\n\nREGION\nid:fred width:40% lines:2 regionanchor:0%,100% viewportanchor:10%,90%\n";
         let slot = |text: &str| match laid(text, "region:fred align:left", header).layout {
             Layout::Region(slot) => slot,
@@ -567,15 +650,47 @@ mod tests {
         let (a, b, c) = (slot("one"), slot("two"), slot("three"));
         let rect = a.rect;
         assert_eq!(rect, Rect { x: 64, y: 324 - 2 * line_height(), w: 256, h: 2 * line_height() });
-        let images = stack_region(&[&a, &b]);
-        assert!(images.iter().all(|i| Rect::of(i).within(&rect)), "{images:?}");
-        // The latest is lowest; both start at the region's left (align:left).
-        assert!(images[1].y > images[0].y);
-        assert!(images.iter().all(|i| i64::from(i.x) >= rect.x && i64::from(i.x) <= rect.x + 10));
-        // A third line scrolls the first out of the two-line region.
-        let images = stack_region(&[&a, &b, &c]);
+        let images = stack_region(&[&a, &b], 0);
+        // Each line fills the region's width on its background.
+        assert!(images.iter().all(|i| Rect::of(i).within(&rect) && i64::from(i.width) == rect.w));
+        // The region's box where no cue box is (the line's right end); the
+        // cue's own box darkens it further where its text is (0.8 over 0.8).
+        let right_end = (images[0].width as usize - 1) * 4;
+        assert_eq!(images[0].rgba[right_end..right_end + 4], DEFAULT_BACKGROUND);
+        assert_eq!(images[0].rgba[..4], [0, 0, 0, 244]);
+        // The latest is lowest, at the region's bottom.
+        assert_eq!((i64::from(images[1].y), i64::from(images[0].y)), (rect.y + line_height(), rect.y));
+        // A third line pushes the first out of the two-line region.
+        let images = stack_region(&[&a, &b, &c], 0);
         assert_eq!(images[0].width, 0);
         assert!(images[1].width > 0 && images[2].width > 0);
+        // Half a line into a scroll: the newest is half below the box.
+        let images = stack_region(&[&a, &b, &c], line_height() / 2);
+        assert_eq!(i64::from(images[2].height), line_height() / 2);
+        assert_eq!(i64::from(images[1].y), rect.y + line_height() / 2);
+        assert_eq!(images[0].height as i64, line_height() / 2);
+    }
+
+    /// `lines:0`: the region box has no height, so its cues show nothing
+    /// and it keeps no other cue away (browsers clip region content to the
+    /// region's height).
+    #[test]
+    fn a_region_without_lines_shows_nothing() {
+        let header = b"WEBVTT\n\nREGION\nid:none lines:0 width:50%\n";
+        let track = WebVttTrack::new(header);
+        assert!(track.region_rects((W as u32, H as u32)).is_empty());
+        let Layout::Region(slot) = laid("hidden", "region:none", header).layout else { panic!("in the region") };
+        assert_eq!(slot.rect.h, 0);
+        assert!(stack_region(&[&slot], 0).iter().all(|i| i.width == 0));
+    }
+
+    #[test]
+    fn the_scroll_eases_as_css_ease_does() {
+        assert_eq!(ease(0.0), 0.0);
+        assert!((ease(1.0) - 1.0).abs() < 1e-9);
+        // cubic-bezier(0.25, 0.1, 0.25, 1) at half time: about 0.8024.
+        assert!((ease(0.5) - 0.8024).abs() < 1e-3, "{}", ease(0.5));
+        assert!((1..100).all(|i| ease(f64::from(i) / 100.0) >= ease(f64::from(i - 1) / 100.0)));
     }
 
     #[test]

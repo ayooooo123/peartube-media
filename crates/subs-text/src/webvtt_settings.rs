@@ -259,12 +259,17 @@ impl CueSettings {
         }
     }
 
-    /// The computed position alignment, for left-to-right cue text (this
-    /// renderer lays out no right-to-left text).
-    pub fn computed_position_align(&self) -> PositionAlign {
+    /// The computed position alignment; `rtl`: the cue text's base
+    /// direction is right-to-left (`start` and `end` then anchor the
+    /// other side).
+    pub fn computed_position_align(&self, rtl: bool) -> PositionAlign {
         match (self.position_align, self.align) {
-            (PositionAlign::Auto, CueAlign::Left | CueAlign::Start) => PositionAlign::LineLeft,
-            (PositionAlign::Auto, CueAlign::Right | CueAlign::End) => PositionAlign::LineRight,
+            (PositionAlign::Auto, CueAlign::Left) => PositionAlign::LineLeft,
+            (PositionAlign::Auto, CueAlign::Right) => PositionAlign::LineRight,
+            (PositionAlign::Auto, CueAlign::Start) if rtl => PositionAlign::LineRight,
+            (PositionAlign::Auto, CueAlign::Start) => PositionAlign::LineLeft,
+            (PositionAlign::Auto, CueAlign::End) if rtl => PositionAlign::LineLeft,
+            (PositionAlign::Auto, CueAlign::End) => PositionAlign::LineRight,
             (PositionAlign::Auto, CueAlign::Center) => PositionAlign::Center,
             (align, _) => align,
         }
@@ -282,9 +287,9 @@ impl CueSettings {
     }
 
     /// The cue box size the position leaves room for, 0..=100.
-    pub fn computed_size(&self) -> f64 {
+    pub fn computed_size(&self, rtl: bool) -> f64 {
         let position = self.computed_position();
-        let maximum = match self.computed_position_align() {
+        let maximum = match self.computed_position_align(rtl) {
             PositionAlign::LineLeft => 100.0 - position,
             PositionAlign::LineRight => position,
             _ if position <= 50.0 => position * 2.0,
@@ -295,9 +300,9 @@ impl CueSettings {
 
     /// Where the cue box starts along its line, a percentage of the video
     /// width (horizontal) or height (vertical).
-    pub fn box_start(&self) -> f64 {
-        let (position, size) = (self.computed_position(), self.computed_size());
-        match self.computed_position_align() {
+    pub fn box_start(&self, rtl: bool) -> f64 {
+        let (position, size) = (self.computed_position(), self.computed_size(rtl));
+        match self.computed_position_align(rtl) {
             PositionAlign::LineLeft => position,
             PositionAlign::LineRight => position - size,
             _ => position - size / 2.0,
@@ -347,12 +352,11 @@ fn parse_region(settings: &[u8]) -> Region {
     region
 }
 
-/// The regions a WebVTT header defines, in order: its `REGION` blocks
-/// that name an `id`. `header` is the file header (the `WEBVTT` block and
-/// what follows it up to the first cue, as a `.vtt` file and WebM's
-/// `CodecPrivate` carry it) or an MP4 `wvtt` sample entry's boxes, whose
-/// `vttC` box holds that header.
-pub fn header_regions(header: &[u8]) -> Vec<Region> {
+/// The WebVTT header text in a stream's extradata: the file header (the
+/// `WEBVTT` block and what follows it up to the first cue, as a `.vtt`
+/// file and WebM's `CodecPrivate` carry it), or the body of the `vttC` box
+/// of an MP4 `wvtt` sample entry. A UTF-8 byte order mark is dropped.
+pub fn header_text(header: &[u8]) -> &[u8] {
     let mut at = 0;
     let mut text = header;
     while let Some(child) = box_at(header, at) {
@@ -362,7 +366,13 @@ pub fn header_regions(header: &[u8]) -> Vec<Region> {
         }
         at = child.end;
     }
-    let text = text.strip_prefix(b"\xef\xbb\xbf").unwrap_or(text);
+    text.strip_prefix(b"\xef\xbb\xbf").unwrap_or(text)
+}
+
+/// The regions a WebVTT header ([`header_text`]) defines, in order: its
+/// `REGION` blocks that name an `id`.
+pub fn header_regions(header: &[u8]) -> Vec<Region> {
+    let text = header_text(header);
     let mut regions = Vec::new();
     let mut lines = text.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l)).peekable();
     while let Some(line) = lines.next() {
@@ -412,11 +422,15 @@ mod tests {
     fn computed_values() {
         assert_eq!(parse("").computed_line(), -1.0);
         assert_eq!(parse("align:left").computed_position(), 0.0);
-        assert_eq!(parse("align:end size:50%").box_start(), 0.0);
-        assert_eq!(parse("align:start size:50%").box_start(), 50.0);
+        assert_eq!(parse("align:end size:50%").box_start(false), 0.0);
+        assert_eq!(parse("align:start size:50%").box_start(false), 50.0);
+        // Right-to-left text: `start` anchors the right side.
+        assert_eq!(parse("align:start size:50%").box_start(true), 0.0);
+        assert_eq!(parse("align:end size:50%").box_start(true), 50.0);
+        assert_eq!(parse("align:left size:50%").box_start(true), 0.0);
         // A centered cue at 20% has room for 40%.
         let s = parse("position:20%");
-        assert_eq!((s.computed_size(), s.box_start()), (40.0, 0.0));
+        assert_eq!((s.computed_size(false), s.box_start(false)), (40.0, 0.0));
     }
 
     #[test]
