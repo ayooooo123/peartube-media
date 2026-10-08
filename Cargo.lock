@@ -1128,7 +1128,7 @@ dependencies = [
 [[package]]
 name = "oxideav-flv"
 version = "0.0.5"
-source = "git+https://github.com/OxideAV/oxideav-flv?rev=02e9158a20786a214a707da2f4ae7650146f3b3e#02e9158a20786a214a707da2f4ae7650146f3b3e"
+source = "git+https://github.com/ayooooo123/oxideav-flv?rev=5b1b6656065c3bea804bc3de3b95970d3286ad3c#5b1b6656065c3bea804bc3de3b95970d3286ad3c"
 dependencies = [
  "oxideav-core",
 ]
