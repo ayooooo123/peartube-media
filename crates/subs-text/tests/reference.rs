@@ -60,7 +60,7 @@ fn test_kate_reference() {
     let decoded = refcheck::decode(
         &sample,
         &[subs_text::register, oxideav_ogg::register],
-        MediaType::Unknown,
+        MediaType::Subtitle,
         0,
     );
 

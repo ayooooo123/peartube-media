@@ -154,6 +154,33 @@ fn cvd_and_svcd_player_use_video_pixels_from_the_first_cue() {
     }
 }
 
+/// VobSub in MP4, as FFmpeg's muxer writes it: a `subp` handler, an `mp4s`
+/// entry whose esds names DVD subtitles (object type 0xE0) and carries the
+/// YUV colour table, which FFmpeg's demuxer turns into the palette its DVD
+/// decoder reads. Every video frame and both cues match FFmpeg. Written
+/// without an edit list: FFmpeg's muxer ends its edit at the last cue's
+/// start (that sample lasts 0), and FFmpeg's demuxer then drops the cue.
+#[test]
+fn mp4_dvd_subtitles_play_like_ffmpeg() {
+    let path = directory().join("vobsub.mp4");
+    let idx = refcheck::fate("sub/vobsub.idx");
+    bitmap::ffmpeg(&[
+        "-f", "lavfi", "-i", "color=c=0x204060:s=720x480:r=5:d=4", "-ss", "180.797", "-i", idx.to_str().unwrap(),
+        "-map", "0:v", "-map", "1:s:0", "-t", "4", "-c:v", "libx264", "-bf", "0", "-g", "1", "-c:s", "copy",
+        "-use_editlist", "0", "-f", "mp4", path.to_str().unwrap(),
+    ]);
+    let (streams, packets) = streams_and_subtitles(&path, "mp4");
+    let subtitle = streams.iter().find(|s| s.params.media_type == MediaType::Subtitle).unwrap();
+    assert_eq!(subtitle.params.codec_id.as_str(), "dvd_subtitle");
+    let ffmpeg: Vec<String> = support::ffprobe_packets(&path, 0).into_iter().map(|p| p.md5).collect();
+    let ours: Vec<String> = packets.iter().map(|p| refcheck::md5_hex(&p.data)).collect();
+    assert_eq!(ours, ffmpeg, "every subtitle packet FFmpeg reads");
+    let reference = support::ffmpeg_reference(&path, 0);
+    assert_eq!((reference.width, reference.height), (720, 480));
+    assert_eq!(reference.cues.len(), 2);
+    check_player(&path, &streams, (reference.width, reference.height), &reference.cues.into_iter().map(|cue| cue.canvas).collect::<Vec<_>>());
+}
+
 #[test]
 #[ignore = "needs a decoded-geometry producer: run_video_thread must publish Decoder::output_video_dimensions() (oxideav-core 96094a9; MPEG-1/2 in the pinned mpeg12video fork) into State::video_size before the subtitle decoder opens. State::video_size holds container dimensions at open only, so this DVD stream keeps the 720x576 fallback canvas where FFmpeg uses 720x480"]
 fn unknown_at_open_ps_video_publishes_canvas_before_first_dvd_cue() {

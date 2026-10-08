@@ -35,6 +35,16 @@ pub fn ffmpeg(args: &[&str]) -> Vec<u8> {
     run(Path::new("ffmpeg"), args)
 }
 
+/// `name` (`ffmpeg`, `ffprobe`) of the FFmpeg 2da55bf build the decoders
+/// and the MOV packet grouping port: `$FFMPEG_SRC/<name>`, default
+/// ~/projects/ffmpeg-src.
+pub fn pinned(name: &str) -> PathBuf {
+    std::env::var_os("FFMPEG_SRC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
+        .join(name)
+}
+
 /// `name` in the persistent test scratch directory, made by `make` (given
 /// a path to write) on first use, published by rename.
 pub fn generated(name: &str, make: impl FnOnce(&Path)) -> PathBuf {
@@ -111,10 +121,8 @@ pub fn caf_remux(name: &str, source: &Path, map: &[&str]) -> PathBuf {
 
 /// `source`'s audio track remuxed by FFmpeg to CAF (as
 /// `fate-caf-qdm2-remux` and `fate-caf-mace6-remux` do), QDesign's
-/// QuickTime atoms in the `kuki` chunk. Read from the MOV files the
-/// packets are not the codec's: oxideav-mov hands over the 1-byte samples
-/// of QuickTime's compressed sound tables (and fails at the end of the
-/// data), where FFmpeg's MOV demuxer groups them into packets.
+/// QuickTime atoms in the `kuki` chunk. `mov_packets.rs` checks the MOV
+/// files' own packets against FFmpeg's.
 pub fn track_caf(source: &Path) -> PathBuf {
     let stem = source.file_stem().unwrap().to_str().unwrap().to_string();
     caf_remux(&format!("{stem}.caf"), source, &["-map", "0:a"])

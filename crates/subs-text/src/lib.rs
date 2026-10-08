@@ -36,6 +36,7 @@ mod scan;
 pub mod srt;
 pub mod subviewer;
 pub mod subviewer1;
+pub mod text;
 pub mod text_common;
 mod text_reader;
 pub mod usf;
@@ -46,7 +47,7 @@ use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, MediaTy
 
 /// Codec id for 3GPP Timed Text / QuickTime text (MP4 `tx3g` / `text`).
 pub const MOV_TEXT_CODEC_ID: &str = "mov_text";
-/// Codec id for QuickTime text samples (`text` sample entry).
+/// Codec id for raw text subtitles (FFmpeg's `text`, as OGM carries them).
 pub const TEXT_CODEC_ID: &str = "text";
 /// Codec id for USF subtitles (Matroska `S_TEXT/USF`).
 pub const USF_CODEC_ID: &str = "usf";
@@ -129,8 +130,8 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .decoder(subviewer::make_decoder),
     );
     // mov_text: MP4 `tx3g` (3GPP TS 26.245) and QuickTime `text` sample
-    // entries. The MP4 demuxer maps both to the `mov_text` / `text`
-    // codec ids; claim the sample-entry FourCCs as tags as well.
+    // entries, both `mov_text` as in FFmpeg's `isom.c`; claim the
+    // sample-entry FourCCs as tags as well.
     reg.register(
         CodecInfo::new(CodecId::new(MOV_TEXT_CODEC_ID))
             .capabilities(subtitle_caps("mov_text_sw"))
@@ -138,11 +139,11 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .tag(oxideav_core::CodecTag::fourcc(b"tx3g"))
             .tag(oxideav_core::CodecTag::fourcc(b"text")),
     );
+    // Raw text (FFmpeg's `text`): OGM text streams.
     reg.register(
         CodecInfo::new(CodecId::new(TEXT_CODEC_ID))
             .capabilities(subtitle_caps("text_sw"))
-            .decoder(mov_text::make_decoder)
-            .tag(oxideav_core::CodecTag::fourcc(b"text")),
+            .decoder(text::make_decoder),
     );
     // USF: Matroska CodecID `S_TEXT/USF`.
     reg.register(
