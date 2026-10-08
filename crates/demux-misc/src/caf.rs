@@ -8,7 +8,9 @@
 // frames_per_packet, or a per-packet table of (bytes, frames) lengths when
 // variable. Timestamps are in samples. The table's priming frames (first
 // packet) and remainder frames (last packet) reach the player as
-// `AudioTrim`, FFmpeg's skip-samples side data.
+// `AudioTrim`, FFmpeg's skip-samples side data. An Opus cookie is not
+// passed on: as FFmpeg does, the reader builds an `OpusHead` from the
+// description and the priming frames instead.
 
 use std::io::{Read, Seek, SeekFrom};
 use oxideav_core::{
@@ -262,6 +264,22 @@ fn read_pakt(
     Ok(table)
 }
 
+/// The `OpusHead` FFmpeg's CAF demuxer writes in place of an Opus magic
+/// cookie (cafdec.c:239-248): version 1, the description's channel count
+/// and rate, `pre_skip` (the packet table's priming frames, low 16 bits),
+/// no output gain, channel mapping family 0.
+fn opus_head(channels: u8, pre_skip: u32, sample_rate: u32) -> Vec<u8> {
+    let mut head = Vec::with_capacity(19);
+    head.extend_from_slice(b"OpusHead");
+    head.push(1);
+    head.push(channels);
+    head.extend_from_slice(&(pre_skip as u16).to_le_bytes());
+    head.extend_from_slice(&sample_rate.to_le_bytes());
+    head.extend_from_slice(&0u16.to_le_bytes());
+    head.push(0);
+    head
+}
+
 pub fn open_caf(
     mut input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
@@ -360,13 +378,30 @@ pub fn open_caf(
                 if !(0..=MAX_CHUNK_SIZE).contains(&size) {
                     return Err(Error::invalid("caf: oversized or negative magic cookie"));
                 }
-                extradata = read_up_to(&mut input, size as u64)?;
-                if extradata.len() as i64 != size {
-                    return Err(Error::invalid("caf: truncated magic cookie"));
+                if codec == "opus" {
+                    // read_kuki_chunk: the cookie's layout is unknown, so
+                    // FFmpeg skips it and builds the header the decoder
+                    // needs from the description (cafdec.c:231-250).
+                    if channels > 2 {
+                        return Err(Error::unsupported("caf: multichannel Opus in CAF"));
+                    }
+                    let priming = pakt.as_ref().map_or(0, |table| table.priming);
+                    extradata = opus_head(channels as u8, priming, sample_rate);
+                } else {
+                    extradata = read_up_to(&mut input, size as u64)?;
+                    if extradata.len() as i64 != size {
+                        return Err(Error::invalid("caf: truncated magic cookie"));
+                    }
                 }
             }
             b"pakt" => {
-                pakt = Some(read_pakt(&mut input, size, bytes_per_packet, frames_per_packet, data_size)?);
+                let table = read_pakt(&mut input, size, bytes_per_packet, frames_per_packet, data_size)?;
+                // read_pakt_chunk: the priming frames are the Opus
+                // pre-skip (cafdec.c:286-287).
+                if codec == "opus" && !extradata.is_empty() {
+                    extradata[10..12].copy_from_slice(&(table.priming as u16).to_le_bytes());
+                }
+                pakt = Some(table);
             }
             // 'free', 'chan', 'info' and unknown chunks are skipped.
             _ => {

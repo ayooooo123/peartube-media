@@ -118,18 +118,13 @@ fn every_fate_opus_file_decodes_to_ffmpegs_samples() {
 
 /// The player's path: every FATE Opus file through the demuxer the player
 /// opens it with and the container's trims, against FFmpeg's decode: its
-/// exact sample count and at least 90 dB. Two files are left to their
-/// owners, the decoder output being FFmpeg's (see the test above):
-/// - `opus/silk-lbrr-mono.mka`: its last packet discards 570 samples of
-///   padding, and the decoder then drains 24 delayed SILK samples. FFmpeg
-///   cuts the padding from the last packet's frame only and keeps the
-///   drained samples (`libavcodec/decode.c:402`); `audio_trim::Trimmer`
-///   cuts it from the end of both, so 24 samples differ at the very end
-///   (69.7 dB, same count). Owner: audio-trim.
-/// - `caf/opus.caf`: `demux-misc`'s CAF reader passes the `kuki` bytes as
-///   the `OpusHead`; FFmpeg builds a 19-byte `OpusHead` from the
-///   description (`libavformat/cafdec.c:231-250`), so the decoder is
-///   refused a zero channel count. Owner: demux-misc.
+/// exact sample count and at least 90 dB. `opus/silk-lbrr-mono.mka` ends
+/// with a packet that discards 570 samples of padding, after which the
+/// decoder drains 24 delayed SILK samples: FFmpeg cuts the padding from
+/// that packet's frame and keeps the drained ones (`libavcodec/decode.c`
+/// trims each frame by the last packet's side data, the padding only where
+/// it fits in the frame). `caf/opus.caf` plays through the `OpusHead` the
+/// CAF reader builds (`caf_opus_header_is_ffmpegs`).
 #[test]
 fn every_fate_opus_file_plays_ffmpegs_samples() {
     let registrars: &[Registrar] = &[
@@ -137,11 +132,9 @@ fn every_fate_opus_file_plays_ffmpegs_samples() {
         oxideav_mkv::__oxideav_entry,
         oxideav_ogg::__oxideav_entry,
         oxideav_mpegts::__oxideav_entry,
+        demux_misc::register,
     ];
-    let files: Vec<String> = fate_opus_files()
-        .into_iter()
-        .filter(|f| f != "opus/silk-lbrr-mono.mka" && f != "caf/opus.caf")
-        .collect();
+    let files = fate_opus_files();
     let mut failures = Vec::new();
     for rel in &files {
         let path = refcheck::fate(rel);
@@ -157,6 +150,21 @@ fn every_fate_opus_file_plays_ffmpegs_samples() {
         }
     }
     assert!(failures.is_empty(), "{} of {} files:\n{}", failures.len(), files.len(), failures.join("\n"));
+}
+
+/// FFmpeg's CAF demuxer does not hand an Opus decoder the `kuki` bytes: it
+/// builds a 19-byte `OpusHead` from the stream description, with the packet
+/// table's priming frames as the pre-skip (`libavformat/cafdec.c:231-250`,
+/// `286-287`). The CAF reader hands the decoder the same header.
+#[test]
+fn caf_opus_header_is_ffmpegs() {
+    let path = refcheck::fate("caf/opus.caf");
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    demux_misc::register(&mut ctx);
+    let format = refcheck::probe_container(&ctx, &path).expect("CAF probe");
+    let file = std::fs::File::open(&path).expect("open caf/opus.caf");
+    let demuxer = ctx.containers.open_demuxer(&format, Box::new(file), &ctx.codecs).expect("open the CAF reader");
+    assert_eq!(demuxer.streams()[0].params.extradata, ffmpeg_extradata(&path));
 }
 
 /// FATE's chained Ogg Opus (two mono links, 4800 samples each after the
