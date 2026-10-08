@@ -7,10 +7,10 @@
 //! The XLL (DTS-HD MA) path is an integer port, so the lossless samples
 //! compare bit-exact: the interleaved PCM stream MD5 must equal FFmpeg's
 //! `-f s24le` / `-f s16le` md5 (the same hash FFmpeg's own FATE tests
-//! use). The lossy core/X96/XBR paths run through FFmpeg's float filter
-//! bank, so those compare at >= 90 dB SNR over the common length —
-//! FFmpeg's own FATE lossy DCA tests use a one-off comparison with fuzz
-//! 9 on f32 for the same reason.
+//! use). The lossy core/X96/XBR paths run FFmpeg's float filter banks;
+//! they compare bit-exact with FFmpeg's C code paths (`-cpuflags 0`),
+//! since its NEON synthesis filters round differently. That needs the
+//! fused multiply-adds clang makes of the C (`-ffp-contract=on`).
 
 use oxideav_core::{Frame, MediaType};
 use refcheck::{decode, fate};
@@ -212,22 +212,23 @@ fn lossy_suite_sample(name: &str) {
 
     // Our float path (or fixed path converted) as interleaved f32.
     let ours = refcheck::interleaved_f32(&decoded);
-    let reference = refcheck::ffmpeg_audio_f32(&path, 0);
+    let reference = ffmpeg_c_f32(&path);
+    assert_eq!(ours.len(), reference.len(), "{name}: interleaved samples vs FFmpeg");
+    let first = ours.iter().zip(&reference).position(|(a, b)| a.to_bits() != b.to_bits());
+    assert_eq!(first, None, "{name}: first sample unlike FFmpeg's C path");
+}
 
-    // FFmpeg's FATE oneoff allows fuzz 9 (f32 ULPs); a 90 dB SNR floor is
-    // much stricter than that on real audio, and the contract asks for it.
-    let nan_ours = ours.iter().filter(|v| v.is_nan()).count();
-    let nan_ref = reference.iter().filter(|v| v.is_nan()).count();
-    if nan_ours > 0 || nan_ref > 0 {
-        panic!("{name}: NaN samples ours={nan_ours} ref={nan_ref}");
-    }
-    let snr = refcheck::snr_db(&reference, &ours, 1024);
-    assert!(
-        snr >= 90.0,
-        "{name}: SNR {snr:.2} dB < 90 dB vs FFmpeg (len {} vs {})",
-        ours.len(),
-        reference.len()
-    );
+/// FFmpeg 2da55bf's decode of stream `0:a:0` on its C code paths
+/// (`-cpuflags 0`), interleaved f32.
+fn ffmpeg_c_f32(path: &std::path::Path) -> Vec<f32> {
+    let out = std::process::Command::new(refcheck::pinned_ffmpeg())
+        .args(["-v", "error", "-nostdin", "-cpuflags", "0", "-i"])
+        .arg(path)
+        .args(["-map", "0:a:0", "-f", "f32le", "-c:a", "pcm_f32le", "-"])
+        .output()
+        .expect("the pinned FFmpeg runs");
+    assert!(out.status.success(), "ffmpeg {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 #[test]
@@ -310,15 +311,15 @@ fn production_decode_matches_ffmpeg(rel: &str, container: &str) {
     let decoded = decode(&path, &[codecs::register_all], MediaType::Audio, 0);
     assert_eq!(decoded.params.codec_id.as_str(), "dts", "{rel}: codec");
     let ours = refcheck::interleaved_f32(&decoded);
-    let reference = refcheck::ffmpeg_audio_f32(&path, 0);
+    let reference = ffmpeg_c_f32(&path);
     let channels = decoded.audio_format.map(|f| usize::from(f.channels));
     assert_eq!(
         (ours.len(), channels),
         (reference.len(), Some(ffprobe_channels(&path))),
         "{rel}: decoded samples and channels vs FFmpeg"
     );
-    let snr = refcheck::snr_db(&reference, &ours, 0);
-    assert!(snr >= 90.0, "{rel}: SNR {snr:.2} dB < 90 dB vs FFmpeg");
+    let first = ours.iter().zip(&reference).position(|(a, b)| a.to_bits() != b.to_bits());
+    assert_eq!(first, None, "{rel}: first sample unlike FFmpeg's C path");
 }
 
 /// dca.mak fate-dca-core: `pcm -i dts/dts.ts`.

@@ -143,10 +143,12 @@ fn ffmpeg_frames(path: &Path) -> Vec<(Option<i64>, u32)> {
     frames
 }
 
-/// FFmpeg's decode of `a:0` as raw interleaved little-endian `fmt`.
+/// FFmpeg's decode of `a:0` as raw interleaved little-endian `fmt`, on its
+/// C code paths (`-cpuflags 0`): its NEON synthesis filters round
+/// differently from the C ones the decoder ports.
 fn ffmpeg_pcm(path: &Path, fmt: &str) -> Vec<u8> {
     let out = std::process::Command::new(refcheck::pinned_ffmpeg())
-        .args(["-v", "error", "-nostdin", "-i"])
+        .args(["-v", "error", "-nostdin", "-cpuflags", "0", "-i"])
         .arg(path)
         .args(["-map", "0:a:0", "-f", fmt, "-c:a", &format!("pcm_{fmt}"), "-"])
         .output()
@@ -155,9 +157,9 @@ fn ffmpeg_pcm(path: &Path, fmt: &str) -> Vec<u8> {
     out.stdout
 }
 
-/// Our PCM against FFmpeg's in our output format: integer output must be
-/// bit-exact, float output (the lossy filter banks) at least 90 dB, the
-/// floor of the reference suite. Equal length in both cases.
+/// Our PCM against FFmpeg's C path in our output format, byte for byte:
+/// integer output (lossless) and float output (the lossy filter banks)
+/// alike. Equal length in both cases.
 fn assert_pcm_matches(what: &str, path: &Path, ours: &Decoded) {
     match ours.format.map(|f| f.sample_format) {
         Some(SampleFormat::S32) | Some(SampleFormat::S16) => {
@@ -169,9 +171,8 @@ fn assert_pcm_matches(what: &str, path: &Path, ours: &Decoded) {
         Some(SampleFormat::F32) => {
             let theirs = ffmpeg_pcm(path, "f32le");
             assert_eq!(ours.pcm.len(), theirs.len(), "{what}: PCM length vs FFmpeg");
-            let f32s = |b: &[u8]| b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<_>>();
-            let snr = refcheck::snr_db(&f32s(&theirs), &f32s(&ours.pcm), 0);
-            assert!(snr >= 90.0, "{what}: SNR {snr:.2} dB < 90 dB vs FFmpeg");
+            let first = ours.pcm.chunks_exact(4).zip(theirs.chunks_exact(4)).position(|(a, b)| a != b);
+            assert_eq!(first, None, "{what}: first float sample unlike FFmpeg's C path");
         }
         other => panic!("{what}: unexpected output format {other:?}"),
     }

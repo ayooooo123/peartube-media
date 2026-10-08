@@ -207,9 +207,9 @@ fn ffmin(a: f32, b: f32) -> f32 {
     if a > b { b } else { a }
 }
 
-/// ff_scalarproduct_float_c (`p += v1[i] * v2[i]`, contracted).
+/// ff_scalarproduct_float_c over the shorter slice ([`crate::sums`]).
 fn scalarproduct(v1: &[f32], v2: &[f32]) -> f32 {
-    v1.iter().zip(v2).fold(0.0f32, |p, (&a, &b)| a.mul_add(b, p))
+    crate::sums::scalarproduct_float(v1, v2, v1.len().min(v2.len()))
 }
 
 fn sort_nearly_sorted_floats(vals: &mut [f32]) {
@@ -412,9 +412,11 @@ fn acelp_interpolatef(
 }
 
 /// ff_celp_lp_synthesis_filterf: `out[n] = in[n] - sum(filter_coeffs[i-1] * out[n-i])`,
-/// evaluated in FFmpeg's four-samples-at-a-time order. `out[n]` is
-/// `buf[out_pos + n]`; `buf[out_pos - filter_length..out_pos]` is the filter
-/// memory. `filter_length` must be even and at least 4.
+/// evaluated in FFmpeg's four-samples-at-a-time order, then the samples left
+/// over one by one in a sum FFmpeg's build vectorizes (the coefficients never
+/// overlap `out`). `out[n]` is `buf[out_pos + n]`;
+/// `buf[out_pos - filter_length..out_pos]` is the filter memory.
+/// `filter_length` must be even and at least 4.
 fn celp_lp_synthesis_filterf(
     buf: &mut [f32],
     out_pos: usize,
@@ -505,10 +507,14 @@ fn celp_lp_synthesis_filterf(
         n += 4;
     }
 
+    let split = crate::sums::unfused_terms(filter_length);
     while n < buffer_length {
         let o = out_pos + n;
         let mut v = input[n];
-        for i in 1..=filter_length {
+        for i in 1..=split {
+            v -= fc[i - 1] * buf[o - i];
+        }
+        for i in split + 1..=filter_length {
             v = (-fc[i - 1]).mul_add(buf[o - i], v);
         }
         buf[o] = v;
@@ -517,7 +523,10 @@ fn celp_lp_synthesis_filterf(
 }
 
 /// ff_celp_lp_zero_synthesis_filterf: `out[n] = in[n] + sum(filter_coeffs[i-1] * in[n-i])`
-/// where `in[n]` is `buf[in_pos + n]`.
+/// where `in[n]` is `buf[in_pos + n]`. FFmpeg's build vectorizes the sum
+/// when `out` overlaps neither `in` nor the coefficients, as in sipr's call:
+/// the first [`crate::sums::unfused_terms`] products are rounded, the rest
+/// fused.
 fn celp_lp_zero_synthesis_filterf(
     out: &mut [f32],
     filter_coeffs: &[f32],
@@ -525,9 +534,13 @@ fn celp_lp_zero_synthesis_filterf(
     in_pos: usize,
     filter_length: usize,
 ) {
+    let split = crate::sums::unfused_terms(filter_length);
     for (n, o) in out.iter_mut().enumerate() {
         let mut v = buf[in_pos + n];
-        for i in 1..=filter_length {
+        for i in 1..=split {
+            v += filter_coeffs[i - 1] * buf[in_pos + n - i];
+        }
+        for i in split + 1..=filter_length {
             v = filter_coeffs[i - 1].mul_add(buf[in_pos + n - i], v);
         }
         *o = v;
