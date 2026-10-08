@@ -301,6 +301,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-wavpack"
+version = "0.1.0"
+dependencies = [
+ "demux-seek-core",
+ "oxideav-core",
+ "oxideav-mkv",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-wma"
 version = "0.1.0"
 dependencies = [
