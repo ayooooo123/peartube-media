@@ -292,7 +292,10 @@ fn stream_time_bases(path: &Path, nth: usize) -> (Vec<(usize, TimeBase)>, usize)
             .lines()
             .filter(|l| !l.trim().is_empty())
             .map(|line| {
-                let (index, tb) = line.trim().split_once(',').unwrap_or_else(|| panic!("ffprobe stream line {line:?}"));
+                // An MPEG-2 video stream's line ends in an empty field (its
+                // side data list), so only the first two fields count.
+                let mut fields = line.trim().split(',');
+                let (Some(index), Some(tb)) = (fields.next(), fields.next()) else { panic!("ffprobe stream line {line:?}") };
                 let (num, den) = tb.split_once('/').unwrap_or_else(|| panic!("time base {tb:?}"));
                 (index.parse().unwrap(), TimeBase::new(num.parse().unwrap(), den.parse().unwrap()))
             })
