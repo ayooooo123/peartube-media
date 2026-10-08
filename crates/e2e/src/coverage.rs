@@ -175,6 +175,11 @@ fn rule(row: &str) -> Option<Rule> {
         "audio:mace3" => codec(Audio, &["mace3"]),
         "audio:mace6" => codec(Audio, &["mace6"]),
         "audio:opus" => codec(Audio, &["opus"]),
+        "audio:als" => codec(Audio, &["mp4als"]),
+        "audio:gsm" => codec(Audio, &["gsm"]),
+        "audio:gsm_ms" => codec(Audio, &["gsm_ms"]),
+        "audio:shorten" => codec(Audio, &["shorten"]),
+        "audio:tak" => codec(Audio, &["tak"]),
 
         "sub:dvd" => codec(Subtitle, &["vobsub", "dvd_subtitle"]),
         "sub:subrip" => codec(Subtitle, &["subrip", "srt"]),

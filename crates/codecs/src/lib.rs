@@ -48,12 +48,14 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_ape::register_codecs,
         codec_musepack::register_codecs,
         codec_wavpack::register_codecs,
-        // GSM 06.10 and Microsoft GSM (MSN Audio rates too), TTA, Shorten
-        // and TAK.
+        // GSM 06.10 and Microsoft GSM (MSN Audio rates too), TTA, Shorten,
+        // TAK, and MPEG-4 ALS (MP4 object type 0x40 with ALS's config;
+        // ahead of the AAC decoders that claim that tag too).
         codec_gsm::register_codecs,
         codec_tta::register_codecs,
         codec_shorten::register_codecs,
         codec_tak::register_codecs,
+        codec_als::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }

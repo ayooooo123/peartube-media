@@ -172,6 +172,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-als"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "oxideav-mp4",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-ape"
 version = "0.1.0"
 dependencies = [
@@ -390,6 +399,7 @@ dependencies = [
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "codec-als",
  "codec-ape",
  "codec-apple-audio",
  "codec-atrac",

@@ -86,6 +86,7 @@ codec-gsm = { path = "../codec-gsm" }
 codec-tta = { path = "../codec-tta" }
 codec-shorten = { path = "../codec-shorten" }
 codec-tak = { path = "../codec-tak" }
+codec-als = { path = "../codec-als" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

@@ -125,6 +125,8 @@ opt-level = 3
 # Hot workspace crates (player, codec-wmv, codec-dca) keep the default 3.
 [profile.release.package.audio-trim]
 opt-level = "s"
+[profile.release.package.codec-als]
+opt-level = "s"
 [profile.release.package.codec-ape]
 opt-level = "s"
 [profile.release.package.codec-gsm]

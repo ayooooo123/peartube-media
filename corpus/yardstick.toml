@@ -82,6 +82,12 @@ rows = [
     "audio:mace3",
     "audio:mace6",
     "audio:opus",
+    # On VLC's feature list too; ported in Audio3.
+    "audio:als",
+    "audio:gsm",
+    "audio:gsm_ms",
+    "audio:shorten",
+    "audio:tak",
 
     # Subtitles
     "sub:dvd",
