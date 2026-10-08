@@ -112,7 +112,7 @@ const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
 
 /// A broken platform decoder must fail visibly, not let audio run ahead
-/// without a decoded picture.
+/// without a decoded picture. User pauses do not count; buffering does.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Side data travels with its packet, including across equal-PTS laces.
@@ -2232,7 +2232,7 @@ fn run_video_thread(
     let mut entered: Option<u64> = None;
     let mut presenting = Duration::ZERO;
     let mut recovering: Option<entry::Recovery> = None;
-    let mut ready_by = Instant::now() + READY_TIMEOUT;
+    let mut ready_by = shared.unpaused_now() + READY_TIMEOUT;
     let mut sw_decoder: Option<Box<dyn Decoder>> = None;
     // What the frame sink was last opened with (see `sync_frame_format`).
     let mut frame_format: Option<CodecParameters> = None;
@@ -2311,18 +2311,18 @@ fn run_video_thread(
             consecutive_errors = 0;
             if compressed {
                 first.arm(seen_seek);
-                ready_by = Instant::now() + READY_TIMEOUT;
+                ready_by = shared.unpaused_now() + READY_TIMEOUT;
             }
         }
 
-        if compressed && !first.reported(seen_seek) && Instant::now() >= ready_by {
+        if compressed && !first.reported(seen_seek) && shared.unpaused_now() >= ready_by {
             set_error(&shared, "platform video decoder produced no presentable picture before the seek deadline".into());
             return;
         }
         // Lane::pop checks this wake condition even with no input. A hard
         // queue bound or a stalled source must not hide the picture deadline.
         let woken = || quit() || Some(shared.running()) != sink_running
-            || (compressed && !first.reported(seen_seek) && Instant::now() >= ready_by);
+            || (compressed && !first.reported(seen_seek) && shared.unpaused_now() >= ready_by);
         let report = |dry| shared.pipe_starved(Pipe::Video, dry);
         let QueuedPacket { packet, metadata } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
             Pop::Packet(p) => p,
@@ -2365,7 +2365,7 @@ fn run_video_thread(
                                 return;
                             }
                         }
-                        if !first.reported(seen_seek) && Instant::now() >= ready_by {
+                        if !first.reported(seen_seek) && shared.unpaused_now() >= ready_by {
                             set_error(&shared, "platform video decoder stalled while draining".into());
                             return;
                         }
@@ -2471,7 +2471,7 @@ fn run_video_thread(
                 }
             }
             let waiting = !first.reported(seen_seek);
-            if waiting && Instant::now() >= ready_by {
+            if waiting && shared.unpaused_now() >= ready_by {
                 set_error(&shared, "platform video decoder produced no presentable picture before the seek deadline".into());
                 return;
             }
@@ -2490,7 +2490,7 @@ fn run_video_thread(
                 sync_video_sink(&mut *sink, &shared, &mut sink_running);
                 match sink.push_packet(&packet, pts, random_access) {
                     Err(SinkError::WouldBlock) => {
-                        if !first.reported(seen_seek) && Instant::now() >= ready_by {
+                        if !first.reported(seen_seek) && shared.unpaused_now() >= ready_by {
                             break Err(SinkError::Fatal("platform video decoder stalled before its first presentable picture".into()));
                         }
                         shared.wait_retry();

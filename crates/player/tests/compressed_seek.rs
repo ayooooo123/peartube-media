@@ -4,6 +4,9 @@
 //! the engine's compressed-output contract against real packet streams.
 #[path = "support/seek_preroll.rs"]
 mod fixture;
+#[allow(dead_code)]
+#[path = "support/scripted.rs"]
+mod scripted;
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -17,6 +20,7 @@ use player::{Event, Headless, Player, PlayerOptions};
 
 #[derive(Default)]
 struct Observed {
+    started: bool,
     shown: Vec<(u64, Duration, Duration)>,
     hidden: Vec<(u64, Duration)>,
     ready: Vec<(u64, Duration, Duration)>,
@@ -174,6 +178,8 @@ impl VideoSink for PlatformVideo {
     fn set_playing(&mut self, playing: bool) {
         self.state.0.lock().playing = playing;
         self.state.1.notify_all();
+        self.observed.0.lock().started = true;
+        self.observed.1.notify_all();
     }
 }
 
@@ -183,6 +189,131 @@ fn open(path: &Path, backend: Arc<Platform>) -> (Player, std::sync::mpsc::Receiv
     let player = Player::open(path.to_str().unwrap(), backend, Arc::new(codecs::context()), options,
         move |event| { let _ = tx.send(event); });
     (player, rx)
+}
+
+// The staged demux helper has one process-wide gate. Keep it released even
+// when an assertion fails, before Player's drop joins the demux thread.
+static STARTUP_GATE: Mutex<()> = Mutex::new(());
+
+struct GatedStartup {
+    player: Player,
+    events: std::sync::mpsc::Receiver<Event>,
+    backend: Arc<Platform>,
+    expected_audio: Vec<f32>,
+    opened: Instant,
+    _serial: parking_lot::MutexGuard<'static, ()>,
+}
+
+impl GatedStartup {
+    fn new(realtime: bool) -> Self {
+        let serial = STARTUP_GATE.lock();
+        let clip = fixture::tmp("compressed_paused_startup.mkv");
+        fixture::encode(&["-f", "lavfi", "-i", "testsrc2=size=64x48:rate=8:duration=1",
+            "-f", "lavfi", "-i", "sine=sample_rate=8000:duration=1",
+            "-c:v", "libx264", "-preset", "ultrafast", "-x264-params", "keyint=8:bframes=0",
+            "-c:a", "pcm_s16le", "-f", "matroska"], &clip);
+        let expected_audio = refcheck::ffmpeg_audio_f32(&clip, 0);
+        let path = fixture::tmp("compressed_paused_startup.ptscript");
+        scripted::write_gated(&path, &clip, scripted::Mode::Seekable);
+        scripted::arm(&[scripted::Hold::FirstPacket]);
+        let backend = Platform::new(realtime, false, 4);
+        // Player sees the wrapper, so configure Headless's device mode here.
+        backend.audio.set_active_streams(None, None, None, realtime);
+        let (tx, events) = std::sync::mpsc::channel();
+        let opened = Instant::now();
+        let player = Player::open(path.to_str().unwrap(), backend.clone(), Arc::new(scripted::context()),
+            PlayerOptions { realtime, ..PlayerOptions::default() }, move |event| { let _ = tx.send(event); });
+        let startup = Self { player, events, backend, expected_audio, opened, _serial: serial };
+        assert!(scripted::entered(scripted::Hold::FirstPacket, Duration::from_secs(3)), "demux did not reach gate");
+        {
+            let mut seen = startup.backend.observed.0.lock();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !seen.started {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "video worker did not start");
+                startup.backend.observed.1.wait_for(&mut seen, remaining);
+            }
+        }
+        startup
+    }
+}
+
+impl Drop for GatedStartup {
+    fn drop(&mut self) { scripted::arm(&[]); }
+}
+
+fn resume_after_startup_pause(realtime: bool) {
+    let startup = GatedStartup::new(realtime);
+    startup.player.pause();
+    let paused_at = Instant::now();
+    std::thread::sleep(Duration::from_millis(5500));
+    let held = startup.player.state();
+    assert!(held.error.is_none(), "timeout during user pause: {held:?}");
+    assert!(!held.playing && held.buffering, "{held:?}");
+    assert_eq!(held.position, Duration::ZERO);
+    assert!(startup.backend.observed.0.lock().ready.is_empty(), "readiness without decoder input");
+    // Resume without seeking: neither the decoder generation nor its
+    // already-spent active timeout allowance should be reset.
+    startup.player.play();
+    scripted::release();
+    ended(&startup.player, &startup.events, Duration::from_secs(8));
+    {
+        let seen = startup.backend.observed.0.lock();
+        let pts: Vec<_> = seen.shown.iter().map(|s| s.1).collect();
+        assert_eq!(pts, (0..8).map(|n| Duration::from_millis(n * 125)).collect::<Vec<_>>());
+        assert_eq!(seen.ready[0].2, Duration::ZERO, "clock ran before decoded output");
+    }
+    if realtime {
+        audio_drained(&startup.backend.audio, &startup.expected_audio);
+    } else {
+        // Unpaced Headless has no device playback runs: every write is final.
+        assert_eq!(startup.backend.audio.capture().audio[0].pcm, startup.expected_audio,
+            "unpaced output lost or changed audio");
+    }
+    eprintln!("startup pause: realtime={realtime}, resumed without seeking after at least 5.5s; ended in {:?}", paused_at.elapsed());
+}
+
+#[test]
+fn user_pause_before_first_packet_resumes_nonrealtime() {
+    resume_after_startup_pause(false);
+}
+
+#[test]
+fn user_pause_before_first_packet_resumes_realtime() {
+    resume_after_startup_pause(true);
+}
+
+#[test]
+fn user_pause_preserves_spent_input_wait_budget() {
+    let startup = GatedStartup::new(true);
+    // Active starvation counts even though the buffering hold stops media.
+    std::thread::sleep(Duration::from_secs(2));
+    let paused_at = Instant::now();
+    startup.player.pause();
+    std::thread::sleep(Duration::from_millis(2750));
+    startup.player.pause(); // Duplicate intent must not lose pause credit.
+    std::thread::sleep(Duration::from_millis(2750));
+    let held = startup.player.state();
+    assert!(held.error.is_none(), "timeout during user pause: {held:?}");
+    assert!(!held.playing && held.buffering, "{held:?}");
+    let resumed_at = Instant::now();
+    startup.player.play();
+    startup.player.play(); // Duplicate intent must not grant extra credit.
+    // Keep input blocked: roughly three seconds remain, not a new five.
+    let watchdog = resumed_at + Duration::from_secs(4);
+    let error = loop {
+        match startup.events.recv_timeout(watchdog.saturating_duration_since(Instant::now())) {
+            Ok(Event::Error(error)) => break error,
+            Ok(Event::Ended) => panic!("stalled input reached a successful end"),
+            Ok(Event::Changed) => {}
+            Err(error) => panic!("active input deadline was reset or disabled: {error}: {:?}", startup.player.state()),
+        }
+    };
+    let active = startup.opened.elapsed().saturating_sub(resumed_at - paused_at);
+    assert!(active >= Duration::from_secs(5), "early deadline after {active:?}: {error}");
+    assert_eq!(startup.player.state().position, Duration::ZERO);
+    assert!(startup.backend.observed.0.lock().ready.is_empty());
+    eprintln!("input deadline retained: active={active:?}, after resume={:?}: {error}", resumed_at.elapsed());
 }
 
 fn ended(player: &Player, rx: &std::sync::mpsc::Receiver<Event>, timeout: Duration) {
