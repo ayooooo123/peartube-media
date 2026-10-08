@@ -13,10 +13,14 @@
 //!   canvas is the picture a player overlays: positions, bitmaps and
 //!   palettes are all in it, transparent pixels included.
 //!
-//! sub2video also emits heartbeat frames at packet times (a blank canvas
-//! once the shown subtitle has ended, otherwise a repeat of the shown
-//! canvas). [`ffmpeg_reference`] picks the canvas of every subtitle out of
-//! that stream and checks that every other frame is such a heartbeat.
+//! sub2video also emits heartbeat frames: ahead of every packet FFmpeg's
+//! demuxer reads, a blank canvas once the shown subtitle has ended,
+//! otherwise a repeat of the shown canvas (a blank canvas while nothing is
+//! shown). FFmpeg 2da55bf sends that heartbeat for packets of streams the
+//! run does not use too, which libavformat still returns when its probe
+//! buffered them, so the run's own `-debug_ts` report says which packets
+//! were read. [`ffmpeg_reference`] picks the canvas of every subtitle out
+//! of that stream and checks that every other frame is such a heartbeat.
 //!
 //! Decoders here follow `oxideav-sub-image`'s model: one RGBA canvas
 //! `VideoFrame` per `AVSubtitle`, at its start, with a display duration when
@@ -78,13 +82,18 @@ pub struct Cue {
 }
 
 fn run(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Vec<u8> {
+    run_logged(program, args).0
+}
+
+/// [`run`], with what the program wrote to stderr.
+fn run_logged(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> (Vec<u8>, String) {
     let program = program.as_ref();
     let out = Command::new(program)
         .args(args)
         .output()
         .unwrap_or_else(|e| panic!("run {}: {e}", program.to_string_lossy()));
     assert!(out.status.success(), "{} {args:?}: {}", program.to_string_lossy(), String::from_utf8_lossy(&out.stderr));
-    out.stdout
+    (out.stdout, String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 /// Every `AVSubtitle` FFmpeg's decoder returns for stream `s:nth`.
@@ -197,61 +206,113 @@ pub fn ffprobe_packets(path: &Path, nth: usize) -> Vec<FfPacket> {
         .collect()
 }
 
-fn sub2video_args(path: &Path, nth: usize, format: &str) -> Vec<String> {
+/// The sub2video run's arguments; with `report_packets`, it also logs
+/// every packet its demuxer reads (`-debug_ts`, at the info level).
+fn sub2video_args(path: &Path, nth: usize, format: &str, report_packets: bool) -> Vec<String> {
+    let log: &[&str] = if report_packets { &["-v", "info", "-debug_ts"] } else { &["-v", "error"] };
     // sub2video's canvas is AV_PIX_FMT_RGB32 (bgra in memory on little
     // endian); asking for bgra keeps FFmpeg from converting it.
-    [
-        "-v",
-        "error",
-        "-copyts",
-        "-i",
-        path.to_str().unwrap(),
-        "-filter_complex",
-        &format!("[0:s:{nth}]null[canvas]"),
-        "-map",
-        "[canvas]",
-        "-fps_mode",
-        "passthrough",
-        "-pix_fmt",
-        "bgra",
-        "-c:v",
-        "rawvideo",
-        "-f",
-        format,
-        "-",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    log.iter()
+        .copied()
+        .chain([
+            "-copyts",
+            "-i",
+            path.to_str().unwrap(),
+            "-filter_complex",
+            &format!("[0:s:{nth}]null[canvas]"),
+            "-map",
+            "[canvas]",
+            "-fps_mode",
+            "passthrough",
+            "-pix_fmt",
+            "bgra",
+            "-c:v",
+            "rawvideo",
+            "-f",
+            format,
+            "-",
+        ])
+        .map(str::to_string)
+        .collect()
 }
 
-/// `(width, height, frame count)` of FFmpeg's sub2video output.
-fn sub2video_shape(path: &Path, nth: usize) -> (usize, usize, usize) {
-    let args = sub2video_args(path, nth, "framecrc");
+/// What the sub2video run produced and read.
+struct Sub2VideoRun {
+    width: usize,
+    height: usize,
+    frames: usize,
+    /// Every packet its demuxer read, in order: the stream index and the
+    /// pts as the heartbeat gets it (`fftools/ffmpeg_demux.c:
+    /// input_packet_process` logs it after its timestamp fixes).
+    read: Vec<(usize, Option<i64>)>,
+}
+
+/// FFmpeg's sub2video output for stream `s:nth`, with its packet report.
+fn sub2video_run(path: &Path, nth: usize) -> Sub2VideoRun {
+    let args = sub2video_args(path, nth, "framecrc", true);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let text = String::from_utf8(run(refcheck::pinned_ffmpeg(), &args)).unwrap();
+    let (out, log) = run_logged(refcheck::pinned_ffmpeg(), &args);
+    let text = String::from_utf8(out).unwrap();
     let mut dims = None;
-    let mut count = 0;
+    let mut frames = 0;
     for line in text.lines() {
         if let Some(d) = line.strip_prefix("#dimensions 0:") {
             let (w, h) = d.trim().split_once('x').expect("dimensions");
             dims = Some((w.parse().unwrap(), h.parse().unwrap()));
         } else if !line.starts_with('#') {
-            count += 1;
+            frames += 1;
         }
     }
-    let (w, h) = dims.expect("framecrc dimensions");
-    (w, h, count)
+    let (width, height) = dims.expect("framecrc dimensions");
+    let field = |line: &str, name: &str| -> String {
+        let at = line.find(name).unwrap_or_else(|| panic!("no {name} in {line:?}")) + name.len();
+        line[at..].split_whitespace().next().unwrap_or_default().to_string()
+    };
+    let read = log
+        .lines()
+        .filter(|line| line.contains("demuxer+ffmpeg -> "))
+        .map(|line| {
+            let index = field(line, "ist_index:");
+            let stream = index.split_once(':').and_then(|(_, s)| s.parse().ok()).unwrap_or_else(|| panic!("ist_index in {line:?}"));
+            let pts = field(line, "pkt_pts:");
+            (stream, (pts != "NOPTS").then(|| pts.parse().unwrap_or_else(|_| panic!("pkt_pts in {line:?}"))))
+        })
+        .collect();
+    Sub2VideoRun { width, height, frames, read }
+}
+
+/// Every stream's index and time base, and the index of stream `s:nth`.
+fn stream_time_bases(path: &Path, nth: usize) -> (Vec<(usize, TimeBase)>, usize) {
+    let rows = |select: &[&str]| -> Vec<(usize, TimeBase)> {
+        let mut args = vec!["-v", "error"];
+        args.extend_from_slice(select);
+        args.extend(["-show_entries", "stream=index,time_base", "-of", "csv=p=0", path.to_str().unwrap()]);
+        String::from_utf8(run(refcheck::pinned_ffprobe(), &args))
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|line| {
+                let (index, tb) = line.trim().split_once(',').unwrap_or_else(|| panic!("ffprobe stream line {line:?}"));
+                let (num, den) = tb.split_once('/').unwrap_or_else(|| panic!("time base {tb:?}"));
+                (index.parse().unwrap(), TimeBase::new(num.parse().unwrap(), den.parse().unwrap()))
+            })
+            .collect()
+    };
+    let stream = format!("s:{nth}");
+    let selected = rows(&["-select_streams", &stream]);
+    assert_eq!(selected.len(), 1, "{stream} of {}", path.display());
+    (rows(&[]), selected[0].0)
 }
 
 /// What ffprobe sees on stream `s:nth`, in processing order: each packet's
 /// pts, followed by the subtitles decoding it returned.
-enum Event {
+#[derive(Debug)]
+enum Probed {
     Packet(Option<i64>),
     Subtitle(FfSubtitle),
 }
 
-fn ffprobe_events(path: &Path, nth: usize) -> Vec<Event> {
+fn ffprobe_events(path: &Path, nth: usize) -> Vec<Probed> {
     let stream = format!("s:{nth}");
     let text = run(
         refcheck::pinned_ffprobe(),
@@ -277,8 +338,8 @@ fn ffprobe_events(path: &Path, nth: usize) -> Vec<Event> {
             let f: Vec<&str> = line.trim().split(',').collect();
             let num = |s: &str| s.parse::<i64>().unwrap_or_else(|_| panic!("ffprobe field {s:?} in {line:?}"));
             match f[0] {
-                "packet" => Event::Packet((f[1] != "N/A").then(|| num(f[1]))),
-                "subtitle" => Event::Subtitle(FfSubtitle {
+                "packet" => Probed::Packet((f[1] != "N/A").then(|| num(f[1]))),
+                "subtitle" => Probed::Subtitle(FfSubtitle {
                     pts_us: num(f[1]),
                     start_display_ms: num(f[2]) as u32,
                     end_display_ms: num(f[3]) as u32,
@@ -288,6 +349,51 @@ fn ffprobe_events(path: &Path, nth: usize) -> Vec<Event> {
             }
         })
         .collect()
+}
+
+/// What sub2video receives, in order.
+#[derive(Debug)]
+enum Event {
+    /// The heartbeat ahead of a packet the demuxer read: its pts in
+    /// microseconds (`AV_TIME_BASE_Q`, sub2video's time base).
+    Heartbeat(i64),
+    /// A subtitle the decoder returned.
+    Subtitle(FfSubtitle),
+}
+
+/// The run's packets (`read`, each stream's time base in `time_bases`) with
+/// the subtitles decoding stream `stream` returned (`probed`): a heartbeat
+/// ahead of every packet that has a pts (`fftools/ffmpeg_demux.c:
+/// demux_send`), then, for a packet of `stream`, the subtitles decoding it
+/// returned; last, those the decoder returns at the end. The run must read
+/// the packets ffprobe lists for `stream`, with the same pts.
+fn sub2video_events(read: &[(usize, Option<i64>)], time_bases: &[(usize, TimeBase)], stream: usize, probed: Vec<Probed>) -> Vec<Event> {
+    let time_base = |s: usize| time_bases.iter().find(|(i, _)| *i == s).map(|(_, tb)| *tb).unwrap_or_else(|| panic!("no stream {s}"));
+    let mut probed = probed.into_iter().peekable();
+    let mut events = Vec::new();
+    for (n, &(s, pts)) in read.iter().enumerate() {
+        if let Some(pts) = pts {
+            events.push(Event::Heartbeat(to_us(pts, time_base(s))));
+        }
+        if s != stream {
+            continue;
+        }
+        match probed.next() {
+            Some(Probed::Packet(p)) => assert_eq!(p, pts, "packet {n} the run read: ffprobe's pts differs"),
+            other => panic!("packet {n} the run read is not ffprobe's next packet of stream {stream}: {other:?}"),
+        }
+        while let Some(Probed::Subtitle(_)) = probed.peek() {
+            let Some(Probed::Subtitle(sub)) = probed.next() else { unreachable!() };
+            events.push(Event::Subtitle(sub));
+        }
+    }
+    for rest in probed {
+        match rest {
+            Probed::Subtitle(sub) => events.push(Event::Subtitle(sub)),
+            Probed::Packet(pts) => panic!("the run did not read ffprobe's packet at pts {pts:?} of stream {stream}"),
+        }
+    }
+    events
 }
 
 /// One frame sub2video pushes.
@@ -302,18 +408,17 @@ enum Sub2VideoFrame {
 }
 
 /// The frames sub2video pushes for these events (`fftools/ffmpeg_filter.c:
-/// sub2video_heartbeat` / `sub2video_update`, with the heartbeat
-/// `fftools/ffmpeg_demux.c` sends ahead of every packet of the input). The
-/// output timestamps are not modelled: the muxer clamps them to be
-/// monotonic, so frames are matched by position.
-fn sub2video_frames(events: &[Event], time_base: TimeBase) -> Vec<Sub2VideoFrame> {
+/// sub2video_heartbeat` / `sub2video_update`). The output timestamps are
+/// not modelled: the muxer clamps them to be monotonic, so frames are
+/// matched by position.
+fn sub2video_frames(events: &[Event]) -> Vec<Sub2VideoFrame> {
     let mut out = Vec::new();
     let (mut last_pts, mut end_pts, mut initialize) = (i64::MIN, i64::MIN, true);
     let mut subs = 0;
     for event in events {
         match event {
-            Event::Packet(Some(pts)) => {
-                let pts2 = to_us(*pts, time_base) - 1;
+            Event::Heartbeat(us) => {
+                let pts2 = us - 1;
                 if pts2 <= last_pts {
                     continue;
                 }
@@ -327,7 +432,6 @@ fn sub2video_frames(events: &[Event], time_base: TimeBase) -> Vec<Sub2VideoFrame
                     out.push(Sub2VideoFrame::Repeat);
                 }
             }
-            Event::Packet(None) => {}
             Event::Subtitle(sub) => {
                 last_pts = sub.start_us();
                 end_pts = sub.pts_us + i64::from(sub.end_display_ms) * 1000;
@@ -346,19 +450,21 @@ fn sub2video_frames(events: &[Event], time_base: TimeBase) -> Vec<Sub2VideoFrame
 /// FFmpeg's decode of subtitle stream `s:nth`: every `AVSubtitle` with the
 /// canvas sub2video paints for it.
 pub fn ffmpeg_reference(path: &Path, nth: usize) -> Reference {
-    let events = ffprobe_events(path, nth);
-    let expected = sub2video_frames(&events, ffprobe_time_base(path, nth));
-    let subs: Vec<FfSubtitle> = events
-        .into_iter()
+    let probed = ffprobe_events(path, nth);
+    let subs: Vec<FfSubtitle> = probed
+        .iter()
         .filter_map(|e| match e {
-            Event::Subtitle(s) => Some(s),
-            Event::Packet(_) => None,
+            Probed::Subtitle(s) => Some(s.clone()),
+            Probed::Packet(_) => None,
         })
         .collect();
-    let (width, height, count) = sub2video_shape(path, nth);
-    assert_eq!(count, expected.len(), "sub2video frames: {expected:?}");
+    let run = sub2video_run(path, nth);
+    let (time_bases, stream) = stream_time_bases(path, nth);
+    let expected = sub2video_frames(&sub2video_events(&run.read, &time_bases, stream, probed));
+    let (width, height) = (run.width, run.height);
+    assert_eq!(run.frames, expected.len(), "sub2video frames: {expected:?}");
 
-    let args = sub2video_args(path, nth, "rawvideo");
+    let args = sub2video_args(path, nth, "rawvideo", false);
     let mut child = Command::new(refcheck::pinned_ffmpeg()).args(&args).stdout(Stdio::piped()).spawn().expect("run ffmpeg");
     let mut out = BufReader::new(child.stdout.take().unwrap());
     let size = width * height * 4;
