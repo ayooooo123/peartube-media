@@ -150,6 +150,22 @@ opt-level = "s"
 opt-level = "s"
 [profile.release.package.subs-text]
 opt-level = "s"
+[profile.release.package.codec-apple-audio]
+opt-level = "s"
+[profile.release.package.codec-atrac]
+opt-level = "s"
+[profile.release.package.codec-dv]
+opt-level = "s"
+[profile.release.package.codec-speech]
+opt-level = "s"
+[profile.release.package.codec-speex]
+opt-level = "s"
+[profile.release.package.codec-vp3]
+opt-level = "s"
+[profile.release.package.codec-vp56]
+opt-level = "s"
+[profile.release.package.demux-mxf]
+opt-level = "s"
 
 # Tests decode real samples; unoptimized codecs make them crawl.
 [profile.dev]

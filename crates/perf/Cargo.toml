@@ -1,0 +1,24 @@
+[package]
+name = "perf"
+description = "Decoder speed audit: ×real-time of every software decoder the player can pick, demux + decode only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A measuring tool, not a test: nothing here runs under `cargo test`.
+[[bin]]
+name = "perf"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+codecs = { path = "../codecs" }
+refcheck = { path = "../refcheck" }
+oxideav-core.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+md5 = "0.7"
+libc = "0.2"
