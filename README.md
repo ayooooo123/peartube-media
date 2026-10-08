@@ -41,6 +41,79 @@ player.suspend(); player.resume();
 let state = player.state(); // position, duration, playing, buffering, ended, error, tracks
 ```
 
+### MIDI and a user-selected SoundFont
+
+`codec-midi` replaces the built-in tone renderer with a safe-Rust port of
+FluidSynth 2.6.1 (LGPL-2.1-or-later). It plays SMF 0/1/2 in `.mid`, `.midi`
+and `.kar`, including SMPTE timing. Format 2 tracks play in sequence.
+Output is stereo float PCM at 44.1 kHz. Voice allocation, SoundFont
+modulators, envelopes, interpolation, resonant low-pass filtering, reverb
+and chorus follow FluidSynth. No instrument bank is bundled or downloaded.
+SF3 is not supported: it needs a separate Vorbis sample-loading path.
+
+The app supplies an existing local SF2 through the engine option:
+
+```rust
+let options = player::PlayerOptions {
+    soundfont: Some(local_sf2_path),
+    ..Default::default()
+};
+```
+
+Pass these options to `player::Player::open`. Without the option, the
+MIDI track reports **“needs a SoundFont”** through the Player error state
+and event. Missing, unreadable and invalid banks report their own errors;
+there is no fallback oscillator. Direct decoder users set
+`CodecParameters.options["soundfont"]` instead.
+
+**App handoff:** the app owner must provide selection and persistence,
+copy a document-provider selection to an app-readable local file when
+needed, and pass that path when opening the Player. The Rust API is
+connected here; the app picker and its native/JS bridge are not.
+Changing the bank takes effect on the next Player open.
+
+Inputs are capped at 16 MiB of SMF data, 128 tracks, 262,144 events,
+4,096 events per 64-sample block and 24 hours of playback. SF2 files
+are capped at 256 MiB, with separate metadata, zone and scan limits.
+Modulator destinations are checked at their full 16-bit width before
+narrowing or admission. Out-of-range preset, instrument and default
+records are ignored without replacing valid modulators.
+The synth has 256 voices; decoder frames contain at most 1,024 samples
+per channel. Seeking replays from the song's only random-access point,
+its beginning.
+
+Reference checks use FluidSynth **2.6.1** and GeneralUser GS **2.0.3**
+outside the repository. Set `PEARTUBE_TEST_SF2` to that SF2; its SHA-256 is
+`9575028c7a1f589f5770fccc8cff2734566af40cd26ed836944e9a5152688cfe`.
+The fixture is from
+[GeneralUser GS](https://github.com/mrbumpy409/GeneralUser-GS/tree/684543d5e5efaef08d02be50dcda8d552478fa60);
+neither the bank nor reference PCM ships with the player.
+
+```sh
+PEARTUBE_TEST_SF2=/path/to/GeneralUser-GS.sf2 cargo test -j 2 -p codec-midi -- --nocapture
+cargo run -j 2 -p codec-midi --example render -- song.mid /path/to/bank.sf2 output.f32
+fluidsynth -ni -q -T raw -O float -r 44100 -z 64 \
+  -o synth.cpu-cores=1 -F reference.f32 /path/to/bank.sf2 song.mid
+```
+
+The eight reference cases measure 137.893–138.181 dB with identical sample
+counts, above the 90 dB floor. They cover program changes, drums, pedals,
+pitch and tuning controls, pressure, effects, tempo changes, karaoke
+running status, short notes, missing note-offs and voice stealing.
+Format 2 and SMPTE are checked against equivalent format-0 sequences:
+FluidSynth's file player does not support those two forms.
+The suite also checks reset, the missing-bank Player error and all three
+extensions through the Player. Two deterministic mutation checks exercise
+2,000 damaged MIDI inputs and 2,000 damaged SF2 inputs.
+Three active-modulator regressions check destination boundaries in
+preset, instrument and default records and preserve valid-modulator PCM.
+The standalone Player render of FluidSynth's upstream MIDI fixture gives
+244,096 stereo frames, matching the CLI's frame count at 138.102 dB.
+
+The general corpus runner accepts `PEARTUBE_SOUNDFONT=/path/to/bank.sf2`.
+Its FFmpeg-only oracle cannot verify MIDI audio; the FluidSynth suite
+above supplies that comparison.
+
 ## Dependencies on OxideAV
 
 OxideAV crates are used at pinned git revisions; their crates.io releases lag their repositories. When a crate needs a fix, it is forked to `ayooooo123/oxideav-<name>` and `[patch.crates-io]` points the whole dependency graph at the fork. Fixes go upstream where OxideAV's clean-room rule allows.

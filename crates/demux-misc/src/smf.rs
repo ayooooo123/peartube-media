@@ -2,15 +2,15 @@
 // demuxer, so this follows the MIDI 1.0 spec (SMF, RP-001/v95.1).
 // License: MIT (workspace).
 //
-// The whole file is emitted as one packet for codec `midi`, which is how
-// OxideAV's midi decoder consumes SMF blobs (one send_packet per song).
+// The whole file is one packet for codec `midi`; the SoundFont renderer
+// emits bounded audio frames incrementally.
 // Header must be "MThd" with a 6-byte length; every subsequent chunk is
 // "MTrk" (kept) or an unknown chunk (skipped, per spec).
 
 use std::io::Read;
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
-    MediaType, Packet, ProbeData, ProbeScore, ReadSeek, Result, StreamInfo,
+    Packet, ProbeData, ProbeScore, ReadSeek, Result, SampleFormat, StreamInfo,
     TimeBase, MAX_PROBE_SCORE,
 };
 
@@ -37,11 +37,14 @@ struct SmfDemuxer {
 }
 
 pub fn open_smf(
-    mut input: Box<dyn ReadSeek>,
+    input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
     let mut data = Vec::new();
-    input.read_to_end(&mut data)?;
+    input.take(16 * 1024 * 1024 + 1).read_to_end(&mut data)?;
+    if data.len() > 16 * 1024 * 1024 {
+        return Err(Error::invalid("smf: file exceeds 16 MiB"));
+    }
     if data.len() < 14 {
         return Err(Error::invalid("smf: file too short"));
     }
@@ -58,10 +61,6 @@ pub fn open_smf(
         return Err(Error::invalid("smf: unsupported format or track count"));
     }
 
-    // Validate chunk structure per spec; cap total size for untrusted input.
-    if data.len() > 256 * 1024 * 1024 {
-        return Err(Error::invalid("smf: file too large"));
-    }
     let mut pos = 8 + mthd_len;
     let mut tracks = 0usize;
     while pos + 8 <= data.len() {
@@ -83,8 +82,10 @@ pub fn open_smf(
         return Err(Error::invalid("smf: no MTrk chunks"));
     }
 
-    let mut params = CodecParameters::data(CodecId::new("midi"));
-    params.media_type = MediaType::Data;
+    let mut params = CodecParameters::audio(CodecId::new("midi"));
+    params.sample_format = Some(SampleFormat::F32);
+    params.sample_rate = Some(44_100);
+    params.channels = Some(2);
     let stream = StreamInfo {
         index: 0,
         params,
@@ -137,5 +138,6 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_probe("smf", probe_smf);
     reg.register_extension("mid", "smf");
     reg.register_extension("midi", "smf");
+    reg.register_extension("kar", "smf");
     reg.register_extension("smf", "smf");
 }
