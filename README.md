@@ -125,6 +125,14 @@ Release builds compile dependencies and this workspace's cold crates at `opt-lev
 
 Leaving TLS out (rustls, ring and the webpki roots, through `oxideav-http`'s `tls` feature) saves another 0.86 MB raw, 0.54 MB deflated, in the Android `libmain.so`.
 
+### Raw MPEG-4 corpus attribution
+
+FATE's `mpeg4/xvid_vlc_trac7411.h263` is raw MPEG-4 despite its suffix.
+Its 20 pictures match the pinned oracle, including playback over HTTP.
+It carries no container brand tag, so it claims only `video:mpeg4`.
+H.263 and branded Xvid coverage use `gen:video_h263.avi` and
+`gen:mpeg4_xvid.avi`, respectively; filenames alone do not establish a codec.
+
 ### PVA audio and MPEG-2 concealment
 
 The PVA demuxer splits audio PES payloads into MP2 frames and resets that

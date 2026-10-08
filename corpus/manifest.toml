@@ -81,10 +81,10 @@ path = "gen:video_h263i.avi"
 rows = ["video:h263i"]
 compare = ["video:md5"]
 
-# The FATE filename is misleading: this is raw MPEG-4 ASP/Xvid, not H.263.
+# Raw MPEG-4 has no brand tag; H.263 and Xvid use their declared-codec fixtures.
 [[entry]]
 path = "fate:mpeg4/xvid_vlc_trac7411.h263"
-rows = ["video:mpeg4", "video:xvid"]
+rows = ["video:mpeg4"]
 compare = ["video:md5"]
 
 [[entry]]
