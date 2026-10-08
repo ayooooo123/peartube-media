@@ -1,16 +1,20 @@
-//! Text subtitles carried inside Matroska, WebM, MP4 and MOV must play
+//! Text subtitles carried inside Matroska, WebM, MP4, MOV and Ogg must play
 //! through the Player. Every file here is generated from `tests/data` by
-//! FFmpeg (or mkvmerge, the usual producer of `S_TEXT/SSA`). For each one:
+//! FFmpeg (or mkvmerge, the usual producer of `S_TEXT/SSA`), or is FATE's.
+//! For each one:
 //!
 //! * the production registry decodes FFmpeg's cues: same count, start, end
 //!   and visible text (flattened as the standalone acceptance does);
-//! * Matroska/WebM cue times equal `ffprobe -show_packets` to the
+//! * Matroska/WebM and OGM cue times equal `ffprobe -show_packets` to the
 //!   microsecond;
-//! * the Player shows every cue, each rendered exactly as FFmpeg's SubRip
-//!   conversion of that cue renders, read by oxideav-subtitle's SubRip
-//!   parser: FFmpeg applies the ASS styles carried in CodecPrivate in that
-//!   conversion, so this is where they are checked, and the colours they
-//!   assign must be on screen.
+//! * the Player shows every cue with text, each rendered exactly as
+//!   FFmpeg's SubRip conversion of that cue renders, read by
+//!   oxideav-subtitle's SubRip parser: FFmpeg applies the ASS styles carried
+//!   in CodecPrivate in that conversion, so this is where they are checked,
+//!   and the colours they assign must be on screen.
+//!
+//! FFmpeg cannot open Ogg Kate or CMML. Their oracles are the libkate
+//! encoding of FATE's Kate sample and the Xiph CMML mapping.
 
 mod common;
 
@@ -60,7 +64,8 @@ struct CaptureSink {
 
 impl SubtitleSink for CaptureSink {
     fn show(&mut self, images: &[SubtitleImage], width: u32, height: u32) {
-        if !images.is_empty() {
+        // A cue of spaces renders as an empty image: nothing on screen.
+        if images.iter().any(|image| image.width > 0 && image.height > 0) {
             self.shown.lock().push(Shown { width, height, images: images.to_vec() });
         }
     }
@@ -152,7 +157,9 @@ fn play(path: &Path, stream: u32, codec: &str) -> Vec<Shown> {
             let _ = tx.send(event);
         },
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Catches a hang. The OGM file also decodes 640x480 XVID and AC-3 in
+    // full, about a minute on a loaded host.
+    let deadline = Instant::now() + Duration::from_secs(240);
     loop {
         match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Event::Ended) => break,
@@ -187,30 +194,16 @@ fn assert_plays_like_ffmpeg(path: &Path, codec: &str, packets_are_cues: bool, co
         "FFmpeg's text and SubRip encodes disagree on the cues"
     );
 
-    let decoded = refcheck::decode(path, &[codecs::register_all], MediaType::Subtitle, 0);
-    assert_eq!(decoded.params.codec_id.as_str(), codec);
-    let cues: Vec<&SubtitleCue> = decoded
-        .frames
-        .iter()
-        .map(|f| match f {
-            Frame::Subtitle(cue) => cue,
-            other => panic!("non-subtitle frame {other:?}"),
-        })
-        .collect();
-    let actual: Vec<(String, String)> = cues
-        .iter()
-        .map(|cue| {
-            let mut body = String::new();
-            visible_text(&cue.segments, &mut body);
-            (srt_timing(cue.start_us, cue.end_us), body.trim().to_string())
-        })
-        .collect();
-    assert_eq!(actual, text, "cue timing and visible text of {}", path.display());
+    let actual = decoded_cues(path, codec);
+    assert_eq!(actual.iter().map(|(t, b, _)| (t.clone(), b.clone())).collect::<Vec<_>>(), text,
+        "cue timing and visible text of {}", path.display());
     if packets_are_cues {
-        let times: Vec<(i64, i64)> = cues.iter().map(|c| (c.start_us, c.end_us)).collect();
+        let times: Vec<(i64, i64)> = actual.iter().map(|(_, _, times)| *times).collect();
         assert_eq!(times, ffprobe_packets(path), "cue times vs ffprobe -show_packets of {}", path.display());
     }
 
+    // A cue without text puts nothing on screen.
+    let styled: Vec<&(String, String)> = styled.iter().filter(|(_, body)| !body.is_empty()).collect();
     let stream = refcheck_stream_index(path);
     let shown = play(path, stream, codec);
     assert_eq!(shown.len(), styled.len(), "cues shown by the Player for {}", path.display());
@@ -222,6 +215,43 @@ fn assert_plays_like_ffmpeg(path: &Path, codec: &str, packets_are_cues: bool, co
     for &(i, rgb) in colors {
         let n = pixels_of(&shown[i].images[0], rgb);
         assert!(n > 0, "cue {i} of {} shows no {rgb:?} text", path.display());
+    }
+}
+
+/// The production registry's decode of the first subtitle stream of `path`:
+/// per cue its SubRip timing, visible text and `(start_us, end_us)`.
+fn decoded_cues(path: &Path, codec: &str) -> Vec<(String, String, (i64, i64))> {
+    let decoded = refcheck::decode(path, &[codecs::register_all], MediaType::Subtitle, 0);
+    assert_eq!(decoded.params.codec_id.as_str(), codec);
+    decoded
+        .frames
+        .iter()
+        .map(|f| match f {
+            Frame::Subtitle(cue) => {
+                let mut body = String::new();
+                visible_text(&cue.segments, &mut body);
+                (srt_timing(cue.start_us, cue.end_us), body.trim().to_string(), (cue.start_us, cue.end_us))
+            }
+            other => panic!("non-subtitle frame {other:?}"),
+        })
+        .collect()
+}
+
+/// Plays a file FFmpeg cannot decode: the Player lists the stream as
+/// `codec`, decodes `expected` (timing, visible text), and shows each cue
+/// as the compositor renders that decoded cue.
+fn assert_plays_cues(path: &Path, codec: &str, expected: &[(i64, i64, &str)]) {
+    let decoded = decoded_cues(path, codec);
+    let actual: Vec<(i64, i64, &str)> = decoded.iter().map(|(_, body, (s, e))| (*s, *e, body.as_str())).collect();
+    assert_eq!(actual, expected, "cues of {}", path.display());
+    let shown = play(path, refcheck_stream_index(path), codec);
+    assert_eq!(shown.len(), expected.len(), "cues shown by the Player for {}", path.display());
+    let rendered = refcheck::decode(path, &[codecs::register_all], MediaType::Subtitle, 0);
+    for (i, (shown, frame)) in shown.iter().zip(&rendered.frames).enumerate() {
+        let Frame::Subtitle(cue) = frame else { unreachable!("checked above") };
+        let expected = player::subs::render_text_cue(cue, shown.width, shown.height);
+        let actual: Vec<Signature> = shown.images.iter().map(signature).collect();
+        assert_eq!(actual, vec![signature(&expected)], "cue {i} of {}", path.display());
     }
 }
 
@@ -336,6 +366,79 @@ fn mp4_mov_text_from_ass_with_styles() {
 fn mov_mov_text_from_ass() {
     let path = ffmpeg_file("styled.ass", "mov_text", "ass.mov");
     assert_plays_like_ffmpeg(&path, "mov_text", false, &[(1, YELLOW), (2, AZURE)]);
+}
+
+/// FFmpeg writes `mov_text` into MOV as a QuickTime `text` entry (above);
+/// a `tx3g` entry, the MP4 form, must play the same.
+#[test]
+fn mov_tx3g_from_srt() {
+    let path = scratch("srt_tx3g.mov");
+    let source = data("styled.srt");
+    run("ffmpeg", &["-nostdin", "-v", "error", "-y", "-i", source.to_str().unwrap(), "-c:s", "mov_text", "-tag:s", "tx3g",
+        path.to_str().unwrap()]);
+    assert_plays_like_ffmpeg(&path, "mov_text", false, &[]);
+}
+
+/// OGM text (FFmpeg `oggparseogm.c`, `textdec.c`): FATE's file has blank
+/// cues at both ends, which FFmpeg keeps and nothing shows.
+#[test]
+fn ogm_text_plays_like_ffmpeg() {
+    assert_plays_like_ffmpeg(&refcheck::fate("ogg-ogm/bots01.ogm"), "text", true, &[]);
+}
+
+/// libkate encoded FATE's sample: two text events with start and duration
+/// in the packets (500 + 1500 and 2500 + 2500 at the ID header's granule
+/// rate 1000/1). The decoder breaks lines at `|`.
+#[test]
+fn ogg_kate_plays_libkates_events() {
+    assert_plays_cues(&refcheck::fate("ogg-kate/kate-subtitles.ogg"), "kate",
+        &[(500_000, 2_000_000, "Hello from Kate\nfirst line"), (2_500_000, 5_000_000, "Second event")]);
+}
+
+/// One Ogg page per packet of a CMML stream (serial 7).
+fn cmml_page(flags: u8, granule_position: i64, seq_no: u32, packets: &[&[u8]]) -> Vec<u8> {
+    use oxideav_ogg::page::{lace, Page};
+    Page {
+        flags,
+        granule_position,
+        serial: 7,
+        seq_no,
+        lacing: packets.iter().flat_map(|p| lace(p.len())).collect(),
+        data: packets.concat(),
+    }
+    .to_bytes()
+}
+
+/// The Xiph CMML mapping (https://wiki.xiph.org/CMML): an ident header
+/// (version 2.1, granule rate 1000/1, granule shift 32), the preamble and
+/// head headers, then one clip per page. A clip page's granule is its time
+/// above the shift and the previous clip's below. A clip lasts until the
+/// next clip of its track; the EOS page's empty clip ends the last one.
+#[test]
+fn ogg_cmml_clips_last_until_the_next_clip() {
+    use oxideav_ogg::page::flags;
+    let mut ident = b"CMML\0\0\0\0".to_vec();
+    ident.extend_from_slice(&2u16.to_le_bytes());
+    ident.extend_from_slice(&1u16.to_le_bytes());
+    ident.extend_from_slice(&1000i64.to_le_bytes());
+    ident.extend_from_slice(&1i64.to_le_bytes());
+    ident.push(32);
+    let granule = |ms: i64, previous: i64| (ms << 32) | previous;
+    let file = [
+        cmml_page(flags::FIRST_PAGE, 0, 0, &[&ident]),
+        cmml_page(0, 0, 1, &[
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<!DOCTYPE cmml SYSTEM \"cmml.dtd\">\n<?cmml lang=\"en\"?>",
+            b"<head>\n<title>Fixture</title>\n</head>",
+        ]),
+        cmml_page(0, granule(1500, 0), 2, &[b"<clip id=\"one\" track=\"main\"><desc>First clip</desc></clip>"]),
+        cmml_page(0, granule(4000, 1500), 3,
+            &[b"<clip id=\"two\" track=\"main\"><a href=\"http://example.com/\">link</a><desc>Second clip</desc></clip>"]),
+        cmml_page(flags::LAST_PAGE, granule(6000, 4000), 4, &[b"<clip track=\"main\"/>"]),
+    ]
+    .concat();
+    let path = scratch("clips.ogg");
+    std::fs::write(&path, file).unwrap();
+    assert_plays_cues(&path, "cmml", &[(1_500_000, 4_000_000, "First clip"), (4_000_000, 6_000_000, "Second clip")]);
 }
 
 #[test]

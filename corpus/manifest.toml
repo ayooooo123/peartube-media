@@ -114,7 +114,7 @@ compare = ["video:md5", "audio:md5"]
 
 [[entry]]
 path = "fate:ogg/videotest.ogv"
-rows = ["video:theora", "video:vp8", "container:ogg"]
+rows = ["video:vp8", "container:ogg"]
 compare = ["video:md5"]
 
 [[entry]]
@@ -591,8 +591,9 @@ path = "fate:sub/dvbsubtest_filter.ts"
 rows = ["sub:dvb", "container:mpeg_ts"]
 compare = ["video:md5", "audio:snr:90", "sub:bitmap"]
 
+# OGM text (oggparseogm.c), next to XVID video and AC-3 audio.
 [[entry]]
-path = "gen:h264_aac_srt.mkv"
+path = "fate:ogg-ogm/bots01.ogm"
 rows = ["sub:ogm"]
 compare = ["video:md5", "audio:snr:90", "sub:text"]
 
@@ -600,6 +601,17 @@ compare = ["video:md5", "audio:snr:90", "sub:text"]
 path = "fate:sub/MovText_capability_tester.mp4"
 rows = ["sub:tx3g"]
 compare = ["sub:text"]
+
+# mov_text in MOV: FFmpeg's QuickTime `text` entry, and a `tx3g` entry.
+[[entry]]
+path = "gen:h264_aac_movtext.mov"
+rows = ["sub:tx3g"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
+
+[[entry]]
+path = "gen:h264_aac_tx3g.mov"
+rows = ["sub:tx3g"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
 
 [[entry]]
 path = "gen:vp9_opus_vtt.webm"
@@ -616,22 +628,25 @@ path = "gen:h264_aac_pgs.mkv"
 rows = ["sub:pgs", "container:mkv"]
 compare = ["video:md5", "sub:bitmap"]
 
-# SVCD / CMML / Kate: no FATE samples and no ffmpeg encoders. SVCD OGT is
-# covered by the subs-bitmap worker's FATE-less row via psx-str; CMML and
-# Kate are Ogg-embedded annotation formats with no sample source at all.
-# These entries document the gaps.
+# SVCD: no FATE sample and no ffmpeg encoder. SVCD OGT is covered by the
+# subs-bitmap worker's FATE-less row via psx-str; this entry documents the
+# gap.
 [[entry]]
 path = "gen:sub_svcd_placeholder.bin"
 rows = ["sub:svcd"]
 compare = ["sub:decodes"]
 
+# CMML and Kate: FFmpeg cannot read either, so these decode without an
+# oracle; the Player tests check their cues against the Xiph mappings.
+# The CMML file is built by generate.sh to the Xiph CMML mapping; the Kate
+# sample is libkate's.
 [[entry]]
-path = "gen:sub_cmml_placeholder.bin"
+path = "gen:sub_cmml.ogg"
 rows = ["sub:cmml"]
 compare = ["sub:decodes"]
 
 [[entry]]
-path = "gen:sub_kate_placeholder.bin"
+path = "fate:ogg-kate/kate-subtitles.ogg"
 rows = ["sub:kate"]
 compare = ["sub:decodes"]
 
@@ -773,6 +788,12 @@ compare = ["audio:snr:90"]
 
 [[entry]]
 path = "gen:video_theora.ogg"
+rows = ["video:theora", "container:ogg"]
+compare = ["video:md5", "audio:snr:90"]
+
+# A real OGM file: DIV3 video in OGM headers, native Ogg Vorbis audio.
+[[entry]]
+path = "fate:ogg-ogm/intro_ogg.ogm"
 rows = ["container:ogm"]
 compare = ["video:md5", "audio:snr:90"]
 

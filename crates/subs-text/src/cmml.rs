@@ -6,6 +6,12 @@
 //! In Ogg logical streams, CMML travels under the BOS packet magic
 //! `CMML\0\0\0\0`. Content packets carry `<clip>` elements specifying
 //! temporal intervals with titles, descriptions, and hyperlinks.
+//!
+//! In Ogg a clip packet has no `start`/`end` attributes: it starts at its
+//! packet's time and lasts until the next clip of its track (`track`,
+//! default `default`) starts; an empty clip only ends the one before. Such
+//! a clip is held until that next clip arrives. Clips with an `end` (a
+//! standalone document) or a packet duration are complete at once.
 
 use std::collections::VecDeque;
 
@@ -18,6 +24,8 @@ use crate::xml::{decode_entities, Scanner, Token};
 use crate::CMML_CODEC_ID;
 
 const MAX_CUE_BYTES: usize = 1 << 20;
+/// Tracks with a held clip; a stream naming more drops the oldest.
+const MAX_TRACKS: usize = 64;
 
 #[derive(Default)]
 pub struct CmmlContext {
@@ -27,6 +35,9 @@ pub struct CmmlContext {
 }
 
 impl CmmlContext {
+    /// The ident header: little-endian 64-bit granule rate numerator and
+    /// denominator at bytes 12 and 20 (Ogg's byte order, as the Skeleton
+    /// fisbone the mapping refers to), the granule shift at byte 28.
     pub fn parse_ident(&mut self, data: &[u8]) -> Result<()> {
         if data.len() < 29 {
             return Err(Error::invalid("CMML ident packet too short"));
@@ -34,8 +45,8 @@ impl CmmlContext {
         if &data[0..8] != b"CMML\x00\x00\x00\x00" {
             return Err(Error::invalid("invalid CMML magic"));
         }
-        self.granulerate_num = u64::from_be_bytes(data[12..20].try_into().unwrap());
-        self.granulerate_den = u64::from_be_bytes(data[20..28].try_into().unwrap());
+        self.granulerate_num = u64::from_le_bytes(data[12..20].try_into().unwrap());
+        self.granulerate_den = u64::from_le_bytes(data[20..28].try_into().unwrap());
         self.granuleshift = data[28];
         Ok(())
     }
@@ -69,12 +80,24 @@ pub fn parse_npt_time(s: &str) -> Option<i64> {
     }
 }
 
-/// Parse CMML payload into SubtitleCue events.
+/// One `clip` element.
+pub struct Clip {
+    /// Its `track` attribute (`default` when absent).
+    pub track: String,
+    pub start_us: i64,
+    /// What it shows; `None` for an empty clip, which only ends the one
+    /// before it on its track.
+    pub cue: Option<SubtitleCue>,
+    /// Its end is known: an `end` attribute or a packet duration.
+    pub ended: bool,
+}
+
+/// Parse a CMML payload into its clips.
 pub fn decode_cmml_payload(
     _ctx: &mut CmmlContext,
     data: &[u8],
     packet: &Packet,
-) -> Result<Vec<SubtitleCue>> {
+) -> Result<Vec<Clip>> {
     let packet_start = packet.pts.map(|pts| {
         packet.time_base.rescale(pts, TimeBase::new(1, 1_000_000))
     });
@@ -86,6 +109,7 @@ pub fn decode_cmml_payload(
     };
 
     struct ClipBuilder {
+        track: Option<String>,
         start_us: Option<i64>,
         end_us: Option<i64>,
         title: Option<String>,
@@ -100,6 +124,7 @@ pub fn decode_cmml_payload(
     impl ClipBuilder {
         fn new() -> Self {
             Self {
+                track: None,
                 start_us: None,
                 end_us: None,
                 title: None,
@@ -112,9 +137,10 @@ pub fn decode_cmml_payload(
             }
         }
 
-        fn finish(self, fallback_start: Option<i64>, fallback_end: Option<i64>) -> Option<SubtitleCue> {
+        fn finish(self, fallback_start: Option<i64>, fallback_end: Option<i64>) -> Clip {
             let start_us = self.start_us.or(fallback_start).unwrap_or(0);
-            let end_us = self.end_us.or(fallback_end).unwrap_or(start_us);
+            let end = self.end_us.or(fallback_end);
+            let end_us = end.unwrap_or(start_us);
 
             let mut segments = Vec::new();
             match (self.title, self.desc) {
@@ -144,22 +170,19 @@ pub fn decode_cmml_payload(
                 }
             }
 
-            if segments.is_empty() {
-                return None;
-            }
-
-            Some(SubtitleCue {
+            let cue = (!segments.is_empty()).then_some(SubtitleCue {
                 start_us,
                 end_us,
                 style_ref: None,
                 positioning: None,
                 segments,
-            })
+            });
+            Clip { track: self.track.unwrap_or_else(|| "default".into()), start_us, cue, ended: end.is_some() }
         }
     }
 
     let mut scanner = Scanner::new(data);
-    let mut cues = Vec::new();
+    let mut clips = Vec::new();
     let mut current_clip: Option<ClipBuilder> = None;
 
     while let Some(tok) = scanner.next()? {
@@ -174,12 +197,12 @@ pub fn decode_cmml_payload(
                             clip.end_us = parse_npt_time(v);
                         } else if k.eq_ignore_ascii_case("title") {
                             clip.title = Some(v.to_string());
+                        } else if k.eq_ignore_ascii_case("track") {
+                            clip.track = Some(v.to_string());
                         }
                     }
                     if self_closing {
-                        if let Some(cue) = clip.finish(packet_start, packet_end) {
-                            cues.push(cue);
-                        }
+                        clips.push(clip.finish(packet_start, packet_end));
                     } else {
                         current_clip = Some(clip);
                     }
@@ -196,9 +219,7 @@ pub fn decode_cmml_payload(
             Token::End(name) => {
                 if name.eq_ignore_ascii_case("clip") {
                     if let Some(clip) = current_clip.take() {
-                        if let Some(cue) = clip.finish(packet_start, packet_end) {
-                            cues.push(cue);
-                        }
+                        clips.push(clip.finish(packet_start, packet_end));
                     }
                 } else if let Some(clip) = &mut current_clip {
                     if name.eq_ignore_ascii_case("title") {
@@ -231,18 +252,18 @@ pub fn decode_cmml_payload(
     }
 
     if let Some(clip) = current_clip.take() {
-        if let Some(cue) = clip.finish(packet_start, packet_end) {
-            cues.push(cue);
-        }
+        clips.push(clip.finish(packet_start, packet_end));
     }
 
-    Ok(cues)
+    Ok(clips)
 }
 
 pub struct CmmlDecoder {
     codec_id: CodecId,
     ctx: CmmlContext,
     pending: VecDeque<Frame>,
+    /// Per track, the clip still waiting for the next one to end it.
+    held: VecDeque<(String, SubtitleCue)>,
     eof: bool,
 }
 
@@ -258,8 +279,20 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
         codec_id: params.codec_id.clone(),
         ctx,
         pending: VecDeque::new(),
+        held: VecDeque::new(),
         eof: false,
     }))
+}
+
+impl CmmlDecoder {
+    /// The held clip of `track` ends at `at` and is complete.
+    fn end_track(&mut self, track: &str, at: i64) {
+        if let Some(i) = self.held.iter().position(|(t, _)| t == track) {
+            let (_, mut cue) = self.held.remove(i).expect("position found");
+            cue.end_us = at.max(cue.start_us);
+            self.pending.push_back(Frame::Subtitle(cue));
+        }
+    }
 }
 
 impl Decoder for CmmlDecoder {
@@ -284,9 +317,19 @@ impl Decoder for CmmlDecoder {
             return Ok(());
         }
 
-        let cues = decode_cmml_payload(&mut self.ctx, &packet.data, packet)?;
-        for cue in cues {
-            self.pending.push_back(Frame::Subtitle(cue));
+        for clip in decode_cmml_payload(&mut self.ctx, &packet.data, packet)? {
+            self.end_track(&clip.track, clip.start_us);
+            match clip.cue {
+                Some(cue) if clip.ended => self.pending.push_back(Frame::Subtitle(cue)),
+                Some(cue) => {
+                    if self.held.len() == MAX_TRACKS {
+                        let (_, oldest) = self.held.pop_front().expect("held is full");
+                        self.pending.push_back(Frame::Subtitle(oldest));
+                    }
+                    self.held.push_back((clip.track, cue));
+                }
+                None => {}
+            }
         }
         Ok(())
     }
@@ -301,13 +344,19 @@ impl Decoder for CmmlDecoder {
         Err(Error::NeedMore)
     }
 
+    /// Clips nothing ended (no empty clip on the EOS page) end where they
+    /// start.
     fn flush(&mut self) -> Result<()> {
+        while let Some((_, cue)) = self.held.pop_front() {
+            self.pending.push_back(Frame::Subtitle(cue));
+        }
         self.eof = true;
         Ok(())
     }
 
     fn reset(&mut self) -> Result<()> {
         self.pending.clear();
+        self.held.clear();
         self.eof = false;
         Ok(())
     }
