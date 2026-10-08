@@ -23,9 +23,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 ff() { ffmpeg -hide_banner -nostdin -v error -y "$@"; }
 
-# Optional group for regenerating HD, SD, audio, or legacy gap inputs.
+# Optional group for regenerating HD, SD, audio, legacy gap or new-decoder inputs.
 GROUP="${1:-all}"
-case "$GROUP" in all|hd|sd|audio|legacy) ;; *) echo "usage: $0 [all|hd|sd|audio|legacy]" >&2; exit 2 ;; esac
+case "$GROUP" in all|hd|sd|audio|legacy|new) ;; *) echo "usage: $0 [all|hd|sd|audio|legacy|new]" >&2; exit 2 ;; esac
 
 BBB="$FATE/mov/buck480p30_na.mp4"
 MUSIC="$FATE/h264/unescaped_extradata.mp4"
@@ -141,6 +141,50 @@ ff -ss 60 -t 20 -i "$BBB" -an -vf scale=848:480 -c:v mpeg4 -vtag 3IV2 -b:v 1500k
 ff -i "$FATE/svq1/marymary-shackles.mov" -t 20 -map 0:v:0 -c copy "$OUT/svq1_rewrapped.mov"
 ff -i "$FATE/svq3/Vertical400kbit.sorenson3.mov" -t 20 -map 0:v:0 -c copy "$OUT/svq3_rewrapped.mov"
 ff -i "$FATE/dirac/vts.profile-main.drc" -map 0:v:0 -c copy "$OUT/dirac_rewrapped.mkv"
+fi
+
+# Decoders added since the first audit. Speex, AMR, ATRAC3+, QDM2, MACE and
+# VP3-VP6 have no encoder in FFmpeg: their manifest samples are measured.
+# ATRAC3 is a FATE sample rewrapped in OMA (WAV loses its extradata until the
+# AviWav branch merges). The MXF file's PCM stream times the MXF demuxer:
+# decoding PCM costs next to nothing. Raw .mp2 is kept to show its routing.
+if [[ "$GROUP" == all || "$GROUP" == new ]]; then
+echo "H.263 CIF and 4CIF, Sorenson H.263 (FLV) 480p, DVCPRO HD 1080i50"
+ff -ss 60 -t 20 -i "$BBB" -an -vf "scale=352:288:flags=lanczos,$GRAIN" -c:v h263 -b:v 768k -g 300 "$OUT/h263_cif.avi"
+ff -ss 60 -t 20 -i "$BBB" -an -vf "scale=704:576:flags=lanczos,$GRAIN" -c:v h263 -b:v 2M -g 300 "$OUT/h263_4cif.avi"
+ff -ss 60 -t 20 -i "$BBB" -an -vf "scale=848:480:flags=lanczos,$GRAIN" -c:v flv -b:v 1500k -g 300 "$OUT/flv1_480p30.flv"
+ff -ss 60 -t 10 -i "$BBB" -an -vf "fps=25,scale=1440:1080:flags=lanczos,$GRAIN" -pix_fmt yuv422p \
+  -c:v dvvideo -f mov "$OUT/dvcprohd_1080i50.mov"
+
+echo "MP2 stereo (raw and Matroska), ALAC stereo, ATRAC3 132k (OMA), MXF (MPEG-2 + PCM)"
+ff -ss 20 -t 30 -i "$MUSIC" -vn -ac 2 -ar 48000 -c:a mp2 -b:a 256k "$OUT/mp2_stereo.mp2"
+ff -i "$OUT/mp2_stereo.mp2" -c copy "$OUT/mp2_stereo.mka"
+ff -ss 20 -t 30 -i "$MUSIC" -vn -ac 2 -ar 44100 -c:a alac "$OUT/alac_stereo.m4a"
+ff -stream_loop 6 -i "$FATE/atrac3/mc_sich_at3_132_small.wav" -c copy -f oma "$OUT/atrac3_132k.oma"
+ff -ss 60 -t 20 -i "$BBB" -ss 20 -t 20 -i "$MUSIC" -map 0:v -map 1:a \
+  -vf "scale=720:576:flags=lanczos" -r 25 -c:v mpeg2video -b:v 8M -g 12 \
+  -c:a pcm_s16le -ar 48000 -ac 2 -f mxf "$OUT/mpeg2_pcm.mxf"
+
+echo "DV audio: Ulead WAV (tag 0x0216) of the audio DIF blocks of 20 s of PAL DV"
+ff -ss 60 -t 20 -i "$BBB" -ss 20 -t 20 -i "$MUSIC" -map 0:v -map 1:a -vf "scale=720:576,fps=25" \
+  -pix_fmt yuv420p -c:v dvvideo -c:a pcm_s16le -ar 48000 -ac 2 -f dv "$TMP/pal.dv"
+python3 - "$TMP/pal.dv" "$OUT/dvaudio_ulead.wav" <<'EOF'
+# The layout crates/codec-dv/tests/dvaudio.rs builds: per DV frame, the nine
+# audio DIF blocks (6, 22, ..., 134) of each of the 12 PAL DIF sequences.
+import struct, sys
+dv = open(sys.argv[1], 'rb').read()
+data = bytearray()
+for f in range(len(dv) // 144000):
+    frame = dv[f * 144000:(f + 1) * 144000]
+    for seq in range(12):
+        for blk in range(9):
+            at = seq * 150 * 80 + (6 + 16 * blk) * 80
+            data += frame[at:at + 80]
+align = 12 * 9 * 80
+fmt = struct.pack('<HHIIHH', 0x0216, 2, 48000, align * 25, align, 16)
+body = b'WAVE' + b'fmt ' + struct.pack('<I', len(fmt)) + fmt + b'data' + struct.pack('<I', len(data)) + bytes(data)
+open(sys.argv[2], 'wb').write(b'RIFF' + struct.pack('<I', len(body)) + body)
+EOF
 fi
 
 du -sh "$OUT"

@@ -119,6 +119,24 @@ const STANDARD: &[Standard] = &[
     Standard { label: "extra:indeo5", file: "fate:iv50/Educ_Movie_DeadlyForce.avi", kind: Kind::Video },
     Standard { label: "extra:wavpack MKV", file: "fate:wavpack/special/matroska_mode.mka", kind: Kind::Audio },
     Standard { label: "extra:HE-AAC v1 5.1", file: "fate:aac/al_sbr_cm_48_5.1.mp4", kind: Kind::Audio },
+    // Decoders added since the first audit (`corpus/perf-inputs.sh new`).
+    // The MXF PCM stream times the demuxer; raw .mp2 shows its routing.
+    Standard { label: "new:h263 CIF", file: "h263_cif.avi", kind: Kind::Video },
+    Standard { label: "new:h263 4CIF", file: "h263_4cif.avi", kind: Kind::Video },
+    Standard { label: "new:flv1 480p30", file: "flv1_480p30.flv", kind: Kind::Video },
+    Standard { label: "new:dv DVCPRO HD 1080i50", file: "dvcprohd_1080i50.mov", kind: Kind::Video },
+    Standard { label: "new:mp2 stereo raw", file: "mp2_stereo.mp2", kind: Kind::Audio },
+    Standard { label: "new:mp2 stereo MKA", file: "mp2_stereo.mka", kind: Kind::Audio },
+    Standard { label: "new:alac stereo", file: "alac_stereo.m4a", kind: Kind::Audio },
+    Standard { label: "new:atrac3 132k OMA", file: "atrac3_132k.oma", kind: Kind::Audio },
+    Standard { label: "new:dvaudio Ulead WAV", file: "dvaudio_ulead.wav", kind: Kind::Audio },
+    Standard { label: "new:mpeg2 in MXF 576p25", file: "mpeg2_pcm.mxf", kind: Kind::Video },
+    Standard { label: "new:pcm in MXF", file: "mpeg2_pcm.mxf", kind: Kind::Audio },
+    // Larger FATE streams for decoders whose manifest sample is tiny.
+    Standard { label: "extra:vp6f FLV", file: "fate:flash-vp6/clip1024.flv", kind: Kind::Video },
+    Standard { label: "extra:vp6a FLV", file: "fate:flash-vp6/300x180-Scr-f8-056alpha.flv", kind: Kind::Video },
+    Standard { label: "extra:mpeg2 XDCAM MXF", file: "fate:mxf/omneon_8.3.0.0_xdcam_startc_footer.mxf", kind: Kind::Video },
+    Standard { label: "extra:atrac1", file: "fate:atrac1/chirp_tone_10-16000.aea", kind: Kind::Audio },
 ];
 
 /// Codec ids (as the demuxers report them) that carry a manifest row's codec.
@@ -142,6 +160,9 @@ const ROW_CODECS: &[(&str, &[&str])] = &[
     ("audio:ulaw", &["pcm_mulaw", "ulaw"]),
     ("audio:lpcm", &["pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le"]),
     ("audio:adpcm", &["adpcm_ms", "adpcm_ima_wav", "adpcm_ima_qt"]),
+    ("audio:amrnb", &["amr_nb", "amrnb"]),
+    ("audio:amrwb", &["amr_wb", "amrwb"]),
+    ("audio:atrac3p", &["atrac3p", "atrac3plus"]),
 ];
 
 fn row_codecs(row: &str) -> Vec<&str> {
@@ -560,11 +581,53 @@ struct Run {
     demux_secs: f64,
     media_secs: f64,
     xrt: f64,
+    /// User + system CPU seconds of the process during the run: on a shared
+    /// machine the wall clock also counts time spent waiting for a core.
+    #[serde(default)]
+    cpu_secs: f64,
+    /// `media_secs / cpu_secs`.
+    #[serde(default)]
+    cpu_xrt: f64,
+    /// Instructions retired and cycles during the run (macOS; 0 elsewhere).
+    #[serde(default)]
+    instructions: u64,
+    #[serde(default)]
+    cycles: u64,
     capped: bool,
     sample_rate: Option<u32>,
     channels: Option<u16>,
     #[serde(flatten)]
     tally: Tally,
+}
+
+/// The process's CPU seconds, instructions and cycles so far.
+#[derive(Clone, Copy)]
+struct Counters {
+    cpu_secs: f64,
+    instructions: u64,
+    cycles: u64,
+}
+
+impl Counters {
+    fn now() -> Counters {
+        // SAFETY: getrusage fills the zeroed struct it is given.
+        let cpu_secs = unsafe {
+            let mut ru: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+            let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+            tv(ru.ru_utime) + tv(ru.ru_stime)
+        };
+        #[cfg(target_os = "macos")]
+        // SAFETY: proc_pid_rusage writes one rusage_info_v4 into the buffer.
+        let (instructions, cycles) = unsafe {
+            let mut info: libc::rusage_info_v4 = std::mem::zeroed();
+            let ok = libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, (&raw mut info).cast());
+            if ok == 0 { (info.ri_instructions, info.ri_cycles) } else { (0, 0) }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (instructions, cycles) = (0, 0);
+        Counters { cpu_secs, instructions, cycles }
+    }
 }
 
 /// The media clock of a decode: audio samples over the output rate, video
@@ -588,6 +651,7 @@ fn timed_run(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>, fps: Option
     let mut demux = Duration::ZERO;
     let mut output = None;
     let start = Instant::now();
+    let before = Counters::now();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         decode_stream(ctx, container, bytes, stream.index, (!max.is_zero()).then(|| start + max), &mut demux, &mut |frame, decoder, params| {
             if let Frame::Audio(audio) = &frame {
@@ -597,6 +661,8 @@ fn timed_run(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>, fps: Option
         })
     }));
     let wall = start.elapsed().as_secs_f64();
+    let after = Counters::now();
+    let cpu = after.cpu_secs - before.cpu_secs;
     let (tally, decoder, params, capped) = match outcome {
         Ok(r) => r?,
         Err(p) => return Err(format!("panicked: {}", panic_text(&p))),
@@ -610,6 +676,8 @@ fn timed_run(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>, fps: Option
         tally.first_error.clone().unwrap_or_else(|| "no media clock: unknown sample or frame rate".into())
     })?;
     Ok(Run { wall_secs: wall, demux_secs: demux.as_secs_f64(), media_secs: media, xrt: media / wall, capped,
+        cpu_secs: cpu, cpu_xrt: if cpu > 0.0 { media / cpu } else { 0.0 },
+        instructions: after.instructions - before.instructions, cycles: after.cycles - before.cycles,
         sample_rate: output.map(|f| f.sample_rate).or(params.sample_rate),
         channels: output.map(|f| f.channels).or(params.channels), tally })
 }
@@ -716,7 +784,7 @@ fn plane_dims(format: PixelFormat, width: u32, height: u32) -> Option<Vec<(usize
 fn check(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Check {
     let outcome = catch_unwind(AssertUnwindSafe(|| match input.kind {
         Kind::Video => check_video(ctx, input, bytes),
-        Kind::Audio => check_audio(ctx, input, bytes),
+        Kind::Audio => check_audio(input),
     }));
     match outcome {
         Ok(Ok(c)) => c,
@@ -773,26 +841,22 @@ fn check_video(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Result
     })
 }
 
-fn check_audio(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Result<Check, String> {
-    let (container, stream) = (input.container.as_deref().unwrap(), input.stream.as_ref().unwrap());
-    let mut frames: Vec<Frame> = Vec::new();
-    let mut frame_formats = Vec::new();
-    let mut max_frame_samples = 0u64;
-    let mut demux = Duration::ZERO;
-    let (tally, decoder, params, _) =
-        decode_stream(ctx, container, bytes, stream.index, None, &mut demux, &mut |frame, decoder, params| {
-            let format = if let Frame::Audio(audio) = &frame {
-                max_frame_samples = max_frame_samples.max(audio.samples as u64);
-                Some(pcm::layout(decoder, params, audio))
-            } else {
-                None
-            };
-            frame_formats.push(format);
-            frames.push(frame);
-        })?;
-    let audio_format = frame_formats.last().copied().flatten().or_else(|| decoder.output_audio_format());
-    let decoded = refcheck::Decoded { params, audio_format, frame_formats, frames };
-    let channels = decoded.audio_format.map(|f| f.channels).or(decoded.params.channels).unwrap_or(1).max(1) as usize;
+/// The player's audio, compared with FFmpeg's. It comes from
+/// `refcheck::decode`: the production registry with the encoder delay and end
+/// padding the container declares and the decoder's start delay removed, as
+/// the engine removes them and as FFmpeg's decode does.
+fn check_audio(input: &Input) -> Result<Check, String> {
+    let stream = input.stream.as_ref().unwrap();
+    let decoded = refcheck::decode(&input.path, &[codecs::register_all], MediaType::Audio, stream.nth);
+    let max_frame_samples = decoded
+        .frames
+        .iter()
+        .filter_map(|f| if let Frame::Audio(a) = f { Some(a.samples as u64) } else { None })
+        .max()
+        .unwrap_or(0);
+    let channels = decoded.frame_formats.iter().flatten().last().map(|f| f.channels)
+        .or(decoded.audio_format.map(|f| f.channels))
+        .or(decoded.params.channels).unwrap_or(1).max(1) as usize;
     let ours = refcheck::interleaved_f32(&decoded);
     let reference = pcm::reference_f32(&input.path, stream.nth)?;
     let ffmpeg_channels = stream.reference.as_ref().and_then(|s| s.channels).unwrap_or(channels as u16);
@@ -805,7 +869,7 @@ fn check_audio(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Result
     let (ours_n, ffmpeg_n) = ((ours.len() / channels) as u64, (reference.len() / ffmpeg_channels.max(1) as usize) as u64);
     // At most one decoder frame, as the shared codec contract requires.
     let slack = max_frame_samples;
-    let mut error = tally.first_error.map(|e| format!("{} decode errors, first: {e}", tally.errors));
+    let mut error = (!decoded.trim_fallbacks.is_empty()).then(|| format!("audio trims not applied: {:?}", decoded.trim_fallbacks));
     if let Err(e) = snr_result {
         error = Some(e);
     }
@@ -853,8 +917,15 @@ struct Measured {
     media_secs: Option<f64>,
     /// Wall seconds of the median run.
     decode_secs: Option<f64>,
-    /// Median ×real-time.
+    /// Median ×real-time on the wall clock.
     xrt: Option<f64>,
+    /// Median ×real-time on the process's CPU time. Verdicts use it: on a
+    /// shared machine the wall clock also counts waits for a core.
+    #[serde(default)]
+    cpu_xrt: Option<f64>,
+    /// Instructions retired by the run with the median CPU time.
+    #[serde(default)]
+    instructions: Option<u64>,
     floor: f64,
     /// Speed and independent output validity: ok / SLOW / FAIL / SLOW! / ERROR / MISSING.
     verdict: Cow<'static, str>,
@@ -883,7 +954,7 @@ impl Measured {
     }
 
     fn headroom(&self) -> f64 {
-        self.xrt.map_or(f64::INFINITY, |x| x / self.floor)
+        self.cpu_xrt.or(self.xrt).map_or(f64::INFINITY, |x| x / self.floor)
     }
 }
 
@@ -1005,6 +1076,8 @@ fn measure(ctx: &RuntimeContext, input: &Input, opts: &Options) -> Measured {
         media_secs: None,
         decode_secs: None,
         xrt: None,
+        cpu_xrt: None,
+        instructions: None,
         floor: floor_for(input.kind, stream.and_then(|s| s.height)),
         verdict: "ERROR".into(),
         ffmpeg_xrt: None,
@@ -1054,15 +1127,20 @@ fn measure(ctx: &RuntimeContext, input: &Input, opts: &Options) -> Measured {
     let xrt = median(m.runs.iter().map(|r| r.xrt).collect()).unwrap();
     let mid = m.runs.iter().find(|r| r.xrt == xrt).unwrap();
     m.xrt = Some(xrt);
+    let cpu_xrt = median(m.runs.iter().map(|r| r.cpu_xrt).collect()).unwrap();
+    m.cpu_xrt = Some(cpu_xrt).filter(|x| *x > 0.0);
+    m.instructions = m.runs.iter().find(|r| r.cpu_xrt == cpu_xrt).map(|r| r.instructions).filter(|n| *n > 0);
+    // Verdicts on CPU time when the platform reports it.
+    let speed = m.cpu_xrt.unwrap_or(xrt);
     m.media_secs = Some(mid.media_secs);
     m.decode_secs = Some(mid.wall_secs);
     m.channels = mid.channels.filter(|c| *c > 0).or(m.channels);
     m.sample_rate = mid.sample_rate.filter(|r| *r > 0).or(m.sample_rate);
-    m.verdict = if xrt < m.floor { "SLOW" } else { "ok" }.into();
+    m.verdict = if speed < m.floor { "SLOW" } else { "ok" }.into();
     if opts.check {
         m.check = Some(check(ctx, input, &bytes));
         if !m.check.as_ref().unwrap().complete {
-            m.verdict = if xrt < m.floor { "SLOW!" } else { "FAIL" }.into();
+            m.verdict = if speed < m.floor { "SLOW!" } else { "FAIL" }.into();
         }
     } else {
         m.verdict = "UNCHECKED".into();
@@ -1070,6 +1148,7 @@ fn measure(ctx: &RuntimeContext, input: &Input, opts: &Options) -> Measured {
     if mid.tally.frames == 0 {
         m.verdict = "ERROR".into();
         m.xrt = None;
+        m.cpu_xrt = None;
         m.error = Some(mid.tally.first_error.clone().unwrap_or("no frames decoded".into()));
     } else if mid.tally.errors > 0 {
         m.error = Some(format!("{} decode errors: {}", mid.tally.errors, mid.tally.first_error.as_deref().unwrap_or("")));
@@ -1096,8 +1175,8 @@ fn measure(ctx: &RuntimeContext, input: &Input, opts: &Options) -> Measured {
 
 fn print_table(rows: &[&Measured]) {
     println!(
-        "{:<3} {:<7} {:>8} {:>5} {:>9}  {:<26} {:<44} {:<10} {:>7} {:>8}  {:<22} rows",
-        "#", "verdict", "×RT", "floor", "ffmpeg×RT", "codec (decoder)", "input", "shape", "media s", "decode s", "check"
+        "{:<3} {:<7} {:>8} {:>8} {:>5} {:>9}  {:<26} {:<44} {:<10} {:>7} {:>8} {:>8}  {:<22} rows",
+        "#", "verdict", "cpu×RT", "wall×RT", "floor", "ffmpeg×RT", "codec (decoder)", "input", "shape", "media s", "decode s", "Ginstr", "check"
     );
     for (i, m) in rows.iter().enumerate() {
         let codec = match (&m.codec, &m.decoder) {
@@ -1117,9 +1196,10 @@ fn print_table(rows: &[&Measured]) {
         };
         let capped = m.runs.iter().any(|r| r.capped);
         println!(
-            "{:<3} {:<7} {:>8} {:>5} {:>9}  {:<26} {:<44} {:<10} {:>7} {:>8}  {:<22} {}",
+            "{:<3} {:<7} {:>8} {:>8} {:>5} {:>9}  {:<26} {:<44} {:<10} {:>7} {:>8} {:>8}  {:<22} {}",
             i + 1,
             m.verdict,
+            m.cpu_xrt.map_or("-".into(), |x| format!("{x:.2}{}", if capped { "*" } else { "" })),
             m.xrt.map_or("-".into(), |x| format!("{x:.2}{}", if capped { "*" } else { "" })),
             m.floor,
             m.ffmpeg_xrt.map_or("-".into(), |x| format!("{x:.1}")),
@@ -1128,6 +1208,7 @@ fn print_table(rows: &[&Measured]) {
             m.shape(),
             m.media_secs.map_or("-".into(), |x| format!("{x:.2}")),
             m.decode_secs.map_or("-".into(), |x| format!("{x:.3}")),
+            m.instructions.map_or("-".into(), |n| format!("{:.2}", n as f64 / 1e9)),
             truncate(&check, 22),
             m.rows.join(" ")
         );
@@ -1138,7 +1219,7 @@ fn print_table(rows: &[&Measured]) {
             println!("{:<12}note: {n}", "");
         }
     }
-    println!("×RT = media seconds ÷ wall seconds, median run; * = runs stopped at --max-secs. floor: audio {AUDIO_FLOOR}, video >576 lines {HD_FLOOR}, SD {SD_FLOOR}.");
+    println!("cpu×RT = media seconds ÷ CPU seconds (verdicts), wall×RT = media seconds ÷ wall seconds; median runs; * = runs stopped at --max-secs. floor: audio {AUDIO_FLOOR}, video >576 lines {HD_FLOOR}, SD {SD_FLOOR}.");
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -1224,7 +1305,7 @@ fn main() {
             let fps = ffprobe_stream(&input.path, input.kind, input.stream.as_ref().unwrap().nth).and_then(|p| p.fps);
             while Instant::now() < until {
                 match timed_run(&ctx, input, &bytes, fps, Duration::from_secs_f64(opts.max_secs)) {
-                    Ok(r) => eprintln!("{}: {:.2}×RT ({:.2} s in {:.3} s)", input.source, r.xrt, r.media_secs, r.wall_secs),
+                    Ok(r) => eprintln!("{}: {:.2}×RT cpu, {:.2}×RT wall ({:.2} s in {:.3} s, {:.2} G instr)", input.source, r.cpu_xrt, r.xrt, r.media_secs, r.wall_secs, r.instructions as f64 / 1e9),
                     Err(e) => {
                         eprintln!("{}: {e}", input.source);
                         break;
@@ -1246,7 +1327,7 @@ fn main() {
         eprintln!(
             "{} {}",
             m.verdict,
-            m.xrt.map_or_else(|| m.error.clone().unwrap_or_default(), |x| format!("{x:.2}×RT"))
+            m.cpu_xrt.or(m.xrt).map_or_else(|| m.error.clone().unwrap_or_default(), |x| format!("{x:.2}×RT cpu, load {:.0}", m.load_avg.unwrap_or(0.0)))
         );
         results.push(m);
     }
