@@ -1,0 +1,17 @@
+[package]
+name = "codec-vp3"
+description = "On2 VP3 and VP4 video decoders (ports of FFmpeg's vp3.c and vp3dsp.c)"
+version.workspace = true
+edition.workspace = true
+# Ports of FFmpeg libavcodec files (see src/*/ headers); LGPL, not the
+# workspace's MIT.
+license = "LGPL-2.1-or-later"
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+# Not a workspace dependency; resolved through the root [patch.crates-io].
+oxideav-avi = "*"

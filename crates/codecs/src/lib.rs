@@ -26,6 +26,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         // EIA-608 and CEA-708 caption triplets (the engine feeds them).
         subs_cc::register_codecs,
         codec_rv::register_codecs,
+        // VP30, VP31 and VP40.
+        codec_vp3::register_codecs,
         codec_wmv::register_codecs,
         codec_wma::lib_registration::register_codecs,
         // ALAC, QDM2, QDMC, MACE 3:1 and 6:1.
