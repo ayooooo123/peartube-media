@@ -1009,7 +1009,7 @@ dependencies = [
 [[package]]
 name = "oxideav-dirac"
 version = "0.0.9"
-source = "git+https://github.com/ayooooo123/oxideav-dirac?rev=e44d05311f450796641982bfa67cbcd16664e6f4#e44d05311f450796641982bfa67cbcd16664e6f4"
+source = "git+https://github.com/ayooooo123/oxideav-dirac?rev=051c87ed060476839493b4368d81fb6dc8294bd6#051c87ed060476839493b4368d81fb6dc8294bd6"
 dependencies = [
  "oxideav-core",
 ]

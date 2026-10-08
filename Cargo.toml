@@ -103,7 +103,7 @@ oxideav-basic = { git = "https://github.com/ayooooo123/oxideav-basic", rev = "33
 oxideav-cinepak = { git = "https://github.com/ayooooo123/oxideav-cinepak", rev = "6e632ae20703b531c5c5755dadcc67fa32479828" }
 oxideav-cook = { git = "https://github.com/OxideAV/oxideav-cook", rev = "f8584e427c6f87de24e2f2de124e0242824f7006" }
 oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }
-oxideav-dirac = { git = "https://github.com/ayooooo123/oxideav-dirac", rev = "e44d05311f450796641982bfa67cbcd16664e6f4" }
+oxideav-dirac = { git = "https://github.com/ayooooo123/oxideav-dirac", rev = "051c87ed060476839493b4368d81fb6dc8294bd6" }
 oxideav-dts = { git = "https://github.com/OxideAV/oxideav-dts", rev = "9a7c128366aa4914331825e3b5d40a3d3304c090" }
 oxideav-dvd = { git = "https://github.com/OxideAV/oxideav-dvd", rev = "f237f8c05fb3a70d0d9c7e7c99c56110c570d849" }
 oxideav-flac = { git = "https://github.com/OxideAV/oxideav-flac", rev = "cfcc7c4359d1f97d39c228dfd95ed46e9246b458" }
