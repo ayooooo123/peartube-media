@@ -230,6 +230,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-musepack"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-ra"
 version = "0.1.0"
 dependencies = [
