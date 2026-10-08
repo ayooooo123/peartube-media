@@ -411,18 +411,20 @@ pub fn synth_filter_float_64(
         let mut c = 0.0f32;
         let mut d = 0.0f32;
         let mut j = 0usize;
+        // Each `a += w * x` contracts to a fused multiply-add, as in the
+        // 32-subband filter.
         while j < 1024 - offset {
-            a += window[i + j] * (-synth_buf[31 - i + j + offset]);
-            b += window[i + j + 32] * (synth_buf[i + j + offset]);
-            c += window[i + j + 64] * (synth_buf[32 + i + j + offset]);
-            d += window[i + j + 96] * (synth_buf[63 - i + j + offset]);
+            a = (-synth_buf[31 - i + j + offset]).mul_add(window[i + j], a);
+            b = synth_buf[i + j + offset].mul_add(window[i + j + 32], b);
+            c = synth_buf[32 + i + j + offset].mul_add(window[i + j + 64], c);
+            d = synth_buf[63 - i + j + offset].mul_add(window[i + j + 96], d);
             j += 128;
         }
         while j < 1024 {
-            a += window[i + j] * (-synth_buf[31 - i + j + offset - 1024]);
-            b += window[i + j + 32] * (synth_buf[i + j + offset - 1024]);
-            c += window[i + j + 64] * (synth_buf[32 + i + j + offset - 1024]);
-            d += window[i + j + 96] * (synth_buf[63 - i + j + offset - 1024]);
+            a = (-synth_buf[31 - i + j + offset - 1024]).mul_add(window[i + j], a);
+            b = synth_buf[i + j + offset - 1024].mul_add(window[i + j + 32], b);
+            c = synth_buf[32 + i + j + offset - 1024].mul_add(window[i + j + 64], c);
+            d = synth_buf[63 - i + j + offset - 1024].mul_add(window[i + j + 96], d);
             j += 128;
         }
         out[i] = a * scale;
@@ -594,14 +596,17 @@ fn lfe_fir_float_hist(
     let mut lfe_pos = 0usize;
 
     for _ in 0..nlfesamples {
-        // One decimated sample generates 64 or 128 interpolated ones
+        // One decimated sample generates 64 or 128 interpolated ones. Each
+        // `a += c * x` is a fused multiply-add; the first, from 0, is the
+        // plain product (FFmpeg builds with -fno-signed-zeros).
         for j in 0..factor / 2 {
-            let mut a = 0.0f32;
-            let mut b = 0.0f32;
-            for k in 0..ncoeffs {
+            let s0 = lfe_samples[lfe_pos + hist] as f32;
+            let mut a = filter_coeff[j * ncoeffs] * s0;
+            let mut b = filter_coeff[255 - j * ncoeffs] * s0;
+            for k in 1..ncoeffs {
                 let s = lfe_samples[lfe_pos + hist - k] as f32;
-                a += filter_coeff[j * ncoeffs + k] * s;
-                b += filter_coeff[255 - j * ncoeffs - k] * s;
+                a = filter_coeff[j * ncoeffs + k].mul_add(s, a);
+                b = filter_coeff[255 - j * ncoeffs - k].mul_add(s, b);
             }
             pcm_samples[pcm_pos + j] = a;
             pcm_samples[pcm_pos + factor / 2 + j] = b;
@@ -611,13 +616,14 @@ fn lfe_fir_float_hist(
     }
 }
 
-/// `lfe_x96_float_c`.
+/// `lfe_x96_float_c`: each sample is one fused multiply-add of the left
+/// product onto the right one.
 pub fn lfe_x96_float(dst: &mut [f32], src: &[f32], hist: &mut f32, len: usize) {
     let mut prev = *hist;
     let mut dpos = 0usize;
     for i in 0..len {
-        let a = 0.25 * src[i] + 0.75 * prev;
-        let b = 0.75 * src[i] + 0.25 * prev;
+        let a = 0.25f32.mul_add(src[i], 0.75 * prev);
+        let b = 0.75f32.mul_add(src[i], 0.25 * prev);
         prev = src[i];
         dst[dpos] = a;
         dst[dpos + 1] = b;
@@ -849,10 +855,10 @@ pub fn vector_fmul_reverse(dst: &mut [f32], src0: &[f32], src1: &[f32], len: usi
     }
 }
 
-/// `vector_fmac_scalar`: `dst[i] += src[i] * mul`.
+/// `vector_fmac_scalar`: `dst[i] += src[i] * mul`, contracted.
 pub fn vector_fmac_scalar(dst: &mut [f32], src: &[f32], mul: f32, len: usize) {
     for i in 0..len {
-        dst[i] += src[i] * mul;
+        dst[i] = src[i].mul_add(mul, dst[i]);
     }
 }
 

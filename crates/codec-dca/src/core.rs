@@ -2744,11 +2744,12 @@ impl CoreDecoder {
             let ls = self.plane_off(out.len(), nsamples, speaker::LS);
             let rs = self.plane_off(out.len(), nsamples, speaker::RS);
             let cs = self.plane_off(out.len(), nsamples, speaker::CS);
+            // vector_fmac_scalar(Ls/Rs, Cs, -M_SQRT1_2): one fused
+            // multiply-add per sample.
             let csrc = out[cs..cs + nsamples].to_vec();
             for i in 0..nsamples {
-                let v = -csrc[i] * std::f32::consts::FRAC_1_SQRT_2;
-                out[ls + i] += v;
-                out[rs + i] += v;
+                out[ls + i] = csrc[i].mul_add(-std::f32::consts::FRAC_1_SQRT_2, out[ls + i]);
+                out[rs + i] = csrc[i].mul_add(-std::f32::consts::FRAC_1_SQRT_2, out[rs + i]);
             }
         }
 

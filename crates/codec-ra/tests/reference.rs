@@ -54,15 +54,16 @@ fn test_ra144_ra() {
     check_audio("realaudio/ra3.ra", f64::INFINITY, 0);
 }
 
+/// ra_288 and sipr are float decoders, bit-exact with FFmpeg 2da55bf once
+/// the sums its build vectorizes round as it does (`codec_ra`'s `sums`).
 #[test]
 fn test_ra288_rm() {
-    // ra_288 is float -> >= 90 dB
-    check_audio("real/ra_288.rm", 90.0, 160);
+    check_audio("real/ra_288.rm", f64::INFINITY, 0);
 }
 
 #[test]
 fn test_ra288_ra() {
-    check_audio("realaudio/ra4_288.ra", 90.0, 160);
+    check_audio("realaudio/ra4_288.ra", f64::INFINITY, 0);
 }
 
 #[test]
@@ -79,18 +80,17 @@ fn test_cook() {
 
 #[test]
 fn test_sipr_5k0() {
-    // sipr is float -> >= 90 dB
-    check_audio("sipr/sipr_5k0.rm", 90.0, 480);
+    check_audio("sipr/sipr_5k0.rm", f64::INFINITY, 0);
 }
 
 #[test]
 fn test_sipr_6k5() {
-    check_audio("sipr/sipr_6k5.rm", 90.0, 288);
+    check_audio("sipr/sipr_6k5.rm", f64::INFINITY, 0);
 }
 
 #[test]
 fn test_sipr_8k5() {
-    check_audio("sipr/sipr_8k5.rm", 90.0, 144);
+    check_audio("sipr/sipr_8k5.rm", f64::INFINITY, 0);
 }
 
 #[test]
@@ -109,10 +109,10 @@ fn test_sipr_16k() {
     assert_eq!(got.len(), ref_samples.len(), "sipr/sipr_16k.rm: sample count");
     let snr = snr_db(&ref_samples, &got, 0);
     println!("sipr/sipr_16k.rm: SNR = {snr:.2} dB");
-    assert!(snr >= 90.0, "sipr/sipr_16k.rm: SNR {snr:.2} dB below minimum 90 dB");
+    assert_eq!(snr, f64::INFINITY, "sipr/sipr_16k.rm must be bit-exact");
 }
 
 #[test]
 fn test_sipr_16k_ra() {
-    check_audio("realaudio/RA5.0_16kbps_voice_wideband.ra", 90.0, 160);
+    check_audio("realaudio/RA5.0_16kbps_voice_wideband.ra", f64::INFINITY, 0);
 }
