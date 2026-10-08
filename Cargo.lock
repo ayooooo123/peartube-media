@@ -121,6 +121,7 @@ version = "0.1.0"
 dependencies = [
  "codecs",
  "oxideav-core",
+ "player",
  "refcheck",
 ]
 
@@ -168,6 +169,14 @@ checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common",
  "inout",
+]
+
+[[package]]
+name = "codec-ape"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
 ]
 
 [[package]]
@@ -230,6 +239,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-musepack"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-ra"
 version = "0.1.0"
 dependencies = [
@@ -271,6 +288,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-svq3"
+version = "0.1.0"
+dependencies = [
+ "compcol",
+ "oxideav-core",
+ "oxideav-mov",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-vp3"
 version = "0.1.0"
 dependencies = [
@@ -289,6 +316,16 @@ dependencies = [
  "oxideav-flv",
  "oxideav-mov",
  "player",
+ "refcheck",
+]
+
+[[package]]
+name = "codec-wavpack"
+version = "0.1.0"
+dependencies = [
+ "demux-seek-core",
+ "oxideav-core",
+ "oxideav-mkv",
  "refcheck",
 ]
 
@@ -319,17 +356,21 @@ dependencies = [
 name = "codecs"
 version = "0.1.0"
 dependencies = [
+ "codec-ape",
  "codec-apple-audio",
  "codec-atrac",
  "codec-dca",
  "codec-dv",
  "codec-mlp",
+ "codec-musepack",
  "codec-ra",
  "codec-rv",
  "codec-speech",
  "codec-speex",
+ "codec-svq3",
  "codec-vp3",
  "codec-vp56",
+ "codec-wavpack",
  "codec-wma",
  "codec-wmv",
  "demux-asf",
@@ -339,7 +380,6 @@ dependencies = [
  "oxideav-aac",
  "oxideav-ac3",
  "oxideav-adpcm",
- "oxideav-ape",
  "oxideav-ass",
  "oxideav-av1",
  "oxideav-avi",
@@ -372,7 +412,6 @@ dependencies = [
  "oxideav-mpeg4video",
  "oxideav-mpegts",
  "oxideav-msmpeg4",
- "oxideav-musepack",
  "oxideav-ogg",
  "oxideav-opus",
  "oxideav-s3m",
@@ -387,7 +426,6 @@ dependencies = [
  "oxideav-vp6",
  "oxideav-vp8",
  "oxideav-vp9",
- "oxideav-wavpack",
  "oxideav-wma",
  "refcheck",
  "subs-bitmap",
@@ -1050,14 +1088,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-ape"
-version = "0.0.4"
-source = "git+https://github.com/OxideAV/oxideav-ape?rev=ea6e8ca2848b18716a49ca6de0fe4d8d26d4893a#ea6e8ca2848b18716a49ca6de0fe4d8d26d4893a"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
 name = "oxideav-ass"
 version = "0.0.9"
 source = "git+https://github.com/OxideAV/oxideav-ass?rev=e89607612ef19285c60b84f51ce5d34c72a493b1#e89607612ef19285c60b84f51ce5d34c72a493b1"
@@ -1080,7 +1110,7 @@ dependencies = [
 [[package]]
 name = "oxideav-avi"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-avi?rev=b919db191b3bc6f5da0fe250e660b37c231d1c26#b919db191b3bc6f5da0fe250e660b37c231d1c26"
+source = "git+https://github.com/ayooooo123/oxideav-avi?rev=941c480806700fd9833b405a8c47efe60ccd75d1#941c480806700fd9833b405a8c47efe60ccd75d1"
 dependencies = [
  "oxideav-core",
 ]
@@ -1088,7 +1118,7 @@ dependencies = [
 [[package]]
 name = "oxideav-basic"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-basic?rev=33120ba15b5cf1aa91061662dbf43826153a3fd3#33120ba15b5cf1aa91061662dbf43826153a3fd3"
+source = "git+https://github.com/ayooooo123/oxideav-basic?rev=b7329a9198fab533fabe6d8d9b5a408eeb77cec4#b7329a9198fab533fabe6d8d9b5a408eeb77cec4"
 dependencies = [
  "oxideav-core",
 ]
@@ -1224,7 +1254,7 @@ dependencies = [
 [[package]]
 name = "oxideav-iff"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-iff?rev=c054ff2d42a347be36b2c2ba4b0d9490932c210f#c054ff2d42a347be36b2c2ba4b0d9490932c210f"
+source = "git+https://github.com/ayooooo123/oxideav-iff?rev=50e0fc05c1c13303df6c9d212e7046f5eb2a3ea5#50e0fc05c1c13303df6c9d212e7046f5eb2a3ea5"
 dependencies = [
  "oxideav-core",
 ]
@@ -1265,7 +1295,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mkv"
 version = "0.0.11"
-source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=5f9ac53c713d1265be26d21704e0bba77d3d1462#5f9ac53c713d1265be26d21704e0bba77d3d1462"
+source = "git+https://github.com/ayooooo123/oxideav-mkv?rev=0de83f90bd7a9390a893ad92d9992057d90ca5ae#0de83f90bd7a9390a893ad92d9992057d90ca5ae"
 dependencies = [
  "compcol",
  "oxideav-core",
@@ -1282,7 +1312,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mov"
 version = "0.0.6"
-source = "git+https://github.com/ayooooo123/oxideav-mov?rev=1fdfe210e151058b36ce570692a557e3829b2de1#1fdfe210e151058b36ce570692a557e3829b2de1"
+source = "git+https://github.com/ayooooo123/oxideav-mov?rev=3cb57f8548867149753f340f3470c281bec36010#3cb57f8548867149753f340f3470c281bec36010"
 dependencies = [
  "compcol",
  "oxideav-core",
@@ -1358,14 +1388,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-musepack"
-version = "0.0.4"
-source = "git+https://github.com/OxideAV/oxideav-musepack?rev=c60b07708683e0e25c6e0007bffbb887e03876f7#c60b07708683e0e25c6e0007bffbb887e03876f7"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
 name = "oxideav-ogg"
 version = "0.1.9"
 source = "git+https://github.com/ayooooo123/oxideav-ogg?rev=0f651ce5b48fef181dfb5100495aef978d42ac3f#0f651ce5b48fef181dfb5100495aef978d42ac3f"
@@ -1376,7 +1398,7 @@ dependencies = [
 [[package]]
 name = "oxideav-opus"
 version = "0.0.14"
-source = "git+https://github.com/ayooooo123/oxideav-opus?rev=5573fa9ac3136c62e68199e877bff754432c89f9#5573fa9ac3136c62e68199e877bff754432c89f9"
+source = "git+https://github.com/ayooooo123/oxideav-opus?rev=6a27d5bd7ec3081eadc527cb610336b7d6d2f32e#6a27d5bd7ec3081eadc527cb610336b7d6d2f32e"
 dependencies = [
  "oxideav-core",
 ]
@@ -1539,14 +1561,6 @@ dependencies = [
 name = "oxideav-vp9"
 version = "0.0.13"
 source = "git+https://github.com/ayooooo123/oxideav-vp9?rev=35a7c43234e04c2d8d12e1cd6a2fda41be5e411e#35a7c43234e04c2d8d12e1cd6a2fda41be5e411e"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
-name = "oxideav-wavpack"
-version = "0.0.3"
-source = "git+https://github.com/OxideAV/oxideav-wavpack?rev=148aed0f4a5403738a963915019082accfdfab44#148aed0f4a5403738a963915019082accfdfab44"
 dependencies = [
  "oxideav-core",
 ]

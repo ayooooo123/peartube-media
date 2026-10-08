@@ -4,9 +4,11 @@
 //! DV (IEC 61834, SMPTE 314M DV25/DVCPRO50, SMPTE 370M DVCPRO HD) for
 //! PearTube media: the `dvvideo` decoder (libavcodec/dvdec.c with dv.c,
 //! dvdata.c, dv_profile.c and the C simple IDCT), the `dvaudio` decoder
-//! (dvaudiodec.c, Ulead DV audio in WAV and AVI) and the raw `dv`
-//! demuxer (libavformat/dv.c), which emits each DIF frame as a video
-//! packet and the frame's audio as 16-bit PCM, as FFmpeg does.
+//! (dvaudiodec.c for Ulead DV audio in WAV and AVI; dv.c's audio
+//! extraction for the whole DIF frames of QuickTime's DV audio tracks and
+//! type-1 DV AVI) and the raw `dv` demuxer (libavformat/dv.c), which emits
+//! each DIF frame as a video packet and the frame's audio as 16-bit PCM,
+//! as FFmpeg does.
 //!
 //! The decoder's IDCT is FFmpeg's C simple IDCT: on arm64 FFmpeg's own
 //! default is NEON code that rounds differently, so reference tests run
@@ -46,8 +48,9 @@ fn make_audio_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 }
 
 /// Registers the `dvvideo` decoder under every DV FourCC and `dvaudio`
-/// under its WAVE format tags (riff.c; FFmpeg's MOV demuxer turns its
-/// 'vdva' and 'dvca' tracks into PCM itself).
+/// under its WAVE format tags (riff.c) and QuickTime's DV audio sample
+/// entries 'vdva' and 'dvca' (isom_tags.c), whose whole DIF frames FFmpeg's
+/// MOV demuxer turns into PCM as the decoder does here.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("dvvideo_sw")
         .with_lossy(true)
@@ -67,7 +70,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .capabilities(caps)
             .with_resolution_priority(PRIORITY)
             .decoder(make_audio_decoder)
-            .tags([CodecTag::wave_format(0x0215), CodecTag::wave_format(0x0216)]),
+            .tags([CodecTag::wave_format(0x0215), CodecTag::wave_format(0x0216), CodecTag::fourcc(b"vdva"), CodecTag::fourcc(b"dvca")]),
     );
 }
 

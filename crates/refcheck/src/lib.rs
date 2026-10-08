@@ -146,6 +146,9 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
             Err(e) => panic!("demux: {e}"),
         }
     }
+    // The last packet's span ends before the drain: drained frames take that
+    // packet's trims frame by frame, as libavcodec's do.
+    out.trimmer.drain(&mut out.kept);
     decoder.flush().unwrap_or_else(|e| panic!("flush: {e}"));
     out.drain(&mut decoder, &stream);
     out.trimmer.finish(&mut out.kept);

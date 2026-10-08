@@ -12,8 +12,8 @@ directory.
 
 | File | Video | Why |
 |---|---|---|
-| `V-codecs/I263/i263.avi` | Intel H.263, 352x240 | loop filter, custom size from the container, dummy frames |
-| `V-codecs/I263/i263_2.avi` | Intel H.263, 320x240 | the same with long vectors |
+| `V-codecs/I263/i263.avi` | Intel H.263, 352x240 | loop filter, custom size from the container, dummy frames; MP3 stored by the byte (`strh.dwSampleSize` 1), played in `tests/player.rs` |
+| `V-codecs/I263/i263_2.avi` | Intel H.263, 320x240 | the same with long vectors; 16-bit PCM |
 | `V-codecs/h263/{baikonur_r7_overflight,baikonur_r7_rollout,iss_soyuztm32_launch,pooch,100374}.mov` | H.263 CIF in QuickTime | long vectors, a real encoder's streams |
 
 The archive's raw `V-codecs/h263/h263-raw/messenger.h263` is left out: it
