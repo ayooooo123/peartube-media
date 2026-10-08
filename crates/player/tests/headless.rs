@@ -1907,4 +1907,132 @@ fn untimed_raw_mpeg_switches_to_software_decoding() {
     }
 }
 
+#[test]
+fn untimed_pictures_continue_the_timeline_in_realtime() {
+    let _cpu = realtime_test();
+    // H.264 with B-pictures in MPEG-PS: FFmpeg's parser times only some
+    // access units, so most decoded pictures carry no timestamp. They must
+    // follow the previous picture by its duration, as FFmpeg's consumers
+    // place them, instead of piling up at time zero and arriving late.
+    let bytes = ffmpeg_file("vob", &[
+        "-f", "lavfi", "-i", "testsrc=size=176x144:rate=25:duration=2",
+        "-c:v", "libx264", "-bf", "2", "-g", "25", "-pix_fmt", "yuv420p", "-f", "vob",
+    ]);
+    let path = tempfile("vob");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    std::fs::remove_file(&path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    assert!(video.pts.len() >= 45, "only {} of 50 pictures shown ({} late)", video.pts.len(), state.dropped_frames);
+    assert!(video.pts.windows(2).all(|w| w[0] < w[1]), "pictures out of order: {:?}", video.pts);
+    assert!(video.pts.last().copied().unwrap_or_default() >= Duration::from_millis(1880), "timeline ended at {:?}", video.pts.last());
+}
 
+#[test]
+fn video_without_container_size_plays_at_the_decoded_size() {
+    // A raw H.264 stream declares no picture size; only the decoder knows
+    // it. Every picture must still reach the sink at that size, matching
+    // FFmpeg, and the player state must report it.
+    let bytes = ffmpeg_file("h264", &[
+        "-f", "lavfi", "-i", "testsrc=size=176x144:rate=25:duration=1",
+        "-c:v", "libx264", "-bf", "0", "-pix_fmt", "yuv420p",
+    ]);
+    let path = tempfile("h264");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let options = PlayerOptions { realtime: false, ..PlayerOptions::default() };
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), options, |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    assert_eq!(state.video_size, Some((176, 144)), "decoded size not published");
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    assert_eq!((video.width, video.height), (176, 144), "sink not opened at the decoded size");
+    let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &[]);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(expected.len(), 25);
+    assert_eq!(video.frame_md5, expected, "pictures differ from FFmpeg");
+}
+
+/// Plays `bytes`, a `ext` file that declares no picture size, and checks
+/// that the player state reports the decoded `size`, that the sink was
+/// opened at it, and that every picture equals FFmpeg's decode (run with
+/// `ffmpeg_input_args`).
+fn assert_plays_at_decoded_size(ext: &str, bytes: Vec<u8>, size: (u32, u32), frames: usize, ffmpeg_input_args: &[&str]) {
+    let path = tempfile(ext);
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let options = PlayerOptions { realtime: false, ..PlayerOptions::default() };
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), options, |_| {});
+    let (_, state) = sample_until(&player, Duration::from_secs(30), finished);
+    drop(player);
+    let expected = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", ffmpeg_input_args);
+    std::fs::remove_file(&path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{ext}: {state:?}");
+    assert_eq!(state.video_size, Some(size), "{ext}: decoded size not published");
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    assert_eq!((video.width, video.height), size, "{ext}: sink not opened at the decoded size");
+    assert_eq!(expected.len(), frames, "{ext}: FFmpeg frame count");
+    assert_eq!(video.frame_md5, expected, "{ext}: pictures differ from FFmpeg");
+}
+
+/// An odd-size test card: one second at 25 fps, cropped from whole blocks.
+const ODD_TESTSRC: &str = "testsrc=size=33x17:rate=25:duration=1";
+
+#[test]
+fn raw_hevc_plays_at_the_cropped_decoded_size() {
+    // x265 codes 4:2:0 only at even sizes; 34×18 is still cropped from the
+    // 40×24 its coding blocks cover.
+    let bytes = ffmpeg_file("hevc", &[
+        "-f", "lavfi", "-i", "testsrc=size=34x18:rate=25:duration=1", "-pix_fmt", "yuv420p",
+        "-c:v", "libx265", "-x265-params", "log-level=error:bframes=2",
+    ]);
+    assert_plays_at_decoded_size("hevc", bytes, (34, 18), 25, &[]);
+}
+
+/// An IVF file of `codec` whose file header declares a 0×0 picture.
+fn ivf_without_size(codec: &[&str]) -> Vec<u8> {
+    let mut args = vec!["-f", "lavfi", "-i", ODD_TESTSRC, "-pix_fmt", "yuv420p"];
+    args.extend_from_slice(codec);
+    let mut bytes = ffmpeg_file("ivf", &args);
+    assert_eq!(&bytes[..4], b"DKIF");
+    // Width and height, 16 bits each, at bytes 12..16.
+    bytes[12..16].fill(0);
+    bytes
+}
+
+#[test]
+fn ivf_vp8_without_size_plays_at_the_decoded_size() {
+    let bytes = ivf_without_size(&["-c:v", "libvpx", "-b:v", "200k"]);
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, &[]);
+}
+
+#[test]
+fn ivf_vp9_without_size_plays_at_the_decoded_size() {
+    let bytes = ivf_without_size(&["-c:v", "libvpx-vp9", "-b:v", "200k"]);
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, &[]);
+}
+
+#[test]
+fn ivf_av1_without_size_plays_at_the_decoded_size() {
+    let bytes = ivf_without_size(&["-c:v", "libaom-av1", "-cpu-used", "8", "-b:v", "200k"]);
+    assert_plays_at_decoded_size("ivf", bytes, (33, 17), 25, &[]);
+}
+
+#[test]
+fn ts_mpeg4_plays_at_the_decoded_size() {
+    // MPEG-TS names MPEG-4 Part 2 video `mpeg4` and declares no picture
+    // size; the `mpeg4` alias reaches the mpeg4video decoder, which
+    // reports the VOL's 33×17. FFmpeg compares with its C simple IDCT, the
+    // one the decoder ports (arm64 FFmpeg defaults to NEON, which rounds
+    // differently).
+    let bytes = ffmpeg_file("ts", &["-f", "lavfi", "-i", ODD_TESTSRC, "-c:v", "mpeg4", "-bf", "2", "-q:v", "4"]);
+    assert_plays_at_decoded_size("ts", bytes, (33, 17), 25, &["-idct", "simple"]);
+}

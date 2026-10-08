@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 oxideav-core.workspace = true
+demux-seek-core.workspace = true
 
 [dev-dependencies]
 refcheck.workspace = true

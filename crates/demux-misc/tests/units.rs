@@ -4,10 +4,10 @@
 //!   is timed from its own header, like every unit before it: a file of
 //!   one frame has a timestamp and seeks to it, and a last E-AC-3 frame
 //!   with fewer blocks lasts those blocks, not the frame before it;
-//! - H.264 SEI payload type and size codes sum without wrapping: a sum
-//!   past 32 bits rejects the SEI instead of reading a valid-looking type
-//!   or size out of the overflow, and a real recovery point still flags
-//!   its access unit key.
+//! - H.264 SEI payload type and size codes sum as FFmpeg sums them, in
+//!   32 bits (h264_sei.c: an int type and an unsigned size): a sum past
+//!   2^32 wraps, so its access unit is key exactly where FFmpeg's parser
+//!   reads a recovery point out of it.
 
 use oxideav_core::{Demuxer, Error, Packet};
 use refcheck::fate;
@@ -99,30 +99,40 @@ fn nal(header: u8, body: &[u8]) -> Vec<u8> {
     [&[0, 0, 0, 1, header][..], body].concat()
 }
 
-/// The key flag of the access unit made of an SEI NAL carrying `message`
-/// and a P slice (first_mb 0, slice_type 0, pps 0) with no parameter
-/// sets: key only for a recovery point.
-fn key_flag(message: &[u8]) -> bool {
+/// The access unit made of an SEI NAL carrying `message` and a P slice
+/// (first_mb 0, slice_type 0, pps 0) with no parameter sets: our key
+/// flag, and that of FFmpeg's parser (ffprobe) on the same raw stream.
+fn key_flags(name: &str, message: &[u8]) -> (bool, bool) {
     let mut stream = nal(0x06, &[message, &[0x80]].concat());
     stream.extend(nal(0x41, &[0xE0, 0x00]));
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("demux-misc-units-{}-{name}.h264", std::process::id()));
+    std::fs::write(&path, &stream).unwrap();
+    let out = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-f", "h264", "-show_entries", "packet=flags", "-of", "csv=p=0"])
+        .arg(&path)
+        .output()
+        .expect("ffprobe must be on PATH");
+    let _ = std::fs::remove_file(&path);
+    let flags = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(flags.lines().count(), 1, "{name}: FFmpeg's one access unit: {flags:?}");
     let (_, packets) = demux("h264", stream);
-    assert_eq!(packets.len(), 1, "one access unit");
-    packets[0].flags.keyframe
+    assert_eq!(packets.len(), 1, "{name}: one access unit");
+    (packets[0].flags.keyframe, flags.starts_with('K'))
 }
 
 /// Payload type and size are sums of bytes, 255 meaning "more follows".
-/// 16843009 bytes of 255 then 7 sum to 2^32 + 6, which a 32-bit sum reads
-/// as 6, a recovery point; then 2^32 + 1 as a size, which it reads as 1.
-/// Both are unrepresentable and reject the SEI. A recovery point stays a
-/// key, another message type does not make one.
+/// 16843009 bytes of 255 then 7 sum to 2^32 + 6, which FFmpeg's 32-bit
+/// sum reads as 6, a recovery point; 2^32 + 1 as a size reads as 1. A
+/// recovery point is key, another message type is not.
 #[test]
-fn sei_type_and_size_sums_never_wrap() {
-    assert!(key_flag(&[6, 1, 0x80]), "recovery point with recovery_frame_cnt 0");
-    assert!(!key_flag(&[5, 1, 0x80]), "user data unregistered");
-
+fn sei_type_and_size_sums_wrap_as_ffmpegs() {
     let run = vec![0xFF; 16_843_009];
-    let wrapped_type = [&run[..], &[7, 1, 0x80]].concat();
-    assert!(!key_flag(&wrapped_type), "payload type 2^32 + 6 is no recovery point");
-    let wrapped_size = [&[6][..], &run, &[2, 0x80]].concat();
-    assert!(!key_flag(&wrapped_size), "payload size 2^32 + 1 is no 1-byte recovery point");
+    for (name, message, key) in [
+        ("recovery-point", vec![6, 1, 0x80], true),
+        ("user-data", vec![5, 1, 0x80], false),
+        ("wrapped-type", [&run[..], &[7, 1, 0x80]].concat(), true),
+        ("wrapped-size", [&[6][..], &run, &[2, 0x80]].concat(), true),
+    ] {
+        assert_eq!(key_flags(name, &message), (key, key), "{name}: (ours, FFmpeg's) key flags");
+    }
 }

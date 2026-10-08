@@ -1,0 +1,16 @@
+[package]
+name = "demux-mxf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+repository.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+# Playback of MXF samples through the engine.
+codecs = { path = "../codecs" }
+player = { path = "../player" }

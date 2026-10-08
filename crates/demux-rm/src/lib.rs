@@ -1,4 +1,5 @@
-// Ported from FFmpeg libavformat/rmdec.c, rmsipr.c, rm.c, commit 2da55bf
+// Ported from FFmpeg libavformat/rmdec.c, rmsipr.c and rm.c (seeking over
+// demux-seek-core's seek.c), commit 2da55bf
 // License: GNU Lesser General Public License (LGPL) version 2.1 or later
 
 #![forbid(unsafe_code)]

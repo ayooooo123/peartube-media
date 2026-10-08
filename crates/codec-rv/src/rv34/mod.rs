@@ -16,7 +16,7 @@ mod vlc_tables;
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock};
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, Result};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, PixelFormat, Result};
 
 use crate::bits::{mid_pred, BitReader, INVALID_VLC};
 use crate::picture::{check_dimensions, Plane};
@@ -449,7 +449,11 @@ pub struct Rv34Decoder {
     tmp_y: [[u8; 256]; 2],
     tmp_uv: [[[u8; 64]; 2]; 2],
 
-    ready: VecDeque<Frame>,
+    /// Output frames not yet returned, each with the size it was cropped
+    /// to (`set_dimensions` drops the references when the size changes).
+    ready: VecDeque<(Frame, (u32, u32))>,
+    /// Size of the frame `receive_frame` last returned.
+    last_output: Option<(u32, u32)>,
 }
 
 /// Result of decoding a slice (`rv34_decode_slice`'s return value).
@@ -520,6 +524,7 @@ impl Rv34Decoder {
             tmp_y: [[0; 256]; 2],
             tmp_uv: [[[0; 64]; 2]; 2],
             ready: VecDeque::new(),
+            last_output: None,
         };
         if width > 0 && height > 0 && check_dimensions(width, height).is_ok() {
             d.set_dimensions(width, height);
@@ -1555,16 +1560,22 @@ impl Rv34Decoder {
     fn finish_frame(&mut self) {
         self.mb_num_left = 0;
         let Some(cur) = self.cur.take() else { return };
+        let size = self.output_size();
         if self.pict_type == PICT_B {
             let f = self.output_frame(&cur);
-            self.ready.push_back(f);
+            self.ready.push_back((f, size));
         } else {
             if let Some(last) = &self.last {
                 let f = self.output_frame(last);
-                self.ready.push_back(f);
+                self.ready.push_back((f, size));
             }
             self.next = Some(Arc::new(cur));
         }
+    }
+
+    /// The size `output_frame` crops to (`check_dimensions` bounds it).
+    fn output_size(&self) -> (u32, u32) {
+        (self.g.width as u32, self.g.height as u32)
     }
 
     /// `ff_mpv_frame_start` for the new picture.
@@ -1760,14 +1771,27 @@ impl Decoder for Rv34Decoder {
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        self.ready.pop_front().ok_or(Error::NeedMore)
+        let (frame, size) = self.ready.pop_front().ok_or(Error::NeedMore)?;
+        self.last_output = Some(size);
+        Ok(frame)
+    }
+
+    /// The frame last returned; before the first, the next queued one.
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        self.last_output
+            .or_else(|| self.ready.front().map(|(_, size)| *size))
+            .filter(|&(w, h)| w > 0 && h > 0)
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output_video_dimensions().map(|_| PixelFormat::Yuv420P)
     }
 
     fn flush(&mut self) -> Result<()> {
         // "special case for last picture": output the delayed reference.
         if let Some(next) = self.next.take() {
             let f = self.output_frame(&next);
-            self.ready.push_back(f);
+            self.ready.push_back((f, self.output_size()));
         }
         Ok(())
     }
@@ -1778,6 +1802,7 @@ impl Decoder for Rv34Decoder {
         self.last = None;
         self.next = None;
         self.ready.clear();
+        self.last_output = None;
         self.mb_num_left = 0;
         self.mb_x = 0;
         self.mb_y = 0;

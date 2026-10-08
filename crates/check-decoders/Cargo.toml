@@ -1,0 +1,18 @@
+[package]
+name = "check-decoders"
+description = "Regression tests: OxideAV decoder forks (H.264, MP2, AC-3) against FFmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+refcheck.workspace = true
+
+[dev-dependencies]
+demux-misc = { path = "../demux-misc" }
+# The forks under test (pinned in the workspace [patch.crates-io]).
+oxideav-h264.workspace = true
+oxideav-mp2.workspace = true
+oxideav-ac3.workspace = true

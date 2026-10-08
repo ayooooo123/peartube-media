@@ -19,6 +19,7 @@ use oxideav_core::{
 };
 
 use crate::parser::{returned, Ac3, AudioClock, Parser};
+use demux_seek_core::{read_on, Allowance, Index};
 
 const SYNCWORD_AC3: u16 = 0x0B77;
 
@@ -174,17 +175,17 @@ pub fn parse_ac3_header(buf: &[u8]) -> Option<Ac3Header> {
     }
 }
 
-/// Parse `buf` assuming the byte-swapped (0x770B) byte order.
+/// Parse `buf` assuming the byte-swapped (0x770B) byte order: its first 8
+/// bytes swapped in pairs, as ac3_eac3_probe does (ac3dec.c:58-64), bytes
+/// past its end read as the zero padding of FFmpeg's probe buffer.
 fn parse_ac3_header_swapped(buf: &[u8]) -> Option<Ac3Header> {
-    let len = buf.len().min(64);
-    let mut tmp = [0u8; 64];
-    for i in (0..len).step_by(2) {
-        tmp[i] = buf[i + 1];
-        if i + 1 < len {
-            tmp[i + 1] = buf[i];
-        }
+    let byte = |i: usize| buf.get(i).copied().unwrap_or(0);
+    let mut tmp = [0u8; 8];
+    for i in (0..8).step_by(2) {
+        tmp[i] = byte(i + 1);
+        tmp[i + 1] = byte(i);
     }
-    parse_ac3_header(&tmp[..len])
+    parse_ac3_header(&tmp)
 }
 
 /// Mirror of ac3_eac3_probe (ac3dec.c): chase syncframes from every
@@ -296,10 +297,26 @@ pub struct Ac3Demuxer {
     format_name: &'static str,
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
-    codec: &'static str,
     parser: Parser<Ac3>,
     clock: AudioClock,
     queue: VecDeque<Packet>,
+    /// Where each queued packet's frame starts in the input.
+    positions: VecDeque<i64>,
+    pos: i64,
+    eof: bool,
+    /// AVFMT_GENERIC_INDEX: every frame returned (all are key frames).
+    index: Index,
+    /// What the seek under way may still read.
+    allowance: Allowance,
+}
+
+/// Where reading was, given back when a seek fails.
+struct Reading {
+    at: u64,
+    parser: Parser<Ac3>,
+    clock: AudioClock,
+    queue: VecDeque<Packet>,
+    positions: VecDeque<i64>,
     pos: i64,
     eof: bool,
 }
@@ -341,16 +358,19 @@ fn open_ac3_inner(
         duration: None,
         start_time: Some(0),
     };
+    let allowance = Allowance::default();
     Ok(Box::new(Ac3Demuxer {
         format_name,
-        input,
+        input: Box::new(allowance.meter(input)),
         streams: vec![stream],
-        codec,
         parser: Parser::new(Ac3::new(codec)),
         clock: AudioClock::new(1, 90_000, 33),
         queue: VecDeque::new(),
+        positions: VecDeque::new(),
         pos: 0,
         eof: false,
+        index: Index::default(),
+        allowance,
     }))
 }
 
@@ -376,6 +396,7 @@ impl Ac3Demuxer {
             }
             n += got;
         }
+        self.allowance.spend(1, 0)?;
         let mut units = Vec::new();
         if n == 0 {
             self.eof = true;
@@ -388,10 +409,69 @@ impl Ac3Demuxer {
             self.pos += n as i64;
         }
         for unit in units {
+            let pos = unit.pos;
             let packet = self.clock.stamp(unit, 0, TIME_BASE, &mut self.queue);
             self.queue.push_back(packet);
+            self.positions.push_back(pos);
         }
         Ok(())
+    }
+
+    /// Reads on from `pos` with a fresh parser (ff_read_frame_flush), the
+    /// clock at `ts` (avpriv_update_cur_dts) or, without one, as at open.
+    fn restart(&mut self, pos: i64, ts: Option<i64>) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos as u64))?;
+        // What the parser set on the codec context outlives it.
+        self.parser = Parser::new(self.parser.split.reset());
+        self.clock = AudioClock::new(1, 90_000, 33);
+        if let Some(ts) = ts {
+            self.clock.seeked(ts);
+        }
+        self.queue.clear();
+        self.positions.clear();
+        self.pos = pos;
+        self.eof = false;
+        Ok(())
+    }
+
+    /// Reading as it stands, moved out for a seek to give back if it fails.
+    fn take_reading(&mut self) -> Result<Reading> {
+        let fresh = Parser::new(self.parser.split.reset());
+        Ok(Reading {
+            at: self.input.stream_position()?,
+            parser: std::mem::replace(&mut self.parser, fresh),
+            clock: std::mem::replace(&mut self.clock, AudioClock::new(1, 90_000, 33)),
+            queue: std::mem::take(&mut self.queue),
+            positions: std::mem::take(&mut self.positions),
+            pos: self.pos,
+            eof: self.eof,
+        })
+    }
+
+    fn give_back(&mut self, reading: Reading) -> Result<()> {
+        self.input.seek(SeekFrom::Start(reading.at))?;
+        (self.parser, self.clock, self.queue, self.positions) = (reading.parser, reading.clock, reading.queue, reading.positions);
+        (self.pos, self.eof) = (reading.pos, reading.eof);
+        Ok(())
+    }
+
+    /// seek_frame_generic from the index search's result `found`.
+    fn land(&mut self, timestamp: i64, mut found: Option<usize>) -> Result<i64> {
+        if found.is_none() || found == Some(self.index.entries().len() - 1) {
+            match self.index.entries().last().copied() {
+                Some(last) => self.restart(last.pos, Some(last.timestamp))?,
+                None => self.restart(0, None)?,
+            }
+            // Every frame is a key frame.
+            read_on(timestamp, || self.next_packet().map(|p| (true, p.dts)))?;
+            found = self.index.search(timestamp, true);
+        }
+        let Some(i) = found else {
+            return Err(Error::invalid("ac3: no frame to seek to"));
+        };
+        let e = self.index.entries()[i];
+        self.restart(e.pos, Some(e.timestamp))?;
+        Ok(e.timestamp)
     }
 }
 
@@ -407,8 +487,13 @@ impl Demuxer for Ac3Demuxer {
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
             if let Some(mut packet) = self.queue.pop_front() {
+                let pos = self.positions.pop_front().unwrap_or(-1);
                 packet.pts = returned(packet.pts);
                 packet.dts = returned(packet.dts);
+                // av_read_frame indexes every key packet it returns.
+                if let Some(dts) = packet.dts {
+                    self.index.add(pos, dts, 0, 0, true);
+                }
                 return Ok(packet);
             }
             if self.eof {
@@ -418,27 +503,25 @@ impl Demuxer for Ac3Demuxer {
         }
     }
 
-    /// Raw streams have no index: read again from the start up to the
-    /// first frame at or after `pts`.
-    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
-        self.input.seek(SeekFrom::Start(0))?;
-        self.parser = Parser::new(Ac3::new(self.codec));
-        self.clock = AudioClock::new(1, 90_000, 33);
-        self.queue.clear();
-        self.pos = 0;
-        self.eof = false;
-        loop {
-            let packet = match self.next_packet() {
-                Ok(packet) => packet,
-                Err(Error::Eof) => return Ok(pts),
-                Err(e) => return Err(e),
-            };
-            let at = packet.pts.unwrap_or(i64::MIN);
-            if at >= pts {
-                self.queue.push_front(packet);
-                return Ok(at);
-            }
+    /// seek.c seek_frame_generic with AVSEEK_FLAG_BACKWARD over the index
+    /// of the frames returned so far (ac3dec.c: AVFMT_GENERIC_INDEX). Past
+    /// its last entry the frames are read on, within the seek's
+    /// allowance, until one starts after the target; reading resumes at
+    /// the last frame at or before it, timed from there as FFmpeg times
+    /// it. A seek that fails leaves reading where it was.
+    fn seek_to(&mut self, _stream_index: u32, timestamp: i64) -> Result<i64> {
+        let found = self.index.search(timestamp, true);
+        if found.is_none() && self.index.entries().first().is_some_and(|e| timestamp < e.timestamp) {
+            return Err(Error::invalid("ac3: seek before the first frame"));
         }
+        let reading = self.take_reading()?;
+        self.allowance.start();
+        let landed = self.land(timestamp, found);
+        let landed = self.allowance.finish(landed);
+        if landed.is_err() {
+            self.give_back(reading)?;
+        }
+        landed
     }
 }
 

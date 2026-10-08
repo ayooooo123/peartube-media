@@ -293,12 +293,13 @@ const BASE: u64 = 900_000;
 
 /// The frames of `name` as one DTS elementary stream in MPEG-TS, cut
 /// every way a muxer may cut it; one frame per PES is the control. Each
-/// cut decodes to FFmpeg's PCM and frame sizes, every frame at its own
-/// presentation time: a PES's PTS belongs to the first frame that starts
-/// in it (ISO/IEC 13818-1 2.4.3.7), the others follow it. FFmpeg's
-/// timestamps are that timeline, except where a PES boundary splits a
-/// sync word: its parser then fetches a frame's PTS from the PES in which
-/// it saw the frame before end, the next one, and runs a frame late.
+/// cut decodes to FFmpeg's PCM, frame sizes and frame times. A PES's PTS
+/// belongs to the first frame that starts in it (ISO/IEC 13818-1
+/// 2.4.3.7), the others follow it, and FFmpeg's timestamps are that
+/// timeline, except where a PES boundary splits a sync word: its parser
+/// then fetches a frame's PTS from the PES in which it saw the frame
+/// before end, the next one, and runs a frame late. The TS demuxer runs
+/// FFmpeg's DTS parser, so its frames are FFmpeg's there too.
 fn repacketized_like_ffmpeg(name: &str) {
     let frames = dtshd_frames(name);
     let rate = frames[0].time_base.den();
@@ -337,8 +338,8 @@ fn repacketized_like_ffmpeg(name: &str) {
             failures.push(format!("{what}: FFmpeg's frames {theirs:?} are not the timeline {timeline:?}"));
         } else if ours.errors != 0 {
             failures.push(format!("{what}: {} decode errors", ours.errors));
-        } else if ours.frames != timeline {
-            failures.push(format!("{what}: frames (pts, samples) {:?}, timeline {timeline:?}", ours.frames));
+        } else if ours.frames != if what == "cut inside the sync word" { theirs.clone() } else { timeline.clone() } {
+            failures.push(format!("{what}: frames (pts, samples) {:?}, FFmpeg's {theirs:?}", ours.frames));
         } else {
             assert_pcm_matches(&format!("{name}, {what}"), &path, &ours);
         }

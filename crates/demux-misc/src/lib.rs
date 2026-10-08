@@ -5,8 +5,9 @@
 //! 2da55bf), with the libavcodec parsers that cut its packets, except
 //! SMF, which follows the MIDI 1.0 spec.
 //!
-//! Stream discovery finishes at open. Program streams retain PES video,
-//! parse MPEG audio / AC-3 into decoder-sized frames, and assemble DVD
+//! Stream discovery finishes at open. Program streams retain PES video
+//! except H.264, which comes out in FFmpeg's access units; they parse
+//! MPEG audio / AC-3 into decoder-sized frames, and assemble DVD
 //! subpictures separately. Raw E-AC-3 units include dependent substreams.
 //! PVA and NUT expose only the timestamps their containers carry; VOC
 //! leaves later ADPCM timestamps unknown when no duration is available.
@@ -15,13 +16,16 @@
 //! FFmpeg source with its built ffmpeg and ffprobe at FFMPEG_SRC
 //! (revision 2da55bf). The inventory expands tests/fate/*.mak and rejects
 //! missing inputs. Raw video compares complete access units and key flags;
-//! raw MPEG-1/2 also FFmpeg's timestamps and durations. Raw AVC/HEVC
-//! timing is unchanged: units are numbered, not timed as FFmpeg does.
+//! raw MPEG-1/2, H.264 and HEVC also FFmpeg's timestamps and durations
+//! (H.264 and HEVC are untimed, as FFmpeg leaves them).
 #![forbid(unsafe_code)]
 
 mod ac3;
+mod av1_cbs;
 mod h264;
+mod h264_parse;
 mod hevc;
+mod hevc_parse;
 mod ivf;
 mod mpegps;
 mod mpegvideo;

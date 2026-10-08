@@ -48,11 +48,18 @@ pub struct Decoded {
     /// stream can change layout mid-way (LATM stereo to 5.1, HE-AAC mono
     /// until parametric stereo starts), so each frame is read in its own.
     pub frame_formats: Vec<Option<AudioFormat>>,
+    /// `Decoder::output_video_dimensions` and `output_pixel_format` as
+    /// reported right after each frame of `frames` was received: one entry
+    /// per frame, in the same order.
+    pub frame_video_layouts: Vec<VideoLayout>,
     pub frames: Vec<Frame>,
     /// Trims that could not be applied. Nonzero counts report a mismatch
     /// even when untrimmed fallback output happens to match a reference.
     pub trim_fallbacks: audio_trim::Fallbacks,
 }
+
+/// A decoder's report of a video frame's visible size and pixel format.
+pub type VideoLayout = (Option<(u32, u32)>, Option<PixelFormat>);
 
 /// The container the player's probe rule picks for `path` (engine-api.md):
 /// the best content probe when it scores at least an extension match,
@@ -116,7 +123,13 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
         .first_decoder(&decoder_params)
         .unwrap_or_else(|e| panic!("no decoder for {:?}: {e}", stream.params.codec_id));
     let trimmer = Trimmer::with_decoder_delay(decoder_delay);
-    let mut out = Output { frames: Vec::new(), frame_formats: Vec::new(), trimmer, kept: Vec::new() };
+    let mut out = Output {
+        frames: Vec::new(),
+        frame_formats: Vec::new(),
+        frame_video_layouts: Vec::new(),
+        trimmer,
+        kept: Vec::new(),
+    };
     loop {
         match demuxer.next_packet() {
             Ok(packet) if packet.stream_index == stream.index => {
@@ -140,8 +153,45 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
     if !trim_fallbacks.is_empty() {
         eprintln!("{}: audio trim mismatch: {trim_fallbacks:?}", path.display());
     }
-    let Output { frames, frame_formats, .. } = out;
-    Decoded { params: stream.params, audio_format: decoder.output_audio_format(), frame_formats, frames, trim_fallbacks }
+    let Output { frames, frame_formats, frame_video_layouts, .. } = out;
+    Decoded {
+        params: stream.params,
+        audio_format: decoder.output_audio_format(),
+        frame_formats,
+        frame_video_layouts,
+        frames,
+        trim_fallbacks,
+    }
+}
+
+/// Asserts that every frame of `decoded` has the size and layout its decoder
+/// reported right after returning it: the luma plane holds at least
+/// `width` samples per row and `height` rows, and every plane fits the
+/// format's plane geometry. Returns the distinct reported layouts, in order.
+pub fn assert_reports_match_frames(decoded: &Decoded, name: &str) -> Vec<((u32, u32), PixelFormat)> {
+    let mut layouts: Vec<((u32, u32), PixelFormat)> = Vec::new();
+    for (i, (frame, report)) in decoded.frames.iter().zip(&decoded.frame_video_layouts).enumerate() {
+        let Frame::Video(vf) = frame else { panic!("{name}: frame {i} is not video") };
+        let (Some((w, h)), Some(format)) = *report else {
+            panic!("{name}: frame {i}: decoder reported {report:?}");
+        };
+        let planes = vf.image_planes();
+        assert_eq!(planes.len(), format.plane_count(), "{name}: frame {i} planes");
+        for (p, plane) in planes.iter().enumerate() {
+            let (_, rows) = format.plane_dimensions(p, w, h).expect("plane geometry");
+            let row = format.plane_row_bytes(p, w).expect("plane row bytes");
+            assert!(plane.stride >= row, "{name}: frame {i} plane {p}: stride {} < {row}", plane.stride);
+            assert!(
+                plane.data.len() >= plane.stride * (rows as usize - 1) + row,
+                "{name}: frame {i} plane {p}: {} bytes for {rows} rows of {row}",
+                plane.data.len()
+            );
+        }
+        if layouts.last() != Some(&((w, h), format)) {
+            layouts.push(((w, h), format));
+        }
+    }
+    layouts
 }
 
 /// What `decode` keeps: frames (with the decoder's layout report for each)
@@ -149,6 +199,9 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
 struct Output {
     frames: Vec<Frame>,
     frame_formats: Vec<Option<AudioFormat>>,
+    /// The decoder's video report right after each frame of `frames`
+    /// (`(None, None)` for audio frames).
+    frame_video_layouts: Vec<VideoLayout>,
     trimmer: Trimmer<Piece>,
     kept: Vec<Piece>,
 }
@@ -181,6 +234,7 @@ impl Output {
                 frame => {
                     self.frames.push(frame);
                     self.frame_formats.push(reported);
+                    self.frame_video_layouts.push((decoder.output_video_dimensions(), decoder.output_pixel_format()));
                 }
             }
         }
@@ -190,6 +244,7 @@ impl Output {
         for piece in self.kept.drain(..) {
             self.frames.push(Frame::Audio(piece.frame));
             self.frame_formats.push(piece.reported);
+            self.frame_video_layouts.push((None, None));
         }
     }
 }
@@ -586,6 +641,7 @@ mod tests {
             trim_fallbacks: audio_trim::Fallbacks::default(),
             audio_format: Some(format(SampleFormat::F32P, 2)),
             frame_formats: vec![Some(format(SampleFormat::S16, 1)), Some(format(SampleFormat::F32P, 2))],
+            frame_video_layouts: vec![(None, None); 2],
             frames: vec![
                 audio(2, vec![s16_plane(&[16384, -16384])]),
                 audio(
@@ -611,6 +667,7 @@ mod tests {
             trim_fallbacks: audio_trim::Fallbacks::default(),
             audio_format: None,
             frame_formats: vec![None],
+            frame_video_layouts: vec![(None, None)],
             frames: vec![audio(2, vec![s16_plane(&[1, 2])])],
         };
         interleaved_f32(&decoded);

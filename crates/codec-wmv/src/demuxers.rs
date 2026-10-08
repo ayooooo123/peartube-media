@@ -1,8 +1,10 @@
-// Ported from FFmpeg libavformat/vc1dec.c, libavformat/vc1test.c, and
-// libavcodec/vc1_parser.c (commit 2da55bf).
+// Ported from FFmpeg libavformat/vc1dec.c, libavformat/vc1test.c,
+// libavcodec/vc1_parser.c, and seek.c's seek_frame_generic over
+// demux-seek-core (commit 2da55bf).
 // License: LGPL-2.1-or-later.
 
 use std::io::{Read, Seek, SeekFrom};
+use demux_seek_core::{read_on, Allowance, Index};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, ContainerRegistry, Demuxer, Error,
     Packet, ProbeData, ProbeScore, Rational, ReadSeek, Result, StreamInfo,
@@ -15,6 +17,67 @@ use crate::bits::BitReader;
 pub const CODEC_ID_VC1: &str = "vc1";
 /// Codec id of the WMV3 (VC-1 Simple/Main) streams in `.rcv` files.
 pub const CODEC_ID_WMV3: &str = "wmv3";
+
+// ───────────────────────── Generic index (seek.c) ─────────────────────────
+
+/// A demuxer seekable the way seek.c seek_frame_generic seeks it
+/// (AVFMT_GENERIC_INDEX: av_read_frame indexes each key packet it
+/// returns).
+trait GenericSeek {
+    /// Where reading was, for a failed seek to give back.
+    type Reading;
+    fn index(&self) -> &Index;
+    /// The next packet (indexing it when key), with its key flag and dts.
+    fn read(&mut self) -> Result<(bool, Option<i64>)>;
+    /// Read on from `pos` (ff_read_frame_flush), the dts at `ts`
+    /// (avpriv_update_cur_dts) or, at the start of the data, where opening
+    /// left it.
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()>;
+    fn data_offset(&self) -> u64;
+    fn allowance(&mut self) -> &mut Allowance;
+    fn take_reading(&mut self) -> Result<Self::Reading>;
+    fn give_back(&mut self, reading: Self::Reading) -> Result<()>;
+}
+
+/// seek_frame_generic with AVSEEK_FLAG_BACKWARD: the last key packet at
+/// or before `ts` among those returned so far; past the last of them
+/// packets are read on, within the seek's allowance, until a key packet
+/// starts after the target or more than 1000 others did. A seek that
+/// fails leaves reading where it was.
+fn seek_generic<D: GenericSeek>(d: &mut D, ts: i64) -> Result<i64> {
+    let found = d.index().search(ts, true);
+    if found.is_none() && d.index().entries().first().is_some_and(|e| ts < e.timestamp) {
+        return Err(Error::invalid("seek before the first key frame"));
+    }
+    let reading = d.take_reading()?;
+    d.allowance().start();
+    let landed = land(d, ts, found);
+    let landed = d.allowance().finish(landed);
+    if landed.is_err() {
+        d.give_back(reading)?;
+    }
+    landed
+}
+
+fn land<D: GenericSeek>(d: &mut D, ts: i64, mut found: Option<usize>) -> Result<i64> {
+    if found.is_none() || found == Some(d.index().entries().len() - 1) {
+        match d.index().entries().last().copied() {
+            Some(e) => d.restart(e.pos as u64, Some(e.timestamp))?,
+            None => {
+                let at = d.data_offset();
+                d.restart(at, None)?
+            }
+        }
+        read_on(ts, || d.read())?;
+        found = d.index().search(ts, true);
+    }
+    let Some(i) = found else {
+        return Err(Error::invalid("no key frame to seek to"));
+    };
+    let e = d.index().entries()[i];
+    d.restart(e.pos as u64, Some(e.timestamp))?;
+    Ok(e.timestamp)
+}
 
 // ───────────────────────── VC-1 Test Format (.rcv) ─────────────────────────
 
@@ -38,6 +101,11 @@ pub struct Vc1TestDemuxer {
     streams: Vec<StreamInfo>,
     fps: u32,
     pts: i64,
+    /// Where the frames start.
+    data_offset: u64,
+    index: Index,
+    /// What the seek under way may still read.
+    allowance: Allowance,
 }
 
 impl Vc1TestDemuxer {
@@ -91,25 +159,22 @@ impl Vc1TestDemuxer {
             start_time: Some(0),
         };
 
+        let data_offset = input.stream_position().map_err(Error::Io)?;
+        let allowance = Allowance::default();
         Ok(Self {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             fps,
             pts: 0,
+            data_offset,
+            index: Index::default(),
+            allowance,
         })
     }
-}
 
-impl Demuxer for Vc1TestDemuxer {
-    fn format_name(&self) -> &str {
-        "vc1test"
-    }
-
-    fn streams(&self) -> &[StreamInfo] {
-        &self.streams
-    }
-
-    fn next_packet(&mut self) -> Result<Packet> {
+    /// vc1t_read_packet: one frame and where its frame header starts.
+    fn read_frame(&mut self) -> Result<(Packet, u64)> {
+        let pos = self.input.stream_position().map_err(Error::Io)?;
         let mut hdr = [0u8; 8];
         match self.input.read_exact(&mut hdr) {
             Ok(()) => {}
@@ -120,6 +185,7 @@ impl Demuxer for Vc1TestDemuxer {
         let frame_size = (hdr[0] as usize) | ((hdr[1] as usize) << 8) | ((hdr[2] as usize) << 16);
         let keyframe = (hdr[3] & 0x80) != 0;
         let file_pts = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        self.allowance.spend(1, 0)?;
 
         let mut data = vec![0u8; frame_size];
         self.input.read_exact(&mut data).map_err(Error::Io)?;
@@ -142,9 +208,71 @@ impl Demuxer for Vc1TestDemuxer {
             data,
         };
         pkt.flags.keyframe = keyframe;
-        Ok(pkt)
+        if let (true, Some(dts)) = (keyframe, pkt.dts) {
+            self.index.add(pos as i64, dts, 0, 0, true);
+        }
+        Ok((pkt, pos))
+    }
+}
+
+impl GenericSeek for Vc1TestDemuxer {
+    /// The input position and the frame counter.
+    type Reading = (u64, i64);
+
+    fn index(&self) -> &Index {
+        &self.index
     }
 
+    fn read(&mut self) -> Result<(bool, Option<i64>)> {
+        let (pkt, _) = self.read_frame()?;
+        Ok((pkt.flags.keyframe, pkt.dts))
+    }
+
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos)).map_err(Error::Io)?;
+        self.pts = ts.unwrap_or(0);
+        Ok(())
+    }
+
+    fn data_offset(&self) -> u64 {
+        self.data_offset
+    }
+
+    fn allowance(&mut self) -> &mut Allowance {
+        &mut self.allowance
+    }
+
+    fn take_reading(&mut self) -> Result<(u64, i64)> {
+        Ok((self.input.stream_position()?, self.pts))
+    }
+
+    fn give_back(&mut self, (at, pts): (u64, i64)) -> Result<()> {
+        self.input.seek(SeekFrom::Start(at))?;
+        self.pts = pts;
+        Ok(())
+    }
+}
+
+impl Demuxer for Vc1TestDemuxer {
+    fn format_name(&self) -> &str {
+        "vc1test"
+    }
+
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> Result<Packet> {
+        Ok(self.read_frame()?.0)
+    }
+
+    /// vc1test.c is AVFMT_GENERIC_INDEX: seek.c seek_frame_generic over
+    /// the key frames the file flags. FFmpeg times frames only with a
+    /// millisecond time base or without B-frame delay, and cannot seek the
+    /// others; this demuxer numbers their frames and seeks those too.
+    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+        seek_generic(self, pts)
+    }
 }
 
 // ───────────────────────── Raw VC-1 Elementary Stream (.vc1) ─────────────────────────
@@ -363,12 +491,20 @@ impl Vc1EsHeaders {
             None => VC1_TIME_BASE / 25,
         }
     }
+
+    /// After a seek FFmpeg's new parser knows no sequence header yet; the
+    /// frame rate it set is the codec context's, which stays.
+    fn reset(&self) -> Self {
+        Self { framerate: self.framerate, ..Self::default() }
+    }
 }
 
 pub struct Vc1Demuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     buffer: Vec<u8>,
+    /// Where `buffer` starts in the input.
+    buffer_pos: u64,
     /// Next buffer offset the frame-boundary search examines.
     scan: usize,
     /// A frame or field start code was seen in the pending packet
@@ -377,10 +513,26 @@ pub struct Vc1Demuxer {
     eof_reached: bool,
     headers: Vc1EsHeaders,
     next_dts: i64,
+    index: Index,
+    /// What the seek under way may still read.
+    allowance: Allowance,
+}
+
+/// Where the raw VC-1 parser was, given back when a seek fails.
+struct Vc1Reading {
+    at: u64,
+    buffer: Vec<u8>,
+    buffer_pos: u64,
+    scan: usize,
+    pic_found: bool,
+    eof_reached: bool,
+    headers: Vc1EsHeaders,
+    next_dts: i64,
 }
 
 impl Vc1Demuxer {
     pub fn open(mut input: Box<dyn ReadSeek>) -> Result<Self> {
+        let buffer_pos = input.stream_position().map_err(Error::Io)?;
         let mut buffer = vec![0u8; 16384];
         let n = input.read(&mut buffer).map_err(Error::Io)?;
         buffer.truncate(n);
@@ -404,15 +556,19 @@ impl Vc1Demuxer {
             duration: None,
             start_time: Some(0),
         };
+        let allowance = Allowance::default();
         Ok(Self {
-            input,
+            input: Box::new(allowance.meter(input)),
             streams: vec![stream],
             buffer,
+            buffer_pos,
             scan: 0,
             pic_found: false,
             eof_reached: n == 0,
             headers: Vc1EsHeaders::default(),
             next_dts: 0,
+            index: Index::default(),
+            allowance,
         })
     }
 
@@ -445,6 +601,8 @@ impl Vc1Demuxer {
     /// dts advances by each frame's duration, I pictures are key frames.
     /// FFmpeg leaves the pts of some frames unset; ours equals the dts.
     fn packet(&mut self, data: Vec<u8>) -> Packet {
+        let pos = self.buffer_pos;
+        self.buffer_pos += data.len() as u64;
         self.headers.scan(&data);
         let duration = self.headers.duration();
         let ts = self.next_dts;
@@ -459,7 +617,66 @@ impl Vc1Demuxer {
             data,
         };
         pkt.flags.keyframe = self.headers.key;
+        if pkt.flags.keyframe {
+            self.index.add(pos as i64, ts, 0, 0, true);
+        }
         pkt
+    }
+}
+
+impl GenericSeek for Vc1Demuxer {
+    type Reading = Vc1Reading;
+
+    fn index(&self) -> &Index {
+        &self.index
+    }
+
+    fn read(&mut self) -> Result<(bool, Option<i64>)> {
+        let pkt = self.next_packet()?;
+        Ok((pkt.flags.keyframe, pkt.dts))
+    }
+
+    /// A new parser at `pos`; its frames timed from `ts` on, or from 0 at
+    /// the start of the data, at the frame rate the codec context kept.
+    fn restart(&mut self, pos: u64, ts: Option<i64>) -> Result<()> {
+        self.input.seek(SeekFrom::Start(pos)).map_err(Error::Io)?;
+        self.buffer.clear();
+        self.buffer_pos = pos;
+        self.scan = 0;
+        self.pic_found = false;
+        self.eof_reached = false;
+        self.headers = self.headers.reset();
+        self.next_dts = ts.unwrap_or(0);
+        Ok(())
+    }
+
+    fn data_offset(&self) -> u64 {
+        0
+    }
+
+    fn allowance(&mut self) -> &mut Allowance {
+        &mut self.allowance
+    }
+
+    fn take_reading(&mut self) -> Result<Vc1Reading> {
+        let headers = self.headers.reset();
+        Ok(Vc1Reading {
+            at: self.input.stream_position()?,
+            buffer: std::mem::take(&mut self.buffer),
+            buffer_pos: self.buffer_pos,
+            scan: self.scan,
+            pic_found: self.pic_found,
+            eof_reached: self.eof_reached,
+            headers: std::mem::replace(&mut self.headers, headers),
+            next_dts: self.next_dts,
+        })
+    }
+
+    fn give_back(&mut self, r: Vc1Reading) -> Result<()> {
+        self.input.seek(SeekFrom::Start(r.at))?;
+        (self.buffer, self.buffer_pos, self.scan, self.pic_found) = (r.buffer, r.buffer_pos, r.scan, r.pic_found);
+        (self.eof_reached, self.headers, self.next_dts) = (r.eof_reached, r.headers, r.next_dts);
+        Ok(())
     }
 }
 
@@ -488,10 +705,12 @@ impl Demuxer for Vc1Demuxer {
                     let data = std::mem::take(&mut self.buffer);
                     return Ok(self.packet(data));
                 }
+                self.buffer_pos += self.buffer.len() as u64;
                 self.buffer.clear();
                 return Err(Error::Eof);
             }
             let n = self.input.read(&mut chunk).map_err(Error::Io)?;
+            self.allowance.spend(1, 0)?;
             if n == 0 {
                 self.eof_reached = true;
             } else {
@@ -501,6 +720,12 @@ impl Demuxer for Vc1Demuxer {
                 self.buffer.extend_from_slice(&chunk[..n]);
             }
         }
+    }
+
+    /// vc1dec.c is FF_DEF_RAWVIDEO_DEMUXER2 with AVFMT_GENERIC_INDEX:
+    /// seek.c seek_frame_generic over the I pictures the parser flags.
+    fn seek_to(&mut self, _stream_index: u32, pts: i64) -> Result<i64> {
+        seek_generic(self, pts)
     }
 }
 

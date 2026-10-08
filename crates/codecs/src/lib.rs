@@ -3,7 +3,7 @@
 //! Decoder factories are first-registered-wins; install our replacements first.
 //! Container factories are keyed by name; install our replacements last.
 
-use oxideav_core::RuntimeContext;
+use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, RuntimeContext};
 
 /// A context holding every container and decoder the player can use.
 pub fn context() -> RuntimeContext {
@@ -23,9 +23,13 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         subs_text::register_codecs,
         // Every PGS, DVB, DVD, CVD and OGT id, ahead of oxideav-sub-image.
         subs_bitmap::register_codecs,
+        // EIA-608 and CEA-708 caption triplets (the engine feeds them).
+        subs_cc::register_codecs,
         codec_rv::register_codecs,
         codec_wmv::register_codecs,
         codec_wma::lib_registration::register_codecs,
+        // ALAC, QDM2, QDMC, MACE 3:1 and 6:1.
+        codec_apple_audio::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }
@@ -93,6 +97,13 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     // MIDI registers its synth only; its decoder plays with the built-in
     // tone instruments.
     oxideav_midi::register_codecs(&mut ctx.codecs);
+    // MPEG-TS and MPEG-PS name MPEG-4 Part 2 video `mpeg4` (FFmpeg's id);
+    // its decoder registers as `mpeg4video`.
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("mpeg4"))
+            .capabilities(CodecCapabilities::video("mpeg4video_sw"))
+            .decoder(oxideav_mpeg4video::make_decoder),
+    );
 
     for register in [
         codec_mlp::register_containers,
@@ -103,7 +114,7 @@ pub fn register_all(ctx: &mut RuntimeContext) {
     ] {
         register(&mut ctx.containers);
     }
-    for register in [demux_asf::register, demux_misc::register, demux_rm::register] {
+    for register in [demux_asf::register, demux_misc::register, demux_rm::register, demux_mxf::register, codec_dv::register] {
         register(ctx);
     }
 }
