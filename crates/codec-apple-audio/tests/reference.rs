@@ -24,16 +24,13 @@ use std::path::{Path, PathBuf};
 
 use oxideav_core::{Frame, MediaType, SampleFormat};
 use refcheck::{decode, fate};
-use support::{archive, caf_remux, ffmpeg, generated, run, track_caf, REGISTRARS};
+use support::{archive, caf_remux, ffmpeg, generated, pinned, run, track_caf, REGISTRARS};
 
 /// FFmpeg 2da55bf's decode of the first audio stream through its C code
 /// paths, as signed 32-bit samples.
 fn ffmpeg_s32(path: &Path) -> Vec<i32> {
-    let src = std::env::var_os("FFMPEG_SRC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
     let args = ["-cpuflags", "0", "-i", path.to_str().unwrap(), "-map", "0:a:0", "-f", "s32le", "-c:a", "pcm_s32le", "-"];
-    run(&src.join("ffmpeg"), &args)
+    run(&pinned("ffmpeg"), &args)
         .chunks_exact(4)
         .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
