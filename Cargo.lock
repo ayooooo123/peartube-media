@@ -171,6 +171,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-ape"
+version = "0.1.0"
+dependencies = [
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-apple-audio"
 version = "0.1.0"
 dependencies = [
