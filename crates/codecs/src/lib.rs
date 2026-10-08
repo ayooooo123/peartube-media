@@ -32,6 +32,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_wma::lib_registration::register_codecs,
         // ALAC, QDM2, QDMC, MACE 3:1 and 6:1.
         codec_apple_audio::register_codecs,
+        // ATRAC1, ATRAC3 (AL) and ATRAC3+ (AL).
+        codec_atrac::register_codecs,
         // VP5, VP6, VP6F and VP6A, ahead of oxideav-vp6.
         codec_vp56::register_codecs,
         // AMR-NB, AMR-WB and QCELP.
@@ -119,6 +121,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         subs_bitmap::register_containers,
         // The amr and qcp demuxers.
         codec_speech::register_containers,
+        // AEA (MD STUDIO) and OMA (Sony OpenMG).
+        codec_atrac::register_containers,
     ] {
         register(&mut ctx.containers);
     }
