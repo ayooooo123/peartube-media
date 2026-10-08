@@ -51,6 +51,39 @@ Release builds compile dependencies and this workspace's cold crates at `opt-lev
 
 Leaving TLS out (rustls, ring and the webpki roots, through `oxideav-http`'s `tls` feature) saves another 0.86 MB raw, 0.54 MB deflated, in the Android `libmain.so`.
 
+### PVA audio and MPEG-2 concealment
+
+The PVA demuxer splits audio PES payloads into MP2 frames and resets that
+parser on seek; video PES payloads remain unparsed. FATE's
+`pva/PVA_test-partial.pva` now returns all 84 audio frames / 96,768 samples
+per channel instead of 21 frames / 24,192 samples. The MP2 fork also accepts
+grouped or fragmented byte chunks, fixing the same loss in MP2-in-WAV.
+Its WAV layer probe distinguishes Layer II from the shared `0x0050` tag's
+Layer-I fallback. Input remains compressed until receive, bounded at
+8 MiB / 4096 chunks; only an incomplete final EOF frame is zero-padded.
+
+The MPEG-1/2 fork ports FFmpeg 2da55bf's 4:2:0 frame-picture decoding and
+error concealment: retain decoded macroblocks, reconstruct missing motion/DC
+data, smooth damaged edges, then display or rotate reference pictures.
+All **37 PVA pictures**, including its cut-off B picture, match FFmpeg
+`-idct simple`. Downloaded 4:2:0 chroma quantizers use the shared luma
+matrices. Macroblock attempts across all slices are capped at twice the
+picture grid, alongside the existing compressed-input and geometry limits.
+
+`demux-misc` tests `pva_video` and `mpeg2_damage` check complete frame/sample
+output, eight clean/damaged/truncated I/P/B TS cases, and 2000 fixed-seed
+slice mutations with bounded draining and reset. Actual headless Player
+smoke passes PVA, its MP2-in-WAV remux and all eight TS cases.
+
+Remaining limits: MP2's floating synthesis is not FFmpeg's fixed-point
+decoder; PVA and its WAV remux each differ at 48,421 of 193,536 interleaved
+samples, by at most 1 LSB. This is not PCM-bit-exact acceptance and the
+corpus's strict audio policies are unchanged. Field pictures and
+4:2:2 / 4:4:4 retain the previous reconstruction/error behavior, without the
+new concealment port. The PVA seek check still excludes parsed audio at
+18979.75 s, where FFmpeg's parser/discovery read-ahead produces a different
+landing; its video and the other three audio targets are compared.
+
 ### Matroska packet compatibility
 
 The MKV fork follows at most two SeekHeads (one target per other master),
