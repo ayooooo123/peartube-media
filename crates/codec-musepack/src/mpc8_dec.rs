@@ -113,8 +113,24 @@ pub struct Mpc8Decoder {
     last_max_band: usize,
     q: [[i32; MPC_FRAME_SIZE]; 2],
     queue: VecDeque<Frame>,
+    /// The packet being decoded (see [`Pending`]).
+    pending: Option<Pending>,
     bands: [Band; BANDS],
     codec_id: CodecId,
+}
+
+/// The packet the decoder is working through. FFmpeg's mpc8_decode_frame
+/// decodes one frame per call and reports the bytes it used, so a packet's
+/// frames (up to 16384) come out one at a time as the caller receives them,
+/// never all at once.
+struct Pending {
+    data: Vec<u8>,
+    /// Where the next frame starts.
+    bit_pos: u32,
+    /// The packet's pts, for its first frame only.
+    pts: Option<i64>,
+    /// Frames still allowed in the packet.
+    left: usize,
 }
 
 impl Mpc8Decoder {
@@ -140,7 +156,7 @@ impl Mpc8Decoder {
             return Err(Error::unsupported("mpc8: multichannel unsupported"));
         }
         let mss = gb.get_bits1() != 0;
-        let frames = 1usize << ((gb.get_bits(3) & 3) * 2);
+        let frames = 1usize << (gb.get_bits(3) * 2);
 
         Ok(Self {
             synth: MpaSynth::new(),
@@ -156,6 +172,7 @@ impl Mpc8Decoder {
             last_max_band: 0,
             q: [[0; MPC_FRAME_SIZE]; 2],
             queue: VecDeque::new(),
+            pending: None,
             bands: [Band::default(); BANDS],
             codec_id: CodecId::new("musepack8"),
         })
@@ -413,6 +430,22 @@ impl Mpc8Decoder {
 
         Ok(true)
     }
+
+    /// Decodes the next frame of the pending packet into the queue.
+    fn decode_pending(&mut self) -> Result<()> {
+        let Some(mut p) = self.pending.take() else { return Ok(()) };
+        let mut gb = BitReader::new(&p.data, p.data.len());
+        gb.skip_bits(p.bit_pos);
+        let more = self.decode_one_frame(&mut gb, p.pts.take())?;
+        p.left -= 1;
+        p.bit_pos = gb.bits_count();
+        if more && gb.bits_left() >= 8 && p.left > 0 {
+            self.pending = Some(p);
+        } else {
+            self.cur_frame = 0;
+        }
+        Ok(())
+    }
 }
 
 impl Decoder for Mpc8Decoder {
@@ -432,25 +465,20 @@ impl Decoder for Mpc8Decoder {
         if packet.data.is_empty() {
             return Ok(());
         }
-
-        let mut gb = BitReader::new(&packet.data, packet.data.len());
-        self.cur_frame = 0;
-
-        let mut pts = packet.pts;
-        for _ in 0..self.frames.min(64) {
-            if !self.decode_one_frame(&mut gb, pts.take())? {
-                break;
-            }
-            if gb.bits_left() < 8 {
-                break;
-            }
+        // Frames of an earlier packet the caller has not received yet come
+        // first, so none is lost.
+        while self.pending.is_some() {
+            self.decode_pending()?;
         }
-
         self.cur_frame = 0;
+        self.pending = Some(Pending { data: packet.data.to_vec(), bit_pos: 0, pts: packet.pts, left: self.frames });
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        if self.queue.is_empty() {
+            self.decode_pending()?;
+        }
         self.queue.pop_front().ok_or(Error::NeedMore)
     }
 
@@ -467,6 +495,7 @@ impl Decoder for Mpc8Decoder {
         self.last_max_band = 0;
         self.q = [[0; MPC_FRAME_SIZE]; 2];
         self.queue.clear();
+        self.pending = None;
         self.bands = [Band::default(); BANDS];
         Ok(())
     }
@@ -474,4 +503,35 @@ impl Decoder for Mpc8Decoder {
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Mpc8Decoder::new(params)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frames from one packet of `fill` bytes, for a stream whose header
+    /// (44.1 kHz, 28 bands, stereo) declares `frames_code` (`frames = 1 <<
+    /// (code * 2)`).
+    fn frames_from_one_packet(frames_code: u8, fill: u8) -> usize {
+        let mut params = CodecParameters::audio(CodecId::new("musepack8"));
+        params.extradata = vec![0x1B, 0x10 | frames_code];
+        let mut dec = Mpc8Decoder::new(&params).expect("decoder");
+        let packet = Packet::new(0, oxideav_core::TimeBase::new(1, 44100), vec![fill; 8192]);
+        dec.send_packet(&packet).expect("send");
+        let mut n = 0;
+        while dec.receive_frame().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    /// A packet holds as many frames as the stream header allows, up to
+    /// 16384 (mpc8.c:176 `c->frames = 1 << (get_bits(&gb, 3) * 2)`), and
+    /// they all come out: here 64 for a 64-frame header, and every frame the
+    /// 8 KiB packet holds (more than 64) for a 16384-frame one.
+    #[test]
+    fn a_packet_yields_as_many_frames_as_the_header_allows() {
+        assert_eq!(frames_from_one_packet(3, 0xFF), 64);
+        assert!(frames_from_one_packet(7, 0xFF) > 64);
+    }
 }
