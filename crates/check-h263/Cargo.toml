@@ -1,0 +1,18 @@
+[package]
+name = "check-h263"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+# The player's registry, with the fork under test (pinned in the
+# workspace [patch.crates-io]) and the AVI and MOV demuxers.
+codecs = { path = "../codecs" }
