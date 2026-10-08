@@ -2,6 +2,11 @@
 //! 8 channels, versions 0 to 3, the embedded WAVE or AIFF/AIFC header) and
 //! the raw `shn` demuxer.
 //!
+//! Packets remain compressed until `receive_frame` decodes one block.
+//! `flush` only signals the end: subsequent receives finish pending packets
+//! and drain buffered blocks, preserving the bit position between calls.
+//! Repeated flush/drain calls do not duplicate output; `reset` drops it.
+//!
 //! Ported from FFmpeg (commit 2da55bf): libavcodec/shorten.c and the
 //! readers it uses (get_bits.h, golomb.h, bytestream.h), libavformat/
 //! shortendec.c and rawdec.c. Licensed under LGPL-2.1-or-later (see
