@@ -1,4 +1,5 @@
 // Copyright (C) 2006 Evgeniy Stepanov <eugeni.stepanov@gmail.com>
+// Copyright (C) 2011 Grigori Goronzy <greg@chown.ath.cx>
 // Copyright (C) 2015 Vabishchevich Nikolay <vabnick@gmail.com>
 //
 // Permission to use, copy, modify, and distribute this software for any

@@ -1,5 +1,5 @@
 // Copyright (C) 2006 Evgeniy Stepanov <eugeni.stepanov@gmail.com>
-// Copyright (C) 2009 Grigori Goronzy <greg@geekmind.org>
+// Copyright (C) 2011 Grigori Goronzy <greg@chown.ath.cx>
 //
 // Permission to use, copy, modify, and distribute this software for any
 // purpose with or without fee is hereby granted, provided that the above
