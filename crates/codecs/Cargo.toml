@@ -82,6 +82,7 @@ codec-dv = { path = "../codec-dv" }
 codec-atrac = { path = "../codec-atrac" }
 codec-vp56 = { path = "../codec-vp56" }
 codec-speex = { path = "../codec-speex" }
+codec-svq3 = { path = "../codec-svq3" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }
