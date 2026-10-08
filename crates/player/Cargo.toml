@@ -17,6 +17,9 @@ probe = []
 audio-trim = { path = "../audio-trim" }
 oxideav-core.workspace = true
 oxideav-http.workspace = true
+# The reorder depth an H.264 stream declares, for seeking as fftools does
+# (engine `seek_position`).
+oxideav-h264.workspace = true
 oxideav-ass = { workspace = true, features = ["render"] }
 oxideav-subtitle = { workspace = true, features = ["text"] }
 md5 = "0.7"
@@ -51,7 +54,6 @@ objc2-ui-kit = "0.3"
 [dev-dependencies]
 oxideav-mp4.workspace = true
 oxideav-ogg.workspace = true
-oxideav-h264.workspace = true
 parking_lot = "0.12"
 codecs = { path = "../codecs" }
 refcheck = { path = "../refcheck" }

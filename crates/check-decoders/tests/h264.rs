@@ -87,6 +87,55 @@ fn pictures_before_the_recovery_point_are_withheld() {
     assert_eq!(ours, theirs);
 }
 
+/// An x264 open-GOP stream without recovery point SEIs (I frames every 2 s,
+/// three references, two B frames), entered at a non-IDR I frame as after
+/// a seek. FFmpeg makes gap frames for the frame_nums it never saw (gray,
+/// then copies), substitutes a default reference for missing list
+/// entries, and judges the unmarked-random-access heuristic on the
+/// references that leaves; it takes frames out for output by its
+/// reorder depth, which decides the frames recovered after it.
+///
+/// The cuts are raw Annex B with the parameter sets in every packet, so
+/// both decoders start from the same bytes (a container cut would carry
+/// them in its avcC, which FFmpeg's Annex B filter adds only at IDR
+/// pictures).
+///
+/// * At the 2 s I frame (frame_num 1): one gap frame, the heuristic
+///   recovers it; FFmpeg shows 148 of the 152 frames. The decoder used
+///   to drop the leading B frame (a missing reference) and then refuse
+///   every later picture for its frame_num.
+/// * At the 4 s I frame (frame_num 4): four gap frames fill the DPB, the
+///   heuristic fails, and FFmpeg shows nothing.
+#[test]
+fn entering_an_open_gop_stream_at_a_non_idr_i_frame_matches_ffmpeg() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let full = dir.join(format!("{}-opengop.mkv", std::process::id()));
+    let x264 = "keyint=50:min-keyint=50:scenecut=0:open-gop=1:ref=3:bframes=2";
+    let status = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=8"])
+        .args(["-c:v", "libx264", "-preset", "medium", "-x264-params", x264])
+        .args(["-bsf:v", "filter_units=remove_types=6", "-f", "matroska"])
+        .arg(&full)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for (first_packet, frames) in [(48, 148), (100, 0)] {
+        let cut = dir.join(format!("{}-opengop-from-{first_packet}.h264", std::process::id()));
+        let filters = format!("noise=drop=lt(n\\,{first_packet}),h264_mp4toannexb,dump_extra=freq=all");
+        let status = Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(&full)
+            .args(["-map", "0:v:0", "-c", "copy", "-bsf:v", &filters, "-f", "h264"])
+            .arg(&cut)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (ours, theirs) = (ours(&cut), theirs(&cut).unwrap());
+        assert_eq!(theirs.len(), frames, "FFmpeg's frames from packet {first_packet}");
+        assert_eq!(ours, theirs, "from packet {first_packet}");
+    }
+}
+
 /// Every H.264 sample FFmpeg's FATE decodes (tests/fate/h264.mak: the
 /// conformance suite and the feature samples, recovery-point streams
 /// included). The reinit-* streams change pixel format mid-stream, which
