@@ -1223,7 +1223,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mov"
 version = "0.0.6"
-source = "git+https://github.com/ayooooo123/oxideav-mov?rev=e322a799a95aa4d8c3ee6bf632d38ebb953b15d5#e322a799a95aa4d8c3ee6bf632d38ebb953b15d5"
+source = "git+https://github.com/ayooooo123/oxideav-mov?rev=c1e7719a39e436bf9690c0b1f5cffc93f421ea54#c1e7719a39e436bf9690c0b1f5cffc93f421ea54"
 dependencies = [
  "compcol",
  "oxideav-core",
