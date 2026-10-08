@@ -438,15 +438,20 @@ pub fn ffmpeg_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
     audio_f32(Path::new("ffmpeg"), path, nth)
 }
 
-/// [`ffmpeg_audio_f32`] from the FFmpeg the ports follow, commit 2da55bf:
-/// `$FFMPEG_SRC/ffmpeg`, default ~/projects/ffmpeg-src. The `ffmpeg` on
-/// PATH (9.0.2) predates some of its behavior, such as reading an iTunes
-/// MP3's gapless counts.
-pub fn ffmpeg_src_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
-    let src = std::env::var_os("FFMPEG_SRC")
+/// The FFmpeg the ports follow, commit 2da55bf: `$FFMPEG_SRC/ffmpeg`,
+/// default ~/projects/ffmpeg-src. The `ffmpeg` on PATH (9.0.2) predates
+/// some of its behavior, such as reading an iTunes MP3's gapless counts.
+/// With `-cpuflags 0` it runs the C code paths a port reproduces.
+pub fn pinned_ffmpeg() -> PathBuf {
+    std::env::var_os("FFMPEG_SRC")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"));
-    audio_f32(&src.join("ffmpeg"), path, nth)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("projects/ffmpeg-src"))
+        .join("ffmpeg")
+}
+
+/// [`ffmpeg_audio_f32`] from [`pinned_ffmpeg`].
+pub fn ffmpeg_src_audio_f32(path: &Path, nth: usize) -> Vec<f32> {
+    audio_f32(&pinned_ffmpeg(), path, nth)
 }
 
 fn audio_f32(binary: &Path, path: &Path, nth: usize) -> Vec<f32> {
