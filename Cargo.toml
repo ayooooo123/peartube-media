@@ -202,7 +202,7 @@ oxideav-mp2 = { git = "https://github.com/ayooooo123/oxideav-mp2", rev = "1f335d
 oxideav-mp3 = { git = "https://github.com/ayooooo123/oxideav-mp3", rev = "ba94ce70a7e6ddb37f02713b3ca34ed5b39f7cf0" }
 oxideav-mp4 = { git = "https://github.com/ayooooo123/oxideav-mp4", rev = "350f323370d7567bc3505933a682c03ac2fe7169" }
 oxideav-mpeg12video = { git = "https://github.com/ayooooo123/oxideav-mpeg12video", rev = "9c4c24c2d336ffde2e23f29d55812e75c40d780a" }
-oxideav-mpeg4video = { git = "https://github.com/ayooooo123/oxideav-mpeg4video", rev = "a759321b87caef26a340186f04a86c8f4060ec15" }
+oxideav-mpeg4video = { git = "https://github.com/ayooooo123/oxideav-mpeg4video", rev = "7328e304a215025b415f6483a261dc9873bb7c9e" }
 oxideav-mpegts = { git = "https://github.com/ayooooo123/oxideav-mpegts", rev = "cae69e3c911a830b07e8e35b1b88e26f2e842b62" }
 oxideav-msmpeg4 = { git = "https://github.com/ayooooo123/oxideav-msmpeg4", rev = "def8962c09aa5d339dada2d2308c61186a67e074" }
 oxideav-ogg = { git = "https://github.com/ayooooo123/oxideav-ogg", rev = "0f651ce5b48fef181dfb5100495aef978d42ac3f" }
