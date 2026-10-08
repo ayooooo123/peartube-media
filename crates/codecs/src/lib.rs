@@ -40,6 +40,8 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         codec_speech::register_codecs,
         // Speex, ahead of oxideav-speex.
         codec_speex::register_codecs,
+        // DVD-Video and Blu-ray LPCM.
+        codec_lpcm::register_codecs,
     ] {
         register(&mut ctx.codecs);
     }

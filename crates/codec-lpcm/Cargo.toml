@@ -1,0 +1,15 @@
+[package]
+name = "codec-lpcm"
+description = "DVD-Video and Blu-ray LPCM decoders (pcm_dvd, pcm_bluray), ported from FFmpeg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+# The Player's registry, containers included.
+codecs = { path = "../codecs" }

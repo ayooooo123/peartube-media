@@ -103,6 +103,7 @@ dependencies = [
 name = "check-decoders"
 version = "0.1.0"
 dependencies = [
+ "codecs",
  "demux-misc",
  "oxideav-ac3",
  "oxideav-core",
@@ -213,6 +214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec-lpcm"
+version = "0.1.0"
+dependencies = [
+ "codecs",
+ "oxideav-core",
+ "refcheck",
+]
+
+[[package]]
 name = "codec-mlp"
 version = "0.1.0"
 dependencies = [
@@ -317,6 +327,7 @@ dependencies = [
  "codec-atrac",
  "codec-dca",
  "codec-dv",
+ "codec-lpcm",
  "codec-mlp",
  "codec-ra",
  "codec-rv",
@@ -1038,7 +1049,7 @@ dependencies = [
 [[package]]
 name = "oxideav-adpcm"
 version = "0.0.7"
-source = "git+https://github.com/OxideAV/oxideav-adpcm?rev=0802fb34c6c57bfa8913670fe78882547416fd16#0802fb34c6c57bfa8913670fe78882547416fd16"
+source = "git+https://github.com/ayooooo123/oxideav-adpcm?rev=9b406df6912068e06743cd04f8c2758ebf8c97f1#9b406df6912068e06743cd04f8c2758ebf8c97f1"
 dependencies = [
  "oxideav-core",
 ]
@@ -1082,7 +1093,7 @@ dependencies = [
 [[package]]
 name = "oxideav-basic"
 version = "0.0.10"
-source = "git+https://github.com/ayooooo123/oxideav-basic?rev=b7329a9198fab533fabe6d8d9b5a408eeb77cec4#b7329a9198fab533fabe6d8d9b5a408eeb77cec4"
+source = "git+https://github.com/ayooooo123/oxideav-basic?rev=609c78b793f7d303e21cff5d60e0fb98313ea288#609c78b793f7d303e21cff5d60e0fb98313ea288"
 dependencies = [
  "oxideav-core",
 ]
@@ -1337,7 +1348,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpegts"
 version = "0.0.3"
-source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=cae69e3c911a830b07e8e35b1b88e26f2e842b62#cae69e3c911a830b07e8e35b1b88e26f2e842b62"
+source = "git+https://github.com/ayooooo123/oxideav-mpegts?rev=cc1142280d1a3da64528887e5634ffe728a8395a#cc1142280d1a3da64528887e5634ffe728a8395a"
 dependencies = [
  "oxideav-core",
  "thiserror 2.0.21",
