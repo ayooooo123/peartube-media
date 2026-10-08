@@ -10,6 +10,7 @@ pub mod engine;
 pub mod headless;
 pub mod source;
 pub mod subs;
+mod webvtt;
 
 pub use engine::{Event, OpenError, Player, PlayerOptions, State, Track, TrackKind};
 pub use headless::{AudioCapture, Capture, Headless, SubtitleCapture, VideoCapture};

@@ -222,6 +222,7 @@ fn check_timing(format: &str, path: &std::path::Path, reference: &oracle::Refere
         beside_media: Box::new(|| false),
         stopped: stopped.clone(),
         retired: Arc::new(AtomicBool::new(false)),
+        webvtt: None,
     };
     let handle = std::thread::spawn(move || {
         let _consumer = consumer;
@@ -388,6 +389,7 @@ fn pipeline(stream: &StreamInfo, packets: &[Packet], setup: Setup) -> (TestThrea
         beside_media: Box::new(move || beside_media),
         stopped: stopped.clone(),
         retired: Arc::new(AtomicBool::new(false)),
+        webvtt: None,
     };
     let max_bytes = Arc::new(AtomicUsize::new(0));
     let sink = Box::new(CountSink { clock: clock.clone(), shows: tx, max_bytes: max_bytes.clone() });
