@@ -73,6 +73,7 @@ codec-rv = { path = "../codec-rv" }
 codec-wmv = { path = "../codec-wmv" }
 codec-wma = { path = "../codec-wma" }
 subs-bitmap = { path = "../subs-bitmap" }
+codec-dv = { path = "../codec-dv" }
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }
