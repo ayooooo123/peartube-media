@@ -123,7 +123,7 @@ impl AudioSink for AndroidAudioSink {
         let stream = {
             let mut state = self.clock.inner.lock();
             if !state.playing { return; }
-            state.held_frames = state.presented_frames();
+            state.observe();
             state.playing = false;
             state.stream.clone()
         };

@@ -5,6 +5,7 @@
 pub mod audio;
 pub mod backend;
 pub mod clock;
+mod position;
 pub mod subtitle;
 pub mod video;
 
