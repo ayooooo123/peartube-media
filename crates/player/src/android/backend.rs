@@ -2,7 +2,7 @@ use super::audio::AndroidAudioSink;
 use super::subtitle::AndroidSubtitleSink;
 use super::video::AndroidVideoSink;
 use crate::backend::{
-    AudioSink, Backend, Clock, SinkError, SubtitleImage, SubtitleSink, VideoSink,
+    AudioSink, Backend, Clock, PictureReady, SinkError, SubtitleImage, SubtitleSink, VideoSink,
 };
 use ndk::native_window::NativeWindow;
 use oxideav_core::{CodecParameters, Packet, VideoFrame};
@@ -135,12 +135,16 @@ struct VideoSinkWrapper {
 }
 
 impl VideoSink for VideoSinkWrapper {
-    fn open_compressed(&mut self, params: &CodecParameters) -> bool {
-        self.inner.lock().open_compressed(params)
+    fn open_compressed(&mut self, params: &CodecParameters, ready: PictureReady) -> bool {
+        self.inner.lock().open_compressed(params, ready)
     }
 
     fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
         self.inner.lock().push_packet(packet, pts, random_access)
+    }
+
+    fn present_from(&mut self, start: Duration) {
+        self.inner.lock().present_from(start)
     }
 
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> {

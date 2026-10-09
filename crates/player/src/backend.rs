@@ -86,17 +86,49 @@ pub trait AudioSink: Send {
     fn clock(&self) -> Arc<dyn Clock>;
 }
 
+/// How a sink that takes a stream compressed tells the engine its decoder
+/// has output a picture it will show: one at or after
+/// [`VideoSink::present_from`]. The engine holds the playback's clock until
+/// the first such picture after each start or seek is there, so the video
+/// starts with the audio instead of behind it while the decoder works
+/// through the pictures before it. Callable from any thread, for every
+/// picture or only the first.
+#[derive(Clone)]
+pub struct PictureReady(Arc<dyn Fn(Duration) + Send + Sync>);
+
+impl PictureReady {
+    pub fn new(report: impl Fn(Duration) + Send + Sync + 'static) -> PictureReady {
+        PictureReady(Arc::new(report))
+    }
+
+    /// The decoder output a picture to show at media time `pts`.
+    pub fn ready(&self, pts: Duration) {
+        (self.0)(pts)
+    }
+}
+
 /// Video output.
 pub trait VideoSink: Send {
     /// Offers the stream compressed. Return `true` to take it: the engine then
-    /// sends packets to `push_packet`. Return `false` to have the engine
-    /// decode in software and call `push_frame`.
-    fn open_compressed(&mut self, params: &CodecParameters) -> bool;
+    /// sends packets to `push_packet`, and the sink reports its decoder's
+    /// pictures to `ready`. Return `false` to have the engine decode in
+    /// software and call `push_frame`.
+    fn open_compressed(&mut self, params: &CodecParameters, ready: PictureReady) -> bool;
     /// One compressed access unit, in decode order; `pts` is its media
     /// presentation time. `random_access` combines the parser keyframe flag
     /// and the container's independent random-access indication. The sink
     /// decodes the unit and presents it on the clock.
     fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError>;
+    /// Compressed input: the pictures to show start at media time `start`.
+    /// The decoder still decodes those before it, which later pictures
+    /// predict from, but they are never shown: after a seek the ones before
+    /// the target, and the incomplete ones before a recovery point has
+    /// recovered. The engine sets it after `open_compressed` and each
+    /// `flush`, before the packets it applies to, and raises it when it
+    /// learns that a recovery point recovers later. It applies to the
+    /// pictures the sink has not yet shown, including decoded output still
+    /// waiting for presentation.
+    fn present_from(&mut self, start: Duration);
     /// Prepares for software frames of this stream.
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError>;
     /// One decoded frame, in presentation order, to show at media time `pts`.
@@ -113,7 +145,8 @@ pub trait VideoSink: Send {
     /// reordered tail. Every sink states what it does; a frame-only output
     /// has nothing to drain.
     fn finish(&mut self) -> Result<(), SinkError>;
-    /// Drops everything queued and decoder state (seek).
+    /// Drops everything queued and decoder state (seek). Once it returns,
+    /// the sink reports no picture pushed before it to `PictureReady`.
     fn flush(&mut self);
     /// Pause/resume presentation (the clock stops with the audio).
     fn set_playing(&mut self, playing: bool);

@@ -1832,9 +1832,10 @@ impl player::backend::Backend for CompressedOutput {
 }
 
 impl player::backend::VideoSink for CompressedSink {
-    fn open_compressed(&mut self, params: &oxideav_core::CodecParameters) -> bool {
+    fn open_compressed(&mut self, params: &oxideav_core::CodecParameters, _: player::backend::PictureReady) -> bool {
         params.codec_id.as_str() == "mpeg2video"
     }
+    fn present_from(&mut self, start: Duration) { self.inner.present_from(start); }
     fn push_packet(&mut self, _: &oxideav_core::Packet, _: Duration, _: bool) -> Result<(), player::backend::SinkError> {
         self.pushed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())

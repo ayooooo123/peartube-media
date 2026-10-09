@@ -1751,6 +1751,7 @@ dependencies = [
  "objc2-ui-kit",
  "oxideav-core",
  "oxideav-h264",
+ "oxideav-h265",
  "oxideav-http",
  "oxideav-mp4",
  "oxideav-ogg",

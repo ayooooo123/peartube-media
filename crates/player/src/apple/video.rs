@@ -1,15 +1,15 @@
 //! Video output: an `AVSampleBufferDisplayLayer` on a container layer.
 //!
-//! Compressed H.264/HEVC goes in as `CMSampleBuffer`s built from the
-//! stream's avcC/hvcC extradata plus the packet payloads. Software-decoded
-//! frames are converted with `oxideav-pixfmt` to NV12 (8-bit 4:2:0) or
-//! 10-bit 4:2:0 as appropriate, wrapped in IOSurface-backed `CVPixelBuffer`s
-//! from a pool, and enqueued on the same layer. Either way the layer shows
+//! Compressed H.264/HEVC goes through VideoToolbox; its decoded-picture
+//! callback releases the engine's clock hold. Software-decoded frames are
+//! converted with `oxideav-pixfmt` to NV12 (8-bit 4:2:0) or 10-bit 4:2:0
+//! and wrapped in IOSurface-backed `CVPixelBuffer`s from a pool.
+//! Both paths enqueue pixel-buffer samples on the same layer, which shows
 //! each sample at its timestamp on the playback's clock: it is a renderer of
 //! the audio's `AVSampleBufferRenderSynchronizer` when there is audio, and
 //! otherwise runs on a timebase of its own, anchored to the engine's clock
 //! whenever that starts or jumps. All layer work happens on the main queue;
-//! engine threads only touch CoreMedia objects and `dispatch2` async blocks.
+//! engine threads only touch CoreMedia/VideoToolbox and dispatch async blocks.
 
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,15 +22,16 @@ use objc2_av_foundation::{
     AVLayerVideoGravityResizeAspect, AVQueuedSampleBufferRenderingStatus,
     AVSampleBufferDisplayLayer, AVSampleBufferRenderSynchronizer, AVSampleBufferVideoRenderer,
 };
-use objc2_core_foundation::{CFNumber, CFRetained};
+use objc2_core_foundation::{CFNumber, CFRetained, CFType};
 use objc2_core_media::{
     CMClock, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
     CMTimebase, CMVideoCodecType, CMVideoFormatDescription, CMVideoFormatDescriptionCreate,
     CMVideoFormatDescriptionCreateFromH264ParameterSets,
     CMVideoFormatDescriptionCreateFromHEVCParameterSets,
+    CMVideoFormatDescriptionCreateForImageBuffer, CMVideoFormatDescriptionMatchesImageBuffer,
 };
 use objc2_core_video::{
-    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+    CVImageBuffer, CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
     CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
     CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount, CVPixelBufferGetWidthOfPlane,
     CVPixelBufferGetHeightOfPlane, CVPixelBufferLockBaseAddress,
@@ -48,7 +49,7 @@ use crate::apple::util::{
     annex_b_to_length_prefixed, create_block_buffer_from_bytes, find_atom, parse_avcc,
     parse_hvcc, SendSync,
 };
-use crate::backend::{Clock, SinkError, VideoSink};
+use crate::backend::{Clock, PictureReady, SinkError, VideoSink};
 
 /// Codec id → VideoToolbox format-description creation, and the annex-B
 /// rewrite that packets may need.
@@ -59,14 +60,270 @@ enum CompressedKind {
 }
 
 struct Compressed {
+    kind: CompressedKind,
     /// NAL length size from avcC/hvcC (1, 2 or 4).
     length_size: usize,
     /// Stream framing from extradata, not ambiguous packet length bytes.
     annex_b: bool,
     format: CFRetained<CMVideoFormatDescription>,
+    reorder_depth: usize,
     /// First keyframe seen; nothing is enqueued before it, so decoding
     /// starts at a random-access point.
     primed: bool,
+    /// HEVC NoRaslOutputFlag: leading pictures after an entry CRA/BLA
+    /// can reference pictures before the decoder's start.
+    first_irap: bool,
+    discard_rasl: bool,
+    present_from: Duration,
+}
+
+impl Compressed {
+    fn filter_leading(&mut self, data: &[u8]) -> Option<Vec<u8>> {
+        if self.kind != CompressedKind::Hevc { return None; }
+        let picture = split_length_prefixed(data, self.length_size).find_map(|nal| {
+            let header = nal.get(..2)?;
+            let kind = (header[0] >> 1) & 0x3f;
+            (kind <= 31).then_some(kind)
+        })?;
+        if (16..=23).contains(&picture) {
+            // HEVC 8.1.3: every IDR/BLA, and a CRA at decoder entry.
+            self.discard_rasl = self.first_irap || picture <= 20;
+            self.first_irap = false;
+        }
+        if !self.discard_rasl || !matches!(picture, 8 | 9) { return None; }
+        // Drop only RASL slices, not parameter sets or SEI sharing the AU.
+        // These slices are not decoded under NoRaslOutputFlag (FFmpeg's
+        // hevcdec.c decode_slice); sending them to VT gives missing refs.
+        let keep = |nal: &&[u8]| nal.len() < 2 || !matches!((nal[0] >> 1) & 0x3f, 8 | 9);
+        let size = split_length_prefixed(data, self.length_size).filter(keep)
+            .map(|nal| self.length_size + nal.len()).sum();
+        let mut kept = Vec::with_capacity(size);
+        for nal in split_length_prefixed(data, self.length_size).filter(keep) {
+            kept.extend_from_slice(&(nal.len() as u32).to_be_bytes()[4 - self.length_size..]);
+            kept.extend_from_slice(nal);
+        }
+        Some(kept)
+    }
+}
+
+// VideoToolbox's C ABI. The session owns the callback's context until all
+// outstanding callbacks have returned; queued display work holds its own Arc.
+#[repr(C)]
+struct DecompressionCallback {
+    callback: unsafe extern "C" fn(
+        *mut std::ffi::c_void, *mut std::ffi::c_void, i32, u32,
+        *mut CVImageBuffer, CMTime, CMTime,
+    ),
+    context: *mut std::ffi::c_void,
+}
+
+#[link(name = "VideoToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn VTDecompressionSessionCreate(
+        allocator: *const std::ffi::c_void,
+        format: *const CMVideoFormatDescription,
+        specification: *const std::ffi::c_void,
+        attributes: *const std::ffi::c_void,
+        callback: *const DecompressionCallback,
+        out: *mut *mut CFType,
+    ) -> i32;
+    fn VTDecompressionSessionDecodeFrame(
+        session: *const CFType, sample: *const CMSampleBuffer, flags: u32,
+        source: *mut std::ffi::c_void, info: *mut u32,
+    ) -> i32;
+    fn VTDecompressionSessionWaitForAsynchronousFrames(session: *const CFType) -> i32;
+    fn VTDecompressionSessionInvalidate(session: *const CFType);
+}
+
+struct NativeDecoder {
+    session: CFRetained<CFType>,
+    output: Arc<DecodedOutput>,
+}
+
+struct DecodedOutput {
+    layer: SinkHandle,
+    main: dispatch2::DispatchRetained<DispatchQueue>,
+    reports: Arc<Mutex<u64>>,
+    generation: u64,
+    present_from: AtomicU64,
+    ready: PictureReady,
+    failed: Arc<Mutex<Option<String>>>,
+    frames_enqueued: Arc<AtomicU64>,
+    format: Mutex<Option<CFRetained<CMVideoFormatDescription>>>,
+    reorder_depth: usize,
+    pictures: Mutex<Vec<(Duration, SendSync<CFRetained<CMSampleBuffer>>)>>,
+    pending_main: AtomicU64,
+}
+
+impl NativeDecoder {
+    fn new(format: &CMVideoFormatDescription, output: DecodedOutput) -> Result<Self, SinkError> {
+        let output = Arc::new(output);
+        let callback = DecompressionCallback {
+            callback: decoded_picture,
+            context: Arc::as_ptr(&output).cast_mut().cast(),
+        };
+        // The display layer needs IOSurface-backed decoded buffers, just
+        // like the software-frame pool below. Keep VT's native pixel format.
+        let surface = objc2_core_foundation::CFDictionary::<CFType, CFType>::empty();
+        let attributes = unsafe {
+            cf_dictionary(&[(kCVPixelBufferIOSurfacePropertiesKey, &surface as &CFType)])
+        }.ok_or_else(|| SinkError::Fallback("could not create decoded pixel attributes".into()))?;
+        let mut raw = ptr::null_mut();
+        let status = unsafe {
+            VTDecompressionSessionCreate(
+                ptr::null(), format, ptr::null(), ptr::from_ref(&*attributes).cast(),
+                &callback, &mut raw,
+            )
+        };
+        if status != 0 || raw.is_null() {
+            return Err(SinkError::Fallback(format!("VTDecompressionSessionCreate: {status}")));
+        }
+        // SAFETY: Create returned a +1 CF object.
+        let session = unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw)) };
+        Ok(Self { session, output })
+    }
+
+    fn present_from(&self, start: Duration) {
+        self.output.present_from.store(
+            u64::try_from(start.as_nanos()).unwrap_or(u64::MAX), Ordering::Release,
+        );
+    }
+
+    fn decode(&self, sample: &CMSampleBuffer) -> Result<(), SinkError> {
+        // Keep callbacks in decode order. The SPS-bounded queue below
+        // puts their pictures in presentation order before rendering.
+        let status = unsafe {
+            VTDecompressionSessionDecodeFrame(
+                &*self.session, sample, 0, ptr::null_mut(), ptr::null_mut(),
+            )
+        };
+        if status == 0 { Ok(()) } else {
+            Err(SinkError::Fallback(format!("VTDecompressionSessionDecodeFrame: {status}")))
+        }
+    }
+
+    fn finish(&self) -> Result<(), SinkError> {
+        let status = unsafe { VTDecompressionSessionWaitForAsynchronousFrames(&*self.session) };
+        if status != 0 {
+            return Err(SinkError::Fallback(format!("VTDecompressionSessionWaitForAsynchronousFrames: {status}")));
+        }
+        let current = self.output.reports.lock().expect("video reports");
+        if *current == self.output.generation {
+            for (pts, sample) in self.output.pictures.lock().expect("decoded pictures").drain(..) {
+                self.output.enqueue(sample, pts);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NativeDecoder {
+    fn drop(&mut self) {
+        // No callback may outlive `output`. Callbacks only dispatch async
+        // layer work, so this wait never needs the main thread to run it.
+        unsafe {
+            VTDecompressionSessionWaitForAsynchronousFrames(&*self.session);
+            VTDecompressionSessionInvalidate(&*self.session);
+        }
+    }
+}
+
+impl DecodedOutput {
+    fn sample(&self, image: &CVImageBuffer, pts: CMTime, duration: CMTime) -> Result<CFRetained<CMSampleBuffer>, SinkError> {
+        let mut cached = self.format.lock().expect("decoded format");
+        unsafe {
+            if cached.as_ref().is_none_or(|format| !CMVideoFormatDescriptionMatchesImageBuffer(format, image)) {
+                let mut raw = ptr::null();
+                let status = CMVideoFormatDescriptionCreateForImageBuffer(None, image, NonNull::from(&mut raw));
+                if status != 0 || raw.is_null() {
+                    return Err(SinkError::Fallback(format!("CMVideoFormatDescriptionCreateForImageBuffer: {status}")));
+                }
+                *cached = Some(CFRetained::from_raw(NonNull::new_unchecked(raw.cast_mut())));
+            }
+            let timing = CMSampleTimingInfo {
+                duration,
+                presentationTimeStamp: pts,
+                decodeTimeStamp: objc2_core_media::kCMTimeInvalid,
+            };
+            let mut raw = ptr::null_mut();
+            let status = CMSampleBuffer::create_ready_with_image_buffer(
+                None, image, cached.as_ref().expect("decoded format"),
+                NonNull::from(&timing), NonNull::from(&mut raw),
+            );
+            if status != 0 || raw.is_null() {
+                return Err(SinkError::Fallback(format!("CMSampleBufferCreateReadyWithImageBuffer: {status}")));
+            }
+            // The sample retains the callback's borrowed image buffer.
+            Ok(CFRetained::from_raw(NonNull::new_unchecked(raw)))
+        }
+    }
+
+    fn enqueue(self: &Arc<Self>, sample: SendSync<CFRetained<CMSampleBuffer>>, pts: Duration) {
+        let output = Arc::clone(self);
+        self.pending_main.fetch_add(1, Ordering::Release);
+        self.main.exec_async(move || {
+            let current = output.reports.lock().expect("video reports");
+            output.pending_main.fetch_sub(1, Ordering::Release);
+            if *current != output.generation
+                || pts.as_nanos() < u128::from(output.present_from.load(Ordering::Acquire))
+            {
+                return;
+            }
+            let enqueued = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                with_renderer(output.layer.layer(), |renderer| unsafe {
+                    let _: () = objc2::msg_send![renderer, enqueueSampleBuffer: &**sample];
+                });
+            }));
+            if enqueued.is_ok() {
+                output.frames_enqueued.fetch_add(1, Ordering::Relaxed);
+                output.ready.ready(pts);
+            } else {
+                *output.failed.lock().expect("failed lock") = Some("Obj-C exception enqueueing a decoded picture".into());
+            }
+        });
+    }
+}
+
+unsafe extern "C" fn decoded_picture(
+    context: *mut std::ffi::c_void,
+    _source: *mut std::ffi::c_void,
+    status: i32,
+    _flags: u32,
+    image: *mut CVImageBuffer,
+    timestamp: CMTime,
+    duration: CMTime,
+) {
+    // SAFETY: NativeDecoder holds this Arc until VT has joined its callbacks.
+    // The added strong reference keeps queued main-thread work alive too.
+    let output = unsafe {
+        let context = context.cast::<DecodedOutput>();
+        Arc::increment_strong_count(context);
+        Arc::from_raw(context)
+    };
+    let current = output.reports.lock().expect("video reports");
+    if *current != output.generation { return; }
+    if status != 0 {
+        *output.failed.lock().expect("failed lock") = Some(format!("VideoToolbox decoded-picture callback: {status}"));
+        return;
+    }
+    let Some(image) = (unsafe { image.as_ref() }) else { return };
+    if !timestamp.flags.contains(CMTimeFlags::Valid) || timestamp.timescale <= 0 { return; }
+    let pts = Duration::from_secs_f64((timestamp.value as f64 / f64::from(timestamp.timescale)).max(0.0));
+    if pts.as_nanos() < u128::from(output.present_from.load(Ordering::Acquire)) { return; }
+    let sample = match output.sample(image, timestamp, duration) {
+        Ok(sample) => SendSync(sample),
+        Err(error) => {
+            *output.failed.lock().expect("failed lock") = Some(error.to_string());
+            return;
+        }
+    };
+    let mut pictures = output.pictures.lock().expect("decoded pictures");
+    let at = pictures.partition_point(|(time, _)| *time <= pts);
+    pictures.insert(at, (pts, sample));
+    if pictures.len() > output.reorder_depth {
+        let (pts, sample) = pictures.remove(0);
+        output.enqueue(sample, pts);
+    }
 }
 
 pub struct AppleVideoSink {
@@ -86,6 +343,10 @@ pub struct AppleVideoSink {
     /// What times the layer's presentation.
     timing: Timing,
     observers: Vec<SendSync<Retained<objc2::runtime::ProtocolObject<dyn objc2_foundation::NSObjectProtocol>>>>,
+    ready: Option<PictureReady>,
+    decoder: Option<NativeDecoder>,
+    /// Flush invalidates both old callbacks and their queued display work.
+    reports: Arc<Mutex<u64>>,
 }
 
 /// What times the layer's presentation: it shows each sample when this
@@ -393,6 +654,9 @@ impl AppleVideoSink {
             fallback_reported: std::cell::Cell::new(false),
             timing,
             observers: vec![SendSync(observer)],
+            ready: None,
+            decoder: None,
+            reports: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -414,6 +678,23 @@ impl AppleVideoSink {
                 .expect("layer pointer null");
             f(&layer);
         });
+    }
+
+    fn create_decoder(&self, format: &CMVideoFormatDescription, reorder_depth: usize) -> Result<NativeDecoder, SinkError> {
+        NativeDecoder::new(format, DecodedOutput {
+            layer: self.clone_sink_handle(),
+            main: self.main.clone(),
+            reports: Arc::clone(&self.reports),
+            generation: *self.reports.lock().expect("video reports"),
+            present_from: AtomicU64::new(0),
+            ready: self.ready.clone().expect("compressed ready callback"),
+            failed: Arc::clone(&self.failed),
+            frames_enqueued: Arc::clone(&self.frames_enqueued),
+            format: Mutex::new(None),
+            reorder_depth,
+            pictures: Mutex::new(Vec::with_capacity(reorder_depth + 1)),
+            pending_main: AtomicU64::new(0),
+        })
     }
 
     fn renderer_status_errors(&self) -> Option<String> {
@@ -465,7 +746,7 @@ fn cm_time_from_duration(d: Duration, timescale: i32) -> CMTime {
 fn create_h264_or_hevc_format(
     kind: CompressedKind,
     params: &CodecParameters,
-) -> Result<(CFRetained<CMVideoFormatDescription>, usize, bool), SinkError> {
+) -> Result<(CFRetained<CMVideoFormatDescription>, usize, bool, usize), SinkError> {
     // The MOV/MP4 demuxers hand the raw stsd-extension atom run (starting
     // with the avcC/hvcC atom header); strip to the record body.
     let record: &[u8] = if let Some(body) = find_atom(&params.extradata, b"avcC") {
@@ -480,7 +761,7 @@ fn create_h264_or_hevc_format(
     let (nals, length_size) = if annex_b {
         // Annex-B extradata: split into NALs and treat as parameter sets.
         rewritten = annex_b_to_length_prefixed(record, 4);
-        (split_length_prefixed(&rewritten, 4), 4)
+        (split_length_prefixed(&rewritten, 4).collect::<Vec<_>>(), 4)
     } else {
         let (kind_nals, len) = match kind {
             CompressedKind::H264 => parse_avcc(record)
@@ -496,7 +777,6 @@ fn create_h264_or_hevc_format(
             nals.len()
         )));
     }
-    let _ = length_size;
     let mut ptrs: Vec<NonNull<u8>> = Vec::with_capacity(nals.len());
     let mut sizes: Vec<usize> = Vec::with_capacity(nals.len());
     for nal in &nals {
@@ -538,32 +818,47 @@ fn create_h264_or_hevc_format(
     // SAFETY: Create-rule function returned +1.
     let format =
         unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw as *mut CMVideoFormatDescription)) };
-    Ok((format, length_size, annex_b))
+    Ok((format, length_size, annex_b, reorder_depth(kind, &nals)))
 }
 
-/// Splits 4-byte-length-prefixed NAL units.
-fn split_length_prefixed(data: &[u8], length_size: usize) -> Vec<&[u8]> {
-    let mut out = Vec::new();
-    let mut p = 0usize;
-    while p + length_size <= data.len() {
-        let len = match length_size {
-            1 => data[p] as usize,
-            2 => u16::from_be_bytes([data[p], data[p + 1]]) as usize,
-            _ => u32::from_be_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]) as usize,
-        };
-        p += length_size;
-        let end = match p.checked_add(len) {
-            Some(e) if e <= data.len() => e,
-            _ => break,
-        };
-        out.push(&data[p..end]);
-        p = end;
-    }
-    out
+/// VT's callback order is decode order, not display order. Reuse the
+/// codec parsers for the SPS reorder bound; missing AVC VUI uses the
+/// standard's maximum DPB size (16 pictures).
+fn reorder_depth(kind: CompressedKind, nals: &[&[u8]]) -> usize {
+    nals.iter().filter_map(|nal| {
+        let header = *nal.first()?;
+        match kind {
+            CompressedKind::H264 if header & 0x1f == 7 => {
+                let rbsp = oxideav_h264::nal::rbsp_from_nal_payload(&nal[1..]);
+                let sps = oxideav_h264::sps::Sps::parse(&rbsp).ok()?;
+                Some(sps.vui.as_ref().and_then(|vui| vui.bitstream_restriction.as_ref())
+                    .map_or(16, |restriction| restriction.max_num_reorder_frames))
+            }
+            CompressedKind::Hevc if (header >> 1) & 0x3f == 33 => {
+                let rbsp = oxideav_h264::nal::rbsp_from_nal_payload(nal.get(2..)?);
+                let sps = oxideav_h265::sps::SeqParameterSet::parse(&rbsp).ok()?;
+                Some(sps.sub_layer_ordering_info[usize::from(sps.max_sub_layers_minus1)].max_num_reorder_pics)
+            }
+            _ => None,
+        }
+    }).max().unwrap_or(16).min(16) as usize
+}
+
+/// Borrows length-prefixed NAL units without allocating a packet-sized list.
+fn split_length_prefixed(mut data: &[u8], length_size: usize) -> impl Iterator<Item = &[u8]> {
+    std::iter::from_fn(move || {
+        if !(1..=4).contains(&length_size) { return None; }
+        let prefix = data.get(..length_size)?;
+        let length = prefix.iter().fold(0usize, |size, &byte| (size << 8) | usize::from(byte));
+        let end = length_size.checked_add(length)?;
+        let nal = data.get(length_size..end)?;
+        data = &data[end..];
+        Some(nal)
+    })
 }
 
 impl VideoSink for AppleVideoSink {
-    fn open_compressed(&mut self, params: &CodecParameters) -> bool {
+    fn open_compressed(&mut self, params: &CodecParameters, ready: PictureReady) -> bool {
         if matches!(self.timing, Timing::Unavailable) { return false; }
         let kind = match params.codec_id.as_str() {
             "h264" => CompressedKind::H264,
@@ -573,18 +868,38 @@ impl VideoSink for AppleVideoSink {
         if params.extradata.is_empty() {
             return false;
         }
-        let (format, length_size, annex_b) = match create_h264_or_hevc_format(kind, params) {
+        let (format, length_size, annex_b, reorder_depth) = match create_h264_or_hevc_format(kind, params) {
             Ok(v) => v,
             Err(_) => return false,
         };
+        self.ready = Some(ready);
+        let decoder = match self.create_decoder(&format, reorder_depth) {
+            Ok(decoder) => decoder,
+            Err(_) => return false,
+        };
+        self.decoder = Some(decoder);
         let mut state = self.state.lock().expect("video state");
         state.compressed = Some(Compressed {
+            kind,
             length_size,
             annex_b,
             format,
+            reorder_depth,
             primed: false,
+            first_irap: true,
+            discard_rasl: false,
+            present_from: Duration::ZERO,
         });
         true
+    }
+
+    fn present_from(&mut self, start: Duration) {
+        if let Some(comp) = self.state.lock().expect("video state").compressed.as_mut() {
+            comp.present_from = start;
+        }
+        if let Some(decoder) = &self.decoder {
+            decoder.present_from(start);
+        }
     }
 
     fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
@@ -597,8 +912,20 @@ impl VideoSink for AppleVideoSink {
             self.fallback_reported.set(true);
             return Err(SinkError::Fallback(err));
         }
+        // Bound both queued main-thread work and the renderer's sample
+        // queue. Input timestamps cannot bound a decoder's reorder delay.
+        if self.decoder.as_ref().is_some_and(|decoder| decoder.output.pending_main.load(Ordering::Acquire) >= 2) {
+            return Err(SinkError::WouldBlock);
+        }
+        let ready = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            with_renderer(&self.layer, |renderer| unsafe {
+                let ready: bool = objc2::msg_send![renderer, isReadyForMoreMediaData];
+                ready
+            })
+        })).map_err(|_| SinkError::Fallback("Obj-C exception reading renderer input capacity".into()))?;
+        if !ready { return Err(SinkError::WouldBlock); }
 
-        let (format, data) = {
+        let (format, data, present_from, reorder_depth) = {
             let mut state = self.state.lock().expect("video state");
             let comp = state
                 .compressed
@@ -611,12 +938,15 @@ impl VideoSink for AppleVideoSink {
                 }
                 comp.primed = true;
             }
-            let data = if comp.annex_b {
+            let mut data = if comp.annex_b {
                 std::borrow::Cow::Owned(annex_b_to_length_prefixed(&packet.data, comp.length_size))
             } else {
                 std::borrow::Cow::Borrowed(packet.data.as_slice())
             };
-            (comp.format.clone(), data)
+            if let Some(filtered) = comp.filter_leading(&data) {
+                data = std::borrow::Cow::Owned(filtered);
+            }
+            (comp.format.clone(), data, comp.present_from, comp.reorder_depth)
         };
         if data.is_empty() {
             return Ok(());
@@ -626,7 +956,7 @@ impl VideoSink for AppleVideoSink {
         let mut raw: *mut CMSampleBuffer = ptr::null_mut();
         let timing = CMSampleTimingInfo {
             duration: unsafe { objc2_core_media::kCMTimeInvalid },
-            presentationTimeStamp: cm_time_from_duration(pts, 600),
+            presentationTimeStamp: cm_time_from_duration(pts, 1_000_000_000),
             decodeTimeStamp: unsafe { objc2_core_media::kCMTimeInvalid },
         };
         let status = unsafe {
@@ -649,24 +979,12 @@ impl VideoSink for AppleVideoSink {
         }
         // SAFETY: Create-rule function returned +1.
         let sample = unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw)) };
-        self.frames_enqueued.fetch_add(1, Ordering::Relaxed);
-        // The sample buffer is only dereferenced on the main queue; hand it
-        // over as a raw +1 pointer.
-        let sample_ptr = std::sync::Arc::new(SendPtr(CFRetained::into_raw(sample).as_ptr()));
-        self.enqueue_on_main(move |layer| {
-            // An Obj-C exception here (renderer gone mid-teardown) must not
-            // abort the process; the next push observes the failed status
-            // and returns Fallback.
-            let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
-                with_renderer(layer, |r| unsafe {
-                    let sample = CFRetained::from_raw(NonNull::new_unchecked(
-                        sample_ptr.0 as *mut CMSampleBuffer,
-                    ));
-                    let _: () = objc2::msg_send![r, enqueueSampleBuffer: &*sample];
-                });
-            }));
-        });
-        Ok(())
+        if self.decoder.is_none() {
+            let decoder = self.create_decoder(&format, reorder_depth)?;
+            decoder.present_from(present_from);
+            self.decoder = Some(decoder);
+        }
+        self.decoder.as_ref().expect("compressed decoder").decode(&sample)
     }
 
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> {
@@ -688,11 +1006,16 @@ impl VideoSink for AppleVideoSink {
     }
 
     fn flush(&mut self) {
+        *self.reports.lock().expect("video reports") += 1;
+        self.decoder.take();
         self.frames_enqueued.store(0, Ordering::Relaxed);
         let playing = {
             let mut state = self.state.lock().expect("video state");
             if let Some(comp) = state.compressed.as_mut() {
                 comp.primed = false;
+                comp.first_irap = true;
+                comp.discard_rasl = false;
+                comp.present_from = Duration::ZERO;
             }
             state.playing
         };
@@ -720,13 +1043,18 @@ impl VideoSink for AppleVideoSink {
         }
     }
 
-    /// The layer's decoder presents queued samples by timestamp without an
-    /// end-of-stream marker: the native smoke displays the final reordered
-    /// frame of a B-frame stream at EOS.
+    /// Drain VideoToolbox's reordered tail before the engine waits for EOS.
     fn finish(&mut self) -> Result<(), SinkError> {
+        if let Some(decoder) = &self.decoder {
+            decoder.finish()?;
+        }
+        if let Some(error) = self.failed.lock().expect("failed lock").take() {
+            return Err(SinkError::Fallback(error));
+        }
         Ok(())
     }
 }
+
 
 impl AppleVideoSink {
     fn open_frames_inner(&mut self, params: &CodecParameters) -> Result<(), SinkError> {
@@ -793,7 +1121,10 @@ impl AppleVideoSink {
         // SAFETY: Create-rule function returned +1.
         let pool = unsafe { CFRetained::from_raw(NonNull::new_unchecked(pool_raw)) };
 
+        *self.reports.lock().expect("video reports") += 1;
+        self.decoder.take();
         let mut state = self.state.lock().expect("video state");
+        state.compressed = None;
         state.software = Some(SoftwarePath {
             src_format,
             width,
@@ -904,6 +1235,8 @@ impl AppleVideoSink {
 
 impl Drop for AppleVideoSink {
     fn drop(&mut self) {
+        *self.reports.lock().expect("video reports") += 1;
+        self.decoder.take();
         for obs in self.observers.drain(..) {
             unsafe {
                 NSNotificationCenter::defaultCenter()

@@ -19,15 +19,17 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 
 - **Source**: `oxideav-http`'s `HttpSource` (HTTP/1.1 Range, `Read + Seek`) behind a bounded read-ahead ring. Reads have a deadline, so a suspended worklet fails reads instead of hanging them; resume reopens at the last offset. Plain http only by default: the app reads every stream from its worklet on 127.0.0.1, so the `oxideav-http` fork builds without its `tls` feature and an `https://` URL fails to open with an error naming it. The player's `https` feature turns TLS back on.
 - **Demux**: `ContainerRegistry::probe_input` (rewinds after reading up to 256 KiB), then `open_demuxer(name, input, &codecs)`. One demux thread fills per-stream packet queues bounded in both duration and bytes.
-- **Packet metadata and seeking**: snapshot `Demuxer::packet_metadata()` with each packet, including queued-byte accounting for owned cue metadata. A container random-access point is separate from the codec parser's keyframe flag; the engine and both native decoder gates accept either without changing parser flags. The open-GOP Matroska regression requires all 100 post-seek frames to match FFmpeg, not merely resumed output. Metadata transport is in place and audio trims are applied (below); WebVTT settings rendering remains incomplete.
-- **Buffering**: the read-ahead ring reports when a read waits for bytes that have not arrived. The clock holds at the start until the first audio and video are decoded and about a second is queued (or the input ends), likewise after a seek, and mid-stream whenever a pipeline runs dry while the source is starved, until a second is queued past the clock again. `buffering` in the state follows the hold; `play`/`pause` stay the user's intent, so a pause during buffering stays paused when the data arrives.
-- **Audio**: always decoded in software (OxideAV or `codec-*`) to PCM. Android plays it through AAudio, Apple through `AVSampleBufferAudioRenderer`. The sink's presented position is the master clock; Android maps AAudio frame/time pairs onto `CLOCK_MONOTONIC`, clamped to the audio actually queued. Pause and buffering stop the audio output, including while its final queued samples drain. After a seek, only audio from the new seek generation may lead; without audio, or after it ends, the free clock continues from the current position.
+- **Packet metadata and seeking**: snapshot `Demuxer::packet_metadata()` with each packet, including queued-byte accounting for owned cue metadata. A container random-access point is separate from the codec parser's keyframe flag; the engine and both native decoder gates accept either without changing parser flags. A seek whose landing is an H.264 or HEVC picture that depends on earlier pictures (a non-IDR I frame without a recovery point, a non-IRAP HEVC picture) walks back to an IDR, completed recovery point or IRAP picture (`engine/entry.rs`), with a 10 s look-back bound checked after each landing. For H.264 `recovery_frame_cnt > 0`, it reads forward to the recovering reference picture; if that is after the target, it tries an earlier landing. If there is no earlier input, it hides partial pictures until recovery completes. The reference-picture counter covers progressive streams without frame-number gaps; fields and gaps remain follow-ups. Pictures before the target are never shown. The open-GOP and intra-refresh regressions cover MKV, MP4 and MPEG-TS against FFmpeg's uninterrupted decode. Audio trims are applied (below); WebVTT cue metadata reaches the runtime-font renderer.
+- **Buffering**: the read-ahead ring reports when a read waits for bytes that have not arrived. The clock holds at the start until the first audio and video are decoded and about a second is queued (or the input ends), likewise after a seek, and mid-stream whenever a pipeline runs dry while the source is starved, until a second is queued past the clock again. `buffering` in the state follows the hold; `play`/`pause` stay the user's intent, so a pause during buffering stays paused when the data arrives. A compressed track keeps its decoded-picture requirement across seeks: an empty packet lane does not release the hold once that generation has received video input.
+- **Priming bounds**: while compressed video awaits its first decoded picture, audio and subtitle lanes may pass the normal two-second duration limit so they cannot block the video input needed for reordering. Their existing byte limits still stop demux reads; queued audio is retained. Normal duration pacing returns when the picture is ready. The five-second picture deadline is checked even while the video lane waits for input, including when another lane reaches its byte limit. It excludes only user-intent pause time: buffering and priming holds still consume the allowance, and resuming does not reset time already spent.
+- **Audio**: always decoded in software (OxideAV or `codec-*`) to PCM. Android plays it through AAudio, Apple through `AVSampleBufferAudioRenderer`. The sink's presented position is the master clock; Android maps AAudio frame/time pairs onto `CLOCK_MONOTONIC`, clamped to the audio actually queued. Pause and buffering stop the audio output, including while its final queued samples drain. Apple's extra automatic startup hold is disabled; the engine owns buffering. A seek stops exactly at the target before publishing its new generation. Only audio from that generation may lead; without audio, or after it ends, the free clock continues from the current position.
   Android never extrapolates from the time `play` was requested. Without a fresh hardware timestamp, only AAudio's endpoint-consumed frame count can advance the position; no media-to-monotonic deadline is invented. This also handles a fully drained stream resumed without another timestamp. Position stays monotonic within a stream; seek/reopen resets it. `cargo test -p player --test android_clock` covers startup, stale resume timestamps, device corrections, starvation and drained resume. Endpoint progress is not independent proof of audible PCM timing.
   Apple sample-rate/channel changes replace the format description for subsequent buffers without flushing queued audio or reanchoring the shared clock. Explicit seek/reset flush still discards old buffers and permits a new anchor. A native paused-queue regression covers 44.1 kHz stereo → 48 kHz mono: the anchor stays at 2.000 s rather than jumping to the next buffer's 2.020 s, then an explicit flush permits a backward anchor at 1.000 s. This verifies the native queue/clock lifecycle, not independently captured audible PCM.
 - **Audio trims**: the encoder delay and end padding a container declares (`PacketMetadata::audio_trim`: MP4 edit lists and iTunSMPB, MP3 LAME/Xing info and iTunSMPB, Ogg Opus pre-skip and end granules, Matroska CodecDelay and DiscardPadding) come off the decoded PCM once, after decoding, as FFmpeg's `decode.c` removes them, and what follows a start skip plays from the skip's end on the packet's timeline. The Opus pre-skip is the decoder's start delay, which a container's skip replaces. OxideAV's Vorbis decoder never outputs its first packet, the frame FFmpeg's decoder outputs and drops as its delay, so a skip on that packet (the CodecDelay FFmpeg's encoders write) is already applied. `crates/audio-trim` does this for both the engine and `refcheck`, so reference tests check what plays. Its input limits (64 packets awaiting output, 32 MiB of held padding) never stop the audio: those samples play untrimmed and `State::audio_trim_fallbacks` counts them. MP4 trims stay in the media timescale, so a skip ends where the edit list says even when the timescale is not the output rate; FFmpeg 2da55bf applies the ticks as output samples there.
-- **Video**: the platform decoder first, chosen by trying it: Android `MediaCodec::from_decoder_type` + `configure` on the slot's `ANativeWindow` (the NDK has no codec-list API below API 36); Apple enqueues compressed `CMSampleBuffer`s on `AVSampleBufferDisplayLayer`. Any failure, at open or mid-stream, tears the platform decoder down and continues in software from the next keyframe. Software frames go to Android as RGBA_8888 through `ANativeWindow_lock` (after `oxideav-pixfmt` conversion), and to Apple as `CVPixelBuffer` sample buffers on the same layer.
+- **Video**: the platform decoder first, chosen by trying it: Android `MediaCodec::from_decoder_type` + `configure` on the slot's `ANativeWindow` (the NDK has no codec-list API below API 36); Apple uses a `VTDecompressionSession` and enqueues decoded, IOSurface-backed pixel-buffer samples on `AVSampleBufferDisplayLayer`. Both sinks decode and discard pre-target pictures while the clock is held, then report the first displayable picture through `PictureReady`. Flush invalidates old reports before the next seek is armed. A decoder that fails to report a picture within five seconds causes a playback error; audio must not run ahead without video. Apple reorders decoded output using the SPS bound, drains its queue at EOS, and suppresses leading HEVC RASL slices after an entry CRA/BLA without dropping parameter sets or SEI. Renderer capacity and bounded main-thread work pace compressed input, not a fixed timestamp window that can strand reordered pictures. At open or mid-stream failure, playback switches to software from the next keyframe. Software frames go to Android as RGBA_8888 through `ANativeWindow_lock` (after `oxideav-pixfmt` conversion), and to Apple as pixel-buffer samples on the same layer.
+- **Empty video at EOS**: if input ends before a startup recovery window completes, or a seek is past the video end, the video pipeline retires without reporting a picture. It does not wait on the held playback clock. Audio then plays and drains normally. A native decoder that should produce a picture but does not still reports a bounded playback error.
 - **Native packet framing**: AVC/HEVC packet framing comes from the stream's configuration, not a per-packet start-code guess. A valid AVCC length of 256–511 starts with `00 00 01`; misreading it as Annex B corrupts the native decoder's input.
-- **Presentation**: software frames wait against the live master clock, with a sink-specific enqueue lead. Android recomputes each MediaCodec release target from the clock rather than committing a distant, uninterruptible deadline. Apple attaches the video renderer to the audio's `AVSampleBufferRenderSynchronizer`; video-only playback uses its own timebase anchored to the engine clock. Neither Apple path uses `DisplayImmediately`. Layer work stays on the main thread, and a failed layer (`requiresFlushToResumeDecoding`) is flushed and re-fed from a keyframe.
+- **Presentation**: software frames wait against the live master clock, with a sink-specific enqueue lead. Android recomputes each MediaCodec release target from the clock instead of committing a distant, uninterruptible deadline. Apple attaches the video renderer to the audio's `AVSampleBufferRenderSynchronizer`; video-only playback uses its own timebase anchored to the engine clock. Neither Apple path uses `DisplayImmediately`. Layer work stays on the main thread, and a failed layer (`requiresFlushToResumeDecoding`) is flushed and re-fed from a keyframe.
 - **Lifecycle**: `open` takes no surface; `set_surface` attaches or detaches one (Android `SurfaceView` callbacks, macOS/iOS view moves). `suspend` / `resume` follow the activity: stop audio, release the platform decoder and surface, resume at the last position.
 - **Subtitles**: text, ASS and bitmap subtitles render to RGBA on an overlay above the video (a second `SurfaceView` on Android, a `CALayer` on Apple). Bitmap frames are display states: `VideoFrame::display_duration` supplies a known end; otherwise the next frame replaces the state, with a blank frame clearing it. Packet duration is not a bitmap display timeout. Bitmap coordinates use the subtitle canvas size, independently of the video's resolution.
 - **Untrusted input**: every stream comes from untrusted peers. Frame dimensions, stream count and queue bytes are capped, demux and decode run under `catch_unwind`, and the corpus includes truncated and mutated files.
@@ -388,9 +390,9 @@ Packets keep FFmpeg's parser keyframe flags. The shared
 `Demuxer::packet_metadata()` snapshot separately carries the container's
 random-access signal on lace 0. The producer test checks all four Cues
 points, including parser-keyframe=false/container-keyframe=true at 4 s.
-The actual Player regression compares every one of FFmpeg's 100 post-seek
-frame MD5s. **The engine/native-gate consumer integration is separate and
-not included on this branch**; the unchanged engine still fails this test.
+The Player regression compares every one of FFmpeg's 100 post-seek frame
+MD5s; the engine starts such a seek at the IDR picture before the 4 s Cue
+(see Packet metadata and seeking above).
 
 Duration-less AAC/HE-AAC, MP3 (including MPEG-2), AC-3/E-AC-3 and DTS core
 laces now match strict FFprobe packet comparisons on nine generated/real
@@ -612,17 +614,54 @@ ffmpeg -v error -nostdin -y \
   -cluster_size_limit 100000 -cluster_time_limit 200 flash-beep.mkv
 ```
 
-On macOS, `cargo run -p player --example apple_play -- flash-beep.mkv`
-runs the real Player and AppleBackend. Add `--software` to force engine
+On macOS, set `CARGO_TARGET_DIR` to an absolute owned directory, then run
+`sh crates/player/examples/apple_play.sh flash-beep.mkv`. The launcher builds
+with `--locked -j 2`, hard-links the executable into a temporary app bundle,
+and opens it in the foreground through LaunchServices. It prints both native
+output streams and returns the probe's exit status, not `open -W`'s status.
+The app bundle is removed after exit. Launch through this entry point for
+a foreground application lifecycle, not a daemon-launched CLI process.
+Playback starts only after a visible-surface notification, with a five-second
+deadline, followed by a fresh check of the actual hosting panel. No visible
+surface is a failure, not a skipped readback.
+
+The probe runs the real Player and AppleBackend. Add `--software` to force engine
 decoding or `--transport` for pause/seek. The harness pauses at sample points
 and reads the renderer's displayed pixel buffer, comparing its identifier
 with the audio timebase while inside the media duration. Hardware-compressed
 readback formats (such as Apple's `&8v0`) are converted by VideoToolbox into
 reused linear NV12 storage before CPU inspection; the source is still the
 displayed buffer, not a decoder input frame. No screen capture is used.
+The short probe uses a nonactivating floating panel with hiding on
+deactivation disabled. It can join other applications' window sets and
+full-screen Spaces. These flags do not prove surface availability. The public
+Cocoa gate requires window visibility, a screen, the active Space and the
+`NSWindowOcclusionState::Visible` bit; application activation is not required.
+After arming, any observed loss is latched for the entire trial. Notifications,
+polling and checks before/during/after readback enforce the gate. `APPLE_BLOCKED`
+returns exit 2 even if visibility later returns; that trial cannot resume or
+collect replacement samples. An occluded layer may retain a stale buffer, but
+occlusion alone does not establish the cause of a particular timing offset.
 Nil/unreadable readback is a hard failure; renderer queue counts and zero
 accumulated-delay counters alone are not timing proof. These are sampled
 displayed-frame offsets, not a continuous presentation-time distribution.
+
+`APPLE_PACKET`, `APPLE_OUTPUT`, `APPLE_SURFACE`, `APPLE_READBACK` and
+`APPLE_DISPLAYED` include monotonic timestamps in the same stderr stream.
+`APPLE_OUTPUT` records the existing decoded-picture callback after renderer
+enqueue and forwards the original readiness notification unchanged. Raw
+readback `Some(frame)` or `None` is logged before the final surface check.
+These records do not replace the original None, EOS or 40 ms assertions.
+
+Run native acceptance in a reserved interval without competing builds, media
+benchmarks or audio/video probes; the Cocoa gate must still verify the actual
+surface. `cargo test --locked -j 2 -p player --example apple_play` checks the
+visibility-state transitions. To exercise the real negative path, launch
+`sh crates/player/examples/apple_play.sh flash-beep.mkv --check-surface-loss`:
+after arming a visible panel it uses public Cocoa `orderOut` and must block
+with exit 2 before Player playback. This is not timing acceptance. For a
+normal run, unexpected visibility loss blocks the whole trial; report the
+public state and reserve a corrected environment before another attempt.
 
 For Android, use the NDK compiler and a 16 KiB-compatible executable link:
 

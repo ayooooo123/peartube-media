@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use oxideav_core::{CodecParameters, Packet, PixelFormat, VideoFrame};
 
 use crate::backend::{
-    AudioSink, Backend, Clock, SinkError, SubtitleImage, SubtitleSink, VideoSink,
+    AudioSink, Backend, Clock, PictureReady, SinkError, SubtitleImage, SubtitleSink, VideoSink,
 };
 use crate::clock::current_monotonic_ns;
 
@@ -525,7 +525,7 @@ struct HeadlessVideoSink {
 }
 
 impl VideoSink for HeadlessVideoSink {
-    fn open_compressed(&mut self, _params: &CodecParameters) -> bool {
+    fn open_compressed(&mut self, _params: &CodecParameters, _ready: PictureReady) -> bool {
         // Declined: force software decoding
         false
     }
@@ -533,6 +533,9 @@ impl VideoSink for HeadlessVideoSink {
     fn push_packet(&mut self, _packet: &Packet, _pts: Duration, _random_access: bool) -> Result<(), SinkError> {
         Ok(())
     }
+
+    /// Declines compressed input: the engine drops what it does not show.
+    fn present_from(&mut self, _start: Duration) {}
 
     fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> {
         let mut inner = self.inner.lock();

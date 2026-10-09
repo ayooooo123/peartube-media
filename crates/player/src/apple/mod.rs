@@ -251,6 +251,9 @@ impl Backend for AppleBackend {
             >> = objc2::runtime::ProtocolObject::from_retained(renderer.clone());
             unsafe {
                 renderer.setMuted(muted);
+                // The engine holds for decoded output and buffered media.
+                // A second native hold can look like drained audio at EOF.
+                synchronizer.setDelaysRateChangeUntilHasSufficientMediaData(false);
                 synchronizer.addRenderer(&proto);
                 let timebase: Retained<objc2_core_media::CMTimebase> =
                     objc2::msg_send![&*synchronizer, timebase];

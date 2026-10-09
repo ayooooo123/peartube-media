@@ -60,6 +60,8 @@ struct PipeState {
     starved: bool,
     /// Seek generation for which the pipeline has had output ready.
     primed: Option<u64>,
+    /// Once this pipeline takes compressed input, each seek needs a picture.
+    requires_picture: bool,
     /// End (seconds) of the newest packet demuxed for the pipeline since the
     /// demuxer last seeked.
     horizon: Option<f64>,
@@ -71,8 +73,10 @@ struct PipeState {
 /// The clock's run state; `SharedState::transport` guards it.
 #[derive(Debug)]
 pub(super) struct Transport {
-    /// The user's intent: `pause()` until the next `play()`.
-    paused: bool,
+    /// The user's intent: when `pause()` started, until the next `play()`.
+    paused: Option<Instant>,
+    /// Completed user pauses, excluded from decoder progress deadlines.
+    paused_for: Duration,
     /// Holding the clock for data. Mirrored in `State::buffering`.
     buffering: bool,
     /// The pipelines exist; until then the source is being probed/opened.
@@ -100,7 +104,8 @@ pub(super) struct Transport {
 impl Transport {
     pub(super) fn new() -> Self {
         Self {
-            paused: false,
+            paused: None,
+            paused_for: Duration::ZERO,
             buffering: true,
             started: false,
             done: false,
@@ -117,6 +122,11 @@ impl Transport {
 
     fn pipe(&mut self, pipe: Pipe) -> &mut PipeState {
         &mut self.pipes[pipe as usize]
+    }
+
+    /// Monotonic deadline time: user pauses stop it, buffering does not.
+    fn unpaused_now(&self) -> Instant {
+        self.paused.unwrap_or_else(Instant::now) - self.paused_for
     }
 }
 
@@ -166,6 +176,7 @@ impl Drop for Live {
             p.live = p.live.saturating_sub(1);
             if p.live == 0 {
                 p.starved = false;
+                p.requires_picture = false;
             }
         });
     }
@@ -177,16 +188,21 @@ impl SharedState {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// Decoder progress deadlines use this clock, not the held media clock.
+    pub(super) fn unpaused_now(&self) -> Instant {
+        self.transport.lock().unpaused_now()
+    }
+
     /// Applies `f`, re-derives the hold and the clock's run state, and wakes
     /// everything that waits on them. `State::buffering` follows the hold;
     /// each change of it is reported as `Event::Changed`.
     fn update(&self, f: impl FnOnce(&mut Transport)) {
         let (changed, run_changed, buffering_changed) = {
             let mut t = self.transport.lock();
-            let before = (t.paused, t.buffering, t.seek_gen);
+            let before = (t.paused.is_some(), t.buffering, t.seek_gen);
             f(&mut t);
             self.rebuffer(&mut t);
-            let run = !t.paused && !t.buffering && !t.done && !self.stopped.load(Ordering::SeqCst);
+            let run = t.paused.is_none() && !t.buffering && !t.done && !self.stopped.load(Ordering::SeqCst);
             let run_changed = run != t.running;
             if run_changed {
                 t.running = run;
@@ -197,7 +213,7 @@ impl SharedState {
             if buffering_changed {
                 self.state.lock().buffering = t.buffering;
             }
-            let changed = run_changed || before != (t.paused, t.buffering, t.seek_gen);
+            let changed = run_changed || before != (t.paused.is_some(), t.buffering, t.seek_gen);
             (changed, run_changed, buffering_changed)
         };
         if changed {
@@ -247,10 +263,12 @@ impl SharedState {
         let generation = t.seek_gen;
         let ready = |p: &&PipeState| p.primed == Some(generation);
         if t.demux_full {
-            // The demuxer cannot queue more until the clock moves: go once
-            // every pipeline has output, except those waiting on an empty
-            // lane (they cannot get any before the demuxer moves on).
-            if t.pipes.iter().filter(live).all(|p| ready(&p) || p.starved) {
+            // Empty lanes can let other tracks move. Once compressed input
+            // arrived in this generation, only a decoded picture is ready:
+            // keep that rule across seeks, before the worker reads a packet.
+            if t.pipes.iter().filter(live).all(|p| ready(&p)
+                || (p.starved && !(p.requires_picture && p.horizon.is_some())))
+            {
                 t.buffering = false;
             }
             return;
@@ -267,9 +285,16 @@ impl SharedState {
         }
     }
 
-    /// `play()` / `pause()`.
+    /// `play()` / `pause()`: only intent transitions change pause credit.
     pub(super) fn set_paused(&self, paused: bool) {
-        self.update(|t| t.paused = paused);
+        self.update(|t| match (paused, t.paused) {
+            (true, None) => t.paused = Some(Instant::now()),
+            (false, Some(since)) => {
+                t.paused_for += since.elapsed();
+                t.paused = None;
+            }
+            _ => {}
+        });
     }
 
     /// `seek()`: the clock jumps to `to` and holds until the pipelines have
@@ -277,7 +302,8 @@ impl SharedState {
     /// the audio plays from `to`.
     pub(super) fn seek_clock(&self, to: Duration) {
         self.update(|t| {
-            t.seek_gen = self.seek_gen.load(Ordering::SeqCst);
+            let mut target = self.seek_target.lock();
+            t.seek_gen = t.seek_gen.wrapping_add(1);
             self.master.seek(to, t.seek_gen);
             for p in &mut t.pipes {
                 p.horizon = None;
@@ -287,6 +313,10 @@ impl SharedState {
             t.tail_limit = None;
             t.demux_full = false;
             t.buffering = true;
+            // Publish the target and generation only after the clock holds.
+            // The demuxer reads the pair under the same target lock.
+            *target = Some(to);
+            self.seek_gen.store(t.seek_gen, Ordering::SeqCst);
         });
     }
 
@@ -322,10 +352,58 @@ impl SharedState {
         self.update(|t| t.pipe(pipe).starved = starved);
     }
 
+    pub(super) fn pipe_pending(&self, pipe: Pipe, generation: u64) {
+        self.update(|t| {
+            if t.seek_gen == generation {
+                let p = t.pipe(pipe);
+                p.requires_picture = true;
+                if p.primed != Some(generation) {
+                    t.buffering = true;
+                }
+            }
+        });
+    }
+
     /// The pipeline has output ready (decoded and past the seek target) for
-    /// seek generation `generation`.
+    /// seek generation `generation`. Wakes `wait_primed` even when the hold
+    /// stays.
     pub(super) fn pipe_primed(&self, pipe: Pipe, generation: u64) {
-        self.update(|t| t.pipe(pipe).primed = Some(generation));
+        self.update(|t| {
+            if t.seek_gen == generation {
+                t.pipe(pipe).primed = Some(generation);
+            }
+        });
+        self.wake_clock_waiters();
+    }
+
+    /// Compressed video still needs input before it can release the clock.
+    /// Nonvideo lanes may exceed their duration bound during this hold, but
+    /// never their byte bounds: audio is retained until it can play.
+    pub(super) fn video_priming(&self) -> bool {
+        let t = self.transport.lock();
+        let video = &t.pipes[Pipe::Video as usize];
+        video.live > 0 && video.requires_picture && video.primed != Some(t.seek_gen)
+    }
+
+    /// Waits until `pipe` has output ready for seek generation `generation`
+    /// (`pipe_primed`) or `until` on `unpaused_now` passes. False when the
+    /// player stopped, the pipeline retired or a newer seek superseded it.
+    pub(super) fn wait_primed(&self, pipe: Pipe, generation: u64, until: Instant, retired: &AtomicBool) -> bool {
+        let mut t = self.transport.lock();
+        loop {
+            if t.done || self.superseded(generation, retired) {
+                return false;
+            }
+            let now = t.unpaused_now();
+            if t.pipe(pipe).primed == Some(generation) || now >= until {
+                return true;
+            }
+            if t.paused.is_some() {
+                self.transport_cv.wait(&mut t);
+            } else {
+                self.transport_cv.wait_for(&mut t, until - now);
+            }
+        }
     }
 
     pub(super) fn source_starved(&self, starved: bool) {
@@ -542,10 +620,10 @@ impl SharedState {
     /// after a short wait. False when the caller's PCM is stale.
     pub(super) fn wait_resumed(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
         let mut t = self.transport.lock();
-        if !t.paused {
+        if t.paused.is_none() {
             self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
         }
-        while t.paused && !self.superseded(seen_seek, retired) {
+        while t.paused.is_some() && !self.superseded(seen_seek, retired) {
             self.transport_cv.wait(&mut t);
         }
         !self.superseded(seen_seek, retired)
@@ -563,7 +641,7 @@ impl SharedState {
     /// parks its pipelines here instead.
     pub(super) fn wait_while_paused(&self, retired: &AtomicBool) {
         let mut t = self.transport.lock();
-        while t.paused && !self.stopped.load(Ordering::SeqCst) && !retired.load(Ordering::SeqCst) {
+        while t.paused.is_some() && !self.stopped.load(Ordering::SeqCst) && !retired.load(Ordering::SeqCst) {
             self.transport_cv.wait(&mut t);
         }
     }

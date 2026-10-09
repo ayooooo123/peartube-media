@@ -189,8 +189,8 @@ impl MasterClock {
         }
     }
 
-    /// A seek to `to` (seek generation `generation`): the clock jumps there,
-    /// and the free clock leads until the audio plays from it.
+    /// A seek stops exactly at `to` until the new generation is ready.
+    /// The free clock leads until audio plays from that generation.
     pub(crate) fn seek(&self, to: Duration, generation: u64) {
         let mut lead = self.lead.lock();
         if generation < lead.generation {
@@ -199,9 +199,8 @@ impl MasterClock {
         }
         lead.generation = generation;
         lead.audio = None;
-        if lead.held.is_some() {
-            lead.held = Some(to);
-        }
+        lead.held = Some(to);
+        self.free.pause();
         self.free.set_position(to);
     }
 
@@ -457,6 +456,21 @@ pub(crate) mod timing {
 #[cfg(test)]
 mod master_tests {
     use super::*;
+
+    #[test]
+    fn running_seek_holds_exact_target_until_resumed() {
+        let master = MasterClock::new();
+        master.set_running(true);
+        let target = Duration::from_secs(4);
+        master.seek(target, 1);
+        assert_eq!(master.now(), Some(target));
+        assert_eq!(master.monotonic_ns_at(target), None);
+        master.seek(Duration::ZERO, 0);
+        assert_eq!(master.now(), Some(target), "stale seek moved the clock");
+        master.set_running(true);
+        assert!(master.now().unwrap() >= target);
+        assert!(master.monotonic_ns_at(target).is_some());
+    }
 
     // A device can lose its timestamp while suspended. The paused position
     // must survive that loss, resume, and the eventual audio hand-back.
