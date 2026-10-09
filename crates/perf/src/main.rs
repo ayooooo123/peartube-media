@@ -21,6 +21,9 @@
 //! `ffmpeg` on PATH: the pinned build has no software AV1 decoder. Failed
 //! comparisons invalidate speed verdicts. The `ffmpeg` on PATH's own
 //! single-threaded decode of the stream is timed for reference.
+//! Frame comparison uses decoder-reported dimensions before container hints.
+//! For example, XDCAM MXF may declare 1088 stored lines while the decoder
+//! outputs 1080; packing those frames with the stored height overreads a plane.
 //!
 //! ```text
 //! cargo run --release -p perf -- --out target/perf/perf.json
@@ -814,8 +817,10 @@ fn check_video(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Result
                     .into_iter().find(|p| refcheck::ffmpeg_pix_fmt_name(*p) == Some(name))
             });
             let format = decoder.output_pixel_format().or(p.pixel_format).or(reference_format).unwrap_or(PixelFormat::Yuv420P);
-            match (stream.width.or(p.width), stream.height.or(p.height)) {
-                (Some(w), Some(h)) => match plane_dims(format, w, h) {
+            let dimensions = decoder.output_video_dimensions()
+                .or_else(|| stream.width.or(p.width).zip(stream.height.or(p.height)));
+            match dimensions {
+                Some((w, h)) => match plane_dims(format, w, h) {
                     Some(dims) => layout = Some((format, w, h, dims)),
                     None => failure = Some(format!("no plane layout for {format:?}")),
                 },
