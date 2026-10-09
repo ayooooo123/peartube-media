@@ -283,12 +283,24 @@ impl Drop for AppleAudioSink {
         if slot.as_ref().is_some_and(|s| std::ptr::eq(&*s.0, &*self.synchronizer.0)) {
             *slot = None;
         }
+        drop(slot);
         if self.requesting.get() {
             unsafe {
                 let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
                 let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
             }
             self.requesting.set(false);
+        }
+        // Video may still own this synchronizer. Retire only the audio
+        // renderer; stopping the shared clock would freeze the video tail.
+        unsafe {
+            let renderer = objc2::runtime::ProtocolObject::from_ref(&*self.audio_renderer.0);
+            let _: () = objc2::msg_send![&*self.audio_renderer.0, flush];
+            self.synchronizer.removeRenderer_atTime_completionHandler(
+                renderer,
+                objc2_core_media::kCMTimeInvalid,
+                None,
+            );
         }
     }
 }

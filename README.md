@@ -583,6 +583,23 @@ right. Non-realtime decoding, subtitle workers and application threads are
 not changed. Native tests check the budget and restoration, not just the
 configuration constants.
 
+Audio-sink retirement releases native output even when video retains the clock.
+Apple clears the published audio slot, stops readiness callbacks, flushes and
+removes only its audio renderer; the shared video synchronizer keeps its rate.
+Android freezes the last observed position, detaches the stream and requests
+stop directly, without an intervening asynchronous pause. Empty and suspended
+sinks do not open a stream during destruction.
+
+Native retirement probes retain the clock/output observers across sink drop.
+The macOS probe submitted 48,000 frames and observed the audio renderer leave
+the surviving video synchronizer without changing its requested rate. The
+16 KiB Android emulator probe submitted 4,800 frames, observed AAudio `Stopped`
+and verified the retained clock stayed frozen without a deadline mapping.
+These are native lifecycle checks, not independent audible-PCM accounting,
+continuous A/V timing, or full-Player/device acceptance. Reproducible probes and
+failure-first logs are retained in
+`.targets/native-audio-retirement/evidence/completion.json`.
+
 Native harnesses use an eight-second H.264/PCM clip with a per-frame binary
 identifier in its top eight pixel rows. Generate it with FFmpeg:
 

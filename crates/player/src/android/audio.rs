@@ -21,9 +21,15 @@ impl AndroidAudioSink {
     }
 
     pub fn suspend(&mut self) {
-        self.pause();
+        // Freeze the clock without first starting an asynchronous pause:
+        // a stop requested during that transition can be rejected.
+        let old = {
+            let mut state = self.clock.inner.lock();
+            if state.playing { state.observe(); }
+            state.playing = false;
+            state.stream.take()
+        };
         self.suspended = true;
-        let old = self.clock.inner.lock().stream.take();
         if let Some(stream) = old { let _ = stream.0.request_stop(); }
     }
 
@@ -50,6 +56,13 @@ impl AndroidAudioSink {
         };
         if let Some(stream) = old { let _ = stream.0.request_stop(); }
         Ok(())
+    }
+}
+
+impl Drop for AndroidAudioSink {
+    fn drop(&mut self) {
+        // Video may retain the clock after the audio lane exits.
+        self.suspend();
     }
 }
 
