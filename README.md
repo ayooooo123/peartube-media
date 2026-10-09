@@ -244,7 +244,8 @@ output streams and returns the probe's exit status, not `open -W`'s status.
 The app bundle is removed after exit. Launch through this entry point for
 a foreground application lifecycle, not a daemon-launched CLI process.
 Playback starts only after a visible-surface notification, with a five-second
-deadline; no visible surface is a failure, not a skipped readback.
+deadline, followed by a fresh check of the actual hosting panel. No visible
+surface is a failure, not a skipped readback.
 
 The probe runs the real Player and AppleBackend. Add `--software` to force engine
 decoding or `--transport` for pause/seek. The harness pauses at sample points
@@ -255,11 +256,34 @@ reused linear NV12 storage before CPU inspection; the source is still the
 displayed buffer, not a decoder input frame. No screen capture is used.
 The short probe uses a nonactivating floating panel with hiding on
 deactivation disabled. It can join other applications' window sets and
-full-screen Spaces. An occluded layer can retain a stale displayed buffer.
-Window visibility and renderer state are logged.
+full-screen Spaces. These flags do not prove surface availability. The public
+Cocoa gate requires window visibility, a screen, the active Space and the
+`NSWindowOcclusionState::Visible` bit; application activation is not required.
+After arming, any observed loss is latched for the entire trial. Notifications,
+polling and checks before/during/after readback enforce the gate. `APPLE_BLOCKED`
+returns exit 2 even if visibility later returns; that trial cannot resume or
+collect replacement samples. An occluded layer may retain a stale buffer, but
+occlusion alone does not establish the cause of a particular timing offset.
 Nil/unreadable readback is a hard failure; renderer queue counts and zero
 accumulated-delay counters alone are not timing proof. These are sampled
 displayed-frame offsets, not a continuous presentation-time distribution.
+
+`APPLE_PACKET`, `APPLE_OUTPUT`, `APPLE_SURFACE`, `APPLE_READBACK` and
+`APPLE_DISPLAYED` include monotonic timestamps in the same stderr stream.
+`APPLE_OUTPUT` records the existing decoded-picture callback after renderer
+enqueue and forwards the original readiness notification unchanged. Raw
+readback `Some(frame)` or `None` is logged before the final surface check.
+These records do not replace the original None, EOS or 40 ms assertions.
+
+Run native acceptance in a reserved interval without competing builds, media
+benchmarks or audio/video probes; the Cocoa gate must still verify the actual
+surface. `cargo test --locked -j 2 -p player --example apple_play` checks the
+visibility-state transitions. To exercise the real negative path, launch
+`sh crates/player/examples/apple_play.sh flash-beep.mkv --check-surface-loss`:
+after arming a visible panel it uses public Cocoa `orderOut` and must block
+with exit 2 before Player playback. This is not timing acceptance. For a
+normal run, unexpected visibility loss blocks the whole trial; report the
+public state and reserve a corrected environment before another attempt.
 
 For Android, use the NDK compiler and a 16 KiB-compatible executable link:
 
