@@ -2,6 +2,8 @@
 //! demuxers and decoders and a platform [`backend::Backend`].
 
 mod ass;
+#[cfg(any(target_os = "android", test))]
+mod audio_mix;
 pub mod annexb;
 pub mod backend;
 pub mod subtitle_compose;

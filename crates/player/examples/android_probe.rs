@@ -870,7 +870,7 @@ fn crate_avcc_split(extra: &[u8]) -> (Vec<u8>, Vec<u8>, usize) {
 fn audio_probe() -> i32 {
     let backend = AndroidBackend::new();
     let mut audio = backend.audio();
-    if let Err(e) = audio.open(48000, 2) {
+    if let Err(e) = audio.open(48000, oxideav_core::ChannelLayout::Stereo) {
         println!("[audio] FAIL: open: {e}");
         return 1;
     }

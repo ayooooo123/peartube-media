@@ -116,7 +116,8 @@ impl AppleAudioSink {
 }
 
 impl AudioSink for AppleAudioSink {
-    fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), SinkError> {
+    fn open(&mut self, sample_rate: u32, layout: oxideav_core::ChannelLayout) -> Result<(), SinkError> {
+        let channels = layout.channel_count();
         if sample_rate == 0 || channels == 0 {
             return Err(SinkError::Fatal(format!(
                 "invalid audio format: {sample_rate} Hz, {channels} channels"

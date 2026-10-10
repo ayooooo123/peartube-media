@@ -213,8 +213,8 @@ struct AudioSinkWrapper {
 }
 
 impl AudioSink for AudioSinkWrapper {
-    fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), crate::backend::SinkError> {
-        self.inner.lock().open(sample_rate, channels)
+    fn open(&mut self, sample_rate: u32, layout: oxideav_core::ChannelLayout) -> Result<(), crate::backend::SinkError> {
+        self.inner.lock().open(sample_rate, layout)
     }
 
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, crate::backend::SinkError> {

@@ -1,4 +1,6 @@
 use super::clock::{AudioClock, AudioClockState, SendAudioStream};
+use crate::audio_mix::StereoMix;
+use oxideav_core::ChannelLayout;
 use crate::backend::{AudioSink, Clock, SinkError};
 use crate::clock::current_monotonic_ns;
 use ndk::audio::{AudioDirection, AudioFormat, AudioPerformanceMode, AudioStreamBuilder};
@@ -10,6 +12,8 @@ pub struct AndroidAudioSink {
     clock: AudioClock,
     sample_rate: u32,
     channels: u16,
+    mix: StereoMix,
+    stereo: [f32; 2048],
     suspended: bool,
 }
 
@@ -17,7 +21,11 @@ impl AndroidAudioSink {
     pub fn new() -> (Self, Arc<dyn Clock>) {
         let clock = AudioClock { inner: Arc::new(Mutex::new(AudioClockState::new())) };
         let clock_dyn = Arc::new(clock.clone());
-        (Self { clock, sample_rate: 0, channels: 0, suspended: false }, clock_dyn)
+        (Self {
+            clock, sample_rate: 0, channels: 0, suspended: false,
+            mix: StereoMix::new(ChannelLayout::Stereo).expect("stereo layout"),
+            stereo: [0.0; 2048],
+        }, clock_dyn)
     }
 
     pub fn suspend(&mut self) {
@@ -42,7 +50,9 @@ impl AndroidAudioSink {
     fn create_stream(&self, rate: u32, channels: u16) -> Result<(), SinkError> {
         let stream = AudioStreamBuilder::new()
             .map_err(|e| SinkError::Fatal(format!("AAudio builder: {e:?}")))?
-            .channel_count(i32::from(channels)).sample_rate(rate as i32)
+            // A count above two becomes an indexed AAudio mask, not a speaker
+            // layout. Mix surround ourselves; never delegate dialogue routing.
+            .channel_count(i32::from(channels.min(2))).sample_rate(rate as i32)
             .format(AudioFormat::PCM_Float).direction(AudioDirection::Output)
             .performance_mode(AudioPerformanceMode::LowLatency)
             .open_stream().map_err(|e| SinkError::Fatal(format!("AAudio open: {e:?}")))?;
@@ -67,10 +77,12 @@ impl Drop for AndroidAudioSink {
 }
 
 impl AudioSink for AndroidAudioSink {
-    fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), SinkError> {
+    fn open(&mut self, sample_rate: u32, layout: ChannelLayout) -> Result<(), SinkError> {
+        let channels = layout.channel_count();
         if sample_rate == 0 || sample_rate > i32::MAX as u32 || channels == 0 || channels > 64 {
             return Err(SinkError::Fatal(format!("invalid audio format {sample_rate} Hz / {channels} channels")));
         }
+        let mix = StereoMix::new(layout).map_err(|e| SinkError::Fatal(e.into()))?;
         // Suspended (app in the background): keep the format and let
         // `resume` create the stream. Opening here would restart audio in
         // the background; writes report `Unavailable` until then.
@@ -79,6 +91,7 @@ impl AudioSink for AndroidAudioSink {
         }
         self.sample_rate = sample_rate;
         self.channels = channels;
+        self.mix = mix;
         Ok(())
     }
 
@@ -88,7 +101,12 @@ impl AudioSink for AndroidAudioSink {
             let state = self.clock.inner.lock();
             (state.stream.clone().ok_or(SinkError::Unavailable)?, state.playing)
         };
-        let frames = pcm.len() / usize::from(self.channels);
+        let (pcm, frames) = if self.channels > 2 {
+            let frames = self.mix.mix(pcm, &mut self.stereo);
+            (&self.stereo[..frames * 2], frames)
+        } else {
+            (pcm, pcm.len() / usize::from(self.channels))
+        };
         if frames == 0 { return Ok(0); }
         let before = stream.0.frames_written();
         // One bounded write lets the engine react to a hold/seek/drop even

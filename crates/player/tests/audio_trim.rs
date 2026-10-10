@@ -175,8 +175,8 @@ struct GatedAudio {
 }
 
 impl AudioSink for GatedAudio {
-    fn open(&mut self, rate: u32, channels: u16) -> Result<(), SinkError> {
-        self.sink.open(rate, channels)
+    fn open(&mut self, rate: u32, layout: oxideav_core::ChannelLayout) -> Result<(), SinkError> {
+        self.sink.open(rate, layout)
     }
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
         if let Some((entered, release)) = self.gate.take() {

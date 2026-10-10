@@ -10,7 +10,7 @@ use audio_trim::{Pcm, Trimmer};
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use oxideav_core::{
-    CodecParameters, Decoder, Demuxer, Frame, MediaType, Packet, PacketMetadata, ProbeData, RuntimeContext,
+    ChannelLayout, CodecParameters, Decoder, Demuxer, Frame, MediaType, Packet, PacketMetadata, ProbeData, RuntimeContext,
     SampleFormat, StreamInfo, TimeBase, VideoFrame, PROBE_SCORE_EXTENSION,
 };
 
@@ -1819,7 +1819,7 @@ fn run_audio_thread(
 
     let mut out = AudioOut {
         rate: stream.params.sample_rate.unwrap_or(48000),
-        channels: stream.params.channels.unwrap_or(2),
+        layout: stream.params.resolved_layout().unwrap_or(ChannelLayout::Stereo),
         open: false,
         written: Written::default(),
         seen_seek_target: 0,
@@ -1827,7 +1827,7 @@ fn run_audio_thread(
     };
     // The output may come from the previous track: none of that plays on.
     sink.flush();
-    out.open = sink.open(out.rate, out.channels).is_ok();
+    out.open = sink.open(out.rate, out.layout).is_ok();
     let mut starved = false;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
@@ -1990,6 +1990,7 @@ fn run_audio_thread(
 struct Chunk {
     pcm: Vec<f32>,
     channels: usize,
+    layout: ChannelLayout,
     rate: u32,
     pts: f64,
     /// The first sample after a declared start skip (`Pcm::begins_presentation`).
@@ -2017,7 +2018,7 @@ impl Pcm for Chunk {
     fn split_off(&mut self, n: usize) -> Self {
         let rest = self.pcm.split_off(n.saturating_mul(self.channels).min(self.pcm.len()));
         let pts = self.pts + n as f64 / f64::from(self.rate.max(1));
-        Chunk { pcm: rest, channels: self.channels, rate: self.rate, pts, begins: false }
+        Chunk { pcm: rest, channels: self.channels, layout: self.layout, rate: self.rate, pts, begins: false }
     }
 
     fn begins_presentation(&mut self) {
@@ -2045,14 +2046,17 @@ fn decoded_chunk(
     };
     let frames = pcm.len() / channels.max(1);
     *decoded_end = Some(pts + frames as f64 / f64::from(rate.max(1)));
-    Chunk { pcm, channels, rate, pts, begins: false }
+    let layout = stream.params.resolved_layout()
+        .filter(|layout| usize::from(layout.channel_count()) == channels)
+        .unwrap_or_else(|| ChannelLayout::from_count(channels as u16));
+    Chunk { pcm, channels, layout, rate, pts, begins: false }
 }
 
 /// What an audio pipeline's output is set up for and has taken.
 struct AudioOut {
     /// The layout the sink was last opened with, and whether that worked.
     rate: u32,
-    channels: u16,
+    layout: ChannelLayout,
     open: bool,
     written: Written,
     /// The newest seek generation whose target the output has reached.
@@ -2095,12 +2099,12 @@ fn present_audio(
     realtime: bool,
     retired: &AtomicBool,
 ) -> bool {
-    let Chunk { mut pcm, channels, rate: sample_rate, pts, begins } = chunk;
-    if !out.open || sample_rate != out.rate || channels as u16 != out.channels {
+    let Chunk { mut pcm, channels, layout, rate: sample_rate, pts, begins } = chunk;
+    if !out.open || sample_rate != out.rate || layout != out.layout {
         out.rate = sample_rate;
-        out.channels = channels as u16;
+        out.layout = layout;
         out.written.reopen(shared);
-        out.open = sink.open(out.rate, out.channels).is_ok();
+        out.open = sink.open(out.rate, out.layout).is_ok();
     }
     let sink_failed = !out.open;
 
@@ -2150,7 +2154,7 @@ fn present_audio(
         return true;
     }
     let pts = Duration::from_secs_f64(pts_secs);
-    write_pcm(sink, shared, &pcm, channels, sample_rate, pts, seen_seek, realtime, &mut out.written, retired)
+    write_pcm(sink, shared, &pcm, layout, sample_rate, pts, seen_seek, realtime, &mut out.written, retired)
 }
 
 /// What an audio pipeline knows about its output across writes.
@@ -2204,7 +2208,7 @@ fn write_pcm(
     sink: &mut dyn AudioSink,
     shared: &SharedState,
     pcm: &[f32],
-    channels: usize,
+    layout: ChannelLayout,
     rate: u32,
     pts: Duration,
     seen_seek: u64,
@@ -2212,7 +2216,7 @@ fn write_pcm(
     written: &mut Written,
     retired: &AtomicBool,
 ) -> bool {
-    let channels = channels.max(1);
+    let channels = usize::from(layout.channel_count()).max(1);
     let rate = rate.max(1);
     let chunk = (rate as usize / 50).max(1);
     let frames = pcm.len() / channels;
@@ -2262,7 +2266,7 @@ fn write_pcm(
                 // Sink refused (device lost): keep the engine alive and
                 // reopen it for the next samples.
                 written.reopen(shared);
-                let _ = sink.open(rate, channels as u16);
+                let _ = sink.open(rate, layout);
                 return true;
             }
         }

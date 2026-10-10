@@ -8,7 +8,7 @@
 //! in software and hands it frames. Either way the video is presented on
 //! the master clock. Subtitles arrive as positioned RGBA images.
 
-use oxideav_core::{CodecParameters, Packet, VideoFrame};
+use oxideav_core::{ChannelLayout, CodecParameters, Packet, VideoFrame};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -68,8 +68,8 @@ pub enum SinkError {
 /// Audio output. PCM is interleaved f32 in [-1, 1].
 pub trait AudioSink: Send {
     /// Configures the output. Called before the first `write` and again when
-    /// the format changes.
-    fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), SinkError>;
+    /// the format changes. PCM channels follow `layout.positions()` where known.
+    fn open(&mut self, sample_rate: u32, layout: ChannelLayout) -> Result<(), SinkError>;
     /// Queues PCM whose first sample plays at media time `pts`. Blocks while
     /// a playing output's buffer is full; a paused output that is full takes
     /// nothing (0). Returns how many frames it took.

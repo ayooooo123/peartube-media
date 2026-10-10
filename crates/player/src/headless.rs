@@ -445,7 +445,8 @@ impl HeadlessAudioSink {
 }
 
 impl AudioSink for HeadlessAudioSink {
-    fn open(&mut self, sample_rate: u32, channels: u16) -> Result<(), SinkError> {
+    fn open(&mut self, sample_rate: u32, layout: oxideav_core::ChannelLayout) -> Result<(), SinkError> {
+        let channels = layout.channel_count();
         let mut inner = self.inner.lock();
         let mut device = self.device.lock();
         self.stop(&mut inner, &mut device, current_monotonic_ns());
