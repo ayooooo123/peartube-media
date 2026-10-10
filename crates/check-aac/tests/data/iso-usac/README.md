@@ -10,10 +10,10 @@ With unmodified libxaac `2fbadd57bca46693b7a077bcf1513131106d960c` built as desc
 
 ```sh
 python3 tests/data/iso-usac/prepare.py \
-  /Users/jd/projects/oracles/iso-usac \
-  /Users/jd/projects/oracles/libxaac-build-macos-c/xaacdec
-ISO_USAC=/Users/jd/projects/oracles/iso-usac \
-  CARGO_TARGET_DIR=/Users/jd/projects/peartube-media-wt/.targets/t3 \
+  "$HOME/projects/oracles/iso-usac" \
+  "$HOME/projects/oracles/libxaac-build-macos-c/xaacdec"
+ISO_USAC="$HOME/projects/oracles/iso-usac" \
+  CARGO_TARGET_DIR="$HOME/projects/peartube-media-wt/.targets/t3" \
   cargo test -j 2 -p check-aac --test iso_reference -- --nocapture
 ```
 
