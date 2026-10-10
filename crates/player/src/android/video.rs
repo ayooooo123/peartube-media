@@ -531,7 +531,9 @@ impl AndroidVideoSink {
     }
 
     pub fn on_output_invalidated(&mut self) {
-        self.mailbox.bump_codec_epoch();
+        // Output revision/suspension already revoke the old producer. Only the
+        // native owner changes codec epochs when it flushes or replaces a codec:
+        // this notification can arrive after the successor has configured.
         self.mailbox.notify_owner();
         self.mailbox.wake_frontend_outside();
     }
