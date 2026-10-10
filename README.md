@@ -18,10 +18,12 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 ## Design
 
 - **Source**: `oxideav-http`'s `HttpSource` (HTTP/1.1 Range, `Read + Seek`) behind a bounded read-ahead ring. Reads have a deadline, so a suspended worklet fails reads instead of hanging them; resume reopens at the last offset. Plain http only by default: the app reads every stream from its worklet on 127.0.0.1, so the `oxideav-http` fork builds without its `tls` feature and an `https://` URL fails to open with an error naming it. The player's `https` feature turns TLS back on.
+  Relative seeks are resolved against the demuxer's consumer position before being sent to the read-ahead worker; the worker's advanced cursor is never used as their origin. Invalid relative offsets fail without changing that position.
 - **Demux**: `ContainerRegistry::probe_input` (rewinds after reading up to 256 KiB), then `open_demuxer(name, input, &codecs)`. One demux thread fills per-stream packet queues bounded in both duration and bytes.
 - **Packet metadata and seeking**: snapshot `Demuxer::packet_metadata()` with each packet, including queued-byte accounting for owned cue metadata. A container random-access point is separate from the codec parser's keyframe flag; the engine and both native decoder gates accept either without changing parser flags. A seek whose landing is an H.264 or HEVC picture that depends on earlier pictures (a non-IDR I frame without a recovery point, a non-IRAP HEVC picture) walks back to an IDR, completed recovery point or IRAP picture (`engine/entry.rs`), with a 10 s look-back bound checked after each landing. For H.264 `recovery_frame_cnt > 0`, it reads forward to the recovering reference picture; if that is after the target, it tries an earlier landing. If there is no earlier input, it hides partial pictures until recovery completes. The reference-picture counter covers progressive streams without frame-number gaps; fields and gaps remain follow-ups. Pictures before the target are never shown. The open-GOP and intra-refresh regressions cover MKV, MP4 and MPEG-TS against FFmpeg's uninterrupted decode. Audio trims are applied (below); WebVTT cue metadata reaches the runtime-font renderer.
 - **Buffering**: the read-ahead ring reports when a read waits for bytes that have not arrived. The clock holds at the start until the first audio and video are decoded and about a second is queued (or the input ends), likewise after a seek, and mid-stream whenever a pipeline runs dry while the source is starved, until a second is queued past the clock again. `buffering` in the state follows the hold; `play`/`pause` stay the user's intent, so a pause during buffering stays paused when the data arrives. A compressed track keeps its decoded-picture requirement across seeks: an empty packet lane does not release the hold once that generation has received video input.
 - **Priming bounds**: while compressed video awaits its first decoded picture, audio and subtitle lanes may pass the normal two-second duration limit so they cannot block the video input needed for reordering. Their existing byte limits still stop demux reads; queued audio is retained. Normal duration pacing returns when the picture is ready. The five-second picture deadline is checked even while the video lane waits for input, including when another lane reaches its byte limit. It excludes only user-intent pause time: buffering and priming holds still consume the allowance, and resuming does not reset time already spent.
+  Pending, `WouldBlock`, and `Unavailable` video transitions all service that active-time deadline; transient backpressure cannot bypass it. A healthy midstream format change gets a fresh transition allowance while retaining earned picture readiness, accepted frames, and the clock anchor.
 - **Audio**: always decoded in software (OxideAV or `codec-*`) to PCM. Android plays it through AAudio, Apple through `AVSampleBufferAudioRenderer`. The sink's presented position is the master clock; Android maps AAudio frame/time pairs onto `CLOCK_MONOTONIC`, clamped to the audio actually queued. Pause and buffering stop the audio output, including while its final queued samples drain. Apple's extra automatic startup hold is disabled; the engine owns buffering. A seek stops exactly at the target before publishing its new generation. Only audio from that generation may lead; without audio, or after it ends, the free clock continues from the current position.
   Android never extrapolates from the time `play` was requested. Without a fresh hardware timestamp, only AAudio's endpoint-consumed frame count can advance the position; no media-to-monotonic deadline is invented. This also handles a fully drained stream resumed without another timestamp. Position stays monotonic within a stream; seek/reopen resets it. `cargo test -p player --test android_clock` covers startup, stale resume timestamps, device corrections, starvation and drained resume. Endpoint progress is not independent proof of audible PCM timing.
   Apple sample-rate/channel changes replace the format description for subsequent buffers without flushing queued audio or reanchoring the shared clock. Explicit seek/reset flush still discards old buffers and permits a new anchor. A native paused-queue regression covers 44.1 kHz stereo → 48 kHz mono: the anchor stays at 2.000 s rather than jumping to the next buffer's 2.020 s, then an explicit flush permits a backward anchor at 1.000 s. This verifies the native queue/clock lifecycle, not independently captured audible PCM.
@@ -30,7 +32,7 @@ Play every format on VLC's published feature list (videolan.org/vlc/features.htm
 - **Empty video at EOS**: if input ends before a startup recovery window completes, or a seek is past the video end, the video pipeline retires without reporting a picture. It does not wait on the held playback clock. Audio then plays and drains normally. A native decoder that should produce a picture but does not still reports a bounded playback error.
 - **Native packet framing**: AVC/HEVC packet framing comes from the stream's configuration, not a per-packet start-code guess. A valid AVCC length of 256–511 starts with `00 00 01`; misreading it as Annex B corrupts the native decoder's input.
 - **Presentation**: software frames wait against the live master clock, with a sink-specific enqueue lead. Android recomputes each MediaCodec release target from the clock instead of committing a distant, uninterruptible deadline. Apple attaches the video renderer to the audio's `AVSampleBufferRenderSynchronizer`; video-only playback uses its own timebase anchored to the engine clock. Neither Apple path uses `DisplayImmediately`. Layer work stays on the main thread, and a failed layer (`requiresFlushToResumeDecoding`) is flushed and re-fed from a keyframe.
-- **Lifecycle**: `open` takes no surface; `set_surface` attaches or detaches one (Android `SurfaceView` callbacks, macOS/iOS view moves). `suspend` / `resume` follow the activity: stop audio, release the platform decoder and surface, resume at the last position.
+- **Lifecycle**: `VideoSink::poll_transition` applies immutable producer-keyed requests on bounded native owners; cancellation and polling do not wait for native cleanup. Android callers register `SurfaceBinding`s through `SurfaceRegistry`, publish them to the backend, and retain their views until `SurfaceRetirement::poll` proves cleanup. Sink drop requests retirement, not synchronous completion. `suspend` / `resume` invalidate output and recover at the held position. Forced framework surface destruction can precede cleanup; it is reported as pending, not a successful retirement.
 - **Subtitles**: text, ASS and bitmap subtitles render to RGBA on an overlay above the video (a second `SurfaceView` on Android, a `CALayer` on Apple). Bitmap frames are display states: `VideoFrame::display_duration` supplies a known end; otherwise the next frame replaces the state, with a blank frame clearing it. Packet duration is not a bitmap display timeout. Bitmap coordinates use the subtitle canvas size, independently of the video's resolution.
 - **Untrusted input**: every stream comes from untrusted peers. Frame dimensions, stream count and queue bytes are capped, demux and decode run under `catch_unwind`, and the corpus includes truncated and mutated files.
 
@@ -601,6 +603,144 @@ These are native lifecycle checks, not independent audible-PCM accounting,
 continuous A/V timing, or full-Player/device acceptance. Reproducible probes and
 failure-first logs are retained in
 `.targets/native-audio-retirement/evidence/completion.json`.
+
+The video lifecycle owner helper limits native workers to four process-wide
+slots. Each slot has a fixed reaper; a retirement receipt becomes readable only
+after its worker has exited and been joined. Failed cleanup or an unwinding
+owner quarantines capacity. Completed receipts use write-once reads, so
+concurrent observers cannot turn completion back into `Pending`. A wake panic
+does not terminate its reaper; that slot stops admitting further owners.
+Unknown panic payloads are retained rather than running their potentially
+panicking destructors; quarantine bounds this retention to the fixed slots
+and any replacement already admitted before a wake failed.
+
+The isolated production-helper CLI and five controlled-thread regressions
+passed, including blocked thread-local teardown, replacement after a failing
+wake, and a panic payload with a panicking destructor. The CLI checked 8,000
+concurrent completed observations. Its original standalone receipt was lost in
+local target cleanup; the owner regressions also appear in the retained Player
+library log, `.packets/LifecycleEvidence/apple-observer-after-and-library.log`.
+Helper results alone are not native retirement or device timing proof.
+
+Android Surface cleanup serializes owner admission and ticket publication with
+the registry, so concurrent retries cannot spawn duplicate cleanup or miss a
+capacity notification while a payload is temporarily removed. Native calls and
+completion callbacks run outside registry locks. Duplicate-window cleanup keeps
+its own registration credit and must finish before the primary retirement receipt.
+Reaper notifications consume completed receipts without requiring another
+frontend poll. An earlier isolated cleanup executable compiled, but its native
+run was unverified: the emulator failed to boot and the probe timed out before
+admission. The probe source was subsequently lost during local target cleanup.
+
+A subsequent host-GPU boot of the 16 KiB emulator completed. The actual-window
+smoke passed shared identity, exclusive leasing, duplicate cleanup with all four
+owner slots occupied, wake-driven retirement/reap, and restoration of all sixteen
+registration credits. An initial twenty-second attempt produced no output; its
+cause remains unresolved. The instrumented attempt used a forty-five-second outer
+watchdog while preserving its five-second scenario assertions. Source hashes and
+results are in `.packets/LifecycleEvidence/android-surface-native-completion.json`.
+This is Surface/owner proof, not MediaCodec, JNI, app UI, or timing acceptance.
+
+The native software-output smoke first reproduced an idle owner retaining its
+revoked Surface lease. The corrected owner releases that window without waiting
+for another frame. The same smoke then read back 768 exact RGBA pixels across
+16×16 and 32×16 Surfaces, observed both readiness reports, and completed EOS,
+owner retirement/reap, and both Surface receipts. This is small-surface native
+functional proof, not realistic-resolution, physical-scanout, or app UI proof.
+
+Pending Android setup expiry is a terminal error, not enqueue backpressure.
+Cancellation, active-time expiry and output identity are rechecked around codec
+creation/configuration and before setup success; failed cleanup is propagated.
+The public deadline smoke failed before this correction and passed afterward,
+including cancellation precedence and retirement after expiry. The compressed
+H.264 probe still failed its five-second setup allowance; a contemporaneous
+platform log records codec allocation timeout. No native compressed acceptance
+or unchanged retry follows. Evidence is retained under
+`.packets/LifecycleEvidence/android-native-completion.json`.
+
+A physical Pixel 9 Pro (API 37, 4 KiB pages) exposed a separate software-input
+publication gap: cancellation discarded an accepted frame before its preserving
+successor arrived. Accepted software input now retains its admission request,
+format and reset epoch. Only a live same-seek/output preserving successor can
+authorize predecessor delivery; intervening resets invalidate it. The owner
+waits without blocking frontend control, and replacement configuration completes
+after predecessor delivery. Readiness remains tagged to the original request.
+The failure-first native probe then passes both preserving and resetting cases:
+256 exact predecessor RGBA pixels survive a preserving YUV-format replacement;
+reset discards that frame, and neither case attributes old readiness to the
+successor. Both finish native retirement/reap and Surface retirement. Evidence:
+`.packets/LifecycleEvidence/android-preservation-completion.json`.
+This is software-input proof, not compressed-video or full-app acceptance.
+
+The standalone Android codec probe initializes its process Binder pool before
+using MediaCodec. Unlike an Android app, an adb shell executable has no inherited
+pool for incoming codec callbacks; the observed no-pool run configured but stalled
+after two native input queues. This initialization belongs in the probe entry
+point, not the Player library ([AOSP contract](https://android.googlesource.com/platform/frameworks/native/+/refs/heads/main/libs/binder/ndk/include_platform/android/binder_process.h)).
+The probe also submits a new producer explicitly after Surface retirement and
+holds its free clock until the first decoded picture. The physical timed run
+still fails its unchanged minimum of 150 readbacks: 104/192 observed, with EOS
+and both windows exercised. Its cause is not established; this is not timing
+acceptance. A separate unpaced native lifecycle scenario must not replace that
+timed result.
+
+The physical unpaced MediaCodec/ImageReader scenario verifies 192 pictures,
+an early flush with CSD recovery, then 192 more pictures after a paused backward
+seek; stale input is rejected without transfer. A controlled clock barrier
+exposed one held picture being presented after retirement intent (385 instead
+of 384 readbacks). The owner now checks cancellation, desired producer, output
+revision and retirement before dequeue and again after clock mapping, before
+native presentation. The same barrier then retains exactly 384 readbacks,
+keeps retirement pending while the owner is held, and completes native
+cleanup/reap and Surface retirement after release.
+The corrected run observed 31.9 ms early flush, 5.1 ms backward-seek flush,
+and 45.9 ms retirement after barrier release; these are observations, not
+worst-case native-call bounds. The process-wide owner bound still contains
+stalled calls rather than interrupting them.
+Evidence: `.packets/LifecycleEvidence/android-held-cancellation-completion.json`.
+An earlier unpaced run missed one of 192 readbacks; its cause remains unresolved.
+Neither this scoped regression nor its full readback counts clears the timed
+104/192 failure, proves hardware decoding, or establishes app/JNI/UI acceptance.
+
+The isolated debug app `com.peartube.lifecycle` was then installed on that
+physical Pixel without replacing the existing app. The actual app/JNI path
+uses the vendor `c2.exynos.h264.decoder`: a silent 160×120 Matroska fixture
+shows a picture, survives a paused backward seek, six seconds paused,
+resume, background/surface recreation and five close/reopen cycles, then
+returns to the list at EOS. The same packets in MP4 initially failed to open
+with `seek past end`. A read-ahead relative-seek correction has two
+failure-first regressions; all 83 Player library tests pass. The rebuilt app
+opens that original MP4, shows its native picture, holds the backward seek
+while paused, resumes, and returns to the list at EOS.
+APK/source hashes, screenshots, UI records and app-scoped codec logs:
+`.packets/LifecycleEvidence/app-install-lifecycle-completion.json`.
+These checks establish scoped app behavior, not release/R8, 16 KiB-page,
+audio/subtitle accuracy, continuous scanout or 40 ms timing acceptance.
+
+`cargo test -p player --test compressed_seek -- --test-threads=1` passes
+16 controlled Player scenarios. They include startup expiry for all three
+transient transition responses, same-seek stale-readiness exclusion, complete
+ordered packet/frame retention under backpressure, paused output replacement
+at the held position, and a real software format change after the original
+startup allowance has expired. The latter keeps all sixteen reference frames.
+The standalone Player smoke reports the readiness error after about five
+seconds in all three transient modes; before correction, `WouldBlock` escaped
+the eight-second watchdog without an error. The recovered raw suite log is
+`.packets/LifecycleEvidence/compressed-lifecycle-corrected.log`; original manifests
+and standalone binaries were lost during local target cleanup. These are
+engine/Headless and bounded platform-model checks, not native or app acceptance.
+
+An Apple native smoke reproduces cancellation arriving before a preserving
+replacement request. Accepted work now waits on the owner—not the frontend or
+main queue—until publication determines preservation versus reset. The smoke
+observes one enqueue for preservation, zero for reset/retirement, and native
+cleanup/reap acknowledgements in all three cases. Preserving replacement keeps
+the existing timebase. Untagged layer notifications only trigger a current native
+status check; they are not relabelled as failures of the newest producer.
+Failure-first logs and probe source are retained in
+`.packets/LifecycleEvidence/publication-gap-completion.json`. This covers one
+software frame and native ownership, not displayed pixels, compressed decoding,
+Android runtime, or the separate 40 ms timing gate.
 
 Native harnesses use an eight-second H.264/PCM clip with a per-frame binary
 identifier in its top eight pixel rows. Generate it with FFmpeg:

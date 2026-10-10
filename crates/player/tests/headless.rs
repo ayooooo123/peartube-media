@@ -1816,6 +1816,8 @@ struct CompressedOutput {
 struct CompressedSink {
     inner: Box<dyn player::backend::VideoSink>,
     pushed: Arc<std::sync::atomic::AtomicUsize>,
+    compressed_producer: Option<player::backend::ProducerId>,
+    frames_producer: Option<player::backend::ProducerId>,
 }
 
 impl player::backend::Backend for CompressedOutput {
@@ -1824,7 +1826,12 @@ impl player::backend::Backend for CompressedOutput {
     }
     fn video(&self, clock: Arc<dyn player::backend::Clock>) -> Box<dyn player::backend::VideoSink> {
         let inner = player::backend::Backend::video(&*self.inner, clock);
-        Box::new(CompressedSink { inner, pushed: self.pushed.clone() })
+        Box::new(CompressedSink {
+            inner,
+            pushed: self.pushed.clone(),
+            compressed_producer: None,
+            frames_producer: None,
+        })
     }
     fn subtitles(&self) -> Box<dyn player::backend::SubtitleSink> {
         player::backend::Backend::subtitles(&*self.inner)
@@ -1832,31 +1839,101 @@ impl player::backend::Backend for CompressedOutput {
 }
 
 impl player::backend::VideoSink for CompressedSink {
-    fn open_compressed(&mut self, params: &oxideav_core::CodecParameters, _: player::backend::PictureReady) -> bool {
-        params.codec_id.as_str() == "mpeg2video"
+    fn output(&self) -> player::backend::VideoOutput {
+        self.inner.output()
     }
-    fn present_from(&mut self, start: Duration) { self.inner.present_from(start); }
-    fn push_packet(&mut self, _: &oxideav_core::Packet, _: Duration, _: bool) -> Result<(), player::backend::SinkError> {
+    fn poll_transition(
+        &mut self,
+        request: &player::backend::VideoRequest,
+    ) -> std::task::Poll<Result<player::backend::VideoMode, player::backend::VideoError>> {
+        match &request.target {
+            player::backend::VideoTarget::Compressed { params, .. } => {
+                if params.codec_id.as_str() == "mpeg2video" {
+                    self.compressed_producer = Some(request.producer);
+                    // Do not admit this producer on the Frames-only inner Headless.
+                    std::task::Poll::Ready(Ok(player::backend::VideoMode::Compressed))
+                } else {
+                    std::task::Poll::Ready(Err(player::backend::VideoError::Unsupported))
+                }
+            }
+            player::backend::VideoTarget::Frames { .. } => {
+                let result = self.inner.poll_transition(request);
+                if matches!(result, std::task::Poll::Ready(Ok(_))) {
+                    self.frames_producer = Some(request.producer);
+                }
+                result
+            }
+            player::backend::VideoTarget::Retired => self.inner.poll_transition(request),
+        }
+    }
+    fn push_packet(
+        &mut self,
+        producer: player::backend::ProducerId,
+        packet: &mut Option<oxideav_core::Packet>,
+        _pts: Duration,
+        _random_access: bool,
+    ) -> Result<(), player::backend::VideoError> {
+        if self.compressed_producer != Some(producer) {
+            return Err(player::backend::VideoError::Superseded);
+        }
         self.pushed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = packet.take();
         Ok(())
     }
-    fn open_frames(&mut self, params: &oxideav_core::CodecParameters) -> Result<(), player::backend::SinkError> {
-        self.inner.open_frames(params)
+    fn push_frame(
+        &mut self,
+        producer: player::backend::ProducerId,
+        frame: &mut Option<oxideav_core::VideoFrame>,
+        pts: Duration,
+    ) -> Result<(), player::backend::VideoError> {
+        if self.frames_producer != Some(producer) {
+            return Err(player::backend::VideoError::Superseded);
+        }
+        self.inner.push_frame(producer, frame, pts)
     }
-    fn push_frame(&mut self, frame: &oxideav_core::VideoFrame, pts: Duration) -> Result<(), player::backend::SinkError> {
-        self.inner.push_frame(frame, pts)
+    fn present_from(
+        &mut self,
+        producer: player::backend::ProducerId,
+        start: Duration,
+    ) -> Result<(), player::backend::VideoError> {
+        if self.compressed_producer == Some(producer) {
+            return Ok(());
+        }
+        if self.frames_producer == Some(producer) {
+            return self.inner.present_from(producer, start);
+        }
+        Err(player::backend::VideoError::Superseded)
+    }
+    fn set_playing(
+        &mut self,
+        producer: player::backend::ProducerId,
+        playing: bool,
+    ) -> Result<(), player::backend::VideoError> {
+        // Forward keyed set_playing only for producers the wrapper admitted on the
+        // Frames path. Compressed-only producers must not hit the inner Headless
+        // that never admitted them (would stick at Superseded forever).
+        if self.compressed_producer == Some(producer) {
+            return Ok(());
+        }
+        if self.frames_producer == Some(producer) {
+            return self.inner.set_playing(producer, playing);
+        }
+        Err(player::backend::VideoError::Superseded)
     }
     fn frame_lead(&self) -> Duration {
         self.inner.frame_lead()
     }
-    fn finish(&mut self) -> Result<(), player::backend::SinkError> {
-        self.inner.finish()
-    }
-    fn flush(&mut self) {
-        self.inner.flush()
-    }
-    fn set_playing(&mut self, playing: bool) {
-        self.inner.set_playing(playing)
+    fn poll_finish(
+        &mut self,
+        producer: player::backend::ProducerId,
+    ) -> std::task::Poll<Result<(), player::backend::VideoError>> {
+        if self.compressed_producer == Some(producer) {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        if self.frames_producer == Some(producer) {
+            return self.inner.poll_finish(producer);
+        }
+        std::task::Poll::Ready(Err(player::backend::VideoError::Superseded))
     }
 }
 

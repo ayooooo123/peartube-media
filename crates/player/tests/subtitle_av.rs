@@ -17,7 +17,11 @@ use std::time::{Duration, Instant};
 use bitmap::{Scratch, ffmpeg};
 use oxideav_core::{CodecParameters, Packet, VideoFrame};
 use parking_lot::Mutex;
-use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleImage, SubtitleSink, VideoSink};
+use std::task::Poll;
+use player::backend::{
+    AudioSink, Backend, Clock, ProducerId, SinkError, SubtitleImage, SubtitleSink,
+    VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink, VideoTarget,
+};
 use player::{Headless, Player, PlayerOptions, State};
 use scripted::{Hold, Mode};
 
@@ -54,7 +58,12 @@ impl Backend for Watched {
 
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
         *self.watch.clock.lock() = Some(clock.clone());
-        Box::new(WatchedVideo(self.headless.video(clock), self.watch.clone()))
+        Box::new(WatchedVideo {
+            sink: self.headless.video(clock),
+            watch: self.watch.clone(),
+            seen_producers: std::collections::HashSet::new(),
+            initial_producer: None,
+        })
     }
 
     fn subtitles(&self) -> Box<dyn SubtitleSink> {
@@ -76,23 +85,69 @@ impl AudioSink for WatchedAudio {
     fn clock(&self) -> Arc<dyn Clock> { self.0.clock() }
 }
 
-struct WatchedVideo(Box<dyn VideoSink>, Arc<Watch>);
+struct WatchedVideo {
+    sink: Box<dyn VideoSink>,
+    watch: Arc<Watch>,
+    /// Successful non-initial reset transitions counted once per producer.
+    seen_producers: std::collections::HashSet<u64>,
+    initial_producer: Option<u64>,
+}
 
 impl VideoSink for WatchedVideo {
-    fn open_compressed(&mut self, params: &CodecParameters, ready: player::backend::PictureReady) -> bool { self.0.open_compressed(params, ready) }
-    fn present_from(&mut self, start: Duration) { self.0.present_from(start); }
-    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
-        self.0.push_packet(packet, pts, random_access)
+    fn output(&self) -> VideoOutput {
+        self.sink.output()
     }
-    fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> { self.0.open_frames(params) }
-    fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> { self.0.push_frame(frame, pts) }
-    fn frame_lead(&self) -> Duration { self.0.frame_lead() }
-    fn finish(&mut self) -> Result<(), SinkError> { self.0.finish() }
-    fn flush(&mut self) {
-        self.1.video_flushes.fetch_add(1, Ordering::SeqCst);
-        self.0.flush()
+    fn poll_transition(&mut self, request: &VideoRequest) -> Poll<Result<VideoMode, VideoError>> {
+        let result = self.sink.poll_transition(request);
+        if let Poll::Ready(Ok(_)) = &result {
+            let id = request.producer.0;
+            if self.initial_producer.is_none() {
+                self.initial_producer = Some(id);
+                self.seen_producers.insert(id);
+            } else if !self.seen_producers.contains(&id) {
+                // Count each successful reset transition once per producer excluding initial.
+                let is_reset = match &request.target {
+                    VideoTarget::Frames { reset: true, .. } | VideoTarget::Compressed { .. } => true,
+                    VideoTarget::Frames { reset: false, .. } => false,
+                    VideoTarget::Retired => false,
+                };
+                if is_reset {
+                    self.seen_producers.insert(id);
+                    self.watch.video_flushes.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        result
     }
-    fn set_playing(&mut self, playing: bool) { self.0.set_playing(playing) }
+    fn push_packet(
+        &mut self,
+        producer: ProducerId,
+        packet: &mut Option<Packet>,
+        pts: Duration,
+        random_access: bool,
+    ) -> Result<(), VideoError> {
+        self.sink.push_packet(producer, packet, pts, random_access)
+    }
+    fn push_frame(
+        &mut self,
+        producer: ProducerId,
+        frame: &mut Option<VideoFrame>,
+        pts: Duration,
+    ) -> Result<(), VideoError> {
+        self.sink.push_frame(producer, frame, pts)
+    }
+    fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {
+        self.sink.present_from(producer, start)
+    }
+    fn set_playing(&mut self, producer: ProducerId, playing: bool) -> Result<(), VideoError> {
+        self.sink.set_playing(producer, playing)
+    }
+    fn frame_lead(&self) -> Duration {
+        self.sink.frame_lead()
+    }
+    fn poll_finish(&mut self, producer: ProducerId) -> Poll<Result<(), VideoError>> {
+        self.sink.poll_finish(producer)
+    }
 }
 
 struct WatchedSubtitles(Arc<Watch>);

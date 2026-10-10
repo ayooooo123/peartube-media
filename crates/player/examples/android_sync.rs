@@ -5,18 +5,20 @@
 //! ImageReader consumer; callback times are not physical-display scanout.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::{Duration, Instant};
-use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleSink, VideoSink};
+use player::backend::{
+    AudioSink, Backend, Clock, ProducerId, SubtitleSink, VideoError, VideoMode, VideoOutput,
+    VideoRequest, VideoSink, VideoTarget,
+};
 use player::{AndroidBackend, Player, PlayerOptions};
-use oxideav_core::{CodecParameters, Packet, VideoFrame};
+use oxideav_core::{Packet, VideoFrame};
 
 struct Probe { native: Arc<AndroidBackend>, software: bool }
 impl Backend for Probe {
     fn audio(&self) -> Box<dyn AudioSink> { self.native.audio() }
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
         let sink = self.native.video(clock);
-        // The emulator's goldfish decoder wedges at configure; use its real
-        // c2.android MediaCodec implementation rather than a mock decoder.
         if let Some(s) = self.native.shared().active_video.lock().as_ref().and_then(|s| s.upgrade()) {
             s.lock().prefer_software_decoder(true);
         }
@@ -24,18 +26,38 @@ impl Backend for Probe {
     }
     fn subtitles(&self) -> Box<dyn SubtitleSink> { self.native.subtitles() }
 }
+
 struct Software(Box<dyn VideoSink>);
 impl VideoSink for Software {
-    fn open_compressed(&mut self, _: &CodecParameters, _: player::backend::PictureReady) -> bool { false }
-    fn present_from(&mut self, start: Duration) { self.0.present_from(start); }
-    fn push_packet(&mut self, p: &Packet, t: Duration, random_access: bool) -> Result<(), SinkError> { self.0.push_packet(p, t, random_access) }
-    fn open_frames(&mut self, p: &CodecParameters) -> Result<(), SinkError> { self.0.open_frames(p) }
-    fn push_frame(&mut self, f: &VideoFrame, t: Duration) -> Result<(), SinkError> { self.0.push_frame(f, t) }
-    fn frame_lead(&self) -> Duration { self.0.frame_lead() }
-    fn finish(&mut self) -> Result<(), SinkError> { self.0.finish() }
-    fn flush(&mut self) { self.0.flush(); }
-    fn set_playing(&mut self, p: bool) { self.0.set_playing(p); }
+    fn output(&self) -> VideoOutput {
+        self.0.output()
+    }
+    fn poll_transition(&mut self, request: &VideoRequest) -> Poll<Result<VideoMode, VideoError>> {
+        if matches!(request.target, VideoTarget::Compressed { .. }) {
+            return Poll::Ready(Err(VideoError::Unsupported));
+        }
+        self.0.poll_transition(request)
+    }
+    fn push_packet(&mut self, producer: ProducerId, packet: &mut Option<Packet>, pts: Duration, random_access: bool) -> Result<(), VideoError> {
+        self.0.push_packet(producer, packet, pts, random_access)
+    }
+    fn push_frame(&mut self, producer: ProducerId, frame: &mut Option<VideoFrame>, pts: Duration) -> Result<(), VideoError> {
+        self.0.push_frame(producer, frame, pts)
+    }
+    fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {
+        self.0.present_from(producer, start)
+    }
+    fn set_playing(&mut self, producer: ProducerId, playing: bool) -> Result<(), VideoError> {
+        self.0.set_playing(producer, playing)
+    }
+    fn frame_lead(&self) -> Duration {
+        self.0.frame_lead()
+    }
+    fn poll_finish(&mut self, producer: ProducerId) -> Poll<Result<(), VideoError>> {
+        self.0.poll_finish(producer)
+    }
 }
+
 fn main() {
     use ndk::media::image_reader::{AcquireResult, ImageFormat, ImageReader};
     use ndk::hardware_buffer::HardwareBufferUsage;
@@ -66,8 +88,13 @@ fn main() {
             drop(image);
         }
     })).unwrap();
+
+    let reservation = player::android::SurfaceRegistry::global().reserve_native().expect("reserve_native");
+    let window = reader.window().expect("reader window");
+    let binding = reservation.commit(window);
+
     let native = AndroidBackend::new();
-    native.set_video_window(Some(reader.window().unwrap()));
+    native.set_video_surface(binding.clone()).expect("set_video_surface");
     let backend = Arc::new(Probe { native, software });
     let player = Player::open(&file, backend, Arc::new(codecs::context()), PlayerOptions::default(), |_| {});
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -89,6 +116,33 @@ fn main() {
         std::thread::sleep(Duration::from_millis(5));
     }
     drop(player);
+
+    let retirement = binding.retire();
+    {
+        fn noop_waker() -> Waker {
+            fn clone_raw(_: *const ()) -> RawWaker { RawWaker::new(std::ptr::null(), &VTABLE) }
+            fn wake_raw(_: *const ()) {}
+            fn wake_by_ref_raw(_: *const ()) {}
+            fn drop_raw(_: *const ()) {}
+            static VTABLE: RawWakerVTable =
+                RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+        }
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let t0 = Instant::now();
+        let mut ok = false;
+        while t0.elapsed() < Duration::from_secs(10) {
+            match retirement.poll(&mut cx) {
+                Poll::Ready(Ok(_)) => { ok = true; break; }
+                Poll::Ready(Err(e)) => panic!("retirement failed: {e:?}"),
+                Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(ok, "retirement timed out while still Pending");
+    }
+    drop(reader);
+
     let received = frames.load(Ordering::Relaxed);
     assert!(received >= 25, "only {received} surface frames");
     println!("Android timing completed: surface_frames={received} software={software} transport={swapped}");

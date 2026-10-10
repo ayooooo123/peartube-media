@@ -10,6 +10,9 @@ pub mod subtitles;
 pub mod util;
 pub mod video;
 
+#[cfg(test)]
+mod video_tests;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -53,6 +56,7 @@ pub struct AppleBackend {
     frame: Mutex<[f64; 4]>,
     /// Audio renderers made from now on are muted (see `set_muted`).
     muted: AtomicBool,
+    layer_lease: Arc<parking_lot::Mutex<video::LayerLeaseState>>,
 }
 
 /// The current playback's synchronizer: `Backend::audio` makes it, the
@@ -87,6 +91,7 @@ impl AppleBackend {
             subtitle_layer: SendSync(subtitle_layer),
             frame: Mutex::new([0.0; 4]),
             muted: AtomicBool::new(false),
+            layer_lease: Arc::new(parking_lot::Mutex::new(video::LayerLeaseState::new())),
         })
     }
 
@@ -288,7 +293,12 @@ impl Backend for AppleBackend {
             .expect("playback lock")
             .as_ref()
             .map(|synchronizer| synchronizer.0.clone());
-        Box::new(AppleVideoSink::new(self.video_layer.0.clone(), synchronizer, clock))
+        Box::new(AppleVideoSink::new(
+            self.video_layer.0.clone(),
+            synchronizer,
+            clock,
+            Arc::clone(&self.layer_lease),
+        ))
     }
 
     fn subtitles(&self) -> Box<dyn SubtitleSink> {

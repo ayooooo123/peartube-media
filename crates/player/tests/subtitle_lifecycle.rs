@@ -13,7 +13,11 @@ use std::time::{Duration, Instant};
 use bitmap::{Scratch, Show, ffmpeg, oracle, pgs_states};
 use oxideav_core::{CodecId, CodecInfo, CodecParameters, Decoder, Packet, RuntimeContext, VideoFrame};
 use parking_lot::{Condvar, Mutex};
-use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleImage, SubtitleSink, VideoSink};
+use std::task::Poll;
+use player::backend::{
+    AudioSink, Backend, Clock, ProducerId, SinkError, SubtitleImage, SubtitleSink,
+    VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink,
+};
 use player::{Headless, Player, PlayerOptions, State};
 
 #[derive(Default)]
@@ -52,17 +56,41 @@ static VIDEO_ENDED_CHANGED: Condvar = Condvar::new();
 struct VideoEnd(Box<dyn VideoSink>);
 
 impl VideoSink for VideoEnd {
-    fn open_compressed(&mut self, params: &CodecParameters, ready: player::backend::PictureReady) -> bool { self.0.open_compressed(params, ready) }
-    fn present_from(&mut self, start: Duration) { self.0.present_from(start); }
-    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
-        self.0.push_packet(packet, pts, random_access)
+    fn output(&self) -> VideoOutput {
+        self.0.output()
     }
-    fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> { self.0.open_frames(params) }
-    fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> { self.0.push_frame(frame, pts) }
-    fn frame_lead(&self) -> Duration { self.0.frame_lead() }
-    fn finish(&mut self) -> Result<(), SinkError> { self.0.finish() }
-    fn flush(&mut self) { self.0.flush() }
-    fn set_playing(&mut self, playing: bool) { self.0.set_playing(playing) }
+    fn poll_transition(&mut self, request: &VideoRequest) -> Poll<Result<VideoMode, VideoError>> {
+        self.0.poll_transition(request)
+    }
+    fn push_packet(
+        &mut self,
+        producer: ProducerId,
+        packet: &mut Option<Packet>,
+        pts: Duration,
+        random_access: bool,
+    ) -> Result<(), VideoError> {
+        self.0.push_packet(producer, packet, pts, random_access)
+    }
+    fn push_frame(
+        &mut self,
+        producer: ProducerId,
+        frame: &mut Option<VideoFrame>,
+        pts: Duration,
+    ) -> Result<(), VideoError> {
+        self.0.push_frame(producer, frame, pts)
+    }
+    fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {
+        self.0.present_from(producer, start)
+    }
+    fn set_playing(&mut self, producer: ProducerId, playing: bool) -> Result<(), VideoError> {
+        self.0.set_playing(producer, playing)
+    }
+    fn frame_lead(&self) -> Duration {
+        self.0.frame_lead()
+    }
+    fn poll_finish(&mut self, producer: ProducerId) -> Poll<Result<(), VideoError>> {
+        self.0.poll_finish(producer)
+    }
 }
 
 impl Drop for VideoEnd {

@@ -29,58 +29,179 @@ impl Backend for Measured {
     }
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
         let sink = self.native.video(clock);
-        Box::new(MeasuredVideo(sink, self.software))
+        Box::new(MeasuredVideo::new(sink, self.software))
     }
     fn subtitles(&self) -> Box<dyn SubtitleSink> { self.native.subtitles() }
 }
-struct MeasuredVideo(Box<dyn VideoSink>, bool);
+struct MeasuredVideo {
+    sink: Box<dyn VideoSink>,
+    software: bool,
+    last_logged_mode: Option<(player::backend::ProducerId, player::backend::VideoMode)>,
+    finish_logged: Option<player::backend::ProducerId>,
+    cached_request: Option<(player::backend::ProducerId, player::backend::VideoRequest)>,
+}
+
+impl MeasuredVideo {
+    fn new(sink: Box<dyn VideoSink>, software: bool) -> Self {
+        Self {
+            sink,
+            software,
+            last_logged_mode: None,
+            finish_logged: None,
+            cached_request: None,
+        }
+    }
+}
+
 impl VideoSink for MeasuredVideo {
-    fn open_compressed(&mut self, p: &CodecParameters, ready: player::backend::PictureReady) -> bool {
-        let accepted = if self.1 { false } else {
-            let report = player::backend::PictureReady::new(move |pts| {
-                // Apple reports after enqueueing a decoded picture, not display.
-                let mono_ns = player::clock::current_monotonic_ns();
-                ready.ready(pts);
-                eprintln!("APPLE_OUTPUT mono_ns={mono_ns} pts_s={:.9}", pts.as_secs_f64());
-            });
-            self.0.open_compressed(p, report)
-        };
-        eprintln!("APPLE_VIDEO compressed={accepted} mono_ns={}", player::clock::current_monotonic_ns());
-        accepted
+    fn output(&self) -> player::backend::VideoOutput {
+        self.sink.output()
     }
-    fn present_from(&mut self, start: Duration) {
-        self.0.present_from(start);
-        eprintln!("APPLE_PRESENT_FROM mono_ns={} pts_s={:.9}", player::clock::current_monotonic_ns(), start.as_secs_f64());
+
+    fn poll_transition(
+        &mut self,
+        request: &player::backend::VideoRequest,
+    ) -> std::task::Poll<Result<player::backend::VideoMode, player::backend::VideoError>> {
+        if self.software && matches!(request.target, player::backend::VideoTarget::Compressed { .. }) {
+            return std::task::Poll::Ready(Err(player::backend::VideoError::Unsupported));
+        }
+
+        let producer = request.producer;
+        if self.cached_request.as_ref().map(|(p, _)| *p) != Some(producer) {
+            let wrapped = match &request.target {
+                player::backend::VideoTarget::Compressed { params, ready, present_from } => {
+                    let ready_inner = ready.clone();
+                    let report = player::backend::PictureReady::new(move |pts| {
+                        let mono_ns = player::clock::current_monotonic_ns();
+                        ready_inner.ready(pts);
+                        eprintln!("APPLE_OUTPUT producer={} mono_ns={mono_ns} pts_s={:.9}", producer.0, pts.as_secs_f64());
+                    });
+                    player::backend::VideoRequest {
+                        producer: request.producer,
+                        seek_generation: request.seek_generation,
+                        output_revision: request.output_revision,
+                        target: player::backend::VideoTarget::Compressed {
+                            params: Arc::clone(params),
+                            ready: report,
+                            present_from: *present_from,
+                        },
+                        deadline: request.deadline,
+                        control: Arc::clone(&request.control),
+                    }
+                }
+                player::backend::VideoTarget::Frames { params, ready, reset } => {
+                    let ready_inner = ready.clone();
+                    let report = player::backend::PictureReady::new(move |pts| {
+                        let mono_ns = player::clock::current_monotonic_ns();
+                        ready_inner.ready(pts);
+                        eprintln!("APPLE_OUTPUT producer={} mono_ns={mono_ns} pts_s={:.9}", producer.0, pts.as_secs_f64());
+                    });
+                    player::backend::VideoRequest {
+                        producer: request.producer,
+                        seek_generation: request.seek_generation,
+                        output_revision: request.output_revision,
+                        target: player::backend::VideoTarget::Frames {
+                            params: Arc::clone(params),
+                            ready: report,
+                            reset: *reset,
+                        },
+                        deadline: request.deadline,
+                        control: Arc::clone(&request.control),
+                    }
+                }
+                player::backend::VideoTarget::Retired => request.clone(),
+            };
+            self.cached_request = Some((producer, wrapped));
+        }
+
+        let poll = self.sink.poll_transition(&self.cached_request.as_ref().unwrap().1);
+        if let std::task::Poll::Ready(Ok(mode)) = &poll {
+            if self.last_logged_mode != Some((producer, *mode)) {
+                self.last_logged_mode = Some((producer, *mode));
+                eprintln!("APPLE_VIDEO mode={mode:?} mono_ns={}", player::clock::current_monotonic_ns());
+            }
+        }
+        poll
     }
-    fn push_packet(&mut self, p: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+
+    fn push_packet(
+        &mut self,
+        producer: player::backend::ProducerId,
+        packet: &mut Option<oxideav_core::Packet>,
+        pts: Duration,
+        random_access: bool,
+    ) -> Result<(), player::backend::VideoError> {
         let entered_ns = player::clock::current_monotonic_ns();
-        let result = self.0.push_packet(p, pts, random_access);
+        let result = self.sink.push_packet(producer, packet, pts, random_access);
         if result.is_ok() {
-            eprintln!("APPLE_PACKET entered_ns={entered_ns} accepted_ns={} pts_s={:.9} random_access={random_access}",
-                player::clock::current_monotonic_ns(), pts.as_secs_f64());
+            eprintln!(
+                "APPLE_PACKET entered_ns={entered_ns} accepted_ns={} pts_s={:.9} random_access={random_access}",
+                player::clock::current_monotonic_ns(),
+                pts.as_secs_f64()
+            );
         }
         result
     }
-    fn open_frames(&mut self, p: &CodecParameters) -> Result<(), SinkError> {
-        eprintln!("APPLE_VIDEO software_frames");
-        self.0.open_frames(p)
+
+    fn push_frame(
+        &mut self,
+        producer: player::backend::ProducerId,
+        frame: &mut Option<oxideav_core::VideoFrame>,
+        pts: Duration,
+    ) -> Result<(), player::backend::VideoError> {
+        self.sink.push_frame(producer, frame, pts)
     }
-    fn push_frame(&mut self, f: &VideoFrame, pts: Duration) -> Result<(), SinkError> { self.0.push_frame(f, pts) }
-    fn frame_lead(&self) -> Duration { self.0.frame_lead() }
-    fn finish(&mut self) -> Result<(), SinkError> {
-        let result = self.0.finish();
+
+    fn present_from(
+        &mut self,
+        producer: player::backend::ProducerId,
+        start: Duration,
+    ) -> Result<(), player::backend::VideoError> {
+        let result = self.sink.present_from(producer, start);
         if result.is_ok() {
-            eprintln!("APPLE_VIDEO_DRAINED mono_ns={}", player::clock::current_monotonic_ns());
+            eprintln!(
+                "APPLE_PRESENT_FROM mono_ns={} pts_s={:.9}",
+                player::clock::current_monotonic_ns(),
+                start.as_secs_f64()
+            );
         }
         result
     }
-    fn flush(&mut self) {
-        self.0.flush();
-        eprintln!("APPLE_VIDEO_FLUSH mono_ns={}", player::clock::current_monotonic_ns());
+
+    fn set_playing(
+        &mut self,
+        producer: player::backend::ProducerId,
+        playing: bool,
+    ) -> Result<(), player::backend::VideoError> {
+        let result = self.sink.set_playing(producer, playing);
+        if result.is_ok() {
+            eprintln!(
+                "APPLE_VIDEO_PLAYING mono_ns={} playing={playing}",
+                player::clock::current_monotonic_ns()
+            );
+        }
+        result
     }
-    fn set_playing(&mut self, p: bool) {
-        self.0.set_playing(p);
-        eprintln!("APPLE_VIDEO_PLAYING mono_ns={} playing={p}", player::clock::current_monotonic_ns());
+
+    fn frame_lead(&self) -> Duration {
+        self.sink.frame_lead()
+    }
+
+    fn poll_finish(
+        &mut self,
+        producer: player::backend::ProducerId,
+    ) -> std::task::Poll<Result<(), player::backend::VideoError>> {
+        let poll = self.sink.poll_finish(producer);
+        if matches!(&poll, std::task::Poll::Ready(Ok(()))) {
+            if self.finish_logged != Some(producer) {
+                self.finish_logged = Some(producer);
+                eprintln!(
+                    "APPLE_VIDEO_DRAINED mono_ns={}",
+                    player::clock::current_monotonic_ns()
+                );
+            }
+        }
+        poll
     }
 }
 

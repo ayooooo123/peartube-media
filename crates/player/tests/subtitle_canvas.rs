@@ -18,7 +18,11 @@ use std::time::{Duration, Instant};
 
 use oxideav_core::{CodecParameters, Error, MediaType, Packet, RuntimeContext, StreamInfo, VideoFrame};
 use parking_lot::Mutex;
-use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleImage, SubtitleSink, VideoSink};
+use std::task::Poll;
+use player::backend::{
+    AudioSink, Backend, Clock, ProducerId, SinkError, SubtitleImage, SubtitleSink,
+    VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink,
+};
 use player::{Headless, Player, PlayerOptions};
 
 struct CanvasBackend {
@@ -48,22 +52,53 @@ struct HashedVideo {
     md5: Arc<Mutex<Vec<String>>>,
 }
 impl VideoSink for HashedVideo {
-    fn open_compressed(&mut self, params: &CodecParameters, ready: player::backend::PictureReady) -> bool { self.sink.open_compressed(params, ready) }
-    fn present_from(&mut self, start: Duration) { self.sink.present_from(start); }
-    fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
-        self.sink.push_packet(packet, pts, random_access)
+    fn output(&self) -> VideoOutput {
+        self.sink.output()
     }
-    fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> { self.sink.open_frames(params) }
-    fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> {
-        let (width, height) = (self.size.0 as usize, self.size.1 as usize);
-        let packed = refcheck::pack(frame, &[(width, height), (width / 2, height / 2), (width / 2, height / 2)]);
-        self.md5.lock().push(refcheck::md5_hex(&packed));
-        self.sink.push_frame(frame, pts)
+    fn poll_transition(&mut self, request: &VideoRequest) -> Poll<Result<VideoMode, VideoError>> {
+        self.sink.poll_transition(request)
     }
-    fn frame_lead(&self) -> Duration { self.sink.frame_lead() }
-    fn finish(&mut self) -> Result<(), SinkError> { self.sink.finish() }
-    fn flush(&mut self) { self.sink.flush(); }
-    fn set_playing(&mut self, playing: bool) { self.sink.set_playing(playing); }
+    fn push_packet(
+        &mut self,
+        producer: ProducerId,
+        packet: &mut Option<Packet>,
+        pts: Duration,
+        random_access: bool,
+    ) -> Result<(), VideoError> {
+        self.sink.push_packet(producer, packet, pts, random_access)
+    }
+    fn push_frame(
+        &mut self,
+        producer: ProducerId,
+        frame: &mut Option<VideoFrame>,
+        pts: Duration,
+    ) -> Result<(), VideoError> {
+        // Hash only after the inner sink accepts the input. A failed WouldBlock
+        // must not double-count the same frame.
+        let snapshot = frame.as_ref().map(|f| {
+            let (width, height) = (self.size.0 as usize, self.size.1 as usize);
+            refcheck::pack(f, &[(width, height), (width / 2, height / 2), (width / 2, height / 2)])
+        });
+        let result = self.sink.push_frame(producer, frame, pts);
+        if result.is_ok() {
+            if let Some(packed) = snapshot {
+                self.md5.lock().push(refcheck::md5_hex(&packed));
+            }
+        }
+        result
+    }
+    fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {
+        self.sink.present_from(producer, start)
+    }
+    fn set_playing(&mut self, producer: ProducerId, playing: bool) -> Result<(), VideoError> {
+        self.sink.set_playing(producer, playing)
+    }
+    fn frame_lead(&self) -> Duration {
+        self.sink.frame_lead()
+    }
+    fn poll_finish(&mut self, producer: ProducerId) -> Poll<Result<(), VideoError>> {
+        self.sink.poll_finish(producer)
+    }
 }
 struct Canvases(Arc<Mutex<Vec<bitmap::Show>>>);
 impl SubtitleSink for Canvases {

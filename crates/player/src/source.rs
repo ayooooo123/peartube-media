@@ -242,13 +242,9 @@ impl Seek for ReadAheadSource {
 
         let target = match pos {
             SeekFrom::Start(n) => Some(n),
-            SeekFrom::Current(d) => {
-                if d >= 0 {
-                    Some(state.cur_pos.saturating_add(d as u64))
-                } else {
-                    state.cur_pos.checked_sub((-d) as u64)
-                }
-            }
+            SeekFrom::Current(d) => Some(state.cur_pos.checked_add_signed(d).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "relative seek out of range")
+            })?),
             SeekFrom::End(_) => None,
         };
 
@@ -261,9 +257,9 @@ impl Seek for ReadAheadSource {
             }
         }
 
-        // Out-of-window or SeekFrom::End seek: request underlying seek. The
-        // worker clears the request once the result is in.
-        state.seek_req = Some(pos);
+        // Relative seeks use the consumer cursor, not the worker's read-ahead
+        // cursor. Only end-relative seeks depend on the underlying source.
+        state.seek_req = Some(target.map(SeekFrom::Start).unwrap_or(pos));
         state.seek_res = None;
         self.shared.worker_cv.notify_one();
 
@@ -462,5 +458,83 @@ pub fn open_source(url: &str) -> std::io::Result<ReadAheadSource> {
     } else {
         let file = std::fs::File::open(url)?;
         Ok(ReadAheadSource::new(Box::new(file)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    struct GatedReader {
+        bytes: Cursor<Vec<u8>>,
+        reads: usize,
+        entered: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Read for GatedReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 2 {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5))
+                    .map_err(std::io::Error::other)?;
+            }
+            let count = out.len().min(16);
+            self.bytes.read(&mut out[..count])
+        }
+    }
+
+    impl Seek for GatedReader {
+        fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+            self.bytes.seek(from)
+        }
+    }
+
+    #[test]
+    fn relative_seek_outside_read_ahead_uses_consumer_position() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let mut source = ReadAheadSource::new(Box::new(GatedReader {
+            bytes: Cursor::new((0..=255).collect()),
+            reads: 0, entered: entered_tx, release: release_rx,
+        }));
+        source.read_exact(&mut [0]).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let shared = Arc::clone(&source.shared);
+        let seeker = std::thread::spawn(move || {
+            let position = source.seek(SeekFrom::Current(127)).unwrap();
+            let mut bytes = [0; 4];
+            source.read_exact(&mut bytes).unwrap();
+            (position, bytes)
+        });
+        // Hold the second prefetch until the consumer's out-of-window seek
+        // is queued. The worker then advances to 32 before servicing it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut state = shared.state.lock();
+        while state.seek_req.is_none() {
+            assert!(Instant::now() < deadline, "seek was not queued");
+            shared.worker_cv.wait_until(&mut state, deadline);
+        }
+        drop(state);
+        release_tx.send(()).unwrap();
+        assert_eq!(seeker.join().unwrap(), (128, [128, 129, 130, 131]));
+    }
+
+    #[test]
+    fn invalid_relative_seeks_preserve_consumer_position() {
+        let mut source = ReadAheadSource::new(Box::new(Cursor::new(vec![0, 1, 2, 3, 4, 5, 6, 7])));
+        source.read_exact(&mut [0]).unwrap();
+        for delta in [-2, i64::MIN] {
+            let error = source.seek(SeekFrom::Current(delta)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(source.stream_position().unwrap(), 1);
+        }
+        let mut next = [0; 2];
+        source.read_exact(&mut next).unwrap();
+        assert_eq!(next, [1, 2]);
     }
 }

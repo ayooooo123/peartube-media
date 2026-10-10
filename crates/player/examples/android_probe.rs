@@ -3,45 +3,107 @@
 //!
 //! 1. Video: opens an `AImageReader`, takes its window as the video surface,
 //!    demuxes an H.264 MP4 with oxideav-mp4, and pushes the packets through
-//!    `Backend::video` + `open_compressed`/`push_packet`, counting the
+//!    `Backend::video` + `poll_transition`/`push_packet`, counting the
 //!    frames the reader receives. Midway through the stream it swaps to a
-//!    second `AImageReader`: `set_video_window(None)` (the integrator's
-//!    contract: this blocks until the codec no longer touches the old
-//!    window), then `set_video_window(Some(new))`, which rebuilds the codec
-//!    on the new window and resumes from the next keyframe. Both readers'
-//!    frame counts are reported; the test passes when the second reader
-//!    receives frames after the swap and the combined total reaches the
-//!    sample's frame count (± slack for the drain).
+//!    second `AImageReader` using `SurfaceRegistry` reservation and retirement
+//!    receipts, which rebuilds the codec on the new window and resumes from
+//!    the next keyframe.
 //! 2. Audio: plays 3 s of a 440 Hz sine (48 kHz, stereo, f32) through
 //!    `Backend::audio`, sampling the sink's `Clock` before and after and
 //!    checking the media clock advances ~3 s.
 //!
-//! Exit status 0 = both probes passed. Counts and clock readings go to
+//! Exit status 0 = selected probes passed. Counts and clock readings go to
 //! stdout.
+//! `--video-only` isolates Surface/decoder lifecycle checks from AAudio.
 
 use oxideav_core::{MediaType, Packet, RuntimeContext, TimeBase};
-use player::backend::{Backend, Clock, PictureReady, SinkError, VideoSink};
+use player::android::{
+    SurfaceAdmissionError, SurfaceBinding, SurfaceRegistry, SurfaceRetirement,
+    SurfaceRetirementError,
+};
+use player::backend::{
+    Backend, Clock, PictureReady, ProducerId, SinkError, VideoControl, VideoError, VideoMode,
+    VideoOutput, VideoRequest, VideoSink, VideoTarget,
+};
 use player::AndroidBackend;
 use std::fs::File;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::{Duration, Instant};
 
+fn noop_waker() -> Waker {
+    fn clone_raw(_: *const ()) -> RawWaker {
+        raw()
+    }
+    fn wake_raw(_: *const ()) {}
+    fn wake_by_ref_raw(_: *const ()) {}
+    fn drop_raw(_: *const ()) {}
+    fn raw() -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
+    unsafe { Waker::from_raw(raw()) }
+}
+
+/// Wait on the retirement *receipt* via poll, not cached is_retired/status (S8).
+fn await_retirement(retirement: &SurfaceRetirement, limit: Duration) -> Result<(), String> {
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let t0 = Instant::now();
+    loop {
+        match retirement.poll(&mut cx) {
+            Poll::Ready(Ok(_)) => return Ok(()),
+            Poll::Ready(Err(SurfaceRetirementError::Failed(e) | SurfaceRetirementError::Quarantined(e))) => {
+                return Err(format!("retirement failed: {e}"));
+            }
+            Poll::Pending => {
+                if t0.elapsed() > limit {
+                    return Err("retirement timed out while still Pending".into());
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+// Shell executables do not inherit an app's Binder pool. These platform entry
+// points belong only in this probe's main, never in the Player library.
+// Contract: frameworks/native/libs/binder/ndk/include_platform/android/binder_process.h.
+fn start_probe_binder_pool() -> Result<(), &'static str> {
+    use std::ffi::{c_char, c_int, c_void};
+    #[link(name = "dl")]
+    unsafe extern "C" {
+        fn dlopen(path: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
+    }
+    unsafe {
+        // Keep the library resident for the process-owned Binder threads.
+        let library = dlopen(c"libbinder_ndk.so".as_ptr(), 2);
+        if library.is_null() { return Err("libbinder_ndk unavailable"); }
+        let set = dlsym(library, c"ABinderProcess_setThreadPoolMaxThreadCount".as_ptr());
+        let start = dlsym(library, c"ABinderProcess_startThreadPool".as_ptr());
+        if set.is_null() || start.is_null() {
+            return Err("standalone Binder pool entry points unavailable");
+        }
+        let set: unsafe extern "C" fn(u32) -> bool = std::mem::transmute(set);
+        let start: unsafe extern "C" fn() = std::mem::transmute(start);
+        if !set(1) { return Err("Binder pool configuration failed"); }
+        start();
+    }
+    Ok(())
+}
+
 fn main() {
-    // One attempt per process: the emulator's codec transport wedges a
-    // process after its first MediaCodec error, and a fresh process
-    // recovers. `--mode=software` runs the stream through the sink's
-    // software path (OxideAV decode -> RGBA -> ANativeWindow post onto the
-    // same AImageReader window).
+    eprintln!("[video] probe pid={}", std::process::id());
+    start_probe_binder_pool().expect("standalone native probe requires incoming Binder callbacks");
     let mode = if std::env::args().any(|a| a == "--mode=software") {
         Mode::SoftwareFrames
     } else {
         Mode::Compressed
     };
-    // Audio first: opening the AAudio stream before the video decoder has
-    // preceded every successful decode run on the emulator (the swcodec
-    // service stalls when the video path runs first on some boots).
-    let mut code = audio_probe();
+    let mut code = if std::env::args().any(|a| a == "--video-only") { 0 } else { audio_probe() };
     code |= video_probe(mode);
     if std::env::args().any(|a| a == "--all") {
         code |= sw_first_probe();
@@ -52,7 +114,6 @@ fn main() {
 
 // ---------------------------------------------------------------- video
 
-/// Sample duration ~3.2 s at 59.94 fps = 192 frames; keyframes every 30.
 const EXPECTED_FRAMES: usize = 192;
 
 fn video_probe(mode: Mode) -> i32 {
@@ -76,35 +137,26 @@ fn video_probe(mode: Mode) -> i32 {
         return 1;
     }
 
-    // One reader up front; the swap/fallback windows are created lazily
-    // (a fresh reader is exactly what the swap path needs). Reader A lives
-    // in a shared slot that `run_stream` empties right after
-    // `set_video_window(None)` returns — mirroring the app, which destroys
-    // its SurfaceView as soon as `surfaceDestroyed` completes.
     let reader_a = make_reader(mode);
     let frames_a = reader_a.1.clone();
+    let reservation_a = SurfaceRegistry::global()
+        .reserve_native()
+        .map_err(|e| format!("reserve native window A: {e:?}"))
+        .unwrap();
     let window_a = reader_a
         .0
         .window()
         .map_err(|e| format!("reader A window: {e:?}"))
         .unwrap();
+    let binding_a = reservation_a.commit(window_a);
     let reader_a_slot: Arc<parking_lot::Mutex<Option<ndk::media::image_reader::ImageReader>>> =
         Arc::new(parking_lot::Mutex::new(Some(reader_a.0)));
 
     let backend = AndroidBackend::new();
-    backend.set_video_window(Some(window_a));
+    backend.set_video_surface(binding_a.clone()).unwrap();
 
-    // The emulator's vendor (goldfish) H.264 decoder wedges without ever
-    // queueing input, so this probe prefers the platform's software decoder
-    // (c2.android.*) up front. A real device uses the type-derived hardware
-    // decoder; the window-swap semantics under test are decoder-agnostic.
-    // The sink comes from `Backend::video`, which registers it in
-    // `active_video` — that registration is what makes
-    // `set_video_window(None)` able to detach the codec. The typed Arc is
-    // recovered from the registration so the probe can call sink methods
-    // directly while the backend still tracks it.
     let clock = probe_clock();
-    let _box_sink = backend.video(clock);
+    let _box_sink = backend.video(clock.clone());
     let sink_video: Arc<parking_lot::Mutex<player::android::AndroidVideoSink>> = backend
         .shared()
         .active_video
@@ -115,28 +167,23 @@ fn video_probe(mode: Mode) -> i32 {
     sink_video.lock().prefer_software_decoder(true);
     let packets = Arc::new(packets);
 
-    // Swap after roughly half the packets have been pushed (the queue
-    // thread tracks its position); the two-step None -> Some exercises
-    // the blocking release and the rebuild-on-new-window path.
     let swap_at = packets.len() / 2;
     let swap_state = Arc::new(parking_lot::Mutex::new(Swap::Pending));
-    // Counters for the lazily created readers (the readers themselves are
-    // leaked in the push thread: ImageReader is not Send).
     let frames_b_slot: Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>> =
         Arc::new(parking_lot::Mutex::new(None));
     let frames_c_slot: Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>> =
         Arc::new(parking_lot::Mutex::new(None));
 
-    // Push inline (single thread): the sink's output thread handles
-    // presentation; the swap is driven from this thread between packets.
     let swap_result = run_stream(
         &backend,
         &sink_video,
+        &clock,
         &params,
         packets.as_ref(),
         time_base,
         swap_at,
         &swap_state,
+        &binding_a,
         &reader_a_slot,
         &frames_b_slot,
         &frames_c_slot,
@@ -167,13 +214,7 @@ fn video_probe(mode: Mode) -> i32 {
     let total = a + b + c;
     println!("[video] total frames received: {total}");
 
-    // Acceptance: frames decoded before the swap (A), frames decoded after
-    // the swap on the NEW window (B/C — decode resumed there), and the
-    // total covering the keyframe-aligned resume. The swap restarts B from
-    // the next keyframe after packet swap_at (keyint 30 ⇒ up to 29 packets
-    // are gate-skipped), so the total floor is 192 minus one GOP minus the
-    // reorder/ drain slack.
-    let gop_skip = 30 + 12; // one keyframe interval + reorder, decode-start and drain slack
+    let gop_skip = 30 + 12;
     let floor = EXPECTED_FRAMES.saturating_sub(gop_skip);
     let ok = a > 0 && b + c > 0 && total >= floor;
     if ok {
@@ -190,49 +231,88 @@ fn video_probe(mode: Mode) -> i32 {
 
 enum Swap {
     Pending,
-    WindowCleared,
     NewWindowSet,
 }
 
+struct ProbeControl;
+impl VideoControl for ProbeControl {
+    fn cancelled(&self, _producer: ProducerId, _seek_generation: u64) -> bool {
+        false
+    }
+    fn active_now(&self) -> Instant {
+        Instant::now()
+    }
+    fn wake(&self) {}
+}
 
-/// One AImageReader (160x120, 8 slots) with a counting, draining
-/// listener: `(reader, frames-received)`.
-
-/// Re-opens the stream for `mode` after a window change.
 fn reopen_mode(
     sink: &mut player::android::AndroidVideoSink,
     mode: Mode,
     params: &oxideav_core::CodecParameters,
+    producer: ProducerId,
+    clock: &Arc<player::clock::FreeRunningClock>,
 ) -> Result<(), SinkError> {
-    match mode {
+    clock.pause();
+    let ready_clock = clock.clone();
+    let first_picture = std::sync::atomic::AtomicBool::new(true);
+    let ready = PictureReady::new(move |pts| {
+        if first_picture.swap(false, Ordering::SeqCst) {
+            ready_clock.seek(pts);
+            ready_clock.play();
+            println!("[video] producer {} first picture at {pts:?}; clock released", producer.0);
+        }
+    });
+    let target = match mode {
         Mode::Compressed => {
             sink.prefer_software_decoder(true);
-            if !sink.open_compressed(params, PictureReady::new(|_| {})) {
-                return Err(SinkError::Fatal("re-open declined".into()));
+            VideoTarget::Compressed {
+                params: Arc::new(params.clone()),
+                ready,
+                present_from: Duration::ZERO,
             }
         }
-        Mode::SoftwareFrames => {
-            sink.teardown_codec();
-            sink.open_frames(params)?;
+        Mode::SoftwareFrames => VideoTarget::Frames {
+            params: Arc::new(params.clone()),
+            ready,
+            reset: true,
+        },
+    };
+    let request = VideoRequest {
+        producer,
+        seek_generation: 1,
+        output_revision: sink.output().revision,
+        target,
+        deadline: Instant::now() + Duration::from_secs(5),
+        control: Arc::new(ProbeControl),
+    };
+    let t0 = Instant::now();
+    loop {
+        match sink.poll_transition(&request) {
+            Poll::Ready(Ok(_)) => return Ok(()),
+            Poll::Ready(Err(e)) => {
+                return Err(SinkError::Fatal(format!("transition error: {e:?}")))
+            }
+            Poll::Pending => {
+                if t0.elapsed() > Duration::from_secs(5) {
+                    return Err(SinkError::Fatal("transition timed out".into()));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
-    Ok(())
 }
 
-/// Decodes one packet with OxideAV's software H.264 decoder and pushes the
-/// resulting frames through the sink's software path.
 fn decode_and_push_frame(
     sink_video: &Arc<parking_lot::Mutex<player::android::AndroidVideoSink>>,
     decoder: &mut Option<Box<dyn oxideav_core::Decoder>>,
     params: &oxideav_core::CodecParameters,
     pkt: &Packet,
     pts: Duration,
+    producer: ProducerId,
 ) -> Result<(), SinkError> {
     let decoder = decoder.get_or_insert_with(|| {
         let mut ctx = oxideav_core::RuntimeContext::new();
         oxideav_h264::register_codecs(&mut ctx.codecs);
-        // The stream's own parameters carry the avcC extradata: without it
-        // the decoder cannot parse the AVCC length-prefixed packets.
         ctx.codecs
             .first_decoder(params)
             .expect("software h264 decoder")
@@ -244,7 +324,17 @@ fn decode_and_push_frame(
         match decoder.receive_frame() {
             Ok(oxideav_core::Frame::Video(frame)) => {
                 let mut sink = sink_video.lock();
-                sink.push_frame(&frame, pts)?;
+                let mut frame_opt = Some(frame);
+                loop {
+                    match sink.push_frame(producer, &mut frame_opt, pts) {
+                        Ok(()) => break,
+                        Err(VideoError::Sink(SinkError::WouldBlock)) => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(VideoError::Sink(e)) => return Err(e),
+                        Err(e) => return Err(SinkError::Fatal(format!("{e:?}"))),
+                    }
+                }
             }
             Ok(_) => {}
             Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
@@ -254,13 +344,6 @@ fn decode_and_push_frame(
     Ok(())
 }
 
-/// One full stream run: open the codec on the current window, push every
-/// packet, exercise the window swap at `swap_at`, and drain. Errors leave
-/// the sink torn down so the caller can retry.
-/// How the stream is decoded for one attempt: MediaCodec with the window
-/// (the platform path), or OxideAV's software H.264 decoder with frames
-/// pushed through the sink's software path (the emulator-transport
-/// fallback; same AImageReader, same window-swap semantics).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
     Compressed,
@@ -271,86 +354,89 @@ enum Mode {
 fn run_stream(
     backend: &Arc<AndroidBackend>,
     sink_video: &Arc<parking_lot::Mutex<player::android::AndroidVideoSink>>,
+    clock: &Arc<player::clock::FreeRunningClock>,
     params: &oxideav_core::CodecParameters,
     packets: &[(Packet, bool)],
     time_base: TimeBase,
     swap_at: usize,
     swap_state: &Arc<parking_lot::Mutex<Swap>>,
+    binding_a: &Arc<SurfaceBinding>,
     reader_a_slot: &Arc<parking_lot::Mutex<Option<ndk::media::image_reader::ImageReader>>>,
     frames_b_slot: &Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>>,
     frames_c_slot: &Arc<parking_lot::Mutex<Option<Arc<AtomicUsize>>>>,
     mode: Mode,
 ) -> Result<(), SinkError> {
-    match mode {
-        Mode::Compressed => {
-            let mut sink = sink_video.lock();
-            sink.prefer_software_decoder(true);
-            if !sink.open_compressed(params, PictureReady::new(|_| {})) {
-                return Err(SinkError::Fatal("open_compressed declined".into()));
-            }
-        }
-        Mode::SoftwareFrames => {
-            let mut sink = sink_video.lock();
-            sink.teardown_codec();
-            if let Err(e) = sink.open_frames(params) {
-                return Err(e);
-            }
-        }
-    }
-    println!("[video] open accepted (mode {mode:?})");
     let mut sw_decoder: Option<Box<dyn oxideav_core::Decoder>> = None;
     let mut pushed = 0usize;
     let mut fallbacks = 0usize;
+    let mut producer_id = 1u64;
+
+    let mut current_producer = ProducerId(producer_id);
+    {
+        let mut sink = sink_video.lock();
+        reopen_mode(&mut sink, mode, params, current_producer, clock)?;
+    }
+    println!("[video] producer {} configured", current_producer.0);
+
+    let mut reader_b: Option<ndk::media::image_reader::ImageReader> = None;
+    let mut binding_b: Option<Arc<SurfaceBinding>> = None;
+    let mut reader_c: Option<ndk::media::image_reader::ImageReader> = None;
+    let mut binding_c: Option<Arc<SurfaceBinding>> = None;
+
     for (pkt, random_access) in packets.iter() {
         if pushed == swap_at {
             println!(
-                "[video] swap: set_video_window(None) at packet {pushed}/{}",
+                "[video] swap: retiring binding A at packet {pushed}/{}",
                 packets.len()
             );
             let t0 = Instant::now();
-            backend.set_video_window(None);
-            println!(
-                "[video] set_video_window(None) blocked for {:?}",
-                t0.elapsed()
-            );
-            // The None barrier guarantees nothing touches the old surface;
-            // destroy it now, exactly like the app destroying the
-            // SurfaceView once `surfaceDestroyed` returns.
-            *reader_a_slot.lock() = None;
-            println!("[video] old ImageReader destroyed");
-            *swap_state.lock() = Swap::WindowCleared;
-        }
-        let pts = packet_media_time(pkt, time_base);
-        let r = if mode == Mode::SoftwareFrames {
-            decode_and_push_frame(sink_video, &mut sw_decoder, params, pkt, pts)
-        } else {
-            let mut sink = sink_video.lock();
-            push_packet(&mut *sink, pkt, pts, *random_access)
-        };
-        match r {
-            Ok(()) => {}
-            // Unavailable right after the None: set the new window (it
-            // re-opens the codec via on_window_available), then retry.
-            Err(SinkError::Unavailable) if pushed >= swap_at => {
-                if matches!(*swap_state.lock(), Swap::WindowCleared) {
-                    let (reader, counter) = make_reader(mode);
-                    frames_b_slot.lock().replace(counter);
-                    let w = reader
-                        .window()
-                        .map_err(|e| SinkError::Fatal(format!("reader B window: {e:?}")))?;
-                    std::mem::forget(reader); // live until process exit
-                    backend.set_video_window(Some(w));
-                    *swap_state.lock() = Swap::NewWindowSet;
-                    println!("[video] swap: new window set at packet {pushed}");
-                    let mut sink = sink_video.lock();
-                    reopen_mode(&mut sink, mode, params)?;
-                    push_packet(&mut *sink, pkt, pts, *random_access)?;
-                } else {
-                    return Err(SinkError::Unavailable);
+            let retirement = binding_a.retire();
+            match await_retirement(&retirement, Duration::from_secs(5)) {
+                Ok(()) => {
+                    println!("[video] binding A retired after {:?}", t0.elapsed());
+                    *reader_a_slot.lock() = None;
+                    println!("[video] old ImageReader destroyed");
+                }
+                Err(e) => {
+                    // Timeout/error must not print retired or drop ImageReader as success (S8).
+                    println!("[video] FAIL: binding A retirement incomplete: {e}");
+                    return Err(SinkError::Fatal(e));
                 }
             }
-            // The decoder wedged (no output): settle, then move to a fresh
-            // reader and re-open.
+            backend.clear_video_surface();
+            if !random_access {
+                return Err(SinkError::Fatal("probe midpoint is not a random-access packet".into()));
+            }
+            // Pollable output replacement needs an explicit new producer.
+            let (reader, counter) = make_reader(mode);
+            frames_b_slot.lock().replace(counter);
+            let res_b = SurfaceRegistry::global()
+                .reserve_native()
+                .map_err(|e| SinkError::Fatal(format!("reserve B: {e:?}")))?;
+            let window = reader.window()
+                .map_err(|e| SinkError::Fatal(format!("reader B window: {e:?}")))?;
+            let binding = res_b.commit(window);
+            backend.set_video_surface(binding.clone())
+                .map_err(|e| SinkError::Fatal(format!("set B: {e:?}")))?;
+            *swap_state.lock() = Swap::NewWindowSet;
+            producer_id += 1;
+            current_producer = ProducerId(producer_id);
+            reopen_mode(&mut sink_video.lock(), mode, params, current_producer, clock)?;
+            println!("[video] replacement producer {} configured", current_producer.0);
+            reader_b = Some(reader);
+            binding_b = Some(binding);
+        }
+
+        let pts = packet_media_time(pkt, time_base);
+        let r = if mode == Mode::SoftwareFrames {
+            decode_and_push_frame(sink_video, &mut sw_decoder, params, pkt, pts, current_producer)
+        } else {
+            let mut sink = sink_video.lock();
+            push_packet(&mut *sink, pkt, pts, *random_access, current_producer)
+        };
+
+        match r {
+            Ok(()) => {}
             Err(SinkError::Fallback(e)) => {
                 println!("[video] fallback at packet {pushed}: {e}");
                 fallbacks += 1;
@@ -360,88 +446,140 @@ fn run_stream(
                     )));
                 }
                 std::thread::sleep(Duration::from_secs(20));
-                backend.set_video_window(None);
+
+                if let Some(prev) = binding_b.take() {
+                    let ret = prev.retire();
+                    await_retirement(&ret, Duration::from_secs(5))
+                        .map_err(SinkError::Fatal)?;
+                    drop(reader_b.take());
+                } else {
+                    drop(reader_b.take());
+                }
+                backend.clear_video_surface();
+
                 let (reader, counter) = make_reader(mode);
                 frames_c_slot.lock().replace(counter);
+                let res_c = SurfaceRegistry::global()
+                    .reserve_native()
+                    .map_err(|e| SinkError::Fatal(format!("reserve C: {e:?}")))?;
                 let w = reader
                     .window()
                     .map_err(|e| SinkError::Fatal(format!("reader C window: {e:?}")))?;
-                std::mem::forget(reader); // live until process exit
-                backend.set_video_window(Some(w));
+                let c_binding = res_c.commit(w);
+                backend
+                    .set_video_surface(c_binding.clone())
+                    .map_err(|e| SinkError::Fatal(format!("set C: {e:?}")))?;
                 println!("[video] moved to fresh window (reader C)");
+
+                producer_id += 1;
+                current_producer = ProducerId(producer_id);
                 let mut sink = sink_video.lock();
-                reopen_mode(&mut sink, mode, params)?;
-                push_packet(&mut *sink, pkt, pts, *random_access)?;
+                reopen_mode(&mut sink, mode, params, current_producer, clock)?;
+                push_packet(&mut *sink, pkt, pts, *random_access, current_producer)?;
+
+                reader_c = Some(reader);
+                binding_c = Some(c_binding);
             }
             Err(e) => return Err(e),
         }
         pushed += 1;
+        if pushed == 1 || pushed % 24 == 0 {
+            println!("[video] admitted {pushed}/{} packets", packets.len());
+        }
     }
-    // Let the decoder drain what it has queued.
+
     std::thread::sleep(Duration::from_millis(1500));
-    let mut sink = sink_video.lock();
-    sink.flush();
+    {
+        let mut sink = sink_video.lock();
+        let t0 = Instant::now();
+        let mut drained = false;
+        while t0.elapsed() < Duration::from_secs(5) {
+            match sink.poll_finish(current_producer) {
+                Poll::Ready(Ok(())) => {
+                    drained = true;
+                    break;
+                }
+                Poll::Ready(Err(e)) => return Err(SinkError::Fatal(format!("{e:?}"))),
+                Poll::Pending => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        if !drained {
+            return Err(SinkError::Fatal(
+                "EOS probe did not complete drain via poll_finish".into(),
+            ));
+        }
+    }
+
+    if let Some(b) = binding_c.or(binding_b) {
+        let ret = b.retire();
+        await_retirement(&ret, Duration::from_secs(5)).map_err(SinkError::Fatal)?;
+        drop(reader_c.take());
+        drop(reader_b.take());
+    } else {
+        drop(reader_c);
+        drop(reader_b);
+    }
+
     Ok(())
 }
+
 
 fn make_reader(mode: Mode) -> (ndk::media::image_reader::ImageReader, Arc<AtomicUsize>) {
     use ndk::hardware_buffer::HardwareBufferUsage;
     use ndk::media::image_reader::{ImageFormat, ImageReader};
-    // Compressed mode hands the reader's window to MediaCodec: YUV output,
-    // with usage flags matching a video decoder's output buffers. Software
-    // mode posts RGBA through ANativeWindow_lock, so that reader is RGBA.
     let (format, usage) = match mode {
         Mode::Compressed => (
             ImageFormat::YUV_420_888,
-            Some(
-                HardwareBufferUsage::GPU_COLOR_OUTPUT
-                    | HardwareBufferUsage::GPU_SAMPLED_IMAGE
-                    | HardwareBufferUsage::VIDEO_ENCODE,
-            ),
+            HardwareBufferUsage::GPU_COLOR_OUTPUT
+                | HardwareBufferUsage::GPU_SAMPLED_IMAGE
+                | HardwareBufferUsage::VIDEO_ENCODE
+                | HardwareBufferUsage::CPU_READ_OFTEN,
         ),
-        Mode::SoftwareFrames => (ImageFormat::RGBA_8888, None),
+        Mode::SoftwareFrames => (
+            ImageFormat::RGBA_8888,
+            HardwareBufferUsage::GPU_COLOR_OUTPUT | HardwareBufferUsage::CPU_READ_OFTEN,
+        ),
     };
-    let mut reader = match usage {
-        Some(usage) => ImageReader::new_with_usage(160, 120, format, usage, 8)
-            .or_else(|_| ImageReader::new(160, 120, format, 8)),
-        None => ImageReader::new(160, 120, format, 8),
-    }
-    .expect("ImageReader::new");
+    let mut reader = ImageReader::new_with_usage(160, 120, format, usage, 8)
+        .map_err(|e| format!("ImageReader::new: {e:?}"))
+        .unwrap();
     let frames = Arc::new(AtomicUsize::new(0));
-    let counter = frames.clone();
+    let count = frames.clone();
     reader
-        .set_image_listener(Box::new(move |reader| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            // Acquire + drop every available image so the codec's
-            // output queue drains; with `max_images` slots full the
-            // decoder would stall.
+        .set_image_listener(Box::new(move |r| {
             while let Ok(ndk::media::image_reader::AcquireResult::Image(img)) =
-                reader.acquire_latest_image()
+                r.acquire_next_image()
             {
+                count.fetch_add(1, Ordering::SeqCst);
                 drop(img);
             }
         }))
-        .expect("set image listener");
+        .unwrap();
     (reader, frames)
 }
 
-/// Demuxes the video track of an MP4 with oxideav-mp4.
+fn probe_clock() -> Arc<player::clock::FreeRunningClock> {
+    Arc::new(player::clock::FreeRunningClock::new())
+}
+
+fn packet_media_time(pkt: &Packet, time_base: TimeBase) -> Duration {
+    let pts = pkt.pts.unwrap_or(0);
+    let micros = pts as i128 * 1_000_000 * time_base.num() as i128 / time_base.den() as i128;
+    Duration::from_micros(micros.max(0) as u64)
+}
+
 fn load_h264(
     path: &str,
 ) -> Result<(Vec<(Packet, bool)>, oxideav_core::CodecParameters, TimeBase), String> {
     let mut ctx = RuntimeContext::new();
     oxideav_mp4::__oxideav_entry(&mut ctx);
     let file = File::open(path).map_err(|e| e.to_string())?;
-    let mut demuxer = ctx
-        .containers
+    let mut demuxer = ctx.containers
         .open_demuxer("mp4", Box::new(file), &ctx.codecs)
         .map_err(|e| e.to_string())?;
-    let video = demuxer
-        .streams()
-        .iter()
+    let video = demuxer.streams().iter()
         .find(|s| s.params.media_type == MediaType::Video)
-        .ok_or("no video stream")?
-        .clone();
+        .ok_or("no video stream")?.clone();
     let mut packets = Vec::new();
     loop {
         match demuxer.next_packet() {
@@ -457,102 +595,33 @@ fn load_h264(
     Ok((packets, video.params, video.time_base))
 }
 
-/// Packet pts in its stream time base, as a media `Duration`.
-fn packet_media_time(pkt: &Packet, time_base: TimeBase) -> Duration {
-    let pts = pkt.pts.unwrap_or(0);
-    let num = time_base.0.num;
-    let den = time_base.0.den;
-    let micros = pts as i128 * 1_000_000 * num as i128 / den as i128;
-    Duration::from_micros(micros.max(0) as u64)
-}
-
-// ---------------------------------------------------------------- audio
-
-fn audio_probe() -> i32 {
-    println!("[audio] starting 3 s sine probe");
-    let backend = AndroidBackend::new();
-    let mut audio = backend.audio();
-    let (rate, ch) = (48000u32, 2u16);
-
-    if let Err(e) = audio.open(rate, ch) {
-        println!("[audio] FAIL: open: {e}");
-        return 1;
-    }
-
-    // 500 ms of sine, written in chunks.
-    let chunk_frames = (rate as usize / 2) * ch as usize;
-    let mut chunk = Vec::with_capacity(chunk_frames);
-    for f in 0..rate as usize / 2 {
-        let t = f as f64 / rate as f64;
-        let s = (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.25;
-        chunk.push(s);
-        chunk.push(s);
-    }
-
-    let clock = audio.clock();
-    audio.play();
-    let mut written_frames = 0usize;
-    let mut clock_before = None;
-    for i in 0..6 {
-        let pts = Duration::from_secs_f64(written_frames as f64 / rate as f64);
-        match audio.write(&chunk, pts) {
-            Ok(n) => written_frames += n / ch as usize,
-            Err(e) => {
-                println!("[audio] FAIL: write: {e}");
-                return 1;
-            }
-        }
-        if i == 0 {
-            clock_before = clock.now();
-            println!("[audio] clock after first write: {clock_before:?}");
-        }
-    }
-    let t0 = Instant::now();
-    // Give a loaded machine time to drain the queued audio before reading
-    // the clock again.
-    std::thread::sleep(Duration::from_millis(1200));
-    let clock_after = clock.now();
-    audio.pause();
-
-    println!("[audio] clock after first write: {clock_before:?}");
-    println!("[audio] clock after drain:    {clock_after:?}");
-    audio.flush();
-
-    let (Some(before), Some(after)) = (clock_before, clock_after) else {
-        println!("[audio] FAIL: clock never became valid");
-        return 1;
-    };
-    let advanced = (after - before).as_secs_f64();
-    println!(
-        "[audio] clock advanced: {advanced:.3} s over {:.2} s wall",
-        t0.elapsed().as_secs_f64() + 0.4
-    );
-    if (2.5..3.6).contains(&advanced) {
-        println!("[audio] PASS");
-        0
-    } else {
-        println!("[audio] FAIL: expected ~3 s of clock advance");
-        1
-    }
-}
-
-/// The video-only probe uses the same free clock as audio-less playback.
-fn probe_clock() -> Arc<dyn Clock> {
-    let clock = player::clock::FreeRunningClock::new();
-    clock.play();
-    Arc::new(clock)
-}
-
-fn push_packet(sink: &mut dyn VideoSink, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
+fn push_packet(
+    sink: &mut dyn VideoSink,
+    packet: &Packet,
+    pts: Duration,
+    random_access: bool,
+    producer: ProducerId,
+) -> Result<(), SinkError> {
+    let mut pkt_opt = Some(packet.clone());
+    let started = Instant::now();
     loop {
-        match sink.push_packet(packet, pts, random_access) {
-            Err(SinkError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
-            result => return result,
+        match sink.push_packet(producer, &mut pkt_opt, pts, random_access) {
+            Ok(()) => return Ok(()),
+            Err(VideoError::Sink(SinkError::WouldBlock)) => {
+                if started.elapsed() >= Duration::from_secs(5) {
+                    return Err(SinkError::Fatal(format!(
+                        "packet admission stalled: producer={}, pts={pts:?}, input_retained={}",
+                        producer.0, pkt_opt.is_some(),
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(VideoError::Sink(e)) => return Err(e),
+            Err(e) => return Err(SinkError::Fatal(format!("{e:?}"))),
         }
     }
 }
 
-/// Experiment: software decoder first on a fresh reader window.
 fn sw_first_probe() -> i32 {
     println!("[sw] starting software-first probe");
     let (packets, params, time_base) = match load_h264("/data/local/tmp/peartube_probe.mp4") {
@@ -588,10 +657,14 @@ fn sw_first_probe() -> i32 {
             }))
             .unwrap();
     }
+    let res = SurfaceRegistry::global().reserve_native().unwrap();
     let window = reader.window().unwrap();
+    let binding = res.commit(window);
     let backend = AndroidBackend::new();
-    backend.set_video_window(Some(window));
-    let _box_sink = backend.video(probe_clock());
+    backend.set_video_surface(binding.clone()).unwrap();
+
+    let clock = probe_clock();
+    let _box_sink = backend.video(clock.clone());
     let sink_video: Arc<parking_lot::Mutex<player::android::AndroidVideoSink>> = backend
         .shared()
         .active_video
@@ -600,14 +673,11 @@ fn sw_first_probe() -> i32 {
         .and_then(|w| w.upgrade())
         .expect("Backend::video registers the sink in active_video");
     let t0 = Instant::now();
+    let producer = ProducerId(101);
     {
         let mut sink = sink_video.lock();
-        // Exercise the software path directly: the emulator's vendor decoder
-        // wedges, and this probe isolates the software decode + ImageReader
-        // pipeline from that.
-        sink.prefer_software_decoder(true);
-        if !sink.open_compressed(&params, PictureReady::new(|_| {})) {
-            println!("[sw] FAIL: open declined");
+        if let Err(e) = reopen_mode(&mut *sink, Mode::Compressed, &params, producer, &clock) {
+            println!("[sw] FAIL: open declined: {e:?}");
             return 1;
         }
     }
@@ -616,7 +686,7 @@ fn sw_first_probe() -> i32 {
         let pts = packet_media_time(pkt, time_base);
         let r = {
             let mut sink = sink_video.lock();
-            push_packet(&mut *sink, pkt, pts, *random_access)
+            push_packet(&mut *sink, pkt, pts, *random_access, producer)
         };
         match r {
             Ok(()) => pushed += 1,
@@ -628,7 +698,18 @@ fn sw_first_probe() -> i32 {
     }
     std::thread::sleep(Duration::from_millis(1500));
     let n = frames.load(Ordering::SeqCst);
-    println!("[sw] pushed {pushed}, frames received: {n} in {:?}", t0.elapsed());
+    println!(
+        "[sw] pushed {pushed}, frames received: {n} in {:?}",
+        t0.elapsed()
+    );
+
+    let retirement = binding.retire();
+    if let Err(e) = await_retirement(&retirement, Duration::from_secs(5)) {
+        println!("[sw] FAIL: retirement incomplete: {e}");
+        return 1;
+    }
+    drop(reader);
+
     if n >= 150 {
         println!("[sw] PASS");
         0
@@ -638,7 +719,6 @@ fn sw_first_probe() -> i32 {
     }
 }
 
-/// Experiment: software decoder with NO surface, raw buffer counting.
 fn nosurface_probe() -> i32 {
     println!("[nosurf] starting no-surface probe");
     let (packets, params, time_base) = match load_h264("/data/local/tmp/peartube_probe.mp4") {
@@ -676,7 +756,6 @@ fn nosurface_probe() -> i32 {
 
     let mut out_count = 0usize;
     for (pkt, _) in packets.iter().take(60) {
-        // input
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let idx = loop {
             match codec.dequeue_input_buffer(Duration::from_millis(20)) {
@@ -714,7 +793,6 @@ fn nosurface_probe() -> i32 {
             .queue_input_buffer(buf, 0, data.len(), pts.as_micros() as u64, 0)
             .map_err(|e| println!("[nosurf] queue err: {e:?}"))
             .unwrap();
-        // drain outputs
         loop {
             match codec.dequeue_output_buffer(Duration::from_millis(5)) {
                 Ok(ndk::media::media_codec::DequeuedOutputBufferInfoResult::Buffer(b)) => {
@@ -727,15 +805,9 @@ fn nosurface_probe() -> i32 {
                     return 1;
                 }
             }
-            if false {
-                break;
-            }
-            // stop draining when nothing more for a moment — simplified: check via TryAgainLater count
-            // (this loop must end; use a bounded count)
             if out_count > 4000 {
                 break;
             }
-            // crude: break the inner loop each packet after trying a few times
             static SPIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let n = SPIN.fetch_add(1, Ordering::Relaxed) % 3;
             if n == 2 {
@@ -753,7 +825,6 @@ fn nosurface_probe() -> i32 {
     }
 }
 
-/// Splits avcC extradata into (csd-0 SPS annexb, csd-1 PPS annexb, length size).
 fn crate_avcc_split(extra: &[u8]) -> (Vec<u8>, Vec<u8>, usize) {
     if extra.len() < 7 || extra[0] != 1 {
         return (Vec::new(), Vec::new(), 4);
@@ -794,4 +865,37 @@ fn crate_avcc_split(extra: &[u8]) -> (Vec<u8>, Vec<u8>, usize) {
         }
     }
     (csd0, csd1, nls)
+}
+
+fn audio_probe() -> i32 {
+    let backend = AndroidBackend::new();
+    let mut audio = backend.audio();
+    if let Err(e) = audio.open(48000, 2) {
+        println!("[audio] FAIL: open: {e}");
+        return 1;
+    }
+    let mut pcm = vec![0.0f32; 48000 * 2];
+    for i in 0..48000 {
+        let t = i as f32 / 48000.0;
+        let s = (t * 440.0 * 2.0 * std::f32::consts::PI).sin() * 0.2;
+        pcm[i * 2] = s;
+        pcm[i * 2 + 1] = s;
+    }
+    audio.play();
+    let t0 = Instant::now();
+    let _ = audio.write(&pcm, Duration::ZERO);
+    let c0 = audio.clock().now();
+    std::thread::sleep(Duration::from_millis(500));
+    let c1 = audio.clock().now();
+    let ok = match (c0, c1) {
+        (Some(a), Some(b)) => b > a,
+        _ => false,
+    };
+    if ok {
+        println!("[audio] PASS: clock advanced from {c0:?} to {c1:?} in {:?}", t0.elapsed());
+        0
+    } else {
+        println!("[audio] FAIL: clock did not advance (c0={c0:?}, c1={c1:?})");
+        1
+    }
 }

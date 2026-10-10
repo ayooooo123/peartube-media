@@ -12,6 +12,7 @@ pub mod headless;
 pub mod source;
 pub mod subs;
 mod webvtt;
+mod video_owner;
 mod webvtt_text;
 
 pub use engine::{Event, OpenError, Player, PlayerOptions, State, Track, TrackKind, CAPTIONS_608, CAPTIONS_708};

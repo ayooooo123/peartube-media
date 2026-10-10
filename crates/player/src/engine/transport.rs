@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::{notify_changed_now, SharedState};
+use super::{notify_changed_now, SeekOrigin, SeekTarget, SharedState};
 use crate::backend::Clock;
 use crate::clock::current_monotonic_ns;
 
@@ -135,9 +135,10 @@ pub(super) enum Due {
     Now,
     /// More than `VIDEO_LEAD` past due: drop it.
     Late,
-    /// Apply a transport run-state change to the sink before waiting again.
+    /// Apply a transport run-state change, honor a video wake, or service a
+    /// newer seek at the outer pump before waiting again. Retained media stays.
     Resync,
-    /// The player stopped or a seek superseded the frame.
+    /// The player stopped, failed, or the pipeline was retired.
     Abort,
 }
 
@@ -145,11 +146,12 @@ pub(super) enum Due {
 pub(super) enum Preroll {
     Go,
     /// The clock's run state changed: apply it to the sink, then ask again.
+    /// Video also uses this for wake/seek so the outer pump can service them.
     Resync,
-    /// The player stopped, the pipeline was retired, or a seek superseded
-    /// the media.
+    /// The player stopped, failed, or the pipeline was retired.
     Abort,
 }
+
 
 /// Counts a pipeline thread as live from spawn until the thread ends,
 /// however it ends.
@@ -229,7 +231,7 @@ impl SharedState {
         }
     }
 
-    fn wake_lanes(&self) {
+    pub(super) fn wake_lanes(&self) {
         for lane in self.lanes.lock().iter() {
             drop(lane.queue.lock());
             lane.cv.notify_all();
@@ -308,6 +310,7 @@ impl SharedState {
             for p in &mut t.pipes {
                 p.horizon = None;
                 p.trusted_end = None;
+                p.primed = None;
             }
             t.demux_eof = false;
             t.tail_limit = None;
@@ -315,9 +318,48 @@ impl SharedState {
             t.buffering = true;
             // Publish the target and generation only after the clock holds.
             // The demuxer reads the pair under the same target lock.
-            *target = Some(to);
+            *target = Some(SeekTarget {
+                target: to,
+                origin: SeekOrigin::User,
+            });
             self.seek_gen.store(t.seek_gen, Ordering::SeqCst);
         });
+    }
+
+    /// Internal output recovery seek: preserves origin and original deadline,
+    /// checks expected generation under the transport/target lock order to avoid
+    /// overwriting a newer user seek.
+    pub(super) fn request_recovery_seek(
+        &self,
+        to: Duration,
+        deadline: Instant,
+        expected_gen: u64,
+    ) -> bool {
+        let mut published = false;
+        self.update(|t| {
+            let mut target = self.seek_target.lock();
+            if t.seek_gen != expected_gen {
+                return;
+            }
+            t.seek_gen = t.seek_gen.wrapping_add(1);
+            self.master.seek(to, t.seek_gen);
+            for p in &mut t.pipes {
+                p.horizon = None;
+                p.trusted_end = None;
+                p.primed = None;
+            }
+            t.demux_eof = false;
+            t.tail_limit = None;
+            t.demux_full = false;
+            t.buffering = true;
+            *target = Some(SeekTarget {
+                target: to,
+                origin: SeekOrigin::InternalRecovery { deadline },
+            });
+            self.seek_gen.store(t.seek_gen, Ordering::SeqCst);
+            published = true;
+        });
+        published
     }
 
     /// The pipelines are running: from now on the hold follows their data.
@@ -357,11 +399,11 @@ impl SharedState {
             if t.seek_gen == generation {
                 let p = t.pipe(pipe);
                 p.requires_picture = true;
-                if p.primed != Some(generation) {
-                    t.buffering = true;
-                }
+                p.primed = None;
+                t.buffering = true;
             }
         });
+        self.wake_clock_waiters();
     }
 
     /// The pipeline has output ready (decoded and past the seek target) for
@@ -393,6 +435,9 @@ impl SharedState {
         loop {
             if t.done || self.superseded(generation, retired) {
                 return false;
+            }
+            if pipe == Pipe::Video && self.video_wake.load(Ordering::SeqCst) {
+                return true;
             }
             let now = t.unpaused_now();
             if t.pipe(pipe).primed == Some(generation) || now >= until {
@@ -473,10 +518,13 @@ impl SharedState {
         let due = pts.saturating_sub(lead.min(VIDEO_LEAD));
         let mut t = self.transport.lock();
         loop {
-            if self.superseded(seen_seek, retired) {
+            if self.terminal(retired) {
                 return Due::Abort;
             }
-            if applied != Some(t.running) {
+            if self.seek_changed(seen_seek)
+                || applied != Some(t.running)
+                || self.video_wake.load(Ordering::SeqCst)
+            {
                 return Due::Resync;
             }
             let now = self.master.now().unwrap_or_default();
@@ -523,10 +571,50 @@ impl SharedState {
     ) -> Preroll {
         let mut t = self.transport.lock();
         loop {
-            if self.superseded(seen_seek, retired) {
+            // Audio keeps seek-as-Abort: the audio consumer restarts on seek.
+            if self.superseded(seen_seek, retired) || self.failed.load(Ordering::SeqCst) {
                 return Preroll::Abort;
             }
             if applied != Some(t.running) {
+                return Preroll::Resync;
+            }
+            let now = self.master.now().unwrap_or_default();
+            // Nothing waits for a stamp past the end's horizon.
+            let pts = t.tail_limit.map_or(pts, |limit| pts.min(limit));
+            if t.running {
+                if let Some(ahead) = ahead {
+                    if pts > now + ahead {
+                        let wait = self.until(pts - ahead, now);
+                        self.transport_cv.wait_for(&mut t, wait);
+                        continue;
+                    }
+                }
+                return Preroll::Go;
+            }
+            if pts <= now + PREROLL {
+                return Preroll::Go;
+            }
+            self.transport_cv.wait(&mut t);
+        }
+    }
+
+    pub(super) fn preroll_video(
+        &self,
+        pts: Duration,
+        applied: Option<bool>,
+        ahead: Option<Duration>,
+        seen_seek: u64,
+        retired: &AtomicBool,
+    ) -> Preroll {
+        let mut t = self.transport.lock();
+        loop {
+            if self.terminal(retired) {
+                return Preroll::Abort;
+            }
+            if self.seek_changed(seen_seek)
+                || applied != Some(t.running)
+                || self.video_wake.load(Ordering::SeqCst)
+            {
                 return Preroll::Resync;
             }
             let now = self.master.now().unwrap_or_default();
@@ -637,6 +725,14 @@ impl SharedState {
         self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
     }
 
+    pub(super) fn video_wait_retry(&self) {
+        if self.video_wake.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut t = self.transport.lock();
+        self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
+    }
+
     /// Without realtime pacing nothing waits on the clock: a paused player
     /// parks its pipelines here instead.
     pub(super) fn wait_while_paused(&self, retired: &AtomicBool) {
@@ -646,12 +742,31 @@ impl SharedState {
         }
     }
 
-    /// The caller's work is stale: the player stopped, a selection switch
-    /// retired the caller's pipeline thread, or a newer seek arrived.
-    fn superseded(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
+    pub(super) fn video_wait_while_paused(&self, retired: &AtomicBool) {
+        let mut t = self.transport.lock();
+        while t.paused.is_some() && !self.stopped.load(Ordering::SeqCst) && !retired.load(Ordering::SeqCst) {
+            if self.video_wake.load(Ordering::SeqCst) {
+                break;
+            }
+            self.transport_cv.wait(&mut t);
+        }
+    }
+
+    /// Stopped, failed, or the caller's pipeline thread was retired.
+    fn terminal(&self, retired: &AtomicBool) -> bool {
         self.stopped.load(Ordering::SeqCst)
+            || self.failed.load(Ordering::SeqCst)
             || retired.load(Ordering::SeqCst)
-            || self.seek_gen.load(Ordering::SeqCst) != seen_seek
+    }
+
+    fn seek_changed(&self, seen_seek: u64) -> bool {
+        self.seek_gen.load(Ordering::SeqCst) != seen_seek
+    }
+
+    /// True when the player stopped, failed, retired the caller's pipeline
+    /// thread, or a newer seek arrived.
+    fn superseded(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
+        self.terminal(retired) || self.seek_changed(seen_seek)
     }
 }
 
