@@ -340,13 +340,15 @@ fn worker_loop(mut reader: Box<dyn ReadSeekSend>, shared: Arc<SharedRing>) {
         // Window full and the consumer has not advanced: park on the
         // worker condvar (the consumer's read/seek notifies it) instead
         // of spinning through this loop.
-        if ahead >= state.capacity
-            || (state.capacity == total_buffered && state.cur_pos > state.tail_pos)
-        {
+        if ahead >= state.capacity {
             shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
             continue;
         }
 
+        // Window full and the consumer has read into it: drop what it has
+        // read to make room. Without this the ring never takes another byte
+        // once 32 MiB have arrived since the last seek, and playback stops
+        // for good when the consumer reaches the end of the window.
         if state.capacity - total_buffered == 0 && state.cur_pos > state.tail_pos {
             let evict = (state.cur_pos - state.tail_pos) as usize;
             state.tail_pos += evict as u64;
@@ -522,6 +524,50 @@ mod tests {
         drop(state);
         release_tx.send(()).unwrap();
         assert_eq!(seeker.join().unwrap(), (128, [128, 129, 130, 131]));
+    }
+
+    fn read_past_full_window(start: u64) {
+        let length = start as usize + RING_CAPACITY + CHUNK_SIZE + 13;
+        let bytes = (0..length).map(|offset| (offset % 251) as u8).collect::<Vec<_>>();
+        let mut source = ReadAheadSource::new(Box::new(Cursor::new(bytes)));
+        let monitor = source.monitor();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<u64> {
+                let mut position = source.seek(SeekFrom::Start(start))?;
+                let mut buffer = [0; 4093];
+                loop {
+                    let count = source.read(&mut buffer)?;
+                    if count == 0 {
+                        return Ok(position);
+                    }
+                    for (offset, &byte) in buffer[..count].iter().enumerate() {
+                        let at = position + offset as u64;
+                        if byte != (at % 251) as u8 {
+                            return Err(std::io::Error::other(format!("incorrect byte at {at}")));
+                        }
+                    }
+                    position += count as u64;
+                }
+            })();
+            let _ = finished_tx.send(result);
+        });
+        let result = finished_rx.recv_timeout(Duration::from_secs(5));
+        // Stop the actual read before asserting: a regression must fail, not
+        // leave a reader and its prefetch worker blocked after the watchdog.
+        monitor.stop();
+        reader.join().unwrap();
+        assert_eq!(result.expect("read-ahead stalled at a full window").unwrap(), length as u64);
+    }
+
+    #[test]
+    fn full_read_ahead_window_recycles_consumed_bytes() {
+        read_past_full_window(0);
+    }
+
+    #[test]
+    fn full_read_ahead_window_recycles_consumed_bytes_after_seek() {
+        read_past_full_window(RING_CAPACITY as u64 + 8192);
     }
 
     #[test]
