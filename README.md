@@ -479,6 +479,13 @@ Apple and Unix builds read platform font directories. ASS embedded fonts
 and Matroska font attachments take precedence. Missing glyphs fall back to
 another face; the old bitmap font is used only when no runtime fonts exist.
 Bitmap subtitles do not trigger system-font discovery.
+ASS-backed text starts font discovery while decoding queued cues, rather than
+waiting until the first cue is due on screen. This keeps a cold platform-font
+scan out of timed presentation; short cues no longer have to spend their
+display interval doing that initialization. The embedded SubRip/ASS selection
+regression in `subtitle_av` checks visible pixels during the cue and expiry,
+with uninterrupted PCM. Native overlay and real-show acceptance remain
+separate from these host checks.
 
 `PlayerOptions.fonts` accepts `FontOptions { directories, default_family }`.
 `directories: None` selects platform fonts; `Some(paths)` uses only those

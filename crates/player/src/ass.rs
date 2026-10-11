@@ -19,6 +19,14 @@ pub(crate) fn configure(fonts: &FontOptions, attachments: Vec<Arc<[u8]>>) {
     });
 }
 
+/// Discover runtime fonts while a text packet is decoded ahead of playback,
+/// not when its first picture is already due. Bitmap tracks stay lazy.
+pub(crate) fn prepare_fonts() {
+    RENDERER.with(|slot| {
+        let _ = slot.borrow().shaper.fonts.is_empty();
+    });
+}
+
 pub(crate) fn default_track() -> Track {
     let mut track = Track::new();
     track.play_res_x = 384;

@@ -235,6 +235,7 @@ fn decoded_cue(
                 let text = layout_cue(&cue, info, track, text_space(width, height));
                 Some(Cue { start, end: Some(end), content: Content::Text(text) })
             } else {
+                crate::ass::prepare_fonts();
                 Some(Cue { start, end: Some(end), content: Content::Ass(crate::ass::event(&cue)) })
             }
         }
@@ -697,6 +698,7 @@ impl SubtitlePipeline {
             }
         }
         if let Some(track) = &mut self.ass {
+            crate::ass::prepare_fonts();
             let start = self.time_base.rescale(packet.pts.unwrap_or(0), TimeBase::new(1, 1000));
             let duration = self.time_base.rescale(packet.duration.unwrap_or(0), TimeBase::new(1, 1000));
             track.prune_events(start);

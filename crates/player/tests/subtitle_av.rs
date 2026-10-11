@@ -32,6 +32,7 @@ struct Shown {
     at: Duration,
     images: usize,
     bytes: usize,
+    opaque: usize,
 }
 
 #[derive(Default)]
@@ -156,7 +157,8 @@ impl SubtitleSink for WatchedSubtitles {
     fn show(&mut self, images: &[SubtitleImage], _width: u32, _height: u32) {
         let at = self.0.clock.lock().as_ref().and_then(|clock| clock.now()).unwrap_or_default();
         let bytes = images.iter().map(|image| image.rgba.len()).sum();
-        self.0.shows.lock().push(Shown { at, images: images.len(), bytes });
+        let opaque = images.iter().flat_map(|image| image.rgba.chunks_exact(4)).filter(|pixel| pixel[3] != 0).count();
+        self.0.shows.lock().push(Shown { at, images: images.len(), bytes, opaque });
     }
 }
 
@@ -200,8 +202,7 @@ fn srt(path: &Path, cues: &[(u32, u32)]) {
 /// A Matroska file of `seconds`: optional H.264 video (`video`: its lavfi
 /// source and GOP length), then a 48 kHz stereo PCM track per tone of
 /// `tones` (Hz), then one WebVTT track per SubRip file of `subtitles`, in
-/// that stream order. (The text decoders take Matroska's WebVTT blocks;
-/// its SubRip and ASS blocks they reject.)
+/// that stream order. The embedded-text regression also remuxes SubRip/ASS.
 fn movie(path: &Path, seconds: u32, video: Option<(&str, &str)>, tones: &[u32], subtitles: &[&Path]) {
     let duration = seconds.to_string();
     let mut args: Vec<String> = Vec::new();
@@ -346,6 +347,30 @@ fn selecting_a_subtitle_keeps_the_default_audio_track() {
     let shows = backend.watch.shows.lock().clone();
     assert!(shows.iter().any(|show| show.images > 0 && show.at >= Duration::from_millis(4000)), "the next cue, from 4.0 s: {shows:?}");
     drop(player);
+}
+
+#[test]
+fn selecting_embedded_subrip_and_ass_draws_caption_pixels() {
+    for codec in ["srt", "ass"] {
+        let scratch = Scratch::new();
+        let cues = scratch.file("cues.srt");
+        srt(&cues, &[(200, 1500), (4000, 5500)]);
+        let source = scratch.file("source.mkv");
+        movie(&source, 6, None, &[440], &[&cues]);
+        let media = scratch.file("embedded.mkv");
+        ffmpeg(&["-i", source.to_str().unwrap(), "-map", "0", "-c", "copy", "-c:s", codec, media.to_str().unwrap()]);
+        let (player, backend) = play(&media, None::<u32>);
+        wait_until(&player, Duration::from_secs(10), "before selection", |state| state.position >= Duration::from_secs(1));
+        player.select_subtitle(Some(1));
+        let state = wait_until(&player, Duration::from_secs(20), "caption playback", |state| state.ended);
+        assert_eq!(state.subtitle, Some(1));
+        let shows = backend.watch.shows.lock().clone();
+        assert!(shows.iter().any(|show| show.opaque > 0 && show.at >= Duration::from_secs(4) && show.at < Duration::from_millis(5500)),
+            "{codec}: selected embedded caption must produce visible pixels during its cue: {shows:?}");
+        assert!(shows.last().is_some_and(|show| show.images == 0), "{codec}: expired caption clears");
+        assert_audio_and_video_complete(&media, &backend, &state, None, codec);
+        drop(player);
+    }
 }
 
 /// A flood of overlapping cues beside video stays within the image and byte
