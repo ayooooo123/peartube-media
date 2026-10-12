@@ -1,0 +1,7 @@
+<subpictures>
+  <stream>
+    <spu start="00:00:01.00" end="00:00:02.50" image="cvd-1.png"/>
+    <spu start="00:00:03.00" image="cvd-2.png"/>
+    <spu start="00:00:04.00" end="00:00:05.00" image="cvd-3.png"/>
+  </stream>
+</subpictures>

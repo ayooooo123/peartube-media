@@ -1,0 +1,20 @@
+[package]
+name = "check-mpegts"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oxideav-core.workspace = true
+# The fork under test (pinned in the workspace [patch.crates-io]).
+oxideav-mpegts.workspace = true
+refcheck.workspace = true
+
+[dev-dependencies]
+# Actual playback of transport streams through the engine.
+codecs = { path = "../codecs" }
+player = { path = "../player" }

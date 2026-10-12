@@ -1,0 +1,954 @@
+# corpus/manifest.toml
+# One entry per corpus sample. `path` is `fate:<relative-under-FATE_SUITE>`,
+# `gen:<name>` (files made by corpus/generate.sh into PEARTUBE_CORPUS_DIR,
+# default ~/projects/peartube-media-corpus), or `samples:<archive path>` (a
+# file of FFmpeg's sample archive, https://samples.ffmpeg.org/, which
+# corpus/fetch-samples.sh fetches into FFMPEG_SAMPLES, default
+# ~/projects/oracles/ffmpeg-samples; corpus/samples.sha256 pins each one,
+# and the runner refuses a file that differs).
+# rows    = yardstick rows covered (ids from corpus/yardstick.toml)
+# compare = one policy per stream kind the sample has (a played stream with
+#           no policy fails):
+#   video:md5        every frame's MD5 equals FFmpeg's, same frame count
+#   audio:md5        PCM byte-identical to FFmpeg's in the decoder's sample
+#                    format, same sample count (integer/lossless decoders)
+#   audio:snr:<dB>   SNR >= floor, lengths within one decoder frame (float
+#                    decoders; the contract's floor is 90 dB, lower is refused)
+#   sub:text         every cue's timing (ms) and body equal FFmpeg's decode
+#                    re-encoded as SubRip, same count, every cue shown
+#   sub:bitmap       as many bitmaps as FFmpeg's decoder emits, same start
+#                    (and end) times, same canvas states as FFmpeg's sub2video
+#   <kind>:decodes   plays to the end with output; only for formats FFmpeg
+#                    cannot decode (the runner fails it when FFmpeg can), and
+#                    never a verified pass
+#   diag:audio:snr:<dB>  SNR against a floor, reported, never accepting (keeps
+#                    the measurement of formats below the contract floor)
+#           Under video:md5 and audio:*, a stream that plays but outputs
+#           nothing passes only when FFmpeg's demuxer reads no packet of it
+#           either (a PMT can declare streams that never carry one).
+#           Records of one sample and stream selection merge; two different
+#           policies for one kind are an error.
+# stream selection: `streams` lists the stream indices to play per kind when
+# non-default; absent = the player's defaults (first of each kind). Records
+# with different selections of one sample are separate entries.
+
+# ---------------- Video ----------------
+
+[[entry]]
+path = "fate:isom/vc1-wmapro.ism"
+rows = ["video:vc1", "audio:wmapro", "container:mp4"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:vc1/SA00050.vc1"
+rows = ["video:vc1"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:vc1/SMM0005.rcv"
+rows = ["video:wmv3"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:mpeg2/matrixbench_mpeg2.lq1.mpg"
+rows = ["video:mpeg2", "container:mpeg_ps"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:mpeg1_mp2.mpg"
+rows = ["video:mpeg1", "audio:mp2", "container:mpeg_ps"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:mpeg4/demo.m4v"
+rows = ["video:mpeg4"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:mpeg4_xvid.avi"
+rows = ["video:mpeg4", "video:xvid", "container:avi"]
+compare = ["video:md5"]
+
+# 3ivx: a real 3ivx Delta 4 movie from FFmpeg's sample archive (MPEG-4 ASP
+# under the 3IV2 tag). FFmpeg cannot decode the older 3IV1 coding.
+[[entry]]
+path = "samples:V-codecs/3iv2/3IV2.mov"
+rows = ["video:3ivx"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:video_h263i.avi"
+rows = ["video:h263i"]
+compare = ["video:md5"]
+
+# Raw MPEG-4 has no brand tag; H.263 and Xvid use their declared-codec fixtures.
+[[entry]]
+path = "fate:mpeg4/xvid_vlc_trac7411.h263"
+rows = ["video:mpeg4"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:video_h261.avi"
+rows = ["video:h261"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:video_h263.avi"
+rows = ["video:h263"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:h264_aac.mkv"
+rows = ["video:h264", "audio:aac", "container:mkv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:mkv/1242-small.mkv"
+rows = ["video:h264", "audio:aac", "container:mkv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:mov/buck480p30_na.mp4"
+rows = ["video:h264", "container:mp4", "container:mov"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:cvid/laracroft-cinepak-partial.avi"
+rows = ["video:cinepak", "container:avi"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:ogg/videotest.ogv"
+rows = ["video:vp8", "container:ogg"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:dirac/vts.profile-main.drc"
+rows = ["video:dirac"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:dirac/vts.profile-vc2-low-delay.drc"
+rows = ["video:dirac"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:video_mjpeg.avi"
+rows = ["video:mjpeg", "container:avi"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:wmv8/wmv8_x8intra.wmv"
+rows = ["video:wmv2", "audio:wma2", "container:asf"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:wmv1_wma1.asf"
+rows = ["video:wmv1", "audio:wma1"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:asf/bug821-2.asf"
+rows = ["video:divx", "container:asf"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:svq1/marymary-shackles.mov"
+rows = ["video:svq1", "container:mov"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:svq3/Vertical400kbit.sorenson3.mov"
+rows = ["video:svq3"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:dv/dvcprohd_720p50.mov"
+rows = ["video:dv"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:vp3/vp31.avi"
+rows = ["video:vp3", "container:avi"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:vp5/potter512-400-partial.avi"
+rows = ["video:vp5", "audio:speex"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:vp6/interlaced32x32.avi"
+rows = ["video:vp6"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:ea-vp6/SmallRing.vp6"
+rows = ["video:vp6"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:iv32/OPENINGH.avi"
+rows = ["video:iv32", "container:avi"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:real/G2_with_SVT_320_240.rm"
+rows = ["video:rv20", "container:rm"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:sipr/sipr_5k0.rm"
+rows = ["video:rv10", "audio:sipr", "container:rm"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:real/rv30.rm"
+rows = ["video:rv30", "audio:cook", "container:rm"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:real/spygames-2MB.rmvb"
+rows = ["video:rv40", "audio:cook"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:hevc/food.hevc"
+rows = ["video:hevc"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:hevc10_eac3.mkv"
+rows = ["video:hevc", "audio:eac3", "container:mkv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:video_vp8.webm"
+rows = ["video:vp8", "audio:vorbis", "container:ogg"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:vp9_opus.webm"
+rows = ["video:vp9", "audio:opus"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:av1_opus.mkv"
+rows = ["video:av1", "audio:opus", "container:mkv"]
+compare = ["video:md5", "audio:snr:90"]
+
+# ---------------- Audio ----------------
+
+[[entry]]
+path = "gen:audio_mp1.mpa"
+rows = ["audio:mp1", "container:mp3"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "samples:A-codecs/mp1-sample.mp1"
+rows = ["audio:mp1", "container:mp3"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:mp3-conformance/compl.bit"
+rows = ["audio:mp3", "container:mp3"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "gen:audio.mp3"
+rows = ["audio:mp3", "container:mp3"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:mpegps/pcm_aud.mpg"
+rows = ["audio:lpcm", "container:mpeg_ps"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:ac3/millers_crossing_4.0.ac3"
+rows = ["audio:ac3", "container:raw_ac3"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "gen:h264_ac3.mkv"
+rows = ["audio:ac3", "container:mkv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:h264_eac3.mkv"
+rows = ["audio:eac3", "container:mkv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:eac3/csi_miami_5.1_256_spx_small.eac3"
+rows = ["audio:eac3"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:dts/dts_es.dts"
+rows = ["audio:dts", "container:raw_dts"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "gen:h264_dts.mkv"
+rows = ["audio:dts", "container:mkv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:lossless-audio/truehd_5.1.raw"
+rows = ["audio:truehd", "container:mpeg_ps"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:truehd/atmos.thd"
+rows = ["audio:truehd"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/luckynight-partial.mlp"
+rows = ["audio:mlp"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:h264_truehd.mkv"
+rows = ["audio:truehd", "container:mkv"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:wmv8/wmv_drm.wmv"
+rows = ["audio:wma2", "container:asf"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:wmapro/Beethovens_9th-1_small.wma"
+rows = ["audio:wmapro", "container:asf"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:wmavoice/streaming_CBR-11K.wma"
+rows = ["audio:wmavoice", "container:asf"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
+
+[[entry]]
+path = "fate:lossless-audio/luckynight-partial.wma"
+rows = ["audio:wmalossless", "container:asf"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/luckynight-partial.rmvb"
+rows = ["audio:ralf", "container:rm"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:mkv/flac_channel_layouts.mka"
+rows = ["audio:flac", "container:mkv"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio.flac"
+rows = ["audio:flac", "container:raw_flac"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio_alac.m4a"
+rows = ["audio:alac", "container:mp4"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:speex/nb_q7.spx"
+rows = ["audio:speex", "container:ogg"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:musepack/inside-mp7.mpc"
+rows = ["audio:musepack"]
+compare = ["audio:md5", "diag:audio:snr:90"]
+
+[[entry]]
+path = "fate:musepack/inside-mp8.mpc"
+rows = ["audio:musepack"]
+compare = ["audio:md5", "diag:audio:snr:90"]
+
+[[entry]]
+path = "fate:atrac3/mc_sich_at3_066_small.wav"
+rows = ["audio:atrac3", "container:wav"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:atrac3p/at3p_sample1.oma"
+rows = ["audio:atrac3p"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:wavpack/lossless/16bit-partial.wv"
+rows = ["audio:wavpack"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio_mod.mod"
+rows = ["audio:mod"]
+compare = ["audio:decodes"]
+
+[[entry]]
+path = "fate:lossless-audio/inside.tta"
+rows = ["audio:tta"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/NoLegacy-cut.ape"
+rows = ["audio:ape"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:real/ra_cook.rm"
+rows = ["audio:cook", "container:rm"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:real/ra3_in_rm_file.rm"
+rows = ["audio:ra144"]
+compare = ["audio:md5", "diag:audio:snr:90"]
+
+[[entry]]
+path = "fate:realaudio/ra4_288.ra"
+rows = ["audio:ra288", "container:rm"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:sipr/sipr_16k.rm"
+rows = ["audio:sipr", "container:rm"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:aa/bush.aa"
+rows = ["audio:sipr"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:qt-surge-suite/surge-1-16-B-alaw.mov"
+rows = ["audio:alaw", "container:mov"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:qt-surge-suite/surge-1-16-B-ulaw.mov"
+rows = ["audio:ulaw", "container:mov"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio_alaw.wav"
+rows = ["audio:alaw", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio_ulaw.wav"
+rows = ["audio:ulaw", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:amrnb/10.2k.amr"
+rows = ["audio:amrnb"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
+
+[[entry]]
+path = "fate:amrwb/deus-23k85.awb"
+rows = ["audio:amrwb"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
+
+[[entry]]
+path = "fate:lossless-audio/als_00_2ch48k16b.mp4"
+rows = ["audio:als", "container:mp4"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/als_05_2ch48k16b.mp4"
+rows = ["audio:als", "container:mp4"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:gsm/sample-gsm-8000.mov"
+rows = ["audio:gsm"]
+# Stream 1 is a QuickTime text track FFmpeg cannot decode ("unknown"), so
+# the file verifies the GSM audio, not the container.
+compare = ["audio:md5", "sub:decodes"]
+
+[[entry]]
+path = "fate:gsm/ciao.wav"
+rows = ["audio:gsm_ms", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/luckynight-partial.shn"
+rows = ["audio:shorten"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:lossless-audio/luckynight-partial.tak"
+rows = ["audio:tak"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio.mid"
+rows = ["audio:midi", "container:midi"]
+compare = ["audio:decodes"]
+
+[[entry]]
+path = "fate:mpegps/pcm_aud.mpg"
+rows = ["audio:lpcm"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio_adpcm.wav"
+rows = ["audio:adpcm", "container:wav"]
+compare = ["audio:md5", "diag:audio:snr:70"]
+
+[[entry]]
+path = "fate:qt-surge-suite/surge-1-16-B-ima4.mov"
+rows = ["audio:adpcm"]
+compare = ["audio:md5", "diag:audio:snr:70"]
+
+# MS ADPCM and IMA WAV in QuickTime (ms\0\x02, ms\0\x11), OKI, G.726, and
+# Creative ADPCM in WAV.
+[[entry]]
+path = "fate:qt-surge-suite/surge-2-16-L-ms02.mov"
+rows = ["audio:adpcm", "container:mov"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:qt-surge-suite/surge-2-16-L-ms11.mov"
+rows = ["audio:adpcm", "container:mov"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:oki/test.wav"
+rows = ["audio:adpcm", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio_g726.wav"
+rows = ["audio:adpcm", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:creative/intro-partial.wav"
+rows = ["audio:adpcm", "container:wav"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:qcp/0036580847.QCP"
+rows = ["audio:qcelp"]
+compare = ["audio:snr:90", "diag:audio:snr:80"]
+
+[[entry]]
+path = "fate:dv/dvcprohd_720p50.mov"
+rows = ["audio:dvaudio"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:qt-surge-suite/surge-2-16-B-QDM2.mov"
+rows = ["audio:qdm2", "container:mov"]
+compare = ["audio:snr:90", "diag:audio:snr:60"]
+
+# QDMC: FATE has none and nothing encodes it; QuickTime's own encode from
+# FFmpeg's sample archive. FFmpeg's decoder computes in floats, as QDM2's.
+[[entry]]
+path = "samples:A-codecs/QDMC/rumcoke.mov"
+rows = ["audio:qdmc", "container:mov"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:qt-surge-suite/surge-1-8-MAC3.mov"
+rows = ["audio:mace3", "container:mov"]
+compare = ["audio:md5", "diag:audio:snr:60"]
+
+[[entry]]
+path = "fate:qt-surge-suite/surge-1-8-MAC6.mov"
+rows = ["audio:mace6", "container:mov"]
+compare = ["audio:md5", "diag:audio:snr:60"]
+
+[[entry]]
+path = "fate:ogg-opus/chained-meta.ogg"
+rows = ["audio:opus", "container:ogg"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:caf/opus.caf"
+rows = ["audio:opus", "container:caf"]
+compare = ["audio:snr:90"]
+
+# Two MP2 tracks of different content (FFmpeg md5s differ): the default
+# selection plays stream 1 and is compared with FFmpeg's 0:1, the explicit
+# one plays stream 2 and is compared with FFmpeg's 0:2.
+[[entry]]
+path = "fate:h264/h264_intra_first-small.ts"
+rows = ["audio:mp2", "container:mpeg_ts"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:h264/h264_intra_first-small.ts"
+rows = ["audio:mp2", "container:mpeg_ts"]
+compare = ["video:md5", "audio:md5"]
+streams = { audio = 2 }
+
+# The second of two FLAC tracks (same PCM as the first, so this exercises the
+# explicit selection and its mapping to FFmpeg's 0:1, not their distinction).
+[[entry]]
+path = "fate:mkv/flac_channel_layouts.mka"
+rows = ["audio:flac", "container:mkv"]
+compare = ["audio:md5"]
+streams = { audio = 1 }
+
+# ---------------- Subtitles ----------------
+
+[[entry]]
+path = "fate:sub/vobsub.idx"
+rows = ["sub:dvd"]
+compare = ["sub:bitmap"]
+
+[[entry]]
+path = "fate:sub/SubRip_capability_tester.srt"
+rows = ["sub:subrip"]
+compare = ["sub:text"]
+
+[[entry]]
+path = "fate:sub/MicroDVD_capability_tester.sub"
+rows = ["sub:microdvd"]
+compare = ["sub:text"]
+
+[[entry]]
+path = "fate:sub/SubViewer_capability_tester.sub"
+rows = ["sub:subviewer"]
+compare = ["sub:text"]
+
+[[entry]]
+path = "fate:sub/1ededcbd7b.ass"
+rows = ["sub:ass"]
+compare = ["sub:text"]
+
+# SSA (v4.00, FFmpeg reads it as `ass`): karaoke, colours, \pos.
+[[entry]]
+path = "fate:sub/a9-misc.ssa"
+rows = ["sub:ass"]
+compare = ["sub:text"]
+
+# ASS in Matroska (S_TEXT/ASS), as FFmpeg muxes it.
+[[entry]]
+path = "gen:h264_aac_ass.mkv"
+rows = ["sub:ass"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
+
+[[entry]]
+path = "fate:sub/SAMI_capability_tester.smi"
+rows = ["sub:sami"]
+compare = ["sub:text"]
+
+[[entry]]
+path = "fate:sub/VPlayer_capability_tester.txt"
+rows = ["sub:vplayer"]
+compare = ["sub:text"]
+
+[[entry]]
+path = "fate:sub/MPL2_capability_tester.txt"
+rows = ["sub:mpl2"]
+compare = ["sub:text"]
+
+# Closed captions in MPEG-2 video (A/53): the player offers them as
+# synthetic tracks, EIA-608 as stream 65536 and CEA-708 service 1 as 65537.
+# FFmpeg reads EIA-608 through lavfi `movie=...[out0+subcc]` and decodes it
+# in real time mode, as the player shows captions; it has no CEA-708
+# decoder, so that track can only decode.
+[[entry]]
+path = "fate:sub/Closedcaption_rollup.m2v"
+rows = ["sub:eia608"]
+streams = { subtitle = 65536 }
+compare = ["video:md5", "sub:text"]
+
+[[entry]]
+path = "fate:sub/Closedcaption_rollup.m2v"
+rows = ["sub:cea708"]
+streams = { subtitle = 65537 }
+compare = ["video:md5", "sub:decodes"]
+
+# Scenarist Closed Captions carry EIA-608 pairs (FFmpeg: eia_608).
+[[entry]]
+path = "fate:sub/witch.scc"
+rows = ["sub:eia608"]
+compare = ["sub:text"]
+
+# USF in Matroska from FFmpeg's sample archive (XviD, Vorbis, USF). FFmpeg
+# cannot decode USF.
+[[entry]]
+path = "samples:sub/usf/usf.mkv"
+rows = ["sub:usf"]
+compare = ["video:md5", "audio:snr:90", "sub:decodes"]
+
+[[entry]]
+path = "fate:sub/dvbsubtest_filter.ts"
+rows = ["sub:dvb", "container:mpeg_ts"]
+compare = ["video:md5", "audio:snr:90", "sub:bitmap"]
+
+# OGM text (oggparseogm.c), next to XVID video and AC-3 audio.
+[[entry]]
+path = "fate:ogg-ogm/bots01.ogm"
+rows = ["sub:ogm"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
+
+[[entry]]
+path = "fate:sub/MovText_capability_tester.mp4"
+rows = ["sub:tx3g"]
+compare = ["sub:text"]
+
+# mov_text in MOV: FFmpeg's QuickTime `text` entry, and a `tx3g` entry.
+[[entry]]
+path = "gen:h264_aac_movtext.mov"
+rows = ["sub:tx3g"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
+
+[[entry]]
+path = "gen:h264_aac_tx3g.mov"
+rows = ["sub:tx3g"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
+
+[[entry]]
+path = "gen:vp9_opus_vtt.webm"
+rows = ["sub:webvtt"]
+compare = ["video:md5", "audio:snr:90", "sub:text"]
+
+[[entry]]
+path = "fate:sub/pgs_sub.sup"
+rows = ["sub:pgs"]
+compare = ["sub:bitmap"]
+
+[[entry]]
+path = "gen:h264_aac_pgs.mkv"
+rows = ["sub:pgs", "container:mkv"]
+compare = ["video:md5", "sub:bitmap"]
+
+# SVCD (OGT) subpictures: no real sample found. FATE has none; FFmpeg's
+# sample archive (its full index, MPEG-VOB/SVCD-bug's 52 MB disc image,
+# MPEG-VOB/interlaced/twc-teme-svcd-sample.mpg) and VLC's SVCD/karaoke.bin
+# carry no private stream 1 at all; FFmpeg and mkvmerge cannot write OGT.
+# This entry documents the gap; the runner reports the row as missing.
+[[entry]]
+path = "gen:sub_svcd_placeholder.bin"
+rows = ["sub:svcd"]
+compare = ["sub:decodes"]
+
+# CMML and Kate: FFmpeg cannot read either, so these decode without an
+# oracle; the Player tests check their cues against the Xiph mappings.
+# The CMML file is built by generate.sh to the Xiph CMML mapping; the Kate
+# sample is libkate's.
+[[entry]]
+path = "gen:sub_cmml.ogg"
+rows = ["sub:cmml"]
+compare = ["sub:decodes"]
+
+[[entry]]
+path = "fate:ogg-kate/kate-subtitles.ogg"
+rows = ["sub:kate"]
+compare = ["sub:decodes"]
+
+# ---------------- Containers ----------------
+
+[[entry]]
+path = "fate:mp3-conformance/he_32khz.bit"
+rows = ["container:mp3", "container:mpeg_es"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:pva/PVA_test-partial.pva"
+rows = ["container:pva"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "gen:h264_aac.avi"
+rows = ["container:avi"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:h264_aac.mp4"
+rows = ["container:mp4"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:h264_aac.ts"
+rows = ["container:mpeg_ts"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:mpegts/h264small.ts"
+rows = ["container:mpeg_ts"]
+compare = ["video:md5"]
+
+# MPEG-TS with the codecs the mpegts fork's FFmpeg parser stage splits
+# besides H.264, AAC, AC-3 and MP2: DTS, TrueHD, Opus, HEVC. (AAC in LATM
+# is checked by crates/check-mpegts and check-aac: FATE's LATM sample
+# changes from stereo to 5.1, which FFmpeg's CLI output keeps at stereo.)
+[[entry]]
+path = "gen:h264_dts.ts"
+rows = ["audio:dts", "container:mpeg_ts"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:h264_truehd.ts"
+rows = ["audio:truehd", "container:mpeg_ts"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "fate:dts/dts.ts"
+rows = ["audio:dts", "container:mpeg_ts"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:opus/test-8-7.1.opus-small.ts"
+rows = ["audio:opus", "container:mpeg_ts"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "fate:lcevc/L_HEVC_640x360p_8bit8bit_2D_dd.ts"
+rows = ["video:hevc", "container:mpeg_ts"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:audio.flac"
+rows = ["container:raw_flac"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:dts/dts_es.dts"
+rows = ["container:raw_dts"]
+compare = ["audio:snr:90"]
+
+# Raw containers: ADTS AAC, Opus in an .opus file, raw DV (FFmpeg's dv
+# muxer, and a camera's single frame from FFmpeg's sample archive).
+[[entry]]
+path = "gen:audio.aac"
+rows = ["container:raw_aac", "audio:aac"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "gen:audio.opus"
+rows = ["container:ogg", "audio:opus"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "gen:video.dv"
+rows = ["container:raw_dv", "video:dv"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "samples:DV-raw/shots0000.dv"
+rows = ["container:raw_dv", "video:dv"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:flv/Enigma_Principles_of_Lust-part.flv"
+rows = ["container:flv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:video.flv"
+rows = ["container:flv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:mxf/Avid-00005.mxf"
+rows = ["container:mxf"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "gen:h264_aac_nut.nut"
+rows = ["container:nut"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "gen:audio.mid"
+rows = ["container:midi"]
+compare = ["audio:decodes"]
+
+# Sound Blaster Pro 4-, 2.6- and 2-bit ADPCM (FATE's adpcm-creative tests).
+[[entry]]
+path = "fate:creative/BBC_4BIT.VOC"
+rows = ["container:voc", "audio:adpcm"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:creative/BBC_3BIT.VOC"
+rows = ["container:voc", "audio:adpcm"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:creative/BBC_2BIT.VOC"
+rows = ["container:voc", "audio:adpcm"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:audio.aiff"
+rows = ["container:aiff"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:caf/caf-pcm16.caf"
+rows = ["container:caf"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:h264_aac.mkv"
+rows = ["container:mkv"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:mov/buck480p30_na.mp4"
+rows = ["container:mov"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "fate:ogg-vorbis/tos.ogg"
+rows = ["container:ogg"]
+compare = ["audio:snr:90"]
+
+[[entry]]
+path = "gen:video_theora.ogg"
+rows = ["video:theora", "container:ogg"]
+compare = ["video:md5", "audio:snr:90"]
+
+# A real OGM file: DIV3 video in OGM headers, native Ogg Vorbis audio.
+[[entry]]
+path = "fate:ogg-ogm/intro_ogg.ogm"
+rows = ["container:ogm"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:real/G2_with_SVT_320_240.rm"
+rows = ["container:rm"]
+compare = ["video:md5"]
+
+[[entry]]
+path = "gen:audio_lpcm.wav"
+rows = ["container:wav"]
+compare = ["audio:md5"]
+
+# DVD LPCM at 24 bits (FATE pcm.mak) and Blu-ray LPCM in M2TS.
+[[entry]]
+path = "fate:pcm-dvd/coolitnow-partial.vob"
+rows = ["audio:lpcm", "container:mpeg_ps"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "gen:audio_pcm_bluray.m2ts"
+rows = ["audio:lpcm", "container:mpeg_ts"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "gen:mpeg2_mp2.mpg"
+rows = ["container:mpeg_ps"]
+compare = ["video:md5", "audio:md5"]
+
+[[entry]]
+path = "gen:h264_ac3.ts"
+rows = ["container:mpeg_ts"]
+compare = ["video:md5", "audio:snr:90"]
+
+[[entry]]
+path = "fate:ac3/millers_crossing_4.0.ac3"
+rows = ["container:raw_ac3"]
+compare = ["audio:snr:90"]

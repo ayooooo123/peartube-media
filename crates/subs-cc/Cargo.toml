@@ -1,0 +1,21 @@
+[package]
+name = "subs-cc"
+description = "Closed captions: ATSC A/53 caption extraction from H.264/HEVC/MPEG-2, EIA-608 and CEA-708 decoders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Ports of FFmpeg's libavcodec/atsc_a53.c, itut35.c, h264_sei.c,
+# hevc/sei.c, h2645_parse.c, mpeg12dec.c and ccaption_dec.c, and of VLC's
+# modules/codec/cea708.c: all LGPL-2.1-or-later in their sources.
+license = "LGPL-2.1-or-later"
+publish = false
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-mkv.workspace = true
+oxideav-mpegts.workspace = true
+demux-misc = { path = "../demux-misc" }
+serde_json = "1"

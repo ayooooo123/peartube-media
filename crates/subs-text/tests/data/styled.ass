@@ -1,0 +1,18 @@
+[Script Info]
+ScriptType: v4.00+
+PlayResX: 384
+PlayResY: 288
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
+Style: Yellow,Arial,16,&H0000FFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
+Style: Left Blue,Arial,16,&H00FF8000,&H000000FF,&H00000000,&H00000000,0,-1,0,0,100,100,0,0,1,1,0,1,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.50,0:00:01.50,Default,,0,0,0,,Plain {\b1}bold{\b0} and {\i1}italic{\i0}
+Dialogue: 0,0:00:02.00,0:00:03.25,Yellow,,0,0,0,,Yellow bold style\Nsecond line
+Dialogue: 0,0:00:03.50,0:00:04.75,Left Blue,,0,0,0,,{\fad(200,200)\pos(20,250)}Left italic blue
+Comment: 0,0:00:04.80,0:00:04.90,Default,,0,0,0,,not an event
+Dialogue: 1,0:00:05.00,0:00:06.00,Default,Speaker,0,0,0,,{\c&H0000FF&}red{\c} then {\u1}under{\u0}

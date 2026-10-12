@@ -1,0 +1,16 @@
+[package]
+name = "codec-mp2"
+description = "Layer II decoder using the shared fixed-point MPEG audio synthesis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+oxideav-mp2.workspace = true
+mpegaudiodsp = { path = "../mpegaudiodsp" }
+
+[dev-dependencies]
+refcheck.workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "codec-wavpack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+oxideav-core.workspace = true
+demux-seek-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-mkv.workspace = true

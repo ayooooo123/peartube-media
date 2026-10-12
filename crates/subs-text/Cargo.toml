@@ -1,0 +1,22 @@
+[package]
+name = "subs-text"
+description = "Text subtitle demuxers and decoders: SubRip, ASS/SSA, WebVTT, MicroDVD, SubViewer, SAMI, VPlayer, mov_text, USF, CMML, Kate"
+version.workspace = true
+edition.workspace = true
+license = "LGPL-2.1-or-later"
+publish.workspace = true
+
+[dependencies]
+oxideav-core.workspace = true
+oxideav-subtitle.workspace = true
+roxmltree = "0.20"
+
+[dev-dependencies]
+codecs = { path = "../codecs" }
+player = { path = "../player" }
+parking_lot = "0.12"
+refcheck.workspace = true
+oxideav-mkv.workspace = true
+oxideav-mp4.workspace = true
+oxideav-ogg.workspace = true
+oxideav-ass.workspace = true

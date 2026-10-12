@@ -1,0 +1,93 @@
+[package]
+name = "codecs"
+description = "Every container and decoder the PearTube player uses, in one registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The player never encodes or muxes: OxideAV siblings' register functions
+# then leave their encoders and muxers unreferenced, and LTO drops them.
+oxideav-core = { workspace = true, features = ["decode-only"] }
+oxideav-avi.workspace = true
+oxideav-basic.workspace = true
+oxideav-dvd.workspace = true
+oxideav-flv.workspace = true
+oxideav-iff.workspace = true
+oxideav-mkv.workspace = true
+oxideav-mov.workspace = true
+oxideav-mp4.workspace = true
+oxideav-mpegts.workspace = true
+oxideav-ogg.workspace = true
+oxideav-av1.workspace = true
+oxideav-cinepak.workspace = true
+oxideav-dirac.workspace = true
+oxideav-h261.workspace = true
+oxideav-h263.workspace = true
+oxideav-h264.workspace = true
+oxideav-h265.workspace = true
+oxideav-indeo.workspace = true
+oxideav-mjpeg.workspace = true
+oxideav-mpeg12video.workspace = true
+oxideav-mpeg4video.workspace = true
+oxideav-msmpeg4.workspace = true
+oxideav-svq.workspace = true
+oxideav-theora.workspace = true
+oxideav-vc2.workspace = true
+oxideav-vp6.workspace = true
+oxideav-vp8.workspace = true
+oxideav-vp9.workspace = true
+oxideav-aac.workspace = true
+oxideav-ac3.workspace = true
+oxideav-adpcm.workspace = true
+oxideav-cook.workspace = true
+oxideav-dts.workspace = true
+oxideav-flac.workspace = true
+oxideav-g711.workspace = true
+codec-midi = { path = "../codec-midi" }
+codec-mp2 = { path = "../codec-mp2" }
+oxideav-mp3.workspace = true
+oxideav-opus.workspace = true
+oxideav-speex.workspace = true
+oxideav-vorbis.workspace = true
+oxideav-wma.workspace = true
+oxideav-ass.workspace = true
+oxideav-sub-image.workspace = true
+oxideav-subtitle.workspace = true
+demux-asf = { path = "../demux-asf" }
+codec-mlp = { path = "../codec-mlp" }
+demux-misc = { path = "../demux-misc" }
+demux-rm = { path = "../demux-rm" }
+demux-mxf = { path = "../demux-mxf" }
+codec-dca = { path = "../codec-dca" }
+subs-text = { path = "../subs-text" }
+subs-cc = { path = "../subs-cc" }
+codec-ra = { path = "../codec-ra" }
+codec-rv = { path = "../codec-rv" }
+codec-vp3 = { path = "../codec-vp3" }
+codec-wmv = { path = "../codec-wmv" }
+codec-wma = { path = "../codec-wma" }
+subs-bitmap = { path = "../subs-bitmap" }
+codec-apple-audio = { path = "../codec-apple-audio" }
+codec-speech = { path = "../codec-speech" }
+codec-dv = { path = "../codec-dv" }
+codec-atrac = { path = "../codec-atrac" }
+codec-vp56 = { path = "../codec-vp56" }
+codec-speex = { path = "../codec-speex" }
+codec-svq1 = { path = "../codec-svq1" }
+codec-svq3 = { path = "../codec-svq3" }
+codec-ape = { path = "../codec-ape" }
+codec-wavpack = { path = "../codec-wavpack" }
+codec-musepack = { path = "../codec-musepack" }
+codec-lpcm = { path = "../codec-lpcm" }
+codec-gsm = { path = "../codec-gsm" }
+codec-tta = { path = "../codec-tta" }
+codec-shorten = { path = "../codec-shorten" }
+codec-tak = { path = "../codec-tak" }
+codec-als = { path = "../codec-als" }
+codec-mp1 = { path = "../codec-mp1" }
+codec-tracker = { path = "../codec-tracker" }
+
+[dev-dependencies]
+refcheck = { path = "../refcheck" }

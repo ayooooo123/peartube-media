@@ -1,0 +1,65 @@
+total samples (sum of self): 13253
+
+self by function:
+   5279  39.8%  oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+   1335  10.1%  oxideav_av1::cdf::PartitionWalker::predict_inter_leaf_from_walk::ha61f23ebd1b71932
+   1283   9.7%  oxideav_av1::cdef::cdef_filter_block::hde74cedd81c87a59
+    746   5.6%  oxideav_av1::transform::inverse_dct::h9edb36caf02f8d66
+    694   5.2%  oxideav_av1::cdf::PartitionWalker::cdef_frame_from_idx::h5c1c358587d548e3
+    315   2.4%  oxideav_av1::loop_filter::wide_filter::h2e7b7b10e604047d
+    294   2.2%  oxideav_av1::loop_restoration::wiener_filter::h6feee271127ddd9e
+    265   2.0%  _platform_memmove
+    259   2.0%  oxideav_av1::cdf::PartitionWalker::decode_inter_block_mode_info::ha217f3bb82b97afb
+    190   1.4%  oxideav_av1::symbol_decoder::SymbolDecoder::read_symbol::ha47f74d7de6cfcbd
+    183   1.4%  oxideav_av1::transform::inverse_transform_2d::hf45db44a68b6a383
+    171   1.3%  oxideav_av1::inter_pred::motion_field_estimation_core::_$u7b$$u7b$closure$u7d$$u7d$::hd4c8900e9e7c09d9
+    137   1.0%  _platform_memset
+    131   1.0%  _xzm_free
+    116   0.9%  oxideav_av1::cdf::PartitionWalker::curr_frame_step3_merge::hc8f425443abd8b81
+    104   0.8%  _$LT$alloc..vec..Vec$LT$T$GT$$u20$as$u20$alloc..vec..spec_from_iter_nested..SpecFromIterNested$LT$T$C$I$GT$$GT$::from_iter::h0d0bc3c677ac0e88
+     99   0.7%  oxideav_av1::inter_pred::predict_inter_compound_blend::hf04877ac2561b521
+     88   0.7%  __bzero
+     70   0.5%  oxideav_av1::inter_pred::reconstruct_inter_leaf_at::he25f7f50f1bb9fc6
+     69   0.5%  mach_absolute_time
+     65   0.5%  oxideav_av1::cdf::dequantize_step1::hdb0e0c2a34a5a595
+     60   0.5%  oxideav_av1::inter_pred::predict_inter::hbc09f0cb34326f7f
+     60   0.5%  oxideav_av1::cdf::PartitionWalker::clear_block_decoded_flags::h1e078d92b396f0b9
+     59   0.4%  oxideav_av1::cdf::PartitionWalker::coefficients_gate_open::h4f4ada61fc3933d2
+     56   0.4%  oxideav_av1::cdf::PartitionWalker::transform_block_emit::hd848cbecb1570565
+     56   0.4%  oxideav_av1::cdf::PartitionWalker::decode_block_syntax::hfb4bb74ced0c452a
+     54   0.4%  _xzm_xzone_malloc_tiny
+     51   0.4%  oxideav_av1::cdf::PartitionWalker::loop_restore_frame_from_grid::h30af8332fcf54330
+     50   0.4%  oxideav_av1::decoder::frame_driver::decode_frame_spec_tiles::hcee12fdc0c07368b
+     43   0.3%  alloc::vec::in_place_collect::from_iter_in_place::h2f4099e2fd955f24
+
+self by line:
+   2310  17.4%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:780 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+   1490  11.2%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:779 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+    821   6.2%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdf.rs:19452 oxideav_av1::cdf::PartitionWalker::predict_inter_leaf_from_walk::ha61f23ebd1b71932
+    694   5.2%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdf.rs:20745 oxideav_av1::cdf::PartitionWalker::cdef_frame_from_idx::h5c1c358587d548e3
+    406   3.1%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdf.rs:19562 oxideav_av1::cdf::PartitionWalker::predict_inter_leaf_from_walk::ha61f23ebd1b71932
+    312   2.4%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/transform.rs:241 oxideav_av1::transform::inverse_dct::h9edb36caf02f8d66
+    265   2.0%                                           _platform_memmove
+    264   2.0%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:813 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+    251   1.9%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:783 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+    227   1.7%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdef.rs:588 oxideav_av1::cdef::cdef_filter_block::hde74cedd81c87a59
+    211   1.6%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/loop_filter.rs:830 oxideav_av1::loop_filter::wide_filter::h2e7b7b10e604047d
+    197   1.5%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdef.rs:590 oxideav_av1::cdef::cdef_filter_block::hde74cedd81c87a59
+    196   1.5%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:781 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+    181   1.4%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:805 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+    155   1.2%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:775 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+    142   1.1%  /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/core/src/cmp.rs:0 oxideav_av1::cdef::cdef_filter_block::hde74cedd81c87a59
+    137   1.0%                                           _platform_memset
+    135   1.0%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdef.rs:591 oxideav_av1::cdef::cdef_filter_block::hde74cedd81c87a59
+    131   1.0%                                           _xzm_free
+    116   0.9%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:7701 oxideav_av1::inter_pred::motion_field_estimation_core::_$u7b$$u7b$closure$u7d$$u7d$::hd4c8900e9e7c09d9
+    114   0.9%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:814 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+    113   0.9%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/inter_pred.rs:816 oxideav_av1::inter_pred::block_inter_prediction::hea6c610e2c6dcfd0
+    104   0.8%  /rustc/31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd/library/alloc/src/vec/spec_from_iter_nested.rs:60 _$LT$alloc..vec..Vec$LT$T$GT$$u20$as$u20$alloc..vec..spec_from_iter_nested..SpecFromIterNested$LT$T$C$I$GT$$GT
+     94   0.7%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/loop_restoration.rs:979 oxideav_av1::loop_restoration::wiener_filter::h6feee271127ddd9e
+     88   0.7%                                           __bzero
+     82   0.6%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdef.rs:589 oxideav_av1::cdef::cdef_filter_block::hde74cedd81c87a59
+     76   0.6%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdef.rs:0 oxideav_av1::cdef::cdef_filter_block::hde74cedd81c87a59
+     73   0.6%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdf.rs:17826 oxideav_av1::cdf::PartitionWalker::curr_frame_step3_merge::hc8f425443abd8b81
+     73   0.6%  oxideav-av1-e3b1e8d01681e521/cab66b0/src/cdef.rs:581 oxideav_av1::cdef::cdef_filter_block::hde74cedd81c87a59
+     69   0.5%                                           mach_absolute_time

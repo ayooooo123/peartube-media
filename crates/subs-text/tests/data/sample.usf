@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE USFSubtitles PUBLIC "-//USF//DTD Subtitles 1.0/EN" "http://ultravcs.sourceforge.net/usf/usf.dtd" []>
+<USFSubtitles version="1.0">
+  <metadata><title>robustness</title><date>2026</date></metadata>
+  <styles><style name="Default"><fontstyle face="Arial" size="20" color="#FFFFFF"/></style></styles>
+  <subtitles>
+    <subtitle start="00:00:00.500" stop="00:00:02.000"><text>Hello <b>bold</b> <i>italic</i> <font color="#ffff00">yellow</font></text></subtitle>
+    <subtitle start="00:00:02.500" stop="00:00:04.000"><text>Second line<br/>wrapped</text></subtitle>
+    <subtitle start="00:00:04.500" stop="00:00:05.500"><text style="Default">Third &amp; last</text></subtitle>
+  </subtitles>
+</USFSubtitles>

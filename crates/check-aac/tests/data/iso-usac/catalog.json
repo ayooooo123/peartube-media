@@ -1,0 +1,229 @@
+{
+  "url": "https://standards.iso.org/iso-iec/23003/-7/ed-1/en/ISO_IEC_23003-7_Conformance_Sequences.zip",
+  "members": {
+    "compressedMp4/Fd_2_c1_Cp_0x0c.mp4": {
+      "offset": 61114748,
+      "compressed": 239518,
+      "size": 244639,
+      "method": 8,
+      "crc": 994403744
+    },
+    "referencesWav/Fd_2_c1_Cp_0x0c.wav": {
+      "offset": 1806649551,
+      "compressed": 1271502,
+      "size": 1323050,
+      "method": 8,
+      "crc": 2116811656
+    },
+    "compressedMp4/Fd_2_c1_SfbCp_0x0c.mp4": {
+      "offset": 66964594,
+      "compressed": 95151,
+      "size": 244639,
+      "method": 8,
+      "crc": 2906662597
+    },
+    "referencesWav/Fd_2_c1_SfbCp_0x0c.wav": {
+      "offset": 1946150585,
+      "compressed": 1253187,
+      "size": 1323050,
+      "method": 8,
+      "crc": 2174151725
+    },
+    "compressedMp4/Fd_2_c1_TnsCp_0x0c.mp4": {
+      "offset": 69679892,
+      "compressed": 240060,
+      "size": 244639,
+      "method": 8,
+      "crc": 134053337
+    },
+    "referencesWav/Fd_2_c1_TnsCp_0x0c.wav": {
+      "offset": 2051076250,
+      "compressed": 1272998,
+      "size": 1323050,
+      "method": 8,
+      "crc": 1281993294
+    },
+    "compressedMp4/Fd_2_c1_WinCp_0x0c.mp4": {
+      "offset": 75065098,
+      "compressed": 240207,
+      "size": 244639,
+      "method": 8,
+      "crc": 1238425209
+    },
+    "referencesWav/Fd_2_c1_WinCp_0x0c.wav": {
+      "offset": 2257977569,
+      "compressed": 1271545,
+      "size": 1323050,
+      "method": 8,
+      "crc": 1875525408
+    },
+    "compressedMp4/Fd_2_c1_WinTnsCp_0x0c.mp4": {
+      "offset": 83157861,
+      "compressed": 163022,
+      "size": 244639,
+      "method": 8,
+      "crc": 4003077325
+    },
+    "referencesWav/Fd_2_c1_WinTnsCp_0x0c.wav": {
+      "offset": 2499721198,
+      "compressed": 1187129,
+      "size": 1323050,
+      "method": 8,
+      "crc": 3764398112
+    },
+    "compressedMp4/Fd_2_c1_Tns_0x0c.mp4": {
+      "offset": 73806005,
+      "compressed": 120956,
+      "size": 123152,
+      "method": 8,
+      "crc": 153583932
+    },
+    "referencesWav/Fd_2_c1_Tns_0x0c.wav": {
+      "offset": 2223045731,
+      "compressed": 1237681,
+      "size": 1323050,
+      "method": 8,
+      "crc": 4140778108
+    },
+    "compressedMp4/Fd_2_c1_TnsMs_0x0c.mp4": {
+      "offset": 70934006,
+      "compressed": 120336,
+      "size": 123152,
+      "method": 8,
+      "crc": 1119739196
+    },
+    "referencesWav/Fd_2_c1_TnsMs_0x0c.wav": {
+      "offset": 2086332923,
+      "compressed": 1238337,
+      "size": 1323050,
+      "method": 8,
+      "crc": 2200625354
+    },
+    "compressedMp4/Fd_2_c1_WinTns_0x0c.mp4": {
+      "offset": 86542560,
+      "compressed": 163532,
+      "size": 244639,
+      "method": 8,
+      "crc": 4284218457
+    },
+    "referencesWav/Fd_2_c1_WinTns_0x0c.wav": {
+      "offset": 2595071355,
+      "compressed": 1152573,
+      "size": 1323050,
+      "method": 8,
+      "crc": 656112613
+    },
+    "compressedMp4/Fd_2_c1_WinTnsMs_0x0c.mp4": {
+      "offset": 84577597,
+      "compressed": 115458,
+      "size": 123152,
+      "method": 8,
+      "crc": 3075536400
+    },
+    "referencesWav/Fd_2_c1_WinTnsMs_0x0c.wav": {
+      "offset": 2532052139,
+      "compressed": 1133969,
+      "size": 1323050,
+      "method": 8,
+      "crc": 712993059
+    },
+    "compressedMp4/Fd_2_c1_Nf_0x0c.mp4": {
+      "offset": 65039823,
+      "compressed": 120526,
+      "size": 123152,
+      "method": 8,
+      "crc": 107091972
+    },
+    "referencesWav/Fd_2_c1_Nf_0x0c.wav": {
+      "offset": 1911146886,
+      "compressed": 1247005,
+      "size": 1323050,
+      "method": 8,
+      "crc": 2873130365
+    },
+    "compressedMp4/Fd_2_c1_Cp_0x04.mp4": {
+      "offset": 60513821,
+      "compressed": 360088,
+      "size": 367148,
+      "method": 8,
+      "crc": 2130658868
+    },
+    "referencesWav/Fd_2_c1_Cp_0x04.wav": {
+      "offset": 1795232373,
+      "compressed": 7609188,
+      "size": 7938050,
+      "method": 8,
+      "crc": 982420205
+    },
+    "compressedMp4/Fd_2_c1_WinCp_0x04.mp4": {
+      "offset": 74461441,
+      "compressed": 361895,
+      "size": 367148,
+      "method": 8,
+      "crc": 3493064948
+    },
+    "referencesWav/Fd_2_c1_WinCp_0x04.wav": {
+      "offset": 2246560586,
+      "compressed": 7610009,
+      "size": 7938050,
+      "method": 8,
+      "crc": 3999054525
+    },
+    "compressedMp4/Fd_2_c1_Nf_0x04.mp4": {
+      "offset": 64570523,
+      "compressed": 347257,
+      "size": 352113,
+      "method": 8,
+      "crc": 2966881329
+    },
+    "referencesWav/Fd_2_c1_Nf_0x04.wav": {
+      "offset": 1899976072,
+      "compressed": 7439040,
+      "size": 7938050,
+      "method": 8,
+      "crc": 3269432972
+    },
+    "compressedMp4/Fd_2_c1_WinTns_0x04.mp4": {
+      "offset": 85864542,
+      "compressed": 474314,
+      "size": 487427,
+      "method": 8,
+      "crc": 318203223
+    },
+    "referencesWav/Fd_2_c1_WinTns_0x04.wav": {
+      "offset": 2584764944,
+      "compressed": 7040348,
+      "size": 7938050,
+      "method": 8,
+      "crc": 2318539222
+    },
+    "compressedMp4/Fd_2_c1_Win_0x04.mp4": {
+      "offset": 87393431,
+      "compressed": 241992,
+      "size": 247329,
+      "method": 8,
+      "crc": 1173389532
+    },
+    "referencesWav/Fd_2_c1_Win_0x04.wav": {
+      "offset": 2618001707,
+      "compressed": 7637847,
+      "size": 7938050,
+      "method": 8,
+      "crc": 1034091700
+    },
+    "compressedMp4/Fd_2_c1_WinNf_0x04.mp4": {
+      "offset": 78482097,
+      "compressed": 347577,
+      "size": 352134,
+      "method": 8,
+      "crc": 1267812149
+    },
+    "referencesWav/Fd_2_c1_WinNf_0x04.wav": {
+      "offset": 2350943226,
+      "compressed": 7528726,
+      "size": 7938050,
+      "method": 8,
+      "crc": 3177792351
+    }
+  }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "codec-speech"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-mp4.workspace = true
+oxideav-mov.workspace = true
+demux-misc = { path = "../demux-misc" }

@@ -1,0 +1,159 @@
+//! Every container and decoder the player uses, in one registry.
+//!
+//! Decoder factories are first-registered-wins; install our replacements first.
+//! Container factories are keyed by name; install our replacements last.
+
+use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag, RuntimeContext};
+
+/// A context holding every container and decoder the player can use.
+pub fn context() -> RuntimeContext {
+    let mut ctx = RuntimeContext::new();
+    register_all(&mut ctx);
+    ctx
+}
+
+/// Installs every container and decoder into `ctx`.
+pub fn register_all(ctx: &mut RuntimeContext) {
+    // The player uses first_decoder, not the priority-walking pipeline.
+    // Install container-aware subtitle factories before standalone ones.
+    subs_text::register(ctx);
+    for register in [
+        codec_mlp::register_codecs,
+        codec_dca::register_codecs,
+        subs_text::register_codecs,
+        // Every PGS, DVB, DVD, CVD and OGT id, ahead of oxideav-sub-image.
+        subs_bitmap::register_codecs,
+        // EIA-608 and CEA-708 caption triplets (the engine feeds them).
+        subs_cc::register_codecs,
+        codec_rv::register_codecs,
+        // VP30, VP31 and VP40.
+        codec_vp3::register_codecs,
+        codec_wmv::register_codecs,
+        codec_wma::lib_registration::register_codecs,
+        // ALAC, QDM2, QDMC, MACE 3:1 and 6:1.
+        codec_apple_audio::register_codecs,
+        // ATRAC1, ATRAC3 (AL) and ATRAC3+ (AL).
+        codec_atrac::register_codecs,
+        // VP5, VP6, VP6F and VP6A, ahead of oxideav-vp6.
+        codec_vp56::register_codecs,
+        // AMR-NB, AMR-WB and QCELP.
+        codec_speech::register_codecs,
+        // Speex, ahead of oxideav-speex.
+        codec_speex::register_codecs,
+        // SVQ1 and SVQ3, ahead of oxideav-svq.
+        codec_svq1::register_codecs,
+        codec_svq3::register_codecs,
+        // Monkey's Audio (every version from 3.80), Musepack SV7 and SV8,
+        // and WavPack (lossless, hybrid, float, DSD): FFmpeg's decoders,
+        // ported.
+        codec_ape::register_codecs,
+        codec_musepack::register_codecs,
+        codec_wavpack::register_codecs,
+        // DVD-Video and Blu-ray LPCM.
+        codec_lpcm::register_codecs,
+        // GSM 06.10 and Microsoft GSM (MSN Audio rates too), TTA, Shorten,
+        // TAK, MPEG-4 ALS (MP4 object type 0x40 with ALS's config; ahead of
+        // the AAC decoders that claim that tag too), and MPEG audio Layer I.
+        codec_gsm::register_codecs,
+        codec_tta::register_codecs,
+        codec_shorten::register_codecs,
+        codec_tak::register_codecs,
+        codec_als::register_codecs,
+        codec_mp1::register_codecs,
+        // libopenmpt tracker player, ported to Rust.
+        codec_tracker::register_codecs,
+    ] {
+        register(&mut ctx.codecs);
+    }
+    codec_ra::register(ctx);
+
+    for register in [
+        // Containers
+        oxideav_avi::__oxideav_entry,
+        oxideav_basic::__oxideav_entry,
+        oxideav_dvd::__oxideav_entry,
+        oxideav_flv::__oxideav_entry,
+        oxideav_iff::__oxideav_entry,
+        oxideav_mkv::__oxideav_entry,
+        oxideav_mov::registry::register,
+        oxideav_mp4::__oxideav_entry,
+        oxideav_mpegts::__oxideav_entry,
+        oxideav_ogg::__oxideav_entry,
+        // Video
+        oxideav_av1::__oxideav_entry,
+        oxideav_cinepak::__oxideav_entry,
+        oxideav_dirac::__oxideav_entry,
+        oxideav_h261::__oxideav_entry,
+        oxideav_h263::__oxideav_entry,
+        oxideav_h264::__oxideav_entry,
+        oxideav_h265::__oxideav_entry,
+        oxideav_indeo::__oxideav_entry,
+        oxideav_mjpeg::__oxideav_entry,
+        oxideav_mpeg12video::__oxideav_entry,
+        oxideav_mpeg4video::__oxideav_entry,
+        oxideav_msmpeg4::__oxideav_entry,
+        oxideav_svq::__oxideav_entry,
+        oxideav_theora::__oxideav_entry,
+        oxideav_vc2::__oxideav_entry,
+        oxideav_vp6::__oxideav_entry,
+        oxideav_vp8::__oxideav_entry,
+        oxideav_vp9::__oxideav_entry,
+        // Audio
+        oxideav_aac::__oxideav_entry,
+        oxideav_ac3::__oxideav_entry,
+        oxideav_adpcm::__oxideav_entry,
+        oxideav_cook::__oxideav_entry,
+        oxideav_dts::__oxideav_entry,
+        oxideav_flac::__oxideav_entry,
+        oxideav_g711::__oxideav_entry,
+        codec_mp2::register,
+        oxideav_mp3::__oxideav_entry,
+        oxideav_opus::__oxideav_entry,
+        oxideav_speex::__oxideav_entry,
+        oxideav_vorbis::__oxideav_entry,
+        oxideav_wma::__oxideav_entry,
+        // Subtitles
+        oxideav_ass::__oxideav_entry,
+        oxideav_sub_image::__oxideav_entry,
+        oxideav_subtitle::__oxideav_entry,
+    ] {
+        register(ctx);
+    }
+    codec_midi::register(ctx);
+    // MPEG-TS and MPEG-PS name MPEG-4 Part 2 video `mpeg4` (FFmpeg's id);
+    // its decoder registers as `mpeg4video`. 3ivx Delta 4's `3IV2` is
+    // MPEG-4 Part 2 in QuickTime and AVI (FFmpeg's isom_tags.c and riff.c).
+    ctx.codecs.register(
+        CodecInfo::new(CodecId::new("mpeg4"))
+            .capabilities(CodecCapabilities::video("mpeg4video_sw"))
+            .decoder(oxideav_mpeg4video::make_decoder)
+            .tag(CodecTag::fourcc(b"3IV2")),
+    );
+
+    for register in [
+        codec_mlp::register_containers,
+        codec_dca::register_containers,
+        codec_wmv::demuxers::register_containers,
+        subs_text::register_containers,
+        subs_bitmap::register_containers,
+        // The amr and qcp demuxers.
+        codec_speech::register_containers,
+        // AEA (MD STUDIO) and OMA (Sony OpenMG).
+        codec_atrac::register_containers,
+        // The ape, mpc (SV7), mpc8 (SV8) and wv demuxers.
+        codec_ape::register_containers,
+        codec_musepack::register_containers,
+        codec_wavpack::register_containers,
+        // Raw GSM (.gsm), TTA (.tta), raw Shorten (.shn) and TAK (.tak).
+        codec_gsm::register_containers,
+        codec_tta::register_containers,
+        codec_shorten::register_containers,
+        codec_tak::register_containers,
+        codec_tracker::register_containers,
+    ] {
+        register(&mut ctx.containers);
+    }
+    for register in [demux_asf::register, demux_misc::register, demux_rm::register, demux_mxf::register, codec_dv::register] {
+        register(ctx);
+    }
+}

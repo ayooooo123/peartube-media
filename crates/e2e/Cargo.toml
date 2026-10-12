@@ -1,0 +1,24 @@
+[package]
+name = "e2e"
+description = "Corpus runner: plays every corpus file through the headless backend and checks it against FFmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+player = { path = "../player" }
+codecs = { path = "../codecs" }
+refcheck = { path = "../refcheck" }
+subs-bitmap = { path = "../subs-bitmap" }
+subs-cc = { path = "../subs-cc" }
+oxideav-core.workspace = true
+oxideav-subtitle = { workspace = true, features = ["text"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+md5 = "0.7"
+# The pins of FFmpeg sample-archive files (corpus/samples.sha256).
+sha2 = "0.10"
+libc = "0.2"

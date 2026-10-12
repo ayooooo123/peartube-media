@@ -1,0 +1,13 @@
+[package]
+name = "codec-svq3"
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1-or-later"
+
+[dependencies]
+oxideav-core.workspace = true
+compcol = { version = "0.6", default-features = false, features = ["zlib"] }
+
+[dev-dependencies]
+refcheck.workspace = true
+oxideav-mov.workspace = true

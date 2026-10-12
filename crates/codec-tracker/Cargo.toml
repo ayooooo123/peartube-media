@@ -1,0 +1,12 @@
+[package]
+name = "codec-tracker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "BSD-3-Clause"
+
+[dependencies]
+oxideav-core.workspace = true
+
+[dev-dependencies]
+sha2 = "0.10"

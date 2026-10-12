@@ -1,0 +1,81 @@
+[package]
+name = "player"
+description = "PearTube's media player engine and its platform backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+autoexamples = false
+
+[features]
+# The on-device probe links the Android NDK; it only builds for the
+# aarch64-linux-android target. Host `cargo test --no-run` skips it because
+# the feature is off by default.
+probe = []
+# https sources (oxideav-http's rustls and ring). Off: the app plays only
+# http streams from its worklet on 127.0.0.1, and an https URL fails to
+# open with an error that names this feature.
+https = ["oxideav-http/tls"]
+
+[dependencies]
+audio-trim = { path = "../audio-trim" }
+oxideav-core.workspace = true
+oxideav-http.workspace = true
+md5 = "0.7"
+libc = "0.2"
+thiserror = "2"
+oxideav-pixfmt.workspace = true
+parking_lot = "0.12"
+subs-cc = { path = "../subs-cc" }
+subs-bitmap = { path = "../subs-bitmap" }
+subs-text = { path = "../subs-text" }
+subs-render = { path = "../subs-render" }
+unicode-bidi = "0.3.18"
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-29"] }
+jni = "0.21"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+oxideav-h264.workspace = true
+oxideav-h265.workspace = true
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-foundation = "0.3"
+objc2-av-foundation = { version = "0.3", features = ["objc2-core-media", "block2"] }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-quartz-core = "0.3"
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"
+objc2-core-audio-types = "0.3"
+dispatch2 = "0.3"
+block2 = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = "0.3"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-ui-kit = "0.3"
+
+[dev-dependencies]
+oxideav-subtitle = { workspace = true, features = ["text"] }
+oxideav-mp4.workspace = true
+oxideav-ogg.workspace = true
+oxideav-h264.workspace = true
+parking_lot = "0.12"
+codecs = { path = "../codecs" }
+refcheck = { path = "../refcheck" }
+
+[[example]]
+name = "android_probe"
+# The example only compiles for Android (ndk dependency); building it on the
+# host is meaningless and would break `cargo test --no-run`. The android
+# build enables the feature.
+required-features = ["probe"]
+
+[[example]]
+name = "apple_play"
+
+[[example]]
+name = "android_sync"
+required-features = ["probe"]

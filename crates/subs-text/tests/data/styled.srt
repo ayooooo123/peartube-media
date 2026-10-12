@@ -1,0 +1,16 @@
+1
+00:00:00,500 --> 00:00:01,500
+Plain <b>bold</b> and <i>italic</i>
+
+2
+00:00:02,000 --> 00:00:03,250
+<font color="#ffff00">Yellow</font> text
+second line
+
+3
+00:00:03,500 --> 00:00:04,750
+{\an7}<u>Top left</u> underlined
+
+4
+00:00:05,000 --> 00:00:06,000
+<b><font color="red">Red bold</font></b> and <s>struck</s>

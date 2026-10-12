@@ -1,0 +1,65 @@
+total samples (sum of self): 15570
+
+self by function:
+   5372  34.5%  oxideav_mpeg12video::forming_predictions::predict_block::hed8b2564384895c1
+   1721  11.1%  oxideav_mpeg12video::slice_macroblock_walk::walk_slice_at::h5697f3e1b547777e
+   1215   7.8%  oxideav_mpeg12video::forming_predictions::ReferencePlane::sample::h46a57000fcae19f5
+   1187   7.6%  oxideav_mpeg12video::inter_reconstruction::write_inter_block::h7e7952b9b61f6e4d
+    864   5.5%  oxideav_mpeg12video::motion_vector::MotionVector::parse_component::hfadf50c66c058064
+    689   4.4%  oxideav_mpeg12video::idct::idct_8x8::h5268e02e0407a9e3
+    610   3.9%  oxideav_mpeg12video::mpeg2_dct_coeff::DctCoeffStep::parse::hc0d7d1b063a9f166
+    570   3.7%  _platform_memmove
+    374   2.4%  oxideav_mpeg12video::mb_address_increment::match_b1::hdfa63faba08bd870
+    362   2.3%  _xzm_free
+    350   2.2%  oxideav_mpeg12video::combine_predictions::average_predictions::h4e56584d4f1c6bd3
+    198   1.3%  oxideav_mpeg12video::inter_reconstruction::reconstruct_inter_macroblock::hedbe5d3ee11cd5f6
+    152   1.0%  _xzm_xzone_malloc
+    140   0.9%  mach_absolute_time
+    136   0.9%  oxideav_core::bits::BitReader::skip::h0c7fba833ca1ec74
+    135   0.9%  oxideav_mpeg12video::picture_reconstruction::decode_inter_picture_with_matrices::h1f0ea3a4395230a1
+    127   0.8%  oxideav_mpeg12video::frame_assembly::place_intra_block::h1183686ab56675c1
+    123   0.8%  _malloc_zone_malloc
+    122   0.8%  oxideav_mpeg12video::macroblock_type::match_row::h3918e18555d1ed2d
+    110   0.7%  oxideav_mpeg12video::coded_block_pattern::CodedBlockPattern::pattern_code::h6c0c9cad7e816342
+     92   0.6%  _free
+     88   0.6%  _xzm_xzone_malloc_tiny
+     85   0.5%  oxideav_mpeg12video::slice_macroblock_walk::reconstruct_mvs::hc1e5ba4f4d4f5d45
+     81   0.5%  __bzero
+     64   0.4%  <deduplicated_symbol>
+     47   0.3%  oxideav_mpeg12video::inter_reconstruction::predict_frame_macroblock_planes::_$u7b$$u7b$closure$u7d$$u7d$::h8454b2b386e1a5b8
+     44   0.3%  oxideav_mpeg12video::slice_macroblock_walk::reconstruct_slice_motion_vectors::h3a90646b8274f4b6
+     36   0.2%  _platform_memset
+     34   0.2%  _$LT$oxideav_mpeg12video..decoder..Mpeg12Decoder$u20$as$u20$oxideav_core..registry..codec..Decoder$GT$::receive_frame::ha3a6667df4c9922e
+     30   0.2%  oxideav_mpeg12video::inter_reconstruction::predict_component::h5926dfb39b77bd8c
+
+self by line:
+   5042  32.4%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/forming_predictions.rs:408 oxideav_mpeg12video::forming_predictions::predict_block::hed8b2564384895c1
+   1153   7.4%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/slice_macroblock_walk.rs:1468 oxideav_mpeg12video::slice_macroblock_walk::walk_slice_at::h5697f3e1b547777e
+    832   5.3%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/motion_vector.rs:370 oxideav_mpeg12video::motion_vector::MotionVector::parse_component::hfadf50c66c058064
+    677   4.3%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/idct.rs:357 oxideav_mpeg12video::idct::idct_8x8::h5268e02e0407a9e3
+    674   4.3%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/inter_reconstruction.rs:1972 oxideav_mpeg12video::inter_reconstruction::write_inter_block::h7e7952b9b61f6e4d
+    617   4.0%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/forming_predictions.rs:311 oxideav_mpeg12video::forming_predictions::ReferencePlane::sample::h46a57000fcae19f5
+    570   3.7%                                           _platform_memmove
+    393   2.5%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/slice_macroblock_walk.rs:1299 oxideav_mpeg12video::slice_macroblock_walk::walk_slice_at::h5697f3e1b547777e
+    362   2.3%                                           _xzm_free
+    347   2.2%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/mb_address_increment.rs:302 oxideav_mpeg12video::mb_address_increment::match_b1::hdfa63faba08bd870
+    335   2.2%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/combine_predictions.rs:101 oxideav_mpeg12video::combine_predictions::average_predictions::h4e56584d4f1c6bd3
+    220   1.4%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/forming_predictions.rs:312 oxideav_mpeg12video::forming_predictions::ReferencePlane::sample::h46a57000fcae19f5
+    195   1.3%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/inter_reconstruction.rs:1969 oxideav_mpeg12video::inter_reconstruction::write_inter_block::h7e7952b9b61f6e4d
+    179   1.1%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/forming_predictions.rs:304 oxideav_mpeg12video::forming_predictions::ReferencePlane::sample::h46a57000fcae19f5
+    152   1.0%                                           _xzm_xzone_malloc
+    151   1.0%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/mpeg2_dct_coeff.rs:1734 oxideav_mpeg12video::mpeg2_dct_coeff::DctCoeffStep::parse::hc0d7d1b063a9f166
+    143   0.9%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/inter_reconstruction.rs:1970 oxideav_mpeg12video::inter_reconstruction::write_inter_block::h7e7952b9b61f6e4d
+    140   0.9%                                           mach_absolute_time
+    137   0.9%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/forming_predictions.rs:406 oxideav_mpeg12video::forming_predictions::predict_block::hed8b2564384895c1
+    126   0.8%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/mpeg2_dct_coeff.rs:1731 oxideav_mpeg12video::mpeg2_dct_coeff::DctCoeffStep::parse::hc0d7d1b063a9f166
+    123   0.8%                                           _malloc_zone_malloc
+    120   0.8%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/forming_predictions.rs:0 oxideav_mpeg12video::forming_predictions::ReferencePlane::sample::h46a57000fcae19f5
+    111   0.7%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/mpeg2_dct_coeff.rs:1748 oxideav_mpeg12video::mpeg2_dct_coeff::DctCoeffStep::parse::hc0d7d1b063a9f166
+     92   0.6%                                           _free
+     88   0.6%                                           _xzm_xzone_malloc_tiny
+     81   0.5%                                           __bzero
+     81   0.5%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/picture_reconstruction.rs:241 oxideav_mpeg12video::picture_reconstruction::decode_inter_picture_with_matrices::h1f0ea3a4395230a1
+     79   0.5%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/frame_assembly.rs:449 oxideav_mpeg12video::frame_assembly::place_intra_block::h1183686ab56675c1
+     71   0.5%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/coded_block_pattern.rs:629 oxideav_mpeg12video::coded_block_pattern::CodedBlockPattern::pattern_code::h6c0c9cad7e816342
+     70   0.4%  oxideav-mpeg12video-fab8bfb616eba0bd/9c4c24c/src/macroblock_type.rs:687 oxideav_mpeg12video::macroblock_type::match_row::h3918e18555d1ed2d

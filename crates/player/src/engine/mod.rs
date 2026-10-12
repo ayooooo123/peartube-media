@@ -1,0 +1,3540 @@
+use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use audio_trim::{Pcm, Trimmer};
+use parking_lot::{Condvar, Mutex, MutexGuard};
+
+use oxideav_core::{
+    ChannelLayout, CodecParameters, Decoder, Demuxer, Frame, MediaType, Packet, PacketMetadata, ProbeData, RuntimeContext,
+    SampleFormat, StreamInfo, TimeBase, VideoFrame, PROBE_SCORE_EXTENSION,
+};
+
+mod captions;
+mod entry;
+
+pub use captions::{CAPTIONS_608, CAPTIONS_708};
+
+use std::task::Poll;
+use crate::backend::{
+    AudioSink, Backend, Clock, PictureReady, ProducerId, SinkError, VideoControl,
+    VideoError, VideoMode, VideoRequest, VideoSink, VideoTarget,
+};
+use crate::clock::MasterClock;
+use crate::headless::find_headless;
+use crate::source::{open_source, ReadAheadSource, SourceMonitor};
+use crate::subs::{run_subtitle_loop, SubtitlePipeline};
+
+mod transport;
+use transport::{Due, Live, Pipe, Preroll, Transport};
+
+#[cfg(test)]
+mod subtitle_tests;
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("unsupported container: {0}")]
+    UnsupportedContainer(String),
+    #[error("failed to open demuxer: {0}")]
+    Demuxer(String),
+    #[error("other error: {0}")]
+    Other(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct PlayerOptions {
+    pub audio: Option<u32>,
+    pub video: Option<u32>,
+    pub subtitle: Option<u32>,
+    pub realtime: bool,
+    /// Local user-selected SF2 bank for MIDI. `None` makes MIDI report
+    /// "needs a SoundFont". No bank is bundled or downloaded.
+    pub soundfont: Option<PathBuf>,
+    /// Runtime font discovery; a fixed directory disables OS fallback.
+    pub fonts: subs_render::FontOptions,
+}
+
+impl Default for PlayerOptions {
+    fn default() -> Self {
+        Self {
+            audio: None,
+            video: None,
+            subtitle: None,
+            realtime: true,
+            soundfont: None,
+            fonts: subs_render::FontOptions::default(),
+        }
+    }
+}
+
+pub enum Event {
+    Changed,
+    Ended,
+    Error(String),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct State {
+    pub position: Duration,
+    pub duration: Option<Duration>,
+    pub playing: bool,
+    pub buffering: bool,
+    pub ended: bool,
+    pub error: Option<String>,
+    pub tracks: Vec<Track>,
+    pub audio: Option<u32>,
+    pub video: Option<u32>,
+    pub subtitle: Option<u32>,
+    pub video_size: Option<(u32, u32)>,
+    pub video_decoder: Option<String>,
+    pub dropped_frames: u64,
+    /// Trim work lost to input limits. Playback continues with untrimmed
+    /// samples; this is not an audio decoder error.
+    pub audio_trim_fallbacks: audio_trim::Fallbacks,
+}
+
+#[derive(Clone, Debug)]
+pub struct Track {
+    pub stream: u32,
+    pub kind: TrackKind,
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackKind {
+    Audio,
+    Video,
+    Subtitle,
+}
+
+/// Queue bounds: duration paces normal playback; bytes also bound priming,
+/// when nonvideo must wait for a reordered picture without blocking input.
+const QUEUE_MAX_SECS: f64 = 2.0;
+const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
+const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
+const SUB_MAX_BYTES: usize = 1024 * 1024;
+
+/// A broken platform decoder must fail visibly, not let audio run ahead
+/// without a decoded picture. User pauses do not count; buffering does.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Side data travels with its packet, including across equal-PTS laces.
+pub(crate) struct QueuedPacket {
+    pub(crate) packet: Packet,
+    pub(crate) metadata: PacketMetadata,
+}
+
+/// One decoder lane. A lane owns its packet queue and wakes the demux loop
+/// whenever it drains, so the demuxer never stalls behind a slow sink.
+pub(crate) struct Lane {
+    pub(crate) queue: Mutex<Vec<QueuedPacket>>,
+    pub(crate) cv: Condvar,
+    /// Seek generation the queued packets belong to; changed only with
+    /// `queue` locked, when the demuxer empties the lane for a seek.
+    pub(crate) seek_gen: AtomicU64,
+    /// A pipeline thread drains the lane (see `Consumer`); changed only with
+    /// `queue` locked. Without one, packets for the lane are dropped:
+    /// queued, they would fill it and park the demuxer for good.
+    consumed: AtomicBool,
+}
+
+/// What a pipeline got from its lane.
+enum Pop {
+    Packet(QueuedPacket),
+    /// The demuxer's end marker.
+    Eof,
+    /// The lane holds packets of a seek the pipeline has not reset for, or
+    /// the caller's `wake` condition turned true while it waited.
+    Wake,
+}
+
+impl Lane {
+    fn new() -> Arc<Lane> {
+        Arc::new(Lane {
+            queue: Mutex::new(Vec::new()),
+            cv: Condvar::new(),
+            seek_gen: AtomicU64::new(0),
+            consumed: AtomicBool::new(false),
+        })
+    }
+
+    fn push(&self, packet: QueuedPacket) {
+        let mut q = self.queue.lock();
+        if !self.consumed.load(Ordering::SeqCst) {
+            return;
+        }
+        q.push(packet);
+        drop(q);
+        self.cv.notify_one();
+    }
+
+    fn push_eof(&self) {
+        let mut q = self.queue.lock();
+        if !self.consumed.load(Ordering::SeqCst) {
+            return;
+        }
+        q.push_eof_marker();
+        drop(q);
+        self.cv.notify_all();
+    }
+
+    /// Empties the lane for the demuxer's seek `generation`: what it queues
+    /// next comes from the seek target.
+    fn clear_for_seek(&self, generation: u64) {
+        let mut q = self.queue.lock();
+        q.clear();
+        self.seek_gen.store(generation, Ordering::SeqCst);
+        drop(q);
+        self.cv.notify_all();
+    }
+
+    /// Media span (seconds between the first and last pts) and bytes queued.
+    fn queued(&self, time_base: TimeBase) -> (f64, usize) {
+        let q = self.queue.lock();
+        let mut first: Option<f64> = None;
+        let mut last: Option<f64> = None;
+        let mut bytes = 0;
+        for p in q.iter() {
+            // An untimed packet (B-pictures only carry a PTS in some raw
+            // streams) says nothing about the queued span.
+            if let Some(ticks) = p.packet.pts.or(p.packet.dts) {
+                let secs = time_base.seconds_of(ticks);
+                first.get_or_insert(secs);
+                last = Some(secs);
+            }
+            let side_bytes = p.metadata.webvtt.as_ref().map_or(0, |m| {
+                std::mem::size_of_val(m.as_ref())
+                    + m.identifier.capacity() + m.settings.capacity()
+            });
+            bytes += std::mem::size_of::<QueuedPacket>() + p.packet.data.capacity() + side_bytes;
+        }
+        let span = match (first, last) {
+            (Some(a), Some(b)) => (b - a).max(0.0),
+            _ => 0.0,
+        };
+        (span, bytes)
+    }
+
+    /// The next packet or the end marker for seek generation `seen_seek`,
+    /// waiting while there is none: packets queued before the demuxer
+    /// applied that seek are never handed out, and `Wake` asks a pipeline
+    /// that has not reset for the demuxer's newest seek to do so first. An
+    /// empty lane short of its end starves the pipeline: `report(true)` when
+    /// that starts and `report(false)` once a packet or the end arrives
+    /// (`starved` carries the reported state across calls; both reports run
+    /// with the lane unlocked). Also returns `Wake` as soon as `wake` holds
+    /// while waiting.
+    fn pop(
+        &self,
+        seen_seek: u64,
+        demux_cv: &Condvar,
+        wake: impl Fn() -> bool,
+        starved: &mut bool,
+        report: impl Fn(bool),
+    ) -> Pop {
+        let mut q = self.queue.lock();
+        let popped = loop {
+            let generation = self.seek_gen.load(Ordering::SeqCst);
+            if generation > seen_seek {
+                break Pop::Wake;
+            }
+            if wake() {
+                break Pop::Wake;
+            }
+            let current = generation == seen_seek;
+            match q.first() {
+                Some(p) if current && p.packet.stream_index == u32::MAX => {
+                    q.remove(0);
+                    break Pop::Eof;
+                }
+                Some(_) if current => break Pop::Packet(q.remove(0)),
+                _ if !*starved => {
+                    *starved = true;
+                    MutexGuard::unlocked(&mut q, || report(true));
+                }
+                _ => {
+                    demux_cv.notify_one();
+                    self.cv.wait_for(&mut q, Duration::from_millis(100));
+                }
+            }
+        };
+        drop(q);
+        if *starved && !matches!(popped, Pop::Wake) {
+            *starved = false;
+            report(false);
+        }
+        demux_cv.notify_one();
+        popped
+    }
+}
+
+/// Marks a lane as drained by one pipeline thread, from spawn until that
+/// thread ends, however it ends: its stream has no decoder, the decoder gave
+/// up, a selection switch retired it, it panicked, or it played to the end.
+/// The lane then empties and queues nothing more, so the demuxer never waits
+/// on a lane that nobody drains.
+struct Consumer {
+    lane: Arc<Lane>,
+    demux_cv: Arc<Condvar>,
+}
+
+impl Consumer {
+    fn new(lane: &Arc<Lane>, demux_cv: &Arc<Condvar>) -> Consumer {
+        let q = lane.queue.lock();
+        lane.consumed.store(true, Ordering::SeqCst);
+        drop(q);
+        Consumer {
+            lane: Arc::clone(lane),
+            demux_cv: Arc::clone(demux_cv),
+        }
+    }
+}
+
+impl Drop for Consumer {
+    fn drop(&mut self) {
+        let mut q = self.lane.queue.lock();
+        self.lane.consumed.store(false, Ordering::SeqCst);
+        q.clear();
+        drop(q);
+        // The demuxer may be waiting for this lane to make room or drain.
+        self.demux_cv.notify_all();
+    }
+}
+
+/// A running pipeline thread and the flag that retires it. A selection
+/// switch retires the old thread, and waits for it, before the new one
+/// starts: a lane has one consumer at a time, and nothing the old thread
+/// still had in hand reaches a sink after the switch.
+struct PipelineThread {
+    handle: JoinHandle<()>,
+    retired: Arc<AtomicBool>,
+}
+
+impl PipelineThread {
+    /// Runs `body` on a new thread called `name`, handing it its retire flag.
+    fn spawn(name: &str, body: impl FnOnce(Arc<AtomicBool>) + Send + 'static) -> PipelineThread {
+        let retired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&retired);
+        let handle = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || body(flag))
+            .unwrap_or_else(|e| panic!("failed to spawn {name} thread: {e}"));
+        PipelineThread { handle, retired }
+    }
+
+    /// Stops the thread without stopping the player, and waits for it.
+    fn retire(self, shared: &SharedState, lane: &Lane) {
+        self.retired.store(true, Ordering::SeqCst);
+        // Wake it wherever it waits: on its lane or on the clock.
+        drop(lane.queue.lock());
+        lane.cv.notify_all();
+        shared.wake_clock_waiters();
+        self.join();
+    }
+
+    fn join(self) {
+        let _ = self.handle.join();
+    }
+}
+
+trait PushEof {
+    fn push_eof_marker(&mut self);
+}
+impl PushEof for Vec<QueuedPacket> {
+    fn push_eof_marker(&mut self) {
+        // EOF marker: a packet with stream_index == u32::MAX.
+        self.push(QueuedPacket {
+            packet: Packet {
+                stream_index: u32::MAX,
+                time_base: TimeBase::new(1, 1000),
+                pts: None,
+                dts: None,
+                duration: None,
+                flags: Default::default(),
+                data: Vec::new(),
+            },
+            metadata: PacketMetadata::default(),
+        });
+    }
+}
+
+/// End of `p` in seconds (pts, else dts, plus its duration).
+fn packet_end_secs(p: &Packet) -> Option<f64> {
+    if !p.time_base.is_valid() {
+        return None;
+    }
+    let start = p.pts.or(p.dts)?;
+    let end = start.saturating_add(p.duration.unwrap_or(0).max(0));
+    Some(p.time_base.seconds_of(end))
+}
+
+struct SharedState {
+    state: Mutex<State>,
+    stopped: Arc<AtomicBool>,
+    /// The playback failed (`set_error`); set with `state` locked. A stream
+    /// error that leaves the rest playing does not count.
+    failed: AtomicBool,
+    /// Paired with `state` for `Player::wait`.
+    condvar: Condvar,
+    on_event: Arc<dyn Fn(Event) + Send + Sync>,
+    last_changed: Mutex<Instant>,
+    /// The demuxer's source, for suspend/resume.
+    source: Mutex<Option<SourceMonitor>>,
+    /// Monotonic counter bumped by every `seek`. The demux loop applies the
+    /// newest request; decoder threads compare their local copy against it to
+    /// detect a seek they have not yet honoured.
+    seek_gen: AtomicU64,
+    /// Target of the latest `seek`; the demux loop applies it once per
+    /// generation.
+    pub(crate) seek_target: Mutex<Option<SeekTarget>>,
+    /// Seek the demux loop has applied (`seek_to` returned): generation and
+    /// target. Decoder threads read it to drop pre-target output.
+    pub(crate) active_seek: Mutex<Option<Seek>>,
+    /// Video wake latch for bounded non-blocking waits.
+    pub(crate) video_wake: AtomicBool,
+    /// Selection written by `select_audio` / `select_subtitle`; the demux
+    /// loop applies it (flush + respawn the pipeline) and mirrors `state`.
+    wanted_audio: Mutex<AudioChoice>,
+    wanted_video: Mutex<Option<u32>>,
+    wanted_subtitle: Mutex<Option<u32>>,
+    /// Bumped on every selection change; the demux loop compares to detect it.
+    select_gen: AtomicU64,
+    /// The playback has video or audio pipelines (playing or played out),
+    /// as its selection stands: subtitles beside them end with the screen
+    /// clear. Set by the demux thread whenever it starts or retires them.
+    beside_media: AtomicBool,
+    backend: Arc<dyn Backend>,
+    /// The playback's clock (see `MasterClock`); `transport` decides when
+    /// it runs.
+    master: Arc<MasterClock>,
+    /// The playback's audio output while no audio pipeline holds it: made
+    /// before the video output (an Apple video layer joins the audio
+    /// output's synchronizer) and kept across audio track switches, so the
+    /// playback has one audio clock throughout.
+    audio_sink: Mutex<Option<Box<dyn AudioSink>>>,
+    /// Play/pause intent and the buffering hold; decides when the clock
+    /// runs (see `transport`).
+    transport: Mutex<Transport>,
+    /// Paired with `transport`: notified whenever the clock's run state,
+    /// position or the hold changes.
+    transport_cv: Condvar,
+    /// Lock-free mirror of `Transport::running`.
+    running: AtomicBool,
+    /// The playback's lanes, woken when the clock starts or stops so idle
+    /// pipelines pause or resume their sinks.
+    lanes: Mutex<Vec<Arc<Lane>>>,
+    ctx: Arc<RuntimeContext>,
+    soundfont: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SeekOrigin {
+    User,
+    InternalRecovery {
+        deadline: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SeekTarget {
+    pub(crate) target: Duration,
+    pub(crate) origin: SeekOrigin,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Seek {
+    pub(crate) generation: u64,
+    /// Target in seconds.
+    pub(crate) target: f64,
+    /// Where the video shows from, in seconds: the target, or later when the
+    /// seek starts at a recovery point that recovers after it
+    /// (`enter_video`).
+    pub(crate) show_from: f64,
+    pub(crate) origin: SeekOrigin,
+}
+
+/// The audio track asked for: the playback's default, or one the caller
+/// chose (`None`: no audio). A switch of another kind keeps the default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AudioChoice {
+    Default,
+    Chosen(Option<u32>),
+}
+
+impl SharedState {
+    /// The clock every sink of this playback follows: the audio output's
+    /// clock while audio plays, else the free-running clock; either stands
+    /// still while buffering or paused.
+    fn sink_clock(&self) -> Arc<dyn Clock> {
+        self.master.clone()
+    }
+
+    /// Moves playback to `to`: the demux loop applies the newest request,
+    /// and each pipeline starts over when it sees the generation change.
+    fn request_seek(&self, to: Duration) {
+        self.seek_clock(to);
+        self.state.lock().position = to;
+        notify_changed(self);
+    }
+}
+
+pub struct Player {
+    shared: Arc<SharedState>,
+    /// Runs the playback: opens the source, owns the demuxer, and spawns and
+    /// joins the pipeline threads.
+    pipeline: Option<JoinHandle<()>>,
+}
+
+impl Player {
+    pub fn open(
+        url: &str,
+        backend: Arc<dyn Backend>,
+        ctx: Arc<RuntimeContext>,
+        options: PlayerOptions,
+        on_event: impl Fn(Event) + Send + Sync + 'static,
+    ) -> Player {
+        let on_event_arc: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(on_event);
+
+        // Playing is the intent; the clock holds at the start (buffering)
+        // until the first audio/video is ready.
+        let initial_state = State {
+            playing: true,
+            buffering: true,
+            ..State::default()
+        };
+
+        let stopped = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(SharedState {
+            state: Mutex::new(initial_state),
+            stopped,
+            failed: AtomicBool::new(false),
+            condvar: Condvar::new(),
+            on_event: on_event_arc,
+            last_changed: Mutex::new(Instant::now() - Duration::from_secs(1)),
+            source: Mutex::new(None),
+            seek_gen: AtomicU64::new(0),
+            seek_target: Mutex::new(None),
+            active_seek: Mutex::new(None),
+            video_wake: AtomicBool::new(false),
+            wanted_audio: Mutex::new(options.audio.map_or(AudioChoice::Default, |stream| AudioChoice::Chosen(Some(stream)))),
+            wanted_video: Mutex::new(options.video),
+            wanted_subtitle: Mutex::new(options.subtitle),
+            select_gen: AtomicU64::new(1),
+            beside_media: AtomicBool::new(false),
+            backend,
+            master: Arc::new(MasterClock::new()),
+            audio_sink: Mutex::new(None),
+            transport: Mutex::new(Transport::new()),
+            transport_cv: Condvar::new(),
+            running: AtomicBool::new(false),
+            lanes: Mutex::new(Vec::new()),
+            ctx,
+            soundfont: options.soundfont.clone(),
+        });
+
+        let url_owned = url.to_string();
+        let shared_clone = Arc::clone(&shared);
+
+        let init_thread = std::thread::Builder::new()
+            .name("peartube-player-pipeline".into())
+            .spawn(move || {
+                run_player_pipeline(url_owned, options, shared_clone);
+            })
+            .expect("failed to spawn player pipeline thread");
+
+        Player {
+            shared,
+            pipeline: Some(init_thread),
+        }
+    }
+
+    /// The user's intent; the clock also waits for data while buffering.
+    pub fn play(&self) {
+        self.shared.set_paused(false);
+        self.shared.state.lock().playing = true;
+        notify_changed(&self.shared);
+    }
+
+    /// The user's intent: stays paused when buffering ends.
+    pub fn pause(&self) {
+        self.shared.set_paused(true);
+        self.shared.state.lock().playing = false;
+        notify_changed(&self.shared);
+    }
+
+    pub fn seek(&self, to: Duration) {
+        self.shared.request_seek(to);
+    }
+
+    pub fn select_audio(&self, stream: Option<u32>) {
+        *self.shared.wanted_audio.lock() = AudioChoice::Chosen(stream);
+        self.shared.select_gen.fetch_add(1, Ordering::SeqCst);
+        self.shared.condvar.notify_all();
+        notify_changed(&self.shared);
+    }
+
+    pub fn select_subtitle(&self, stream: Option<u32>) {
+        *self.shared.wanted_subtitle.lock() = stream;
+        self.shared.select_gen.fetch_add(1, Ordering::SeqCst);
+        self.shared.condvar.notify_all();
+        notify_changed(&self.shared);
+    }
+
+    pub fn suspend(&self) {
+        self.pause();
+        if let Some(src) = &*self.shared.source.lock() {
+            src.suspend();
+        }
+        self.shared.backend.suspend();
+        notify_changed(&self.shared);
+    }
+
+    pub fn resume(&self) {
+        if let Some(src) = &*self.shared.source.lock() {
+            src.resume();
+        }
+        self.shared.backend.resume();
+        self.play();
+    }
+
+    pub fn state(&self) -> State {
+        let mut st = self.shared.state.lock();
+        st.position = self.shared.master.now().unwrap_or(st.position);
+        st.clone()
+    }
+
+    /// Blocks until the playback ended or failed (a stream error that leaves
+    /// the rest playing does not end the wait), or the player is dropped.
+    pub fn wait(&self) -> State {
+        let mut st = self.shared.state.lock();
+        while !st.ended
+            && !self.shared.failed.load(Ordering::SeqCst)
+            && !self.shared.stopped.load(Ordering::SeqCst)
+        {
+            self.shared.condvar.wait(&mut st);
+        }
+        st.position = self.shared.master.now().unwrap_or(st.position);
+        st.clone()
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.shared.stopped.store(true, Ordering::SeqCst);
+        self.shared.stop();
+        // A demuxer waiting on a stalled source gets an error instead of
+        // the bytes, and the playback winds down without them.
+        let opened = match &*self.shared.source.lock() {
+            Some(source) => {
+                source.stop();
+                true
+            }
+            None => false,
+        };
+        self.shared.condvar.notify_all();
+        if let Some(pipeline) = self.pipeline.take() {
+            // Until the source exists the pipeline thread may sit in the
+            // request that opens it, which a stalled peer can hold for as
+            // long as it likes: leave it then (it ends as soon as that
+            // returns, see `run_player_pipeline`).
+            if opened {
+                let _ = pipeline.join();
+            }
+        }
+    }
+}
+
+/// `Event::Changed`, at most every 100 ms.
+fn notify_changed(shared: &SharedState) {
+    let mut last = shared.last_changed.lock();
+    let now = Instant::now();
+    if now.duration_since(*last) >= Duration::from_millis(100) {
+        *last = now;
+        (shared.on_event)(Event::Changed);
+    }
+}
+
+/// `Event::Changed` that must not be dropped (buffering started or ended).
+fn notify_changed_now(shared: &SharedState) {
+    *shared.last_changed.lock() = Instant::now();
+    (shared.on_event)(Event::Changed);
+}
+
+fn set_error(shared: &SharedState, err: String) {
+    {
+        let mut st = shared.state.lock();
+        if st.error.is_none() {
+            st.error = Some(err.clone());
+            st.playing = false;
+        }
+        shared.failed.store(true, Ordering::SeqCst);
+    }
+    shared.finish();
+    (shared.on_event)(Event::Error(err));
+    shared.condvar.notify_all();
+}
+
+fn set_ended(shared: &SharedState) {
+    {
+        let mut st = shared.state.lock();
+        st.ended = true;
+        st.playing = false;
+    }
+    shared.finish();
+    (shared.on_event)(Event::Ended);
+    shared.condvar.notify_all();
+}
+
+fn run_player_pipeline(
+    url: String,
+    options: PlayerOptions,
+    shared: Arc<SharedState>,
+) {
+    let ctx = &*shared.ctx;
+    // 1. One read-ahead source feeds the probe and then the demuxer. The
+    //    engine keeps its monitor: starvation reports drive the buffering
+    //    hold, suspend/resume pause the download. A VobSub index (`.idx`)
+    //    plays from its program stream (`.sub`): that is the source.
+    let vobsub = crate::source::vobsub_stream_url(&url);
+    let mut source = match open_source(vobsub.as_deref().unwrap_or(&url)) {
+        Ok(s) => s,
+        Err(e) => {
+            if !shared.stopped.load(Ordering::SeqCst) {
+                set_error(&shared, format!("failed to open source: {e}"));
+            }
+            return;
+        }
+    };
+    let monitor = source.monitor();
+    let weak: Weak<SharedState> = Arc::downgrade(&shared);
+    monitor.on_starved(move |starved| {
+        if let Some(shared) = weak.upgrade() {
+            shared.source_starved(starved);
+        }
+    });
+    *shared.source.lock() = Some(monitor);
+    if shared.stopped.load(Ordering::SeqCst) {
+        // Dropped while the source opened: `Player::drop` neither waited for
+        // this thread nor could stop a source that did not exist yet.
+        return;
+    }
+
+    let mut demuxer = if vobsub.is_some() {
+        // 2-3. VobSub: the index, read whole as it opens, beside the
+        //    program stream (FFmpeg's vobsub demuxer pairs them the same
+        //    way). No probe: no registered container reads the pair.
+        let opened = open_source(&url).map_err(|e| e.to_string()).and_then(|index| {
+            subs_bitmap::open_vobsub(Box::new(index), Box::new(source)).map_err(|e| e.to_string())
+        });
+        match opened {
+            Ok(d) => d,
+            Err(e) => {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, format!("failed to open demuxer: {e}"));
+                }
+                return;
+            }
+        }
+    } else {
+        // 2. Probe (rule from engine-api.md, same as refcheck), then rewind.
+        let container = match probe_container(&url, &mut source, &shared) {
+            Ok(c) => c,
+            Err(e) => {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, e);
+                }
+                return;
+            }
+        };
+
+        // 3. Demuxer. Container codec tags resolve through the registry —
+        //    the mpeg4video fork claims Matroska's MPEG-4 Part 2 CodecIDs
+        //    (V_MPEG4/ISO/ASP, //SP, //AP) directly.
+        match ctx.containers.open_demuxer(&container, Box::new(source), &ctx.codecs) {
+            Ok(d) => d,
+            Err(e) => {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, format!("failed to open demuxer: {e}"));
+                }
+                return;
+            }
+        }
+    };
+
+    // 4. Streams (cap 64; drop video tracks above the size limits).
+    let streams_all = demuxer.streams();
+    let count = streams_all.len().min(64);
+    let mut streams: Vec<StreamInfo> = streams_all[..count].to_vec();
+
+    let mut tracks = Vec::new();
+    let mut first_audio = None;
+    let mut first_video = None;
+    let mut first_subtitle = None;
+    for s in &streams {
+        let kind = match s.params.media_type {
+            MediaType::Audio => {
+                if first_audio.is_none() {
+                    first_audio = Some(s.index);
+                }
+                TrackKind::Audio
+            }
+            MediaType::Video => {
+                let w = s.params.width.unwrap_or(0);
+                let h = s.params.height.unwrap_or(0);
+                if w > 16384 || h > 16384 || u64::from(w) * u64::from(h) > 8192 * 8192 {
+                    continue;
+                }
+                if first_video.is_none() {
+                    first_video = Some(s.index);
+                }
+                TrackKind::Video
+            }
+            MediaType::Subtitle => {
+                if first_subtitle.is_none() {
+                    first_subtitle = Some(s.index);
+                }
+                TrackKind::Subtitle
+            }
+            _ => continue,
+        };
+        tracks.push(Track {
+            stream: s.index,
+            kind,
+            codec: s.params.codec_id.as_str().to_string(),
+            language: s.params.language.clone(),
+            title: None,
+            default: false,
+        });
+    }
+
+    let duration = demuxer
+        .duration_micros()
+        .map(|us| Duration::from_micros(us.max(0) as u64))
+        .or_else(|| {
+            streams
+                .iter()
+                .filter_map(|s| {
+                    s.duration.and_then(|d| {
+                        if s.time_base.is_valid() {
+                            Some(Duration::from_secs_f64(
+                                s.time_base.seconds_of(d).max(0.0),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .max()
+        });
+    // Captions in the video: selectable streams, tracks once data shows up.
+    captions::add_streams(&mut streams, shared.wanted_video.lock().or(first_video));
+
+    // 5. Selection. The pipeline thread owns `current_*`; `select_*` writes
+    // `wanted_*` and bumps `select_gen` so the demux loop applies switches.
+    // Read the generation first: a switch made while this reads `wanted_*`
+    // then still counts as new.
+    let select_gen = shared.select_gen.load(Ordering::SeqCst);
+    let options_video = *shared.wanted_video.lock();
+    let current_video = options_video.or(first_video);
+    let current_audio = match *shared.wanted_audio.lock() {
+        AudioChoice::Default => first_audio,
+        AudioChoice::Chosen(stream) => stream,
+    };
+    let current_subtitle = *shared.wanted_subtitle.lock();
+
+    {
+        let mut st = shared.state.lock();
+        st.tracks = tracks;
+        st.audio = current_audio;
+        st.video = current_video;
+        st.subtitle = current_subtitle;
+        st.duration = duration;
+        st.video_size = current_video.and_then(|idx| {
+            streams.iter().find(|s| s.index == idx).and_then(|s| {
+                let (w, h) = (s.params.width?, s.params.height?);
+                (w > 0 && h > 0).then_some((w, h))
+            })
+        });
+        st.video_decoder = current_video.map(|idx| {
+            streams
+                .iter()
+                .find(|s| s.index == idx)
+                .map(|s| s.params.codec_id.as_str().to_string())
+                .unwrap_or_default()
+        });
+    }
+    notify_changed(&shared);
+
+    // Tell the headless registry which streams the captures describe.
+    if let Some(headless) = find_headless(Arc::as_ptr(&shared.backend) as *const () as usize) {
+        let info = |idx: Option<u32>, kind: MediaType| {
+            idx.and_then(|i| {
+                streams
+                    .iter()
+                    .find(|s| s.index == i && s.params.media_type == kind)
+                    .map(|s| (i, s.params.codec_id.as_str().to_string()))
+            })
+        };
+        headless.set_active_streams(
+            info(current_video, MediaType::Video),
+            info(current_audio, MediaType::Audio),
+            info(current_subtitle, MediaType::Subtitle),
+            options.realtime,
+        );
+        headless.set_clock(shared.sink_clock());
+    }
+
+    // 6. Lanes + sinks.
+    let video_lane = Lane::new();
+    let audio_lane = Lane::new();
+    let sub_lane = Lane::new();
+    *shared.lanes.lock() = vec![
+        Arc::clone(&video_lane),
+        Arc::clone(&audio_lane),
+        Arc::clone(&sub_lane),
+    ];
+    let demux_cv = Arc::new(Condvar::new());
+    let video_tb = current_video
+        .and_then(|i| streams.iter().find(|s| s.index == i))
+        .map(|s| s.time_base)
+        .unwrap_or_else(|| TimeBase::new(1, 1000));
+    let audio_tb = current_audio
+        .and_then(|i| streams.iter().find(|s| s.index == i))
+        .map(|s| s.time_base)
+        .unwrap_or_else(|| TimeBase::new(1, 1000));
+    let sub_tb = current_subtitle
+        .and_then(|i| streams.iter().find(|s| s.index == i))
+        .map(|s| s.time_base)
+        .unwrap_or_else(|| TimeBase::new(1, 1000));
+
+    // 7. Pipeline threads. The demux loop replaces the audio and subtitle
+    // pipelines on a selection switch; the video pipeline stays fixed (the
+    // public API cannot switch it mid-playback).
+    let realtime = options.realtime;
+    let mut run = Run {
+        shared: &shared,
+        demuxer: &mut *demuxer,
+        streams: &streams,
+        options: &options,
+        video_lane: &video_lane,
+        audio_lane: &audio_lane,
+        sub_lane: &sub_lane,
+        demux_cv: &demux_cv,
+        video_tb,
+        audio_tb,
+        sub_tb,
+        select_gen,
+        current_video,
+        current_audio,
+        current_subtitle,
+        video_thread: None,
+        audio_thread: None,
+        sub_thread: None,
+        replay: VecDeque::new(),
+    };
+    let video_stream = find_stream(&streams, current_video);
+    let audio_stream = find_stream(&streams, current_audio);
+    // The audio output comes first: the video output may join its clock
+    // (an Apple video layer joins the audio's synchronizer).
+    if audio_stream.is_some() {
+        *shared.audio_sink.lock() = Some(shared.backend.audio());
+    }
+    run.video_thread =
+        video_stream.map(|stream| spawn_video(&shared, stream, &video_lane, &demux_cv, realtime));
+    run.audio_thread =
+        audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
+    shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
+    run.sub_thread = find_stream(&streams, current_subtitle)
+        .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime, &options.fonts, run.demuxer.attachments()));
+
+    // 8. From here the buffering hold follows the pipelines' data.
+    shared.pipelines_started();
+    run_demux_loop(&mut run);
+
+    // Subtitles never hold the end of a playback with video or audio: a
+    // state still up when those have played (its end can be minutes or
+    // hours out) comes down with them. Alone, subtitles play to their last
+    // end; without realtime nothing waits on the clock and the pipeline
+    // ends once its lane has drained.
+    let paced = run.video_thread.is_some() || run.audio_thread.is_some();
+    for thread in [run.video_thread.take(), run.audio_thread.take()].into_iter().flatten() {
+        thread.join();
+    }
+    if let Some(subtitles) = run.sub_thread.take() {
+        if paced && realtime {
+            subtitles.retire(&shared, &sub_lane);
+        } else {
+            subtitles.join();
+        }
+    }
+    // Everything has played: the idle audio output stops with the clock.
+    if let Some(sink) = shared.audio_sink.lock().as_mut() {
+        sink.pause();
+    }
+
+    // A stream that lost its decoder leaves an error in `State` while the
+    // rest plays on; the playback still ends. Only a failure (`set_error`)
+    // or a drop ends it otherwise.
+    if !shared.stopped.load(Ordering::SeqCst) && !shared.finished() {
+        set_ended(&shared);
+    }
+}
+
+fn find_stream(streams: &[StreamInfo], index: Option<u32>) -> Option<StreamInfo> {
+    let index = index?;
+    streams.iter().find(|s| s.index == index).cloned()
+}
+
+/// The stream's decoder, built from the registry. Seeks build a fresh one
+/// rather than calling `Decoder::reset`, which may drop state the codec
+/// parameters set up: oxideav-h264's reset forgets the avcC SPS/PPS, after
+/// which every slice fails. H.264 whose extradata is Annex B (NUT, AVI, or
+/// any stream muxed with global headers outside MP4/Matroska) reaches the
+/// decoder in-band, as a packet of its own ahead of the stream: that decoder
+/// reads only avcC extradata, while FFmpeg's accepts both forms.
+fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
+    let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if params.codec_id.as_str() != "h264" || !is_annex_b(&params.extradata) {
+            return ctx.codecs.first_decoder(params);
+        }
+        let mut bare = params.clone();
+        let parameter_sets = std::mem::take(&mut bare.extradata);
+        let mut decoder = ctx.codecs.first_decoder(&bare)?;
+        decoder.send_packet(&Packet {
+            stream_index: 0,
+            time_base: TimeBase::new(1, 1000),
+            pts: None,
+            dts: None,
+            duration: None,
+            flags: Default::default(),
+            data: parameter_sets,
+        })?;
+        Ok(decoder)
+    }));
+    built.unwrap_or_else(|_| Err(oxideav_core::Error::Other("decoder panicked while opening".into())))
+}
+
+/// Annex B framing: the bytes start with a start code. (An avcC record
+/// starts with its version, 1.)
+fn is_annex_b(data: &[u8]) -> bool {
+    data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1])
+}
+
+fn spawn_video(
+    shared: &Arc<SharedState>,
+    stream: StreamInfo,
+    lane: &Arc<Lane>,
+    demux_cv: &Arc<Condvar>,
+    realtime: bool,
+) -> PipelineThread {
+    let consumer = Consumer::new(lane, demux_cv);
+    let live = Live::new(shared, Pipe::Video);
+    let sink = shared.backend.video(shared.sink_clock());
+    let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
+    PipelineThread::spawn("peartube-video", move |retired| {
+        let _guards = (live, consumer);
+        #[cfg(target_os = "macos")]
+        if realtime {
+            if let Err(error) = crate::clock::timing::initialize_worker() {
+                eprintln!("macOS video worker scheduling setup failed: {error}");
+            }
+        }
+        run_video_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
+    })
+}
+
+fn spawn_audio(
+    shared: &Arc<SharedState>,
+    stream: StreamInfo,
+    lane: &Arc<Lane>,
+    demux_cv: &Arc<Condvar>,
+    realtime: bool,
+) -> PipelineThread {
+    let consumer = Consumer::new(lane, demux_cv);
+    let live = Live::new(shared, Pipe::Audio);
+    let held = shared.audio_sink.lock().take();
+    let sink = held.unwrap_or_else(|| shared.backend.audio());
+    let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
+    PipelineThread::spawn("peartube-audio", move |retired| {
+        let _guards = (live, consumer);
+        #[cfg(target_os = "macos")]
+        if realtime {
+            if let Err(error) = crate::clock::timing::initialize_worker() {
+                eprintln!("macOS audio worker scheduling setup failed: {error}");
+            }
+        }
+        let mut output = AudioOutput {
+            shared: Arc::clone(&shared),
+            sink: Some(sink),
+        };
+        if let Some(sink) = output.sink.as_deref_mut() {
+            // However the pipeline fails, the track stops being the audio
+            // track, as when its decoder fails: a panic outside the decoder
+            // calls included.
+            let failed = Arc::clone(&shared);
+            let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired)
+            }));
+            if run.is_err() {
+                audio_failed(&failed, "audio pipeline failed".into());
+            }
+        }
+    })
+}
+
+/// The playback's audio output while an audio pipeline holds it. However
+/// the pipeline ends, the output's clock stops leading (the free clock
+/// carries on from where it was) and the output goes back to
+/// `SharedState::audio_sink` for the next audio pipeline.
+struct AudioOutput {
+    shared: Arc<SharedState>,
+    sink: Option<Box<dyn AudioSink>>,
+}
+
+impl Drop for AudioOutput {
+    fn drop(&mut self) {
+        self.shared.master.release_audio();
+        *self.shared.audio_sink.lock() = self.sink.take();
+    }
+}
+
+fn spawn_subtitles(
+    shared: &Arc<SharedState>,
+    stream: StreamInfo,
+    lane: &Arc<Lane>,
+    demux_cv: &Arc<Condvar>,
+    realtime: bool,
+    fonts: &subs_render::FontOptions,
+    attachments: &[oxideav_core::Attachment],
+) -> PipelineThread {
+    let consumer = Consumer::new(lane, demux_cv);
+    let sink = shared.backend.subtitles();
+    let clock = shared.sink_clock();
+    let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
+    let fonts = fonts.clone();
+    let mut bytes = 0usize;
+    let attachments: Vec<Arc<[u8]>> = attachments.iter().filter_map(|attachment| {
+        let signature = attachment.data.get(..4)?;
+        if ![&b"\0\x01\0\0"[..], &b"OTTO"[..], &b"ttcf"[..], &b"true"[..]].contains(&signature) { return None; }
+        bytes = bytes.saturating_add(attachment.data.len());
+        (bytes <= 64 << 20).then(|| Arc::from(attachment.data.as_slice()))
+    }).collect();
+    PipelineThread::spawn("peartube-subtitles", move |retired| {
+        let _consumer = consumer;
+        let mut params = stream.params.clone();
+        let (video_size, lanes) = (shared.state.lock().video_size, shared.lanes.lock().clone());
+        // DVD, CVD and OGT place regions in video pixels. For a stream that
+        // declares no canvas, FFmpeg's is the video's (fftools/ffmpeg_demux.c
+        // sub2video); the DVD decoder's own `size:` line still takes
+        // precedence, as dvdsubdec's does. The video size is known only from
+        // the container at open: nothing publishes a decoded one, so without
+        // it the decoders keep their 720x576, and nothing waits for a size.
+        let video_pixels = matches!(params.codec_id.as_str(), "dvd_subtitle" | "dvdsub" | "vobsub" | "cvd_subtitle" | "ogt");
+        let declared = params.width.unwrap_or(0) > 0 && params.height.unwrap_or(0) > 0;
+        if let Some((width, height)) = video_size.filter(|_| video_pixels && !declared) {
+            params.width = Some(params.width.unwrap_or(0).max(width));
+            params.height = Some(params.height.unwrap_or(0).max(height));
+        }
+        let (w, h) = video_size.unwrap_or((320, 240));
+        let decoder = match shared.ctx.codecs.first_decoder(&params) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let ctx = Arc::clone(&shared.ctx);
+        let (seeks, members) = (Arc::clone(&shared), Arc::clone(&shared));
+        // WebVTT cues are placed per their settings and the regions the
+        // stream's header (extradata) defines.
+        let webvtt = (params.codec_id.as_str() == subs_text::webvtt::CODEC_ID)
+            .then(|| crate::webvtt::WebVttTrack::with_fonts(&params.extradata, &fonts));
+        if let Some(track) = &webvtt {
+            for data in &attachments { track.add_font(data.clone()); }
+        }
+        let ass = matches!(params.codec_id.as_str(), "ass" | "ssa").then(|| {
+            let mut track = subs_render::Track::new();
+            let header = subs_text::text_common::decode_subtitle_text(&params.extradata);
+            track.process_codec_private(header.as_bytes());
+            track
+        });
+        let pipeline = SubtitlePipeline {
+            decoder,
+            new_decoder: Box::new(move || ctx.codecs.first_decoder(&params)),
+            clock,
+            time_base: stream.time_base,
+            video_width: w,
+            video_height: h,
+            realtime,
+            lane,
+            demux_cv,
+            seek_generation: Box::new(move || seeks.seek_gen.load(Ordering::SeqCst)),
+            // A video or audio pipeline drains its lane: the demuxer's
+            // read-ahead is bounded by theirs.
+            paced: Box::new(move || lanes.iter().take(2).any(|lane| lane.consumed.load(Ordering::SeqCst))),
+            beside_media: Box::new(move || members.beside_media.load(Ordering::SeqCst)),
+            stopped: shared.stopped.clone(),
+            retired,
+            webvtt,
+            ass,
+            fonts,
+            attachments,
+        };
+        run_subtitle_loop(pipeline, sink);
+    })
+}
+
+/// Probes the first 256 KiB of `source` and rewinds it to the start (the
+/// read-ahead ring still holds those bytes, so the demuxer re-reads them
+/// without another request).
+fn probe_container(
+    url: &str,
+    source: &mut ReadAheadSource,
+    shared: &SharedState,
+) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let ctx = &*shared.ctx;
+    // One read returns what has arrived so far, which over a P2P stream can
+    // be a few bytes: fill the buffer (or reach the end) before probing.
+    let mut probe_buf = vec![0u8; 256 * 1024];
+    let mut n = 0;
+    while n < probe_buf.len() {
+        if shared.stopped.load(Ordering::SeqCst) {
+            return Err("stopped".into());
+        }
+        match source.read(&mut probe_buf[n..]) {
+            Ok(0) => break,
+            Ok(read) => n += read,
+            Err(e) => return Err(format!("failed to read for probe: {e}")),
+        }
+    }
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("failed to rewind after probing: {e}"))?;
+    probe_buf.truncate(n);
+
+    let ext = url.split(['?', '#']).next().unwrap_or(url);
+    let ext = std::path::Path::new(ext)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+
+    let probe_data = ProbeData {
+        buf: &probe_buf,
+        ext: ext.as_deref(),
+    };
+    let candidates = ctx.containers.probe_candidates(&probe_data);
+    let by_extension = ext.as_deref().and_then(|e| ctx.containers.container_for_extension(e));
+    match (candidates.first(), by_extension) {
+        (Some(c), _) if c.score >= PROBE_SCORE_EXTENSION => Ok(c.name.to_string()),
+        (_, Some(name)) => Ok(name.to_string()),
+        _ => Err("no container claims this input".into()),
+    }
+}
+
+/// What the demux loop works with: the demuxer, the lanes, the selection and
+/// the pipeline threads it replaces on a selection switch.
+struct Run<'a> {
+    shared: &'a Arc<SharedState>,
+    demuxer: &'a mut dyn Demuxer,
+    streams: &'a [StreamInfo],
+    options: &'a PlayerOptions,
+    video_lane: &'a Arc<Lane>,
+    audio_lane: &'a Arc<Lane>,
+    sub_lane: &'a Arc<Lane>,
+    demux_cv: &'a Arc<Condvar>,
+    video_tb: TimeBase,
+    audio_tb: TimeBase,
+    sub_tb: TimeBase,
+    /// The `SharedState::select_gen` the `current_*` selection reflects.
+    select_gen: u64,
+    current_video: Option<u32>,
+    current_audio: Option<u32>,
+    current_subtitle: Option<u32>,
+    video_thread: Option<PipelineThread>,
+    audio_thread: Option<PipelineThread>,
+    sub_thread: Option<PipelineThread>,
+    /// What the demuxer read while a seek looked for its entry point
+    /// (`enter_video`), handed on before anything newer.
+    replay: VecDeque<Read>,
+}
+
+/// One demuxer read: the packet and its metadata, the read's error, or the
+/// demuxer's panic.
+type Read = std::thread::Result<oxideav_core::Result<QueuedPacket>>;
+
+/// Reads the demuxer's next packet with its metadata, catching a panic.
+fn read_packet(demuxer: &mut dyn Demuxer) -> Read {
+    std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let packet = demuxer.next_packet()?;
+        let metadata = demuxer.packet_metadata();
+        Ok::<_, oxideav_core::Error>(QueuedPacket { packet, metadata })
+    }))
+}
+
+fn run_demux_loop(run: &mut Run<'_>) {
+    let shared = run.shared;
+    let mut active: Vec<u32> = [run.current_video, run.current_audio, run.current_subtitle]
+        .into_iter()
+        .flatten()
+        .collect();
+    let _ = run.demuxer.set_active_streams(&active);
+    let mut eof = false;
+    let mut full = false;
+    let mut captions = captions::Captions::new(run);
+
+    // Resolve a start inside an intra-refresh cycle before any packet
+    // reaches a decoder. B-pyramid decode order can put a
+    // displayable picture before the picture completing recovery.
+    let streams = run.streams;
+    if shared.seek_target.lock().is_none() {
+        if let Some(stream) = streams.iter().find(|s| Some(s.index) == run.current_video) {
+            if entry::checked(&stream.params)
+                && matches!(read_to_random_access(run, stream.index, &stream.params),
+                    Some((_, entry::Entry::Recovery { .. })))
+            {
+                if let Some(pts) = read_to_recovery(run, stream.index, &stream.params) {
+                    *shared.active_seek.lock() = Some(Seek {
+                        generation: 0,
+                        target: 0.0,
+                        show_from: stream.time_base.seconds_of(pts),
+                        origin: SeekOrigin::User,
+                    });
+                }
+            }
+        }
+    }
+
+    while !shared.stopped.load(Ordering::SeqCst) {
+        // Selection switch: replace the changed pipelines.
+        let gen_now = shared.select_gen.load(Ordering::SeqCst);
+        if gen_now != run.select_gen {
+            run.select_gen = gen_now;
+            apply_selection_switch(run, &mut active);
+            if eof {
+                eof = false;
+                shared.demux_eof(false);
+            }
+        }
+
+        // Seek: apply each new request; a request already applied for this
+        // generation is skipped so a slow seek_to doesn't re-run.
+        let (latest, pending) = {
+            let target = shared.seek_target.lock();
+            (shared.seek_gen.load(Ordering::SeqCst), *target)
+        };
+        if let Some(target) = pending {
+            let applied = (*shared.active_seek.lock()).map(|sk| sk.generation) == Some(latest);
+            if !applied {
+                do_seek(run, target, latest, &mut eof);
+            }
+        }
+
+        // Keep byte bounds during priming, but let nonvideo queue past the
+        // normal duration limit so a held audio output cannot strand the
+        // video decoder before it has enough input to release the clock.
+        let now_full = !eof && lanes_full(run);
+        if now_full != full {
+            full = now_full;
+            shared.demux_full(full);
+        }
+        if full {
+            let mut none: Option<()> = None;
+            let guard = Mutex::new(&mut none);
+            let mut g = guard.lock();
+            run.demux_cv.wait_for(&mut g, Duration::from_millis(50));
+            continue;
+        }
+
+        if eof {
+            // Wait until the pipelines drained their lanes, end markers
+            // included, so a trailing packet is never cut off, then leave. A
+            // lane without a consumer is always empty (see `Consumer`).
+            // Leaving ends `run_player_pipeline`, which joins the pipelines
+            // and sets Ended. A seek or a selection switch clears lanes and
+            // reopens `eof` at the top of this loop. In realtime, subtitles
+            // beside video or audio do not hold the end: their last state
+            // comes down when those have played (`run_player_pipeline`).
+            let paced = run.options.realtime && (run.video_thread.is_some() || run.audio_thread.is_some());
+            let subtitles = run.sub_thread.as_ref().filter(|_| !paced);
+            let drained = [run.video_thread.as_ref(), run.audio_thread.as_ref(), subtitles]
+                .into_iter().flatten().all(|thread| thread.handle.is_finished());
+            if drained {
+                return;
+            }
+            // Consumers notify `demux_cv` on every packet they take.
+            let mut none: Option<()> = None;
+            let guard = Mutex::new(&mut none);
+            let mut g = guard.lock();
+            run.demux_cv.wait_for(&mut g, Duration::from_millis(10));
+            continue;
+        }
+
+        let packet_res = match run.replay.pop_front() {
+            Some(read) => read,
+            None => read_packet(run.demuxer),
+        };
+        match packet_res {
+            Ok(Ok(packet)) => {
+                let stream_id = packet.packet.stream_index;
+                let pipe = if Some(stream_id) == run.current_video {
+                    Some(Pipe::Video)
+                } else if Some(stream_id) == run.current_audio {
+                    Some(Pipe::Audio)
+                } else {
+                    None
+                };
+                let end = pipe.and_then(|_| packet_end_secs(&packet.packet));
+                if pipe == Some(Pipe::Video) {
+                    captions.video_packet(run, &packet.packet);
+                }
+                match pipe {
+                    Some(Pipe::Video) => run.video_lane.push(packet),
+                    Some(Pipe::Audio) => run.audio_lane.push(packet),
+                    None if Some(stream_id) == run.current_subtitle => run.sub_lane.push(packet),
+                    // Inactive streams' packets are dropped.
+                    None => {}
+                }
+                if let (Some(pipe), Some(end)) = (pipe, end) {
+                    shared.demuxed(pipe, end);
+                }
+            }
+            Ok(Err(oxideav_core::Error::Eof)) => {
+                captions.finish(run);
+                eof = true;
+                run.video_lane.push_eof();
+                run.audio_lane.push_eof();
+                run.sub_lane.push_eof();
+                shared.demux_eof(true);
+            }
+            Ok(Err(e)) => {
+                // A source stopped by `Player::drop` fails the read: that
+                // ends the loop, it is not a playback error.
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(shared, format!("demux error: {e}"));
+                }
+                return;
+            }
+            Err(_) => {
+                set_error(shared, "demuxer panicked".into());
+                return;
+            }
+        }
+    }
+}
+
+fn lanes_full(run: &Run<'_>) -> bool {
+    let priming = run.shared.video_priming();
+    let full = |lane: &Lane, tb: TimeBase, max_bytes: usize, pace: bool| {
+        let (secs, bytes) = lane.queued(tb);
+        bytes >= max_bytes || (pace && secs >= QUEUE_MAX_SECS)
+    };
+    full(run.video_lane, run.video_tb, VIDEO_MAX_BYTES, true)
+        || full(run.audio_lane, run.audio_tb, AUDIO_MAX_BYTES, !priming)
+        || full(run.sub_lane, run.sub_tb, SUB_MAX_BYTES, !priming)
+}
+
+fn do_seek(run: &mut Run<'_>, pending: SeekTarget, generation: u64, eof: &mut bool) {
+    let shared = run.shared;
+    let target = pending.target;
+    // Convert to the seek stream's time base. The demuxer seeks the video
+    // stream when present, else audio, else stream 0.
+    let seek_stream = run.current_video.or(run.current_audio).unwrap_or(0);
+    let tb = run
+        .streams
+        .iter()
+        .find(|s| s.index == seek_stream)
+        .map(|s| s.time_base)
+        .unwrap_or_else(|| TimeBase::new(1, 1000));
+    let ticks = tb.ticks_of(target.as_secs_f64());
+
+    // `seek_target` keeps the newest request: the generation decides what
+    // has been applied, so a seek arriving meanwhile is not lost.
+    *shared.active_seek.lock() = Some(Seek {
+        generation,
+        target: target.as_secs_f64(),
+        show_from: target.as_secs_f64(),
+        origin: pending.origin,
+    });
+    run.video_lane.clear_for_seek(generation);
+    run.audio_lane.clear_for_seek(generation);
+    run.sub_lane.clear_for_seek(generation);
+    run.replay.clear();
+    *eof = false;
+    shared.demux_seeked(generation);
+
+    let seek_ok = seek(run, seek_stream, ticks);
+    if shared.seek_gen.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    if !seek_ok && matches!(pending.origin, SeekOrigin::InternalRecovery { .. }) {
+        set_error(run.shared, "internal video recovery seek failed".into());
+        return;
+    }
+    if seek_ok && Some(seek_stream) == run.current_video {
+        let entered = enter_video(run, seek_stream, target.as_secs_f64(), ticks);
+        if shared.seek_gen.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if let Some(recovered) = entered {
+            if let Some(seek) = shared.active_seek.lock().as_mut().filter(|s| s.generation == generation) {
+                seek.show_from = tb.seconds_of(recovered);
+            }
+        } else if matches!(pending.origin, SeekOrigin::InternalRecovery { .. }) {
+            // None show_from is valid (refresh / recovery-before-target). Validate
+            // the already-selected replay landing; do not consume the next GOP.
+            if let Some(stream) = run.streams.iter().find(|s| s.index == seek_stream) {
+                if entry::checked(&stream.params) {
+                    if let Some(kind) = first_replay_entry(run, seek_stream, &stream.params) {
+                        if matches!(kind, entry::Entry::Dependent) {
+                            if shared.seek_gen.load(Ordering::SeqCst) != generation {
+                                return;
+                            }
+                            set_error(
+                                run.shared,
+                                "internal video recovery failed: dependent landing without recovery point".into(),
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `Demuxer::seek_to`; false when it failed. A panic is the playback's
+/// error.
+fn seek(run: &mut Run<'_>, stream: u32, ticks: i64) -> bool {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| run.demuxer.seek_to(stream, ticks))) {
+        Ok(Ok(_)) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            set_error(run.shared, "demuxer panicked during seek".into());
+            false
+        }
+    }
+}
+
+/// After the demuxer landed for a seek to `target` (seconds; `ticks` in the
+/// video stream's time base): when the video's first random-access picture
+/// there depends on earlier pictures, or is a recovery point that recovers
+/// after the target (`entry`), seeks to the random-access point before it,
+/// until one a decoder can start from or `LOOKBACK_SECS` before the target.
+/// The reads go to `Run::replay`; the video pipeline drops the pictures
+/// before the target as after any seek. Returns where the video shows from
+/// when that is past the target: the seek could not go back past a
+/// recovery point that recovers later, and its pictures before then are
+/// never shown, as FFmpeg's decoder outputs none of them.
+fn enter_video(run: &mut Run<'_>, video: u32, target: f64, ticks: i64) -> Option<i64> {
+    let streams = run.streams;
+    let stream = streams.iter().find(|s| s.index == video)?;
+    if !entry::checked(&stream.params) {
+        return None;
+    }
+    let (params, tb) = (&stream.params, stream.time_base);
+    let late = |recovered: Option<i64>| recovered.filter(|&r| r > ticks);
+    // When the first landing recovers, and the landing before this one.
+    let mut first: Option<Option<i64>> = None;
+    let mut previous: Option<i64> = None;
+    loop {
+        let (pts, kind) = read_to_random_access(run, video, params)?;
+        let pts = pts?;
+        let recovers = match kind {
+            entry::Entry::Refresh => return None,
+            entry::Entry::Recovery { .. } => match read_to_recovery(run, video, params) {
+                Some(recovered) if recovered <= ticks => return None,
+                recovered => recovered,
+            },
+            entry::Entry::Dependent => None,
+        };
+        let first_recovers = *first.get_or_insert(recovers);
+        if tb.seconds_of(pts) <= target - entry::LOOKBACK_SECS {
+            return late(recovers);
+        }
+        match previous {
+            // As far back as the demuxer goes.
+            Some(e) if pts == e => return late(recovers),
+            // The demuxer went forward instead: back where the seek landed
+            // first.
+            Some(e) if pts > e => {
+                run.replay.clear();
+                seek(run, video, ticks);
+                return late(first_recovers);
+            }
+            _ => {}
+        }
+        previous = Some(pts);
+        run.replay.clear();
+        if !seek(run, video, pts - 1) {
+            run.replay.clear();
+            seek(run, video, ticks);
+            return late(first_recovers);
+        }
+    }
+}
+
+/// Reads at most this many packets, holding at most a video lane's bytes,
+/// past a seek's landing looking for the video's first random-access
+/// packet.
+const ENTRY_READ_LIMIT: usize = 4096;
+
+/// Reads on, into `Run::replay`, to the first random-access packet of
+/// stream `video`: its pts and what decoding from it gives. `None` when the
+/// reads ended or reached `ENTRY_READ_LIMIT` packets or `VIDEO_MAX_BYTES`
+/// first.
+fn read_to_random_access(run: &mut Run<'_>, video: u32, params: &CodecParameters) -> Option<(Option<i64>, entry::Entry)> {
+    let mut bytes = 0usize;
+    for _ in 0..ENTRY_READ_LIMIT {
+        let read = read_packet(run.demuxer);
+        let found = match &read {
+            Ok(Ok(q)) if q.packet.stream_index == video && (q.packet.flags.keyframe || q.metadata.container_keyframe) => {
+                Some((q.packet.pts, entry::entry(params, &q.packet.data)))
+            }
+            Ok(Ok(q)) => {
+                bytes += q.packet.data.len();
+                None
+            }
+            _ => {
+                run.replay.push_back(read);
+                return None;
+            }
+        };
+        run.replay.push_back(read);
+        if found.is_some() || bytes > VIDEO_MAX_BYTES {
+            return found;
+        }
+    }
+    None
+}
+
+/// Inspect the first random-access video packet already held in `replay`
+/// without reading further from the demuxer.
+fn first_replay_entry(run: &Run<'_>, video: u32, params: &CodecParameters) -> Option<entry::Entry> {
+    for read in &run.replay {
+        if let Ok(Ok(q)) = read {
+            if q.packet.stream_index == video
+                && (q.packet.flags.keyframe || q.metadata.container_keyframe)
+            {
+                return Some(entry::entry(params, &q.packet.data));
+            }
+        }
+    }
+    None
+}
+
+/// Reads on, into `Run::replay`, from a recovery point (the latest read) to
+/// the picture where it recovers (`entry::Recovery`): that picture's pts.
+/// `None` when the reads ended or reached `ENTRY_READ_LIMIT` packets or
+/// `VIDEO_MAX_BYTES` first.
+fn read_to_recovery(run: &mut Run<'_>, video: u32, params: &CodecParameters) -> Option<i64> {
+    let mut recovery = entry::Recovery::new();
+    match run.replay.back() {
+        Some(Ok(Ok(q))) if recovery.recovered(params, &q.packet.data) => return q.packet.pts,
+        Some(Ok(Ok(_))) => {}
+        _ => return None,
+    }
+    let mut bytes = 0usize;
+    for _ in 0..ENTRY_READ_LIMIT {
+        let read = read_packet(run.demuxer);
+        let found = match &read {
+            Ok(Ok(q)) => {
+                bytes += q.packet.data.len();
+                (q.packet.stream_index == video && recovery.recovered(params, &q.packet.data)).then_some(q.packet.pts)
+            }
+            _ => {
+                run.replay.push_back(read);
+                return None;
+            }
+        };
+        run.replay.push_back(read);
+        if let Some(pts) = found {
+            return pts;
+        }
+        if bytes > VIDEO_MAX_BYTES {
+            return None;
+        }
+    }
+    None
+}
+
+/// `select_audio` / `select_subtitle` took effect: retire the replaced
+/// pipeline, start the new one, and refresh the headless registry entry. A
+/// new audio track resumes where playback is: the demuxer re-reads from the
+/// clock's position (a refresh seek) instead of starting the track wherever
+/// it has read ahead to. A subtitle switch never seeks: the new track shows
+/// from its next cue the demuxer reads.
+fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
+    let shared = run.shared;
+
+    // The default audio track stays whatever else changes.
+    let wanted_audio = match *shared.wanted_audio.lock() {
+        AudioChoice::Default => run.current_audio,
+        AudioChoice::Chosen(stream) => stream,
+    };
+    let wanted_subtitle = *shared.wanted_subtitle.lock();
+    let audio_changed = wanted_audio != run.current_audio;
+    let sub_changed = wanted_subtitle != run.current_subtitle;
+
+    // The old thread goes first: a lane has one consumer, and nothing the
+    // old pipeline still holds may reach a sink once the new stream is the
+    // selected one.
+    if audio_changed {
+        if let Some(old) = run.audio_thread.take() {
+            old.retire(shared, run.audio_lane);
+        }
+    }
+    if sub_changed {
+        if let Some(old) = run.sub_thread.take() {
+            old.retire(shared, run.sub_lane);
+        }
+    }
+
+    // The video stream stays as opened: the public API cannot switch it.
+    run.current_audio = wanted_audio;
+    run.current_subtitle = wanted_subtitle;
+    let time_base = |index: Option<u32>| {
+        find_stream(run.streams, index)
+            .map(|s| s.time_base)
+            .unwrap_or_else(|| TimeBase::new(1, 1000))
+    };
+    run.audio_tb = time_base(wanted_audio);
+    run.sub_tb = time_base(wanted_subtitle);
+
+    {
+        let mut st = shared.state.lock();
+        st.audio = wanted_audio;
+        st.subtitle = wanted_subtitle;
+    }
+    notify_changed(shared);
+
+    if let Some(headless) = find_headless(Arc::as_ptr(&shared.backend) as *const () as usize) {
+        let info = |idx: Option<u32>, kind: MediaType| {
+            idx.and_then(|i| {
+                run.streams
+                    .iter()
+                    .find(|s| s.index == i && s.params.media_type == kind)
+                    .map(|s| (i, s.params.codec_id.as_str().to_string()))
+            })
+        };
+        headless.set_active_streams(
+            info(run.current_video, MediaType::Video),
+            info(run.current_audio, MediaType::Audio),
+            info(run.current_subtitle, MediaType::Subtitle),
+            run.options.realtime,
+        );
+    }
+
+    let realtime = run.options.realtime;
+    if audio_changed {
+        let stream = find_stream(run.streams, run.current_audio)
+            .filter(|s| s.params.media_type == MediaType::Audio);
+        if let Some(stream) = stream {
+            shared.request_seek(shared.master.now().unwrap_or_default());
+            run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
+        }
+    }
+    // Subtitles beside video or audio, running or new, end with them.
+    shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
+    if sub_changed {
+        let stream = find_stream(run.streams, run.current_subtitle)
+            .filter(|s| s.params.media_type == MediaType::Subtitle);
+        if let Some(stream) = stream {
+            run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime, &run.options.fonts, run.demuxer.attachments()));
+        }
+    }
+
+    *active = [run.current_video, run.current_audio, run.current_subtitle]
+        .into_iter()
+        .flatten()
+        .collect();
+    let _ = run.demuxer.set_active_streams(active);
+}
+
+fn audio_failed(shared: &SharedState, message: String) {
+    let mut st = shared.state.lock();
+    st.error.get_or_insert(message);
+    st.audio = None;
+    drop(st);
+    notify_changed(shared);
+}
+
+fn record_trim_fallbacks(shared: &SharedState, trimmer: &mut Trimmer<Chunk>) {
+    let fallbacks = trimmer.take_fallbacks();
+    if !fallbacks.is_empty() {
+        shared.state.lock().audio_trim_fallbacks.add(fallbacks);
+    }
+}
+
+/// Packet lanes → decoder → sink, for one audio stream. The sink follows the
+/// clock's run state (`play`/`pause`); while the clock stands still, PCM goes
+/// out only up to `PREROLL` past it. From its first samples of each seek the
+/// output's clock leads the playback. At EOF the pipeline ends once its last
+/// samples are heard; it ends early when the player stops or a selection
+/// switch sets `retired`. The encoder delay and end padding the container
+/// declares (`PacketMetadata::audio_trim`) never reach the sink: they come
+/// off the decoder's output through `audio_trim`, as `refcheck` removes
+/// them, so the reference tests check what plays. A decoder's own start
+/// delay comes off there too, once, unless the container's skip replaces it.
+fn run_audio_thread(
+    stream: StreamInfo,
+    sink: &mut dyn AudioSink,
+    lane: Arc<Lane>,
+    demux_cv: Arc<Condvar>,
+    shared: Arc<SharedState>,
+    realtime: bool,
+    retired: Arc<AtomicBool>,
+) {
+    let mut decoder_params = stream.params.clone();
+    if decoder_params.codec_id.as_str() == "midi" {
+        if let Some(path) = &shared.soundfont {
+            let Some(path) = path.to_str() else {
+                audio_failed(&shared, "MIDI SoundFont path is not valid UTF-8".into());
+                return;
+            };
+            decoder_params.options.insert("soundfont", path);
+        }
+    }
+    let decoder_delay = audio_trim::take_decoder_delay(&mut decoder_params);
+    let mut decoder = match make_decoder(&shared.ctx, &decoder_params) {
+        Ok(d) => d,
+        Err(e) => {
+            // No decoder: the track is skipped (still listed in `tracks`)
+            // and the rest plays on.
+            let message = if decoder_params.codec_id.as_str() == "midi" {
+                format!("MIDI playback failed: {e}")
+            } else {
+                format!("no audio decoder found: {e}")
+            };
+            audio_failed(&shared, message);
+            return;
+        }
+    };
+
+    let mut out = AudioOut {
+        rate: stream.params.sample_rate.unwrap_or(48000),
+        layout: stream.params.resolved_layout().unwrap_or(ChannelLayout::Stereo),
+        open: false,
+        written: Written::default(),
+        seen_seek_target: 0,
+        primed: None,
+    };
+    // The output may come from the previous track: none of that plays on.
+    sink.flush();
+    out.open = sink.open(out.rate, out.layout).is_ok();
+    let mut starved = false;
+    let mut consecutive_errors = 0;
+    let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
+    let mut trimmer: Trimmer<Chunk> = Trimmer::with_decoder_delay(decoder_delay);
+    let mut kept: Vec<Chunk> = Vec::new();
+    // Where the decoder's output so far ends: where a frame without a pts
+    // of its own starts.
+    let mut decoded_end: Option<f64> = None;
+    let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
+
+    while !quit() {
+        if !realtime {
+            // Nothing waits on the clock: park while paused instead.
+            shared.wait_while_paused(&retired);
+            if quit() {
+                break;
+            }
+        }
+        sync_audio_sink(sink, &shared, &mut out.written.running);
+
+        // Seek generation: start the decoder, the trims and the sink over,
+        // drop pre-target output after the demuxer's seek lands.
+        let gen_now = shared.seek_gen.load(Ordering::SeqCst);
+        if gen_now != seen_seek {
+            seen_seek = gen_now;
+            sink.flush();
+            out.written.running = None;
+            out.written.end = None;
+            trimmer.reset();
+            decoded_end = None;
+            decoder = match make_decoder(&shared.ctx, &decoder_params) {
+                Ok(d) => d,
+                Err(e) => {
+                    audio_failed(&shared, format!("audio decoder failed to restart: {e}"));
+                    return;
+                }
+            };
+            consecutive_errors = 0;
+        }
+
+        // Pull a packet; the EOF marker ends this pipeline.
+        let applied = out.written.running;
+        let woken = || quit() || Some(shared.running()) != applied;
+        let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
+        let QueuedPacket { packet, metadata } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+            Pop::Packet(p) => p,
+            Pop::Wake => continue,
+            Pop::Eof => {
+                // Drain the decoder's tail into the sink. The last packet's
+                // span ends first: drained frames take that packet's trims
+                // frame by frame, as libavcodec's do (audio_trim::Trimmer::
+                // drain). What the trimmer still holds after that is the
+                // stream's end padding.
+                trimmer.drain(&mut kept);
+                let _ = decoder.flush();
+                let mut packet_pts = None;
+                while !quit() {
+                    let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
+                    let af = match recv {
+                        Ok(Ok(Frame::Audio(af))) => af,
+                        Ok(Ok(_)) => continue,
+                        _ => break,
+                    };
+                    // An empty frame ends the tail: a decoder may return
+                    // them forever.
+                    if af.samples == 0 {
+                        break;
+                    }
+                    let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
+                    trimmer.frame(chunk, af.pts, &mut kept);
+                    record_trim_fallbacks(&shared, &mut trimmer);
+                    if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
+                        break;
+                    }
+                }
+                // A tail the trimmer held as padding but finds too short for
+                // it plays (FFmpeg ignores such padding).
+                trimmer.finish(&mut kept);
+                record_trim_fallbacks(&shared, &mut trimmer);
+                if !quit() {
+                    let _ = present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired);
+                }
+                // The output plays what it holds before the pipeline ends:
+                // the audio leads the clock up to its last sample, and the
+                // playback ends after that sample is heard.
+                if let (true, Some(end), Some(leads)) = (realtime, out.written.end, out.written.leads) {
+                    if leads == seen_seek {
+                        shared.wait_heard(end, seen_seek, &retired, |running| {
+                            if out.written.running != Some(running) {
+                                if running { sink.play(); } else { sink.pause(); }
+                                out.written.running = Some(running);
+                            }
+                        });
+                    }
+                }
+                if shared.seek_gen.load(Ordering::SeqCst) != seen_seek { continue; }
+                break;
+            }
+        };
+
+        // Decode one packet under catch_unwind. A decoder that panics or
+        // errors 3 times in a row on this stream disables it: the track goes
+        // silent but playback continues.
+        let send_res = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.send_packet(&packet)));
+        match send_res {
+            Ok(Ok(())) => {
+                consecutive_errors = 0;
+                trimmer.packet(&packet, metadata.audio_trim);
+                record_trim_fallbacks(&shared, &mut trimmer);
+            }
+            Ok(Err(_)) | Err(_) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= 3 {
+                    audio_failed(&shared, format!("audio decoder failed 3 times on stream {}", stream.index));
+                    return;
+                }
+                continue;
+            }
+        }
+
+        // A decoder that does not stamp its frames gets the packet's time
+        // for the first one; the rest continue where the previous ended.
+        let mut packet_pts = packet.pts;
+        loop {
+            if quit() {
+                return;
+            }
+            let recv_res =
+                std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
+            let frame = match recv_res {
+                Ok(Ok(f)) => {
+                    consecutive_errors = 0;
+                    f
+                }
+                Ok(Err(oxideav_core::Error::NeedMore))
+                | Ok(Err(oxideav_core::Error::Eof)) => break,
+                Ok(Err(_)) | Err(_) => {
+                    consecutive_errors += 1;
+                    if consecutive_errors >= 3 {
+                        audio_failed(&shared, format!("audio decoder failed 3 times on stream {}", stream.index));
+                        return;
+                    }
+                    break;
+                }
+            };
+            let Frame::Audio(af) = frame else { continue };
+            let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
+            trimmer.frame(chunk, af.pts, &mut kept);
+            record_trim_fallbacks(&shared, &mut trimmer);
+            if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
+                // Stopped, retired or a seek: the rest of this packet is stale.
+                break;
+            }
+        }
+    }
+}
+
+/// Decoded audio on its way to the sink: interleaved f32 in its own layout
+/// and the time its first sample plays.
+struct Chunk {
+    pcm: Vec<f32>,
+    channels: usize,
+    layout: ChannelLayout,
+    rate: u32,
+    pts: f64,
+    /// The first sample after a declared start skip (`Pcm::begins_presentation`).
+    begins: bool,
+}
+
+impl Pcm for Chunk {
+    fn samples(&self) -> usize {
+        self.pcm.len() / self.channels.max(1)
+    }
+
+    fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.pcm.capacity() * std::mem::size_of::<f32>()
+    }
+
+    fn drop_front(&mut self, n: usize) {
+        self.pcm.drain(..n.saturating_mul(self.channels).min(self.pcm.len()));
+        self.pts += n as f64 / f64::from(self.rate.max(1));
+    }
+
+    fn split_off(&mut self, n: usize) -> Self {
+        let rest = self.pcm.split_off(n.saturating_mul(self.channels).min(self.pcm.len()));
+        let pts = self.pts + n as f64 / f64::from(self.rate.max(1));
+        Chunk { pcm: rest, channels: self.channels, layout: self.layout, rate: self.rate, pts, begins: false }
+    }
+
+    fn begins_presentation(&mut self) {
+        self.begins = true;
+    }
+}
+
+/// A decoded frame as a `Chunk`, stamped where it starts: its own pts, else
+/// the packet's for the first frame after a send, else where the decoder's
+/// previous frame ended.
+fn decoded_chunk(
+    decoder: &dyn Decoder,
+    stream: &StreamInfo,
+    af: &oxideav_core::AudioFrame,
+    packet_pts: &mut Option<i64>,
+    decoded_end: &mut Option<f64>,
+) -> Chunk {
+    let layout = audio_trim::frame_layout(decoder.output_audio_format(), &stream.params, af);
+    let (format, rate, channels) = (layout.sample_format, layout.sample_rate, layout.channels as usize);
+    let pcm = convert_audio_to_f32(af, format, channels);
+    let pts = match (af.pts.or(packet_pts.take()), *decoded_end) {
+        (Some(ticks), _) => stream.time_base.seconds_of(ticks),
+        (None, Some(end)) => end,
+        (None, None) => 0.0,
+    };
+    let frames = pcm.len() / channels.max(1);
+    *decoded_end = Some(pts + frames as f64 / f64::from(rate.max(1)));
+    let layout = stream.params.resolved_layout()
+        .filter(|layout| usize::from(layout.channel_count()) == channels)
+        .unwrap_or_else(|| ChannelLayout::from_count(channels as u16));
+    Chunk { pcm, channels, layout, rate, pts, begins: false }
+}
+
+/// What an audio pipeline's output is set up for and has taken.
+struct AudioOut {
+    /// The layout the sink was last opened with, and whether that worked.
+    rate: u32,
+    layout: ChannelLayout,
+    open: bool,
+    written: Written,
+    /// The newest seek generation whose target the output has reached.
+    seen_seek_target: u64,
+    /// The seek generation a failed output last let the playback go for.
+    primed: Option<u64>,
+}
+
+/// Hands what the trimmer released to the sink, in order. False when the
+/// player stopped, the pipeline was retired, or a seek superseded the
+/// audio; the rest is dropped then.
+fn present_kept(
+    sink: &mut dyn AudioSink,
+    shared: &SharedState,
+    out: &mut AudioOut,
+    kept: &mut Vec<Chunk>,
+    seen_seek: u64,
+    realtime: bool,
+    retired: &AtomicBool,
+) -> bool {
+    for chunk in kept.drain(..) {
+        if !present_audio(sink, shared, out, chunk, seen_seek, realtime, retired) {
+            return false;
+        }
+    }
+    true
+}
+
+/// One chunk of decoded audio to the sink, which is (re)opened for its
+/// layout. Samples stamped before zero precede the presentation (codec
+/// priming no container trim covered), unless a declared start skip just
+/// came off: those begin the presentation at zero, as FFmpeg plays them.
+/// After a seek, those before its target never play.
+fn present_audio(
+    sink: &mut dyn AudioSink,
+    shared: &SharedState,
+    out: &mut AudioOut,
+    chunk: Chunk,
+    seen_seek: u64,
+    realtime: bool,
+    retired: &AtomicBool,
+) -> bool {
+    let Chunk { mut pcm, channels, layout, rate: sample_rate, pts, begins } = chunk;
+    if !out.open || sample_rate != out.rate || layout != out.layout {
+        out.rate = sample_rate;
+        out.layout = layout;
+        out.written.reopen(shared);
+        out.open = sink.open(out.rate, out.layout).is_ok();
+    }
+    let sink_failed = !out.open;
+
+    // Clamping undeclared priming stamped before zero to zero would overlap
+    // the first real samples on the output's timeline. Declared priming is
+    // gone already; what follows it starts the presentation even when the
+    // container's timestamps disagree with its skip.
+    let mut pts_secs = pts;
+    if pts_secs < 0.0 {
+        if !begins {
+            let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
+            pcm.drain(..(before.saturating_mul(channels)).min(pcm.len()));
+        }
+        pts_secs = 0.0;
+    }
+
+    // Drop pre-target output after a seek: audio before the target never
+    // reaches the sink. The chunk that holds the target loses its samples
+    // before it, so the clock restarts at the target with the target's own
+    // sample.
+    if let Some(seek) = *shared.active_seek.lock() {
+        if seek.generation > out.seen_seek_target && pts_secs < seek.target {
+            let frames = pcm.len() / channels.max(1);
+            let before = ((seek.target - pts_secs) * f64::from(sample_rate)).round() as usize;
+            if before < frames {
+                pcm.drain(..before * channels);
+                pts_secs = seek.target;
+            } else {
+                pcm.clear();
+            }
+        }
+        if !pcm.is_empty() {
+            out.seen_seek_target = seen_seek;
+        }
+    }
+    if pcm.is_empty() {
+        return true;
+    }
+
+    // A failed output cannot prime; let the remaining streams run. A
+    // working output primes only after it has actually taken PCM.
+    if sink_failed {
+        if out.primed != Some(seen_seek) {
+            out.primed = Some(seen_seek);
+            shared.pipe_primed(Pipe::Audio, seen_seek);
+        }
+        return true;
+    }
+    let pts = Duration::from_secs_f64(pts_secs);
+    write_pcm(sink, shared, &pcm, layout, sample_rate, pts, seen_seek, realtime, &mut out.written, retired)
+}
+
+/// What an audio pipeline knows about its output across writes.
+#[derive(Default)]
+struct Written {
+    /// The clock run state last applied to the sink (`play`/`pause`).
+    running: Option<bool>,
+    /// The seek generation whose audio the output has taken: from its first
+    /// samples on, the output's clock leads the playback.
+    leads: Option<u64>,
+    /// Where the audio written since the last flush ends.
+    end: Option<Duration>,
+}
+
+impl Written {
+    /// The sink is about to be (re)opened, which restarts its clock: the
+    /// free clock carries on from where the output was until it plays the
+    /// next write.
+    fn reopen(&mut self, shared: &SharedState) {
+        shared.master.release_audio();
+        self.leads = None;
+        self.end = None;
+        self.running = None;
+    }
+}
+
+/// Applies the clock's run state to an audio sink when it changed.
+fn sync_audio_sink(sink: &mut dyn AudioSink, shared: &SharedState, applied: &mut Option<bool>) {
+    let running = shared.running();
+    if *applied != Some(running) {
+        if running {
+            sink.play();
+        } else {
+            sink.pause();
+        }
+        *applied = Some(running);
+    }
+}
+
+/// Hands interleaved `pcm`, whose first frame plays at `pts`, to the sink,
+/// in writes of at most 20 ms so the output follows a change of the clock's
+/// run state within one of them. While the clock stands still (buffering or
+/// paused), audio goes out only up to `PREROLL` past it, so a paused output
+/// never fills up and blocks; what a paused sink did not take is written
+/// again once the clock runs, so no audio is skipped across a hold. The
+/// first samples the output takes after a seek put its clock in the lead.
+/// False when the player stopped, the pipeline was retired, or a seek
+/// superseded this audio.
+#[allow(clippy::too_many_arguments)]
+fn write_pcm(
+    sink: &mut dyn AudioSink,
+    shared: &SharedState,
+    pcm: &[f32],
+    layout: ChannelLayout,
+    rate: u32,
+    pts: Duration,
+    seen_seek: u64,
+    realtime: bool,
+    written: &mut Written,
+    retired: &AtomicBool,
+) -> bool {
+    let channels = usize::from(layout.channel_count()).max(1);
+    let rate = rate.max(1);
+    let chunk = (rate as usize / 50).max(1);
+    let frames = pcm.len() / channels;
+    let mut done = 0;
+    while done < frames {
+        let at = pts + Duration::from_secs_f64(done as f64 / f64::from(rate));
+        sync_audio_sink(sink, shared, &mut written.running);
+        let result = {
+            #[cfg(target_os = "macos")]
+            let _timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
+            if realtime {
+                match shared.preroll(at, written.running, None, seen_seek, retired) {
+                    Preroll::Go => {}
+                    Preroll::Resync => continue,
+                    Preroll::Abort => return false,
+                }
+            }
+            let until = frames.min(done + chunk);
+            sink.write(&pcm[done * channels..until * channels], at)
+        };
+        let until = frames.min(done + chunk);
+        match result {
+            Ok(0) => {
+                // Full (or paused): retain these samples and retry once the
+                // output can drain.
+                if !shared.wait_output(seen_seek, retired) { return false; }
+            }
+            Ok(n) => {
+                done += n.min(until - done);
+                written.end = Some(pts + Duration::from_secs_f64(done as f64 / f64::from(rate)));
+                if written.leads != Some(seen_seek) {
+                    written.leads = Some(seen_seek);
+                    shared.master.follow_audio(sink.clock(), seen_seek);
+                    shared.pipe_primed(Pipe::Audio, seen_seek);
+                }
+            }
+            Err(SinkError::Unavailable) => {
+                // Suspended: the platform's resume recreates the output.
+                // Reopening here would restart it in the background. Keep
+                // the samples; the free clock leads until audio plays again.
+                if written.leads.is_some() {
+                    written.reopen(shared);
+                }
+                if !shared.wait_resumed(seen_seek, retired) { return false; }
+            }
+            Err(_) => {
+                // Sink refused (device lost): keep the engine alive and
+                // reopen it for the next samples.
+                written.reopen(shared);
+                let _ = sink.open(rate, layout);
+                return true;
+            }
+        }
+    }
+    true
+}
+
+fn convert_audio_to_f32(
+    af: &oxideav_core::AudioFrame,
+    format: SampleFormat,
+    channels: usize,
+) -> Vec<f32> {
+    let n = af.samples as usize;
+    let mut out = Vec::with_capacity(n * channels);
+    for i in 0..n {
+        for c in 0..channels {
+            out.push(sample_f32(format, &af.data, channels, c, i));
+        }
+    }
+    out
+}
+
+fn sample_f32(
+    format: SampleFormat,
+    data: &[Vec<u8>],
+    channels: usize,
+    c: usize,
+    i: usize,
+) -> f32 {
+    let (plane, index) = if format.is_planar() {
+        if c < data.len() {
+            (&data[c], i)
+        } else {
+            (&data[0], i)
+        }
+    } else {
+        (&data[0], i * channels + c)
+    };
+    let w = format.bytes_per_sample();
+    let start = index * w;
+    if start + w > plane.len() {
+        return 0.0;
+    }
+    let b = &plane[start..start + w];
+    match format {
+        SampleFormat::U8 | SampleFormat::U8P => (b[0] as f32 - 128.0) / 128.0,
+        SampleFormat::S8 => (b[0] as i8 as f32) / 128.0,
+        SampleFormat::S16 | SampleFormat::S16P => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
+        SampleFormat::S24 => (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8388608.0,
+        SampleFormat::S32 | SampleFormat::S32P => {
+            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2147483648.0
+        }
+        SampleFormat::F32 | SampleFormat::F32P => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        SampleFormat::F64 | SampleFormat::F64P => {
+            f64::from_le_bytes(b.try_into().unwrap_or([0; 8])) as f32
+        }
+        // Non-exhaustive upstream: treat anything new as silence rather than
+        // panicking on untrusted input.
+        _ => 0.0,
+    }
+}
+
+struct PipelineVideoControl {
+    shared: Weak<SharedState>,
+    retired: Arc<AtomicBool>,
+    active_producer: AtomicU64,
+}
+
+impl PipelineVideoControl {
+    fn new(shared: &Arc<SharedState>, retired: &Arc<AtomicBool>, initial_producer: ProducerId) -> Arc<Self> {
+        Arc::new(Self {
+            shared: Arc::downgrade(shared),
+            retired: Arc::clone(retired),
+            active_producer: AtomicU64::new(initial_producer.0),
+        })
+    }
+
+    fn set_active_producer(&self, producer: ProducerId) {
+        self.active_producer.store(producer.0, Ordering::SeqCst);
+    }
+
+    fn invalidate_producer(&self) {
+        self.active_producer.store(0, Ordering::SeqCst);
+    }
+}
+
+impl VideoControl for PipelineVideoControl {
+    fn cancelled(&self, producer: ProducerId, seek_generation: u64) -> bool {
+        if self.active_producer.load(Ordering::SeqCst) != producer.0 {
+            return true;
+        }
+        let Some(shared) = self.shared.upgrade() else { return true };
+        shared.stopped.load(Ordering::SeqCst)
+            || shared.failed.load(Ordering::SeqCst)
+            || self.retired.load(Ordering::SeqCst)
+            || shared.seek_gen.load(Ordering::SeqCst) != seek_generation
+    }
+
+    fn active_now(&self) -> Instant {
+        self.shared.upgrade().map(|s| s.unpaused_now()).unwrap_or_else(Instant::now)
+    }
+
+    fn wake(&self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.video_wake.store(true, Ordering::SeqCst);
+            shared.wake_lanes();
+            shared.wake_clock_waiters();
+            shared.condvar.notify_all();
+        }
+    }
+}
+
+static NEXT_PRODUCER_ID: AtomicU64 = AtomicU64::new(1);
+fn next_producer_id() -> ProducerId {
+    ProducerId(NEXT_PRODUCER_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+struct RetainedFrame {
+    frame: VideoFrame,
+    pts: Duration,
+    seen_seek: u64,
+}
+
+enum PresentOutcome {
+    Admitted,
+    NeedsPump,
+    Aborted,
+}
+
+/// One video session phase. The outer pump services control before every step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoPhase {
+    /// Accept packets from the lane / retained packet.
+    Feeding,
+    /// After EOF: drain the software decoder (flush already issued once).
+    DecoderDrain,
+    /// Seal sink input once; wait for finish.
+    SinkFinish,
+    /// Wait for first-picture readiness and presentation tail, then retire.
+    PresentationTail,
+}
+
+struct VideoSession {
+    producer: ProducerId,
+    seek_generation: u64,
+    output_revision: u64,
+    mode: Option<VideoMode>,
+    target_compressed: bool,
+    params: Arc<CodecParameters>,
+    request: VideoRequest,
+    first_picture_observed: Arc<AtomicBool>,
+    first_picture_reported: bool,
+    /// Original seek/startup deadline for the current episode.
+    deadline: Instant,
+    /// When set, an outage/recovery episode is pending and retains this allowance.
+    recovery_deadline: Option<Instant>,
+    control: Arc<PipelineVideoControl>,
+    sw_decoder: Option<Box<dyn Decoder>>,
+    frame_format: Option<CodecParameters>,
+    need_keyframe: bool,
+    sink_running: Option<bool>,
+    shown_seek: u64,
+    last_end: Duration,
+    frame_clock: FrameClock,
+    /// Packet PTS carried across receive/drain/backpressure for untimed frames.
+    packet_pts_seed: Option<i64>,
+    presenting: Duration,
+    presenting_for: Option<u64>,
+    entered: Option<u64>,
+    recovering: Option<entry::Recovery>,
+    retained_packet: Option<QueuedPacket>,
+    retained_frame: Option<RetainedFrame>,
+    pending_format_change: Option<Arc<CodecParameters>>,
+    phase: VideoPhase,
+    /// Decoder flush issued once per EOF episode.
+    decoder_flushed: bool,
+    /// Sink finish sealed once per EOF episode.
+    sink_finish_sealed: bool,
+}
+
+impl VideoSession {
+    fn new(
+        stream: &StreamInfo,
+        shared: &Arc<SharedState>,
+        retired: &Arc<AtomicBool>,
+        seen_seek: u64,
+        output_revision: u64,
+        deadline: Instant,
+        target_compressed: bool,
+    ) -> Self {
+        let producer = next_producer_id();
+        let control = PipelineVideoControl::new(shared, retired, producer);
+        let params = Arc::new(stream.params.clone());
+        let observation = Arc::new(AtomicBool::new(false));
+        let obs = Arc::clone(&observation);
+        let ctrl = Arc::clone(&control);
+        let ready = PictureReady::new(move |_| {
+            obs.store(true, Ordering::SeqCst);
+            ctrl.wake();
+        });
+        let target = if target_compressed {
+            VideoTarget::Compressed {
+                params: Arc::clone(&params),
+                ready,
+                present_from: Duration::ZERO,
+            }
+        } else {
+            VideoTarget::Frames {
+                params: Arc::clone(&params),
+                ready,
+                reset: true,
+            }
+        };
+        let request = VideoRequest {
+            producer,
+            seek_generation: seen_seek,
+            output_revision,
+            target,
+            deadline,
+            control: Arc::clone(&control) as Arc<dyn VideoControl>,
+        };
+        VideoSession {
+            producer,
+            seek_generation: seen_seek,
+            output_revision,
+            mode: None,
+            target_compressed,
+            params,
+            request,
+            first_picture_observed: observation,
+            first_picture_reported: false,
+            deadline,
+            recovery_deadline: None,
+            control,
+            sw_decoder: None,
+            frame_format: None,
+            need_keyframe: false,
+            sink_running: None,
+            shown_seek: 0,
+            last_end: Duration::ZERO,
+            frame_clock: FrameClock::default(),
+            packet_pts_seed: None,
+            presenting: Duration::ZERO,
+            presenting_for: None,
+            entered: None,
+            recovering: None,
+            retained_packet: None,
+            retained_frame: None,
+            pending_format_change: None,
+            phase: VideoPhase::Feeding,
+            decoder_flushed: false,
+            sink_finish_sealed: false,
+        }
+    }
+
+    fn effective_deadline(&self) -> Instant {
+        self.recovery_deadline.unwrap_or(self.deadline)
+    }
+
+    fn episode_pending(&self) -> bool {
+        !self.first_picture_reported || self.recovery_deadline.is_some()
+    }
+
+    /// Fresh outage/format after healthy playback: new five-active-second episode.
+    /// Replacements during an already-pending episode keep the original deadline.
+    fn start_recovery_episode(&mut self) -> Instant {
+        if let Some(dl) = self.recovery_deadline {
+            return dl;
+        }
+        if !self.first_picture_reported {
+            // Startup/recovery still pending: retain the original allowance.
+            self.recovery_deadline = Some(self.deadline);
+            return self.deadline;
+        }
+        // Healthy playback hit a fresh outage/format: new five-active-second episode.
+        let dl = self.control.active_now() + READY_TIMEOUT;
+        self.recovery_deadline = Some(dl);
+        self.deadline = dl;
+        dl
+    }
+
+    fn make_ready_callback(&self) -> (Arc<AtomicBool>, PictureReady) {
+        let observation = Arc::new(AtomicBool::new(false));
+        let obs = Arc::clone(&observation);
+        let ctrl = Arc::clone(&self.control);
+        let ready = PictureReady::new(move |_| {
+            obs.store(true, Ordering::SeqCst);
+            ctrl.wake();
+        });
+        (observation, ready)
+    }
+
+    fn rebuild_request(&mut self, target: VideoTarget, deadline: Instant) {
+        self.request = VideoRequest {
+            producer: self.producer,
+            seek_generation: self.seek_generation,
+            output_revision: self.output_revision,
+            target,
+            deadline,
+            control: Arc::clone(&self.control) as Arc<dyn VideoControl>,
+        };
+    }
+
+    fn deadline_for_generation(shared: &SharedState, generation: u64) -> (Instant, bool) {
+        // Never hold seek_target/active_seek across unpaused_now (transport lock):
+        // seek_clock orders transport → seek_target.
+        let active_origin = {
+            let active = shared.active_seek.lock();
+            active.as_ref().filter(|s| s.generation == generation).map(|s| s.origin)
+        };
+        if let Some(origin) = active_origin {
+            return match origin {
+                SeekOrigin::InternalRecovery { deadline } => (deadline, true),
+                SeekOrigin::User => (shared.unpaused_now() + READY_TIMEOUT, false),
+            };
+        }
+
+        // Snapshot generation + pending target under seek_target together, then
+        // drop before any transport lock. Reject mismatched gen so a concurrent
+        // publish cannot pair this caller's gen with a newer target.
+        let pending_origin = {
+            let target = shared.seek_target.lock();
+            let current_gen = shared.seek_gen.load(Ordering::SeqCst);
+            if current_gen == generation {
+                target.as_ref().map(|t| t.origin)
+            } else {
+                None
+            }
+        };
+        if let Some(origin) = pending_origin {
+            return match origin {
+                SeekOrigin::InternalRecovery { deadline } => (deadline, true),
+                SeekOrigin::User => (shared.unpaused_now() + READY_TIMEOUT, false),
+            };
+        }
+        (shared.unpaused_now() + READY_TIMEOUT, false)
+    }
+
+    fn new_producer_for_seek(
+        &mut self,
+        new_seek: u64,
+        new_deadline: Instant,
+        is_recovery: bool,
+        shared: &SharedState,
+    ) {
+        self.seek_generation = new_seek;
+        self.deadline = new_deadline;
+        if is_recovery {
+            self.recovery_deadline = Some(new_deadline);
+        } else {
+            self.recovery_deadline = None;
+        }
+        self.producer = next_producer_id();
+        self.control.set_active_producer(self.producer);
+        self.mode = None;
+        let (obs, ready) = self.make_ready_callback();
+        self.first_picture_observed = obs;
+        self.first_picture_reported = false;
+        // Explicit seek/reset supersedes retained media.
+        self.retained_packet = None;
+        self.retained_frame = None;
+        self.pending_format_change = None;
+        self.presenting_for = None;
+        self.entered = None;
+        self.recovering = None;
+        self.last_end = Duration::ZERO;
+        self.frame_clock = FrameClock::default();
+        self.packet_pts_seed = None;
+        self.need_keyframe = true;
+        self.phase = VideoPhase::Feeding;
+        self.decoder_flushed = false;
+        self.sink_finish_sealed = false;
+        self.sink_running = None;
+        shared.pipe_pending(Pipe::Video, new_seek);
+
+        let target = if self.target_compressed {
+            VideoTarget::Compressed {
+                params: Arc::clone(&self.params),
+                ready,
+                present_from: self.presenting,
+            }
+        } else {
+            VideoTarget::Frames {
+                params: Arc::clone(&self.params),
+                ready,
+                reset: true,
+            }
+        };
+        self.rebuild_request(target, self.effective_deadline());
+    }
+
+    fn new_producer_for_software_fallback(&mut self, shared: &SharedState) {
+        self.producer = next_producer_id();
+        self.control.set_active_producer(self.producer);
+        self.target_compressed = false;
+        // Clear only after the software decoder actually accepts a restart keyframe.
+        self.need_keyframe = true;
+        self.mode = None;
+        let (obs, ready) = self.make_ready_callback();
+        self.first_picture_observed = obs;
+        // Healthy fallback renews; pending startup/recovery retains allowance.
+        let _ = self.start_recovery_episode();
+        self.first_picture_reported = false;
+        shared.pipe_pending(Pipe::Video, self.seek_generation);
+        self.phase = VideoPhase::Feeding;
+        self.decoder_flushed = false;
+        self.sink_finish_sealed = false;
+        self.sink_running = None;
+        let target = VideoTarget::Frames {
+            params: Arc::clone(&self.params),
+            ready,
+            reset: true,
+        };
+        self.rebuild_request(target, self.effective_deadline());
+    }
+
+    fn new_producer_for_format_change(
+        &mut self,
+        new_params: Arc<CodecParameters>,
+        shared: &SharedState,
+    ) {
+        let preserve_ready = self.first_picture_reported;
+        self.producer = next_producer_id();
+        self.control.set_active_producer(self.producer);
+        self.mode = None;
+        let (obs, ready) = self.make_ready_callback();
+        self.first_picture_observed = obs;
+        // A healthy format change gets a new transition allowance without
+        // rearming transport readiness or reusing an expired startup deadline.
+        if preserve_ready {
+            self.deadline = self.control.active_now() + READY_TIMEOUT;
+        } else {
+            let _ = self.start_recovery_episode();
+            self.first_picture_reported = false;
+            shared.pipe_pending(Pipe::Video, self.seek_generation);
+        }
+        self.sink_running = None;
+        let target = VideoTarget::Frames {
+            params: Arc::clone(&new_params),
+            ready,
+            reset: false,
+        };
+        self.params = new_params;
+        self.rebuild_request(target, self.effective_deadline());
+    }
+
+    fn map_control_error(shared: &SharedState, what: &str, e: VideoError) -> PresentOutcome {
+        match e {
+            VideoError::Superseded | VideoError::Sink(SinkError::Unavailable) => PresentOutcome::NeedsPump,
+            VideoError::Sink(SinkError::WouldBlock) => {
+                shared.video_wait_retry();
+                PresentOutcome::NeedsPump
+            }
+            other => {
+                set_error(shared, format!("{what}: {other}"));
+                PresentOutcome::Aborted
+            }
+        }
+    }
+
+    fn sync_playing(&mut self, sink: &mut dyn VideoSink, shared: &SharedState) -> Result<(), VideoError> {
+        let running = shared.running();
+        if self.sink_running != Some(running) {
+            sink.set_playing(self.producer, running)?;
+            self.sink_running = Some(running);
+        }
+        Ok(())
+    }
+
+    fn observe_readiness(&mut self, shared: &SharedState) {
+        if self.first_picture_reported {
+            return;
+        }
+        if !self.first_picture_observed.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.control.active_producer.load(Ordering::SeqCst) != self.producer.0 {
+            return;
+        }
+        if shared.seek_gen.load(Ordering::SeqCst) != self.seek_generation {
+            return;
+        }
+        self.first_picture_reported = true;
+        shared.pipe_primed(Pipe::Video, self.seek_generation);
+        self.recovery_deadline = None;
+    }
+
+    fn try_present_retained_frame(
+        &mut self,
+        sink: &mut dyn VideoSink,
+        shared: &SharedState,
+        realtime: bool,
+        retired: &AtomicBool,
+    ) -> PresentOutcome {
+        let Some(retained) = self.retained_frame.as_ref() else {
+            return PresentOutcome::Admitted;
+        };
+        let pts = retained.pts;
+        // First presentable picture skips ordinary running-clock pacing; the
+        // sink callback still gates priming. Later pictures wait on the clock.
+        if realtime && self.first_picture_reported {
+            let running = self.sink_running;
+            match shared.wait_due(pts, sink.frame_lead(), running, self.seek_generation, retired) {
+                Due::Now => {}
+                Due::Resync => return PresentOutcome::NeedsPump,
+                Due::Late => {
+                    shared.state.lock().dropped_frames += 1;
+                    self.retained_frame = None;
+                    return PresentOutcome::Admitted;
+                }
+                Due::Abort => return PresentOutcome::Aborted,
+            }
+        }
+        if let Err(e) = self.sync_playing(sink, shared) {
+            return Self::map_control_error(shared, "set_playing failed", e);
+        }
+        let mut retained_val = self.retained_frame.take().unwrap();
+        let mut frame_opt = Some(retained_val.frame);
+        match sink.push_frame(self.producer, &mut frame_opt, pts) {
+            Ok(()) => {
+                self.retained_frame = None;
+                PresentOutcome::Admitted
+            }
+            Err(VideoError::Sink(SinkError::WouldBlock))
+            | Err(VideoError::Superseded)
+            | Err(VideoError::Sink(SinkError::Unavailable)) => {
+                if let Some(frame) = frame_opt {
+                    retained_val.frame = frame;
+                    self.retained_frame = Some(retained_val);
+                }
+                shared.video_wait_retry();
+                PresentOutcome::NeedsPump
+            }
+            Err(e) => {
+                set_error(shared, format!("push_frame error: {e}"));
+                PresentOutcome::Aborted
+            }
+        }
+    }
+
+    fn drain_one_decoder_frame(
+        &mut self,
+        shared: &SharedState,
+        stream: &StreamInfo,
+    ) -> Result<bool, String> {
+        if self.retained_frame.is_some() || self.pending_format_change.is_some() {
+            return Ok(true);
+        }
+        let Some(decoder) = self.sw_decoder.as_mut() else { return Ok(false) };
+        let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
+        match recv {
+            Ok(Ok(Frame::Video(vf))) => {
+                let dec_dims = decoder.output_video_dimensions();
+                let dec_pix_fmt = decoder.output_pixel_format();
+                let format_changed = match &self.frame_format {
+                    Some(curr) => {
+                        let (w, h) = (curr.width, curr.height);
+                        let pf = curr.pixel_format;
+                        dec_dims.is_some_and(|(dw, dh)| Some(dw) != w || Some(dh) != h)
+                            || dec_pix_fmt.is_some_and(|dpf| Some(dpf) != pf)
+                    }
+                    None => true,
+                };
+
+                let seed = self.packet_pts_seed.take();
+                let ticks = self.frame_clock.time(vf.pts, seed);
+                let frame_pts_secs = stream.time_base.seconds_of(ticks).max(0.0);
+                let pts = Duration::from_secs_f64(frame_pts_secs);
+
+                if format_changed {
+                    let mut want = (*self.params).clone();
+                    if let Some((w, h)) = dec_dims {
+                        want.width = Some(w);
+                        want.height = Some(h);
+                    }
+                    if let Some(format) = dec_pix_fmt {
+                        want.pixel_format = Some(format);
+                    }
+                    // Install format before transferring the frame.
+                    self.pending_format_change = Some(Arc::new(want));
+                }
+
+                if before_seek_target(shared, frame_pts_secs, self.seek_generation, &mut self.shown_seek) {
+                    return Ok(true);
+                }
+
+                self.retained_frame = Some(RetainedFrame {
+                    frame: vf,
+                    pts,
+                    seen_seek: self.seek_generation,
+                });
+                Ok(true)
+            }
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(oxideav_core::Error::NeedMore)) => Ok(false),
+            Ok(Err(oxideav_core::Error::Eof)) => Ok(false),
+            Ok(Err(e)) => Err(format!("video decoder error: {e}")),
+            Err(_) => Err("video decoder panicked".into()),
+        }
+    }
+
+    fn handle_present_from(
+        &mut self,
+        sink: &mut dyn VideoSink,
+        shared: &SharedState,
+        start: Duration,
+    ) -> PresentOutcome {
+        match sink.present_from(self.producer, start) {
+            Ok(()) => PresentOutcome::Admitted,
+            Err(e) => Self::map_control_error(shared, "present_from failed", e),
+        }
+    }
+}
+
+/// Video lane -> platform decoder or registry software decoder -> sink, paced
+/// against the clock in realtime, pushed immediately otherwise. The sink
+/// follows the clock's run state (`set_playing`).
+fn run_video_thread(
+    stream: StreamInfo,
+    mut sink: Box<dyn VideoSink>,
+    lane: Arc<Lane>,
+    demux_cv: Arc<Condvar>,
+    shared: Arc<SharedState>,
+    realtime: bool,
+    retired: Arc<AtomicBool>,
+) {
+    let seen_seek = shared.seek_gen.load(Ordering::SeqCst);
+    let (deadline, is_recovery) = VideoSession::deadline_for_generation(&shared, seen_seek);
+    let output = sink.output();
+    let mut session = VideoSession::new(
+        &stream,
+        &shared,
+        &retired,
+        seen_seek,
+        output.revision,
+        deadline,
+        true,
+    );
+    if is_recovery {
+        session.recovery_deadline = Some(deadline);
+    }
+
+    shared.pipe_pending(Pipe::Video, seen_seek);
+
+    let quit = || {
+        shared.stopped.load(Ordering::SeqCst)
+            || shared.failed.load(Ordering::SeqCst)
+            || retired.load(Ordering::SeqCst)
+    };
+    let mut starved = false;
+
+    'pump: while !quit() {
+        shared.video_wake.store(false, Ordering::SeqCst);
+
+        // --- control plane: seek / output / format / transition / ready / deadline ---
+
+        let gen_now = shared.seek_gen.load(Ordering::SeqCst);
+        if gen_now != session.seek_generation {
+            let (new_deadline, is_recovery) = VideoSession::deadline_for_generation(&shared, gen_now);
+            session.new_producer_for_seek(gen_now, new_deadline, is_recovery, &shared);
+            if session.sw_decoder.is_some() {
+                match make_decoder(&shared.ctx, &stream.params) {
+                    Ok(d) => session.sw_decoder = Some(d),
+                    Err(e) => {
+                        let mut st = shared.state.lock();
+                        let _ = st.error.get_or_insert_with(|| format!("video decoder failed to restart: {e}"));
+                        st.video = None;
+                        drop(st);
+                        notify_changed(&shared);
+                        return;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let output = sink.output();
+        if !output.available || output.revision != session.output_revision {
+            session.control.invalidate_producer();
+            session.mode = None;
+            session.sink_running = None;
+            // Fresh healthy outage renews; pending startup/recovery retains allowance.
+            let _ = session.start_recovery_episode();
+            session.first_picture_reported = false;
+            let (obs, _) = session.make_ready_callback();
+            session.first_picture_observed = obs;
+            shared.pipe_pending(Pipe::Video, session.seek_generation);
+
+            let held = session.presenting.max(shared.master.now().unwrap_or(Duration::ZERO));
+            let recovery_dl = session.effective_deadline();
+            if session.control.active_now() >= recovery_dl {
+                set_error(&shared, "platform video output recovery timed out".into());
+                return;
+            }
+            if output.available && output.revision != session.output_revision {
+                session.output_revision = output.revision;
+                // Publish recovery origin/deadline atomically with the new generation.
+                let _ = shared.request_recovery_seek(held, recovery_dl, session.seek_generation);
+            } else {
+                shared.video_wait_retry();
+            }
+            continue;
+        }
+
+        // Format must install before transferring a retained frame.
+        if let Some(new_params) = session.pending_format_change.take() {
+            session.new_producer_for_format_change(new_params, &shared);
+            continue;
+        }
+
+        let transition_ready = match sink.poll_transition(&session.request) {
+            Poll::Ready(Ok(mode)) => {
+                let first_config = session.mode.is_none();
+                session.mode = Some(mode);
+                session.output_revision = output.revision;
+                if first_config && matches!(mode, VideoMode::Frames) {
+                    if let (Some(w), Some(h)) = (session.params.width, session.params.height) {
+                        if w > 0 && h > 0 {
+                            let changed = std::mem::replace(&mut shared.state.lock().video_size, Some((w, h)))
+                                != Some((w, h));
+                            if changed {
+                                notify_changed(&shared);
+                            }
+                        }
+                    }
+                    session.frame_format = Some((*session.params).clone());
+                }
+                // Cached playing state reapplies only to a newly configured producer.
+                if first_config {
+                    session.sink_running = None;
+                }
+                true
+            }
+            Poll::Ready(Err(VideoError::Unsupported))
+            | Poll::Ready(Err(VideoError::Sink(SinkError::Fallback(_)))) => {
+                if session.target_compressed {
+                    match make_decoder(&shared.ctx, &stream.params) {
+                        Ok(d) => {
+                            session.sw_decoder = Some(d);
+                            session.new_producer_for_software_fallback(&shared);
+                            continue;
+                        }
+                        Err(e) => {
+                            set_error(&shared, format!("video software decoder fallback failed: {e}"));
+                            return;
+                        }
+                    }
+                } else {
+                    set_error(&shared, "video frame sink unsupported".into());
+                    return;
+                }
+            }
+            Poll::Ready(Err(VideoError::Superseded))
+            | Poll::Ready(Err(VideoError::Sink(SinkError::Unavailable)))
+            | Poll::Ready(Err(VideoError::Sink(SinkError::WouldBlock))) => false,
+            Poll::Ready(Err(VideoError::Sink(SinkError::Fatal(e)))) => {
+                set_error(&shared, format!("video sink fatal error: {e}"));
+                return;
+            }
+            Poll::Pending => session.mode.is_some(),
+        };
+
+        session.observe_readiness(&shared);
+
+        if (session.mode.is_none() || !session.first_picture_reported)
+            && session.control.active_now() >= session.effective_deadline()
+        {
+            set_error(
+                &shared,
+                "platform video decoder produced no presentable picture before the seek deadline".into(),
+            );
+            return;
+        }
+
+        // Every transient result still services readiness and the active budget.
+        // In particular, unavailable output must not turn into an unbounded spin.
+        if !transition_ready {
+            shared.video_wait_retry();
+            continue;
+        }
+
+        if !realtime {
+            shared.video_wait_while_paused(&retired);
+            if quit() {
+                break;
+            }
+            if shared.seek_gen.load(Ordering::SeqCst) != session.seek_generation
+                || shared.video_wake.load(Ordering::SeqCst)
+            {
+                continue;
+            }
+        }
+
+        if session.mode.is_some() {
+            if let Err(e) = session.sync_playing(&mut *sink, &shared) {
+                match VideoSession::map_control_error(&shared, "sync_video_sink failed", e) {
+                    PresentOutcome::Aborted => return,
+                    PresentOutcome::NeedsPump => continue,
+                    PresentOutcome::Admitted => {}
+                }
+            }
+        }
+
+        // Mode must be configured before admitting media (except retained during format install).
+        if session.mode.is_none() {
+            shared.video_wait_retry();
+            continue;
+        }
+
+        // --- one phase step ---
+        match session.phase {
+            VideoPhase::Feeding => {
+                if session.retained_frame.is_some() {
+                    match session.try_present_retained_frame(&mut *sink, &shared, realtime, &retired) {
+                        PresentOutcome::Admitted => {}
+                        PresentOutcome::NeedsPump => continue,
+                        PresentOutcome::Aborted => return,
+                    }
+                }
+
+                if session.sw_decoder.is_some()
+                    && session.retained_frame.is_none()
+                    && session.pending_format_change.is_none()
+                {
+                    match session.drain_one_decoder_frame(&shared, &stream) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(e) => {
+                            set_error(&shared, e);
+                            return;
+                        }
+                    }
+                }
+
+                let QueuedPacket { packet, metadata } =
+                    if let Some(queued) = session.retained_packet.take() {
+                        queued
+                    } else {
+                        let seen_seek = session.seek_generation;
+                        let ready_by = session.effective_deadline();
+                        let waiting = !session.first_picture_reported;
+                        let woken = || {
+                            quit()
+                                || Some(shared.running()) != session.sink_running
+                                || shared.video_wake.load(Ordering::SeqCst)
+                                || shared.seek_gen.load(Ordering::SeqCst) != seen_seek
+                                // SOFTWARE and compressed: readiness deadline wakes the empty wait.
+                                || (waiting && session.control.active_now() >= ready_by)
+                        };
+                        let report = |dry| shared.pipe_starved(Pipe::Video, dry);
+                        match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+                            Pop::Packet(p) => p,
+                            Pop::Wake => continue,
+                            Pop::Eof => {
+                                session.phase = VideoPhase::DecoderDrain;
+                                continue;
+                            }
+                        }
+                    };
+
+                if let Some(end) = packet_end_secs(&packet) {
+                    session.last_end = session.last_end.max(Duration::from_secs_f64(end.max(0.0)));
+                }
+                session.frame_clock.note_duration(packet.duration);
+
+                let random_access = packet.flags.keyframe || metadata.container_keyframe;
+                if session.need_keyframe && !random_access {
+                    // Drop dependents until a restart keyframe is accepted.
+                    continue;
+                }
+
+                if session.target_compressed && packet.pts.is_none() {
+                    match make_decoder(&shared.ctx, &stream.params) {
+                        Ok(d) => {
+                            session.sw_decoder = Some(d);
+                            // Retain the packet through software handoff; never clone.
+                            session.retained_packet = Some(QueuedPacket { packet, metadata });
+                            session.new_producer_for_software_fallback(&shared);
+                            continue;
+                        }
+                        Err(e) => {
+                            set_error(&shared, format!("video software decoder fallback failed: {e}"));
+                            return;
+                        }
+                    }
+                }
+
+                if session.target_compressed {
+                    let ticks = packet.pts.unwrap_or(0).max(0);
+                    let pts = Duration::from_secs_f64(stream.time_base.seconds_of(ticks).max(0.0));
+                    let seen_seek = session.seek_generation;
+                    if session.presenting_for != Some(seen_seek) {
+                        session.presenting_for = Some(seen_seek);
+                        session.recovering = None;
+                        session.presenting = show_from(&shared, seen_seek).unwrap_or(pts);
+                        match session.handle_present_from(&mut *sink, &shared, session.presenting) {
+                            PresentOutcome::Admitted => {}
+                            PresentOutcome::NeedsPump => {
+                                session.retained_packet = Some(QueuedPacket { packet, metadata });
+                                continue;
+                            }
+                            PresentOutcome::Aborted => return,
+                        }
+                    }
+                    if session.entered != Some(seen_seek) && random_access {
+                        session.entered = Some(seen_seek);
+                        if show_from(&shared, seen_seek).is_none()
+                            && matches!(
+                                entry::entry(&stream.params, &packet.data),
+                                entry::Entry::Recovery { .. }
+                            )
+                        {
+                            session.recovering = Some(entry::Recovery::new());
+                            session.presenting = Duration::MAX;
+                            match session.handle_present_from(&mut *sink, &shared, session.presenting) {
+                                PresentOutcome::Admitted => {}
+                                PresentOutcome::NeedsPump => {
+                                    session.retained_packet = Some(QueuedPacket { packet, metadata });
+                                    continue;
+                                }
+                                PresentOutcome::Aborted => return,
+                            }
+                        }
+                    }
+                    if let Some(recovery) = session.recovering.as_mut() {
+                        if recovery.recovered(&stream.params, &packet.data) {
+                            session.recovering = None;
+                            session.presenting = pts;
+                            match session.handle_present_from(&mut *sink, &shared, session.presenting) {
+                                PresentOutcome::Admitted => {}
+                                PresentOutcome::NeedsPump => {
+                                    session.retained_packet = Some(QueuedPacket { packet, metadata });
+                                    continue;
+                                }
+                                PresentOutcome::Aborted => return,
+                            }
+                        }
+                    }
+
+                    let waiting = !session.first_picture_reported;
+                    if waiting && session.control.active_now() >= session.effective_deadline() {
+                        set_error(
+                            &shared,
+                            "platform video decoder produced no presentable picture before the seek deadline"
+                                .into(),
+                        );
+                        return;
+                    }
+
+                    if realtime && !waiting {
+                        if let Err(e) = session.sync_playing(&mut *sink, &shared) {
+                            match VideoSession::map_control_error(&shared, "sync_video_sink failed", e) {
+                                PresentOutcome::Aborted => return,
+                                PresentOutcome::NeedsPump => {
+                                    session.retained_packet = Some(QueuedPacket { packet, metadata });
+                                    continue;
+                                }
+                                PresentOutcome::Admitted => {}
+                            }
+                        }
+                        match shared.preroll_video(
+                            pts,
+                            session.sink_running,
+                            None,
+                            seen_seek,
+                            &retired,
+                        ) {
+                            Preroll::Go => {}
+                            Preroll::Resync => {
+                                session.retained_packet = Some(QueuedPacket { packet, metadata });
+                                continue;
+                            }
+                            Preroll::Abort => return,
+                        }
+                    }
+
+                    if let Err(e) = session.sync_playing(&mut *sink, &shared) {
+                        match VideoSession::map_control_error(&shared, "sync_video_sink failed", e) {
+                            PresentOutcome::Aborted => return,
+                            PresentOutcome::NeedsPump => {
+                                session.retained_packet = Some(QueuedPacket { packet, metadata });
+                                continue;
+                            }
+                            PresentOutcome::Admitted => {}
+                        }
+                    }
+                    let mut pkt_opt = Some(packet);
+                    match sink.push_packet(session.producer, &mut pkt_opt, pts, random_access) {
+                        Ok(()) => {
+                            // Accepted: keyframe requirement satisfied.
+                            session.need_keyframe = false;
+                        }
+                        Err(VideoError::Sink(SinkError::WouldBlock)) => {
+                            if let Some(pkt) = pkt_opt {
+                                session.retained_packet = Some(QueuedPacket { packet: pkt, metadata });
+                            }
+                            if waiting && session.control.active_now() >= session.effective_deadline()
+                            {
+                                set_error(
+                                    &shared,
+                                    "platform video decoder stalled before its first presentable picture"
+                                        .into(),
+                                );
+                                return;
+                            }
+                            shared.video_wait_retry();
+                            continue;
+                        }
+                        Err(VideoError::Unsupported)
+                        | Err(VideoError::Sink(SinkError::Fallback(_))) => {
+                            // Retain owned input through software handoff; never clone.
+                            if let Some(pkt) = pkt_opt {
+                                session.retained_packet =
+                                    Some(QueuedPacket { packet: pkt, metadata });
+                            }
+                            match make_decoder(&shared.ctx, &stream.params) {
+                                Ok(d) => {
+                                    session.sw_decoder = Some(d);
+                                    session.new_producer_for_software_fallback(&shared);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    set_error(
+                                        &shared,
+                                        format!("video software decoder fallback failed: {e}"),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        Err(VideoError::Superseded) => {
+                            if let Some(pkt) = pkt_opt {
+                                session.retained_packet =
+                                    Some(QueuedPacket { packet: pkt, metadata });
+                            }
+                            continue;
+                        }
+                        Err(VideoError::Sink(SinkError::Unavailable)) => {
+                            if let Some(pkt) = pkt_opt {
+                                session.retained_packet =
+                                    Some(QueuedPacket { packet: pkt, metadata });
+                            }
+                            continue;
+                        }
+                        Err(VideoError::Sink(SinkError::Fatal(f))) => {
+                            set_error(&shared, format!("video fatal error: {f}"));
+                            return;
+                        }
+                    }
+                } else if session.sw_decoder.is_some() {
+                    if skips_before_target(&shared, &stream, &packet, session.shown_seek) {
+                        continue;
+                    }
+                    // Carry packet PTS for untimed decoded pictures.
+                    session.packet_pts_seed = packet.pts;
+                    let send_res = {
+                        let decoder = session.sw_decoder.as_mut().unwrap();
+                        std::panic::catch_unwind(AssertUnwindSafe(|| decoder.send_packet(&packet)))
+                    };
+                    match send_res {
+                        Ok(Ok(())) => {
+                            session.need_keyframe = false;
+                            match session.drain_one_decoder_frame(&shared, &stream) {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    set_error(&shared, e);
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            // Keep need_keyframe until a packet is actually accepted.
+                            set_error(&shared, format!("video decoder send_packet failed: {e}"));
+                            return;
+                        }
+                        Err(_) => {
+                            set_error(&shared, "video decoder send_packet panicked".into());
+                            return;
+                        }
+                    }
+                }
+            }
+
+            VideoPhase::DecoderDrain => {
+                if !session.decoder_flushed {
+                    if let Some(dec) = session.sw_decoder.as_mut() {
+                        let _ = dec.flush();
+                    }
+                    session.decoder_flushed = true;
+                }
+                if session.retained_frame.is_some() {
+                    match session.try_present_retained_frame(&mut *sink, &shared, realtime, &retired)
+                    {
+                        PresentOutcome::Admitted => {}
+                        PresentOutcome::NeedsPump => continue,
+                        PresentOutcome::Aborted => return,
+                    }
+                }
+                if session.pending_format_change.is_some() {
+                    continue;
+                }
+                if session.sw_decoder.is_some() && session.retained_frame.is_none() {
+                    match session.drain_one_decoder_frame(&shared, &stream) {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            session.phase = VideoPhase::SinkFinish;
+                            continue;
+                        }
+                        Err(e) => {
+                            set_error(&shared, e);
+                            return;
+                        }
+                    }
+                } else {
+                    session.phase = VideoPhase::SinkFinish;
+                    continue;
+                }
+            }
+
+            VideoPhase::SinkFinish => {
+                match sink.poll_transition(&session.request) {
+                    Poll::Ready(Err(e)) => {
+                        set_error(&shared, format!("video sink error during finish: {e}"));
+                        return;
+                    }
+                    _ => {}
+                }
+                if let Err(e) = session.sync_playing(&mut *sink, &shared) {
+                    match VideoSession::map_control_error(&shared, "sync_video_sink fatal", e) {
+                        PresentOutcome::Aborted => return,
+                        PresentOutcome::NeedsPump => continue,
+                        PresentOutcome::Admitted => {}
+                    }
+                }
+                match sink.poll_finish(session.producer) {
+                    Poll::Ready(Ok(())) => {
+                        session.sink_finish_sealed = true;
+                        session.phase = VideoPhase::PresentationTail;
+                        continue;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        set_error(&shared, format!("video sink poll_finish failed: {e}"));
+                        return;
+                    }
+                    Poll::Pending => {
+                        if !session.first_picture_reported
+                            && session.control.active_now() >= session.effective_deadline()
+                        {
+                            set_error(&shared, "platform video decoder stalled while draining".into());
+                            return;
+                        }
+                        shared.video_wait_retry();
+                        continue;
+                    }
+                }
+            }
+
+            VideoPhase::PresentationTail => {
+                // Pending finish must consume readiness so playback may start.
+                if session.presenting_for == Some(session.seek_generation)
+                    && session.last_end > session.presenting
+                    && !session.first_picture_reported
+                {
+                    session.observe_readiness(&shared);
+                    if !session.first_picture_reported {
+                        if session.control.active_now() >= session.effective_deadline() {
+                            set_error(
+                                &shared,
+                                "platform video decoder produced no presentable picture before the seek deadline"
+                                    .into(),
+                            );
+                            return;
+                        }
+                        shared.video_wait_retry();
+                        continue;
+                    }
+                }
+
+                if !session.first_picture_reported {
+                    // Empty-video EOF: retire without error when nothing was presentable.
+                    break 'pump;
+                }
+
+                if realtime {
+                    if let Err(e) = session.sync_playing(&mut *sink, &shared) {
+                        match VideoSession::map_control_error(&shared, "sync_video_sink failed", e) {
+                            PresentOutcome::Aborted => return,
+                            PresentOutcome::NeedsPump => continue,
+                            PresentOutcome::Admitted => {}
+                        }
+                    }
+                    match shared.preroll_video(
+                        session.last_end,
+                        session.sink_running,
+                        Some(Duration::ZERO),
+                        session.seek_generation,
+                        &retired,
+                    ) {
+                        Preroll::Resync => continue,
+                        Preroll::Go | Preroll::Abort => break 'pump,
+                    }
+                }
+                break 'pump;
+            }
+        }
+    }
+}
+
+/// Timestamps for decoded pictures that carry none. FFmpeg leaves many
+/// pictures untimed (raw and MPEG-PS H.264 time only some access units);
+/// its consumers continue the timeline from the previous picture's time
+/// plus its duration (fftools `ffmpeg_dec.c` video_frame_process). A
+/// timed picture always keeps its own time.
+#[derive(Default)]
+struct FrameClock {
+    /// Where the next untimed picture goes: the last picture plus `duration`.
+    next: Option<i64>,
+    /// The latest positive packet duration, in stream ticks.
+    duration: Option<i64>,
+}
+
+impl FrameClock {
+    fn note_duration(&mut self, duration: Option<i64>) {
+        if let Some(d) = duration.filter(|&d| d > 0) {
+            self.duration = Some(d);
+        }
+    }
+
+    /// The picture's time in stream ticks: its own, else the continued
+    /// timeline, else (first picture) the packet's, else zero.
+    fn time(&mut self, frame_pts: Option<i64>, packet_pts: Option<i64>) -> i64 {
+        let ticks = frame_pts.or(self.next).or(packet_pts).unwrap_or(0).max(0);
+        self.next = self.duration.map(|d| ticks.saturating_add(d));
+        ticks
+    }
+}
+
+/// Whether a frame at `pts_secs` precedes where the video of the latest
+/// seek shows from (its target, or a later recovery) while this pipeline
+/// has shown nothing since it (`shown_seek` is the newest seek generation
+/// it has shown a frame for). Such frames are dropped; the first frame at
+/// or after that point closes the window.
+fn before_seek_target(shared: &SharedState, pts_secs: f64, seen_seek: u64, shown_seek: &mut u64) -> bool {
+    let Some(seek) = *shared.active_seek.lock() else {
+        return false;
+    };
+    if seek.generation > *shown_seek && pts_secs < seek.show_from {
+        return true;
+    }
+    *shown_seek = seen_seek;
+    false
+}
+
+/// Whether `packet` holds a picture `before_seek_target` would drop once
+/// decoded and that no other picture predicts from
+/// (`entry::non_reference`): such a picture is not decoded at all, so the
+/// pictures a seek decodes before its target cost less.
+fn skips_before_target(shared: &SharedState, stream: &StreamInfo, packet: &Packet, shown_seek: u64) -> bool {
+    let Some(pts) = packet.pts else { return false };
+    let Some(seek) = *shared.active_seek.lock() else { return false };
+    seek.generation > shown_seek
+        && stream.time_base.seconds_of(pts) < seek.show_from
+        && entry::non_reference(&stream.params, &packet.data)
+}
+
+/// Where the video of seek generation `generation` shows from: the latest
+/// seek's `show_from` when that is the generation, else the start.
+fn show_from(shared: &SharedState, generation: u64) -> Option<Duration> {
+    let seek = (*shared.active_seek.lock())?;
+    (seek.generation == generation).then(|| Duration::from_secs_f64(seek.show_from.max(0.0)))
+}

@@ -1,0 +1,65 @@
+total samples (sum of self): 15846
+
+self by function:
+   4996  31.5%  oxideav_mpeg4video::quarter_sample::horiz_taps::heeb81dc0ea545bd5
+   1878  11.9%  oxideav_mpeg4video::quarter_sample::interpolate_quarter_pixel_src::h0236e52cff99ecb2
+   1310   8.3%  oxideav_mpeg4video::quarter_sample::interpolate_block_qpel_into::hd95a6d8a2cbec992
+   1106   7.0%  oxideav_mpeg4video::quarter_sample::compute_k::ha88143fee3f1de71
+   1066   6.7%  oxideav_mpeg4video::quarter_sample::compute_l::ha0607e8e65506ef0
+    601   3.8%  oxideav_mpeg4video::half_sample::fetch_clamped_sample::h131a474ffa87ac88
+    533   3.4%  oxideav_mpeg4video::framestore::DecodedFrame::blit_macroblock::h6c889a5f504fec8d
+    508   3.2%  oxideav_mpeg4video::quarter_sample::half_pel_d_src::h4847b217e8aeb06b
+    446   2.8%  oxideav_mpeg4video::texture::decode_tcoef_vlc::h56fb60565bc1ca22
+    412   2.6%  _platform_memmove
+    326   2.1%  oxideav_mpeg4video::quarter_sample::vert_taps::h27bfbfa98b1a8c7e
+    283   1.8%  oxideav_mpeg4video::inverse_quant::inverse_quant_method2::h9f21d2b05748213f
+    209   1.3%  _platform_memset
+    186   1.2%  oxideav_mpeg4video::ffmpeg_idct::idct_row_cond_dc::h68041614b2ac010e
+    170   1.1%  oxideav_mpeg4video::pvop_mv::predict_chroma_macroblock::h8409bec5a4673c2d
+    159   1.0%  _xzm_free
+    155   1.0%  oxideav_mpeg4video::block::inter_block_from_events::h2510a1698e92bf7a
+    120   0.8%  oxideav_mpeg4video::pvop_mv::predict_inter_macroblock::h8252d7e477df828c
+    118   0.7%  mach_absolute_time
+    117   0.7%  oxideav_mpeg4video::reconstruct::reconstruct_inter_macroblock_into::h6d1641ae81f853f4
+    113   0.7%  oxideav_mpeg4video::block::decode_intra_block_tail::h17274e50c6221a10
+    104   0.7%  oxideav_mpeg4video::decoder::Mpeg4VideoDecoder::decode_with_pts::hee00db66d54a57c4
+    102   0.6%  oxideav_mpeg4video::texture::decode_ac_events::h16a127db8b7ef5f1
+     93   0.6%  oxideav_mpeg4video::motion::decode_motion_vector_delta::h9b218b3176f7d17b
+     90   0.6%  oxideav_mpeg4video::block::decode_inter_macroblock::h53571c308ae23de0
+     52   0.3%  _xzm_xzone_malloc
+     47   0.3%  oxideav_mpeg4video::macroblock::parse_macroblock_header::h89ce34fb1cc4f73b
+     41   0.3%  _xzm_malloc_zone_malloc_type_calloc_entry
+     37   0.2%  oxideav_mpeg4video::idct::idct_8x8::had7531c217a0744e
+     36   0.2%  oxideav_mpeg4video::texture::decode_intra_dc::h75591e1a83dfff1d
+
+self by line:
+   4219  26.6%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:364 oxideav_mpeg4video::quarter_sample::horiz_taps::heeb81dc0ea545bd5
+    794   5.0%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:826 oxideav_mpeg4video::quarter_sample::interpolate_block_qpel_into::hd95a6d8a2cbec992
+    629   4.0%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:648 oxideav_mpeg4video::quarter_sample::compute_k::ha88143fee3f1de71
+    491   3.1%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:665 oxideav_mpeg4video::quarter_sample::compute_l::ha0607e8e65506ef0
+    412   2.6%                                           _platform_memmove
+    409   2.6%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:525 oxideav_mpeg4video::quarter_sample::interpolate_quarter_pixel_src::h0236e52cff99ecb2
+    409   2.6%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/half_sample.rs:301 oxideav_mpeg4video::half_sample::fetch_clamped_sample::h131a474ffa87ac88
+    395   2.5%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:639 oxideav_mpeg4video::quarter_sample::interpolate_quarter_pixel_src::h0236e52cff99ecb2
+    393   2.5%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:463 oxideav_mpeg4video::quarter_sample::half_pel_d_src::h4847b217e8aeb06b
+    392   2.5%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:546 oxideav_mpeg4video::quarter_sample::interpolate_quarter_pixel_src::h0236e52cff99ecb2
+    371   2.3%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:835 oxideav_mpeg4video::quarter_sample::interpolate_block_qpel_into::hd95a6d8a2cbec992
+    330   2.1%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:0 oxideav_mpeg4video::quarter_sample::horiz_taps::heeb81dc0ea545bd5
+    322   2.0%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/texture.rs:593 oxideav_mpeg4video::texture::decode_tcoef_vlc::h56fb60565bc1ca22
+    304   1.9%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:0 oxideav_mpeg4video::quarter_sample::interpolate_quarter_pixel_src::h0236e52cff99ecb2
+    296   1.9%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:367 oxideav_mpeg4video::quarter_sample::horiz_taps::heeb81dc0ea545bd5
+    264   1.7%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:544 oxideav_mpeg4video::quarter_sample::interpolate_quarter_pixel_src::h0236e52cff99ecb2
+    263   1.7%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:377 oxideav_mpeg4video::quarter_sample::vert_taps::h27bfbfa98b1a8c7e
+    238   1.5%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:649 oxideav_mpeg4video::quarter_sample::compute_k::ha88143fee3f1de71
+    227   1.4%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/framestore.rs:288 oxideav_mpeg4video::framestore::DecodedFrame::blit_macroblock::h6c889a5f504fec8d
+    209   1.3%                                           _platform_memset
+    198   1.2%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:663 oxideav_mpeg4video::quarter_sample::compute_l::ha0607e8e65506ef0
+    183   1.2%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/inverse_quant.rs:200 oxideav_mpeg4video::inverse_quant::inverse_quant_method2::h9f21d2b05748213f
+    159   1.0%                                           _xzm_free
+    156   1.0%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:664 oxideav_mpeg4video::quarter_sample::compute_l::ha0607e8e65506ef0
+    151   1.0%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:361 oxideav_mpeg4video::quarter_sample::horiz_taps::heeb81dc0ea545bd5
+    121   0.8%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:666 oxideav_mpeg4video::quarter_sample::compute_l::ha0607e8e65506ef0
+    120   0.8%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/framestore.rs:300 oxideav_mpeg4video::framestore::DecodedFrame::blit_macroblock::h6c889a5f504fec8d
+    118   0.7%                                           mach_absolute_time
+    102   0.6%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/decoder.rs:294 oxideav_mpeg4video::decoder::Mpeg4VideoDecoder::decode_with_pts::hee00db66d54a57c4
+    100   0.6%  oxideav-mpeg4video-d2e98e0a6f7f1510/a759321/src/quarter_sample.rs:650 oxideav_mpeg4video::quarter_sample::compute_k::ha88143fee3f1de71
