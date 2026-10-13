@@ -26,6 +26,8 @@ const BUFFER_AHEAD_SECS: f64 = 1.0;
 /// (CPU starvation, never data starvation: the clock holds before it passes
 /// media that has not arrived).
 const VIDEO_LEAD: Duration = Duration::from_millis(100);
+/// Isolated late pictures are dropped; sustained lateness holds both tracks.
+const VIDEO_LATE_GRACE: Duration = Duration::from_millis(250);
 /// While the clock stands still, audio and compressed video are handed to
 /// their sinks at most this far past it: enough to have the output primed,
 /// short of filling a paused output so far that `write`/`push_packet` block.
@@ -79,6 +81,8 @@ pub(super) struct Transport {
     paused_for: Duration,
     /// Holding the clock for data. Mirrored in `State::buffering`.
     buffering: bool,
+    video_late_since: Option<Instant>,
+    video_catchup_until: Option<Instant>,
     /// The pipelines exist; until then the source is being probed/opened.
     started: bool,
     /// Playback ended or failed: the clock stops for good.
@@ -107,6 +111,8 @@ impl Transport {
             paused: None,
             paused_for: Duration::ZERO,
             buffering: true,
+            video_late_since: None,
+            video_catchup_until: None,
             started: false,
             done: false,
             running: false,
@@ -124,6 +130,11 @@ impl Transport {
         &mut self.pipes[pipe as usize]
     }
 
+    fn clear_video_lateness(&mut self) {
+        self.video_late_since = None;
+        self.video_catchup_until = None;
+    }
+
     /// Monotonic deadline time: user pauses stop it, buffering does not.
     fn unpaused_now(&self) -> Instant {
         self.paused.unwrap_or_else(Instant::now) - self.paused_for
@@ -135,6 +146,8 @@ pub(super) enum Due {
     Now,
     /// More than `VIDEO_LEAD` past due: drop it.
     Late,
+    /// Resume the recovery hold outside the paced scheduling region.
+    CaughtUp,
     /// Apply a transport run-state change, honor a video wake, or service a
     /// newer seek at the outer pump before waiting again. Retained media stays.
     Resync,
@@ -240,11 +253,18 @@ impl SharedState {
 
     /// Enters or leaves the buffering hold.
     fn rebuffer(&self, t: &mut Transport) {
+        if t.done || t.pipes[Pipe::Video as usize].live == 0 {
+            t.clear_video_lateness();
+        }
         if t.done {
             t.buffering = false;
             return;
         }
         if !t.started || self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        if t.video_catchup_until.is_some() {
+            t.buffering = true;
             return;
         }
         let live = |p: &&PipeState| p.live > 0;
@@ -307,6 +327,7 @@ impl SharedState {
             let mut target = self.seek_target.lock();
             t.seek_gen = t.seek_gen.wrapping_add(1);
             self.master.seek(to, t.seek_gen);
+            t.clear_video_lateness();
             for p in &mut t.pipes {
                 p.horizon = None;
                 p.trusted_end = None;
@@ -343,6 +364,7 @@ impl SharedState {
             }
             t.seek_gen = t.seek_gen.wrapping_add(1);
             self.master.seek(to, t.seek_gen);
+            t.clear_video_lateness();
             for p in &mut t.pipes {
                 p.horizon = None;
                 p.trusted_end = None;
@@ -397,6 +419,9 @@ impl SharedState {
     pub(super) fn pipe_pending(&self, pipe: Pipe, generation: u64) {
         self.update(|t| {
             if t.seek_gen == generation {
+                if pipe == Pipe::Video {
+                    t.clear_video_lateness();
+                }
                 let p = t.pipe(pipe);
                 p.requires_picture = true;
                 p.primed = None;
@@ -427,6 +452,39 @@ impl SharedState {
         video.live > 0 && video.requires_picture && video.primed != Some(t.seek_gen)
     }
 
+
+    /// Keep the existing late-picture cutoff, but stop audio from continually
+    /// outrunning a software decoder. User pause time never spends this budget.
+    pub(super) fn video_late(&self, pts: Duration, generation: u64) {
+        self.update(|t| {
+            if t.seek_gen != generation || t.paused.is_some() || t.done {
+                return;
+            }
+            if self.master.now().unwrap_or_default() <= pts + VIDEO_LEAD {
+                return; // A bogus timestamp beyond the tail is not CPU lateness.
+            }
+            let now = t.unpaused_now();
+            let since = *t.video_late_since.get_or_insert(now);
+            if t.video_catchup_until.is_none() && now.duration_since(since) >= VIDEO_LATE_GRACE {
+                t.video_catchup_until = Some(now + super::READY_TIMEOUT);
+                t.buffering = true;
+            }
+        });
+    }
+
+    pub(super) fn video_catchup_expired(&self, generation: u64) -> bool {
+        let t = self.transport.lock();
+        t.seek_gen == generation
+            && t.video_catchup_until.is_some_and(|until| t.unpaused_now() >= until)
+    }
+
+    pub(super) fn video_caught_up(&self, generation: u64) {
+        self.update(|t| {
+            if t.seek_gen == generation {
+                t.clear_video_lateness();
+            }
+        });
+    }
     /// Waits until `pipe` has output ready for seek generation `generation`
     /// (`pipe_primed`) or `until` on `unpaused_now` passes. False when the
     /// player stopped, the pipeline retired or a newer seek superseded it.
@@ -513,8 +571,6 @@ impl SharedState {
         seen_seek: u64,
         retired: &AtomicBool,
     ) -> Due {
-        #[cfg(target_os = "macos")]
-        let _timing = crate::clock::timing::Guard::enter();
         let due = pts.saturating_sub(lead.min(VIDEO_LEAD));
         let mut t = self.transport.lock();
         loop {
@@ -532,7 +588,13 @@ impl SharedState {
             if now > pts + VIDEO_LEAD || t.tail_limit.is_some_and(|limit| pts > limit) {
                 return Due::Late;
             }
+            if t.video_catchup_until.is_some() && pts >= now {
+                // The caller retains this picture and clears the hold after
+                // restoring scheduling, before notifying the application.
+                return Due::CaughtUp;
+            }
             if due <= now {
+                t.video_late_since = None;
                 return Due::Now;
             }
             if t.running {

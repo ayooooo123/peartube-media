@@ -1765,6 +1765,21 @@ fn audio_failed(shared: &SharedState, message: String) {
     notify_changed(shared);
 }
 
+fn video_decoder_failed(shared: &SharedState, error: oxideav_core::Error) {
+    if matches!(error, oxideav_core::Error::CodecNotFound(_)) {
+        // A missing decoder retires only this stream, as for unsupported audio.
+        // Consumer/Live teardown releases its queue and readiness hold.
+        let mut state = shared.state.lock();
+        state.error.get_or_insert_with(|| format!("no video decoder found: {error}"));
+        state.video = None;
+        state.video_size = None;
+        drop(state);
+        notify_changed_now(shared);
+    } else {
+        set_error(shared, format!("video software decoder fallback failed: {error}"));
+    }
+}
+
 fn record_trim_fallbacks(shared: &SharedState, trimmer: &mut Trimmer<Chunk>) {
     let fallbacks = trimmer.take_fallbacks();
     if !fallbacks.is_empty() {
@@ -2765,6 +2780,11 @@ impl VideoSession {
             return PresentOutcome::Admitted;
         };
         let pts = retained.pts;
+        // Keep the paced wait and sink admission in one scheduling region.
+        // Restoring ordinary scheduling between them can delay a due picture.
+        // Decoder work remains outside this bounded handoff.
+        #[cfg(target_os = "macos")]
+        let timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
         // First presentable picture skips ordinary running-clock pacing; the
         // sink callback still gates priming. Later pictures wait on the clock.
         if realtime && self.first_picture_reported {
@@ -2772,8 +2792,17 @@ impl VideoSession {
             match shared.wait_due(pts, sink.frame_lead(), running, self.seek_generation, retired) {
                 Due::Now => {}
                 Due::Resync => return PresentOutcome::NeedsPump,
+                Due::CaughtUp => {
+                    #[cfg(target_os = "macos")]
+                    drop(timing);
+                    shared.video_caught_up(self.seek_generation);
+                    return PresentOutcome::NeedsPump;
+                }
                 Due::Late => {
+                    #[cfg(target_os = "macos")]
+                    drop(timing);
                     shared.state.lock().dropped_frames += 1;
+                    shared.video_late(pts, self.seek_generation);
                     self.retained_frame = None;
                     return PresentOutcome::Admitted;
                 }
@@ -2781,11 +2810,16 @@ impl VideoSession {
             }
         }
         if let Err(e) = self.sync_playing(sink, shared) {
+            #[cfg(target_os = "macos")]
+            drop(timing);
             return Self::map_control_error(shared, "set_playing failed", e);
         }
         let mut retained_val = self.retained_frame.take().unwrap();
         let mut frame_opt = Some(retained_val.frame);
-        match sink.push_frame(self.producer, &mut frame_opt, pts) {
+        let result = sink.push_frame(self.producer, &mut frame_opt, pts);
+        #[cfg(target_os = "macos")]
+        drop(timing);
+        match result {
             Ok(()) => {
                 self.retained_frame = None;
                 PresentOutcome::Admitted
@@ -3010,7 +3044,7 @@ fn run_video_thread(
                             continue;
                         }
                         Err(e) => {
-                            set_error(&shared, format!("video software decoder fallback failed: {e}"));
+                            video_decoder_failed(&shared, e);
                             return;
                         }
                     }
@@ -3038,6 +3072,10 @@ fn run_video_thread(
                 &shared,
                 "platform video decoder produced no presentable picture before the seek deadline".into(),
             );
+            return;
+        }
+        if shared.video_catchup_expired(session.seek_generation) {
+            set_error(&shared, "software video decoder could not catch up while buffering".into());
             return;
         }
 
@@ -3113,6 +3151,7 @@ fn run_video_thread(
                                 || Some(shared.running()) != session.sink_running
                                 || shared.video_wake.load(Ordering::SeqCst)
                                 || shared.seek_gen.load(Ordering::SeqCst) != seen_seek
+                                || shared.video_catchup_expired(seen_seek)
                                 // SOFTWARE and compressed: readiness deadline wakes the empty wait.
                                 || (waiting && session.control.active_now() >= ready_by)
                         };
@@ -3148,7 +3187,7 @@ fn run_video_thread(
                             continue;
                         }
                         Err(e) => {
-                            set_error(&shared, format!("video software decoder fallback failed: {e}"));
+                            video_decoder_failed(&shared, e);
                             return;
                         }
                     }
@@ -3289,10 +3328,7 @@ fn run_video_thread(
                                     continue;
                                 }
                                 Err(e) => {
-                                    set_error(
-                                        &shared,
-                                        format!("video software decoder fallback failed: {e}"),
-                                    );
+                                    video_decoder_failed(&shared, e);
                                     return;
                                 }
                             }
@@ -3372,6 +3408,7 @@ fn run_video_thread(
                     match session.drain_one_decoder_frame(&shared, &stream) {
                         Ok(true) => continue,
                         Ok(false) => {
+                            shared.video_caught_up(session.seek_generation);
                             session.phase = VideoPhase::SinkFinish;
                             continue;
                         }
@@ -3381,6 +3418,7 @@ fn run_video_thread(
                         }
                     }
                 } else {
+                    shared.video_caught_up(session.seek_generation);
                     session.phase = VideoPhase::SinkFinish;
                     continue;
                 }

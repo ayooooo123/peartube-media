@@ -318,7 +318,7 @@ pub fn h_s_overlap(buf: &mut [i16], left: usize, right: usize, left_stride: usiz
 // ───────────────────────── loop filter ─────────────────────────
 
 /// `vc1_filter_line`: filters across the edge between `p - stride` and `p`.
-#[inline]
+#[inline(always)]
 fn filter_line(src: &mut [u8], p: isize, stride: isize, pq: i32) -> bool {
     let at = |k: isize| (p + k * stride) as usize;
     let (m2, m1, z0, p1) = (src[at(-2)] as i32, src[at(-1)] as i32, src[at(0)] as i32, src[at(1)] as i32);
@@ -350,6 +350,7 @@ fn filter_line(src: &mut [u8], p: isize, stride: isize, pq: i32) -> bool {
 }
 
 /// `vc1_loop_filter`: `step` walks along the edge, `stride` across it.
+#[inline(always)]
 pub fn loop_filter(src: &mut [u8], off: isize, step: isize, stride: isize, len: usize, pq: i32) {
     let mut p = off;
     let mut i = 0;

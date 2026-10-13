@@ -32,6 +32,10 @@ use std::time::{Duration, Instant};
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use player::{Capture, Event, Headless, Player, PlayerOptions};
 
+#[cfg(target_os = "macos")]
+#[path = "headless/video_callback_policy.rs"]
+mod video_callback_policy;
+
 static CPU: RwLock<()> = RwLock::new(());
 
 /// For a test that times playback against the wall clock: it runs alone.
@@ -1421,8 +1425,8 @@ fn stream_without_decoder_does_not_stall() {
     let (capture, state) = play_to_end_within(path.to_str().unwrap(), Duration::from_secs(60));
     std::fs::remove_file(&path).ok();
     assert!(state.ended);
-    let error = state.error.as_deref().unwrap_or_default();
-    assert!(error.contains("no video decoder"), "state error: {error:?}");
+    assert!(state.error.is_some(), "unsupported video must remain visible in state");
+    assert_eq!(state.video, None, "the unsupported video track must be retired");
     assert!(capture.video.iter().all(|v| v.frame_md5.is_empty()));
     assert_eq!(capture.audio[0].pcm, ffmpeg_audio_f32(&bytes), "the audio");
 }
@@ -2123,4 +2127,124 @@ fn ts_mpeg4_plays_at_the_decoded_size() {
     assert_plays_at_decoded_size("ts", bytes, (33, 17), 25, |p| {
         refcheck::ffmpeg_video_md5s_with(p, 0, "yuv420p", &["-idct", "simple"])
     });
+}
+
+// Sustained CPU lateness must not leave video dropping forever while audio
+// advances. Failure modes: no rebuffer, lost pause intent, stale hold at EOF,
+// dropped audio, reordered/altered pictures, or an unbounded playback wait.
+struct SlowSoftwareVideo {
+    inner: Box<dyn oxideav_core::Decoder>,
+    packets: usize,
+}
+
+impl SlowSoftwareVideo {
+    fn open(params: &oxideav_core::CodecParameters) -> oxideav_core::Result<Box<dyn oxideav_core::Decoder>> {
+        Ok(Box::new(Self { inner: codecs::context().codecs.first_decoder(params)?, packets: 0 }))
+    }
+}
+
+impl oxideav_core::Decoder for SlowSoftwareVideo {
+    fn codec_id(&self) -> &oxideav_core::CodecId { self.inner.codec_id() }
+    fn send_packet(&mut self, packet: &oxideav_core::Packet) -> oxideav_core::Result<()> {
+        self.packets += 1;
+        if (6..=45).contains(&self.packets) {
+            std::thread::sleep(Duration::from_millis(70));
+        }
+        self.inner.send_packet(packet)
+    }
+    fn receive_frame(&mut self) -> oxideav_core::Result<oxideav_core::Frame> { self.inner.receive_frame() }
+    fn flush(&mut self) -> oxideav_core::Result<()> { self.inner.flush() }
+    fn reset(&mut self) -> oxideav_core::Result<()> { self.inner.reset() }
+    fn output_video_dimensions(&self) -> Option<(u32, u32)> { self.inner.output_video_dimensions() }
+    fn output_pixel_format(&self) -> Option<oxideav_core::PixelFormat> { self.inner.output_pixel_format() }
+}
+
+#[test]
+fn slow_software_video_rebuffers_without_losing_pause_audio_or_final_picture() {
+    let _cpu = realtime_test();
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=25:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-c:v", "mpeg2video", "-g", "25", "-bf", "0", "-c:a", "flac",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, &bytes).unwrap();
+    let mut context = oxideav_core::RuntimeContext::new();
+    context.codecs.register(
+        oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("mpeg2video"))
+            .capabilities(oxideav_core::CodecCapabilities::video("slow_software"))
+            .decoder(SlowSoftwareVideo::open),
+    );
+    codecs::register_all(&mut context);
+    let backend = Headless::new();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), Arc::new(context), PlayerOptions::default(), |_| {});
+    let (_, held) = sample_until(&player, Duration::from_secs(12), |st| {
+        finished(st) || (st.buffering && st.position > Duration::from_millis(200))
+    });
+    assert!(held.buffering && held.playing && !held.ended && held.error.is_none(),
+        "slow decoding never held the already-running audio clock: {held:?}");
+    player.pause();
+    std::thread::sleep(Duration::from_millis(100));
+    let paused = player.state().position;
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(!player.state().playing, "recovery erased user pause intent");
+    assert_eq!(player.state().position, paused, "clock advanced while user-paused");
+    player.play();
+    let (_, state) = sample_until(&player, Duration::from_secs(15), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    assert!(video.pts.windows(2).all(|w| w[0] < w[1]), "out-of-order pictures");
+    assert!(video.pts.windows(2).all(|w| w[1] - w[0] <= Duration::from_millis(600)),
+        "sustained video starvation: {:?}", video.pts);
+    let expected = ffmpeg_video_frames_with(&bytes, &["-idct", "simple"]);
+    assert_eq!(video.pts.last(), expected.last().map(|f| &f.0), "final picture lost");
+    for (pts, hash) in video.pts.iter().zip(&video.frame_md5) {
+        let reference = expected.iter().find(|f| same_pts(f.0, *pts)).expect("foreign timestamp");
+        assert_eq!(*hash, reference.1, "changed pixels at {pts:?}");
+    }
+    assert_eq!(capture.audio[0].pcm, ffmpeg_audio_f32(&bytes), "audio was discarded during recovery");
+}
+
+#[test]
+fn seek_supersedes_slow_software_video_recovery() {
+    let _cpu = realtime_test();
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=25:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-c:v", "mpeg2video", "-g", "25", "-bf", "0", "-c:a", "flac",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, &bytes).unwrap();
+    let mut context = oxideav_core::RuntimeContext::new();
+    context.codecs.register(
+        oxideav_core::CodecInfo::new(oxideav_core::CodecId::new("mpeg2video"))
+            .capabilities(oxideav_core::CodecCapabilities::video("slow_software"))
+            .decoder(SlowSoftwareVideo::open),
+    );
+    codecs::register_all(&mut context);
+    let backend = Headless::new();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), Arc::new(context), PlayerOptions::default(), |_| {});
+    let (_, held) = sample_until(&player, Duration::from_secs(12), |st| {
+        finished(st) || (st.buffering && st.position > Duration::from_millis(200))
+    });
+    assert!(held.buffering && !finished(&held), "no active decode recovery: {held:?}");
+    let target = Duration::from_secs(4);
+    player.seek(target);
+    let (_, state) = sample_until(&player, Duration::from_secs(15), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    let start = *video.flushes.last().expect("seek did not reset output");
+    assert!(video.pts[start..].iter().all(|pts| *pts >= target), "stale recovery output after seek");
+    let expected = ffmpeg_video_frames_with(&bytes, &["-idct", "simple"]);
+    assert_eq!(video.pts.last(), expected.last().map(|f| &f.0), "seek lost the final picture");
+    for (pts, hash) in video.pts[start..].iter().zip(&video.frame_md5[start..]) {
+        let reference = expected.iter().find(|f| same_pts(f.0, *pts)).expect("foreign timestamp");
+        assert_eq!(*hash, reference.1, "changed post-seek pixels");
+    }
 }
