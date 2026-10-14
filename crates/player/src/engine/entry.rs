@@ -187,7 +187,7 @@ fn hevc(nals: &[&[u8]]) -> Entry {
 
 /// How a stream's packets frame their NAL units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Framing {
+pub(super) enum Framing {
     /// Start codes (MPEG-TS, raw streams).
     AnnexB,
     /// Big-endian lengths of this many bytes (MP4, Matroska).
@@ -198,7 +198,7 @@ enum Framing {
 /// FFmpeg's h264 decoder tells it) frames NAL units by length; anything
 /// else is Annex B. The packets are never sniffed: a 4-byte length of 256
 /// to 511 starts with `00 00 01`.
-fn h264_framing(extradata: &[u8]) -> Framing {
+pub(super) fn h264_framing(extradata: &[u8]) -> Framing {
     match extradata {
         [1, _, _, _, size, ..] => Framing::Length(usize::from(size & 3) + 1),
         _ => Framing::AnnexB,
@@ -208,7 +208,7 @@ fn h264_framing(extradata: &[u8]) -> Framing {
 /// HEVCDecoderConfigurationRecord extradata (FFmpeg's hevc decoder takes
 /// extradata not starting with a start code as one) frames NAL units by
 /// length.
-fn hevc_framing(extradata: &[u8]) -> Framing {
+pub(super) fn hevc_framing(extradata: &[u8]) -> Framing {
     if extradata.len() < 23 || extradata.starts_with(&[0, 0, 1]) || extradata.starts_with(&[0, 0, 0, 1]) {
         Framing::AnnexB
     } else {
@@ -217,7 +217,7 @@ fn hevc_framing(extradata: &[u8]) -> Framing {
 }
 
 /// The NAL units of one packet.
-fn nals(data: &[u8], framing: Framing) -> Vec<&[u8]> {
+pub(super) fn nals(data: &[u8], framing: Framing) -> Vec<&[u8]> {
     let mut out = Vec::new();
     match framing {
         Framing::Length(size) => {
@@ -245,7 +245,7 @@ fn nals(data: &[u8], framing: Framing) -> Vec<&[u8]> {
 }
 
 /// A NAL unit's payload without its emulation-prevention bytes.
-fn rbsp(payload: &[u8]) -> Vec<u8> {
+pub(super) fn rbsp(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len());
     let mut zeros = 0;
     for &b in payload {

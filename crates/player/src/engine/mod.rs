@@ -16,6 +16,7 @@ use oxideav_core::{
 
 mod captions;
 mod entry;
+mod decode_order;
 
 pub use captions::{CAPTIONS_608, CAPTIONS_708};
 
@@ -729,7 +730,7 @@ fn run_player_pipeline(
         return;
     }
 
-    let mut demuxer = if vobsub.is_some() {
+    let demuxer = if vobsub.is_some() {
         // 2-3. VobSub: the index, read whole as it opens, beside the
         //    program stream (FFmpeg's vobsub demuxer pairs them the same
         //    way). No probe: no registered container reads the pair.
@@ -770,6 +771,7 @@ fn run_player_pipeline(
             }
         }
     };
+    let mut demuxer = decode_order::wrap(demuxer);
 
     // 4. Streams (cap 64; drop video tracks above the size limits).
     let streams_all = demuxer.streams();
@@ -1587,7 +1589,8 @@ fn enter_video(run: &mut Run<'_>, video: u32, target: f64, ticks: i64) -> Option
 const ENTRY_READ_LIMIT: usize = 4096;
 
 /// Reads on, into `Run::replay`, to the first random-access packet of
-/// stream `video`: its pts and what decoding from it gives. `None` when the
+/// stream `video`: its container decode stamp (dts, else pts) used as the
+/// walk-back seek key and what decoding from it gives. `None` when the
 /// reads ended or reached `ENTRY_READ_LIMIT` packets or `VIDEO_MAX_BYTES`
 /// first.
 fn read_to_random_access(run: &mut Run<'_>, video: u32, params: &CodecParameters) -> Option<(Option<i64>, entry::Entry)> {
@@ -1596,7 +1599,8 @@ fn read_to_random_access(run: &mut Run<'_>, video: u32, params: &CodecParameters
         let read = read_packet(run.demuxer);
         let found = match &read {
             Ok(Ok(q)) if q.packet.stream_index == video && (q.packet.flags.keyframe || q.metadata.container_keyframe) => {
-                Some((q.packet.pts, entry::entry(params, &q.packet.data)))
+                // Use the container's decode stamp for walk-back seeking so repaired pts does not stall on the same keyframe.
+                Some((q.packet.dts.or(q.packet.pts), entry::entry(params, &q.packet.data)))
             }
             Ok(Ok(q)) => {
                 bytes += q.packet.data.len();
