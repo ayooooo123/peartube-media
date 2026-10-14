@@ -4,6 +4,37 @@
 
 use crate::backend::SubtitleImage;
 
+/// Where a `canvas_width x canvas_height` subtitle canvas goes on a surface
+/// of `surface_width x surface_height`: a buffer of the surface's shape,
+/// `(width, height, x, y)`, with the canvas centred at `(x, y)` keeping its
+/// own shape. The platform scales the buffer to the surface evenly, so a
+/// canvas the size of the video lands on the letterboxed picture and a 16:9
+/// Blu-ray canvas fills a 16:9 slot. `None` when a size is empty or the
+/// buffer would exceed `max_pixels`: the canvas is then drawn as it is.
+pub fn fit_canvas(
+    canvas_width: u32,
+    canvas_height: u32,
+    surface_width: u32,
+    surface_height: u32,
+    max_pixels: u64,
+) -> Option<(u32, u32, u32, u32)> {
+    let (cw, ch) = (u64::from(canvas_width), u64::from(canvas_height));
+    let (sw, sh) = (u64::from(surface_width), u64::from(surface_height));
+    if cw == 0 || ch == 0 || sw == 0 || sh == 0 {
+        return None;
+    }
+    // Rounded to the nearest pixel, never below the canvas.
+    let (bw, bh) = if cw * sh >= ch * sw {
+        (cw, (cw * sh + sw / 2) / sw)
+    } else {
+        ((ch * sw + sh / 2) / sh, ch)
+    };
+    if bw * bh > max_pixels || bw > i32::MAX as u64 || bh > i32::MAX as u64 {
+        return None;
+    }
+    Some((bw as u32, bh as u32, ((bw - cw) / 2) as u32, ((bh - ch) / 2) as u32))
+}
+
 /// Blends `images` (straight alpha) into an RGBA buffer of `dst.len()`
 /// bytes laid out as `dst_stride`-pixel rows, `dst_height` rows. All
 /// coordinates are widened to i64 before the range checks so hostile

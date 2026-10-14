@@ -1,7 +1,7 @@
 use super::backend::BackendShared;
 use super::surface::owner_capacity_changed;
 use crate::backend::{SubtitleImage, SubtitleSink};
-use crate::subtitle_compose::compose_straight;
+use crate::subtitle_compose::{compose_straight, fit_canvas};
 use crate::video_owner::{try_spawn, OwnerError, OwnerTicket};
 #[cfg(target_os = "android")]
 use ndk::hardware_buffer_format::HardwareBufferFormat;
@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
+
+/// Largest caption buffer drawn, in pixels.
+const MAX_BUFFER_PIXELS: u64 = 8192 * 8192;
 
 struct DesiredOverlay {
     images: Vec<SubtitleImage>,
@@ -171,7 +174,7 @@ impl SubtitleSink for AndroidSubtitleSink {
         if video_width > 16384 || video_height > 16384 {
             return;
         }
-        if u64::from(video_width) * u64::from(video_height) > 8192 * 8192 {
+        if u64::from(video_width) * u64::from(video_height) > MAX_BUFFER_PIXELS {
             return;
         }
 
@@ -287,26 +290,37 @@ fn run_subtitle_owner(
                         Err(e) => return Err(e),
                     };
 
+                    // The surface's own size: ANativeWindow_getWidth reports the
+                    // consumer's default size, whatever geometry was set.
+                    let surface_w = window.width().max(0) as u32;
+                    let surface_h = window.height().max(0) as u32;
                     let (geom_w, geom_h, clear_only) = if overlay.clear_with_surface_geometry
                         || overlay.video_width == 0
                         || overlay.video_height == 0
                     {
                         // Actual current surface geometry for empty clear (C15).
-                        let w = window.width().max(0) as u32;
-                        let h = window.height().max(0) as u32;
-                        if w == 0 || h == 0 {
+                        if surface_w == 0 || surface_h == 0 {
                             continue;
                         }
-                        (w, h, true)
+                        (surface_w, surface_h, true)
                     } else {
                         (overlay.video_width, overlay.video_height, false)
+                    };
+                    // A caption buffer takes the surface's shape with the canvas
+                    // centred in it. The surface scales it evenly, so captions
+                    // keep their shape and sit on the letterboxed picture.
+                    let (buf_w, buf_h, canvas_x, canvas_y) = if clear_only {
+                        (geom_w, geom_h, 0, 0)
+                    } else {
+                        fit_canvas(geom_w, geom_h, surface_w, surface_h, MAX_BUFFER_PIXELS)
+                            .unwrap_or((geom_w, geom_h, 0, 0))
                     };
 
                     // Propagate geometry failure (C4).
                     window
                         .set_buffers_geometry(
-                            geom_w as i32,
-                            geom_h as i32,
+                            buf_w as i32,
+                            buf_h as i32,
                             Some(HardwareBufferFormat::R8G8B8A8_UNORM),
                         )
                         .map_err(|e| format!("subtitle geometry: {e:?}"))?;
@@ -352,11 +366,18 @@ fn run_subtitle_owner(
                         };
                         // Pitch in pixels for compose.
                         let pitch_px = if bpp == 0 { 0 } else { dst_stride };
-                        let _ = dst_width;
+                        // The canvas's place in a buffer of the requested size;
+                        // any other size gets it from the corner, as before.
+                        let (x, y) = if dst_width == buf_w as usize && dst_height == buf_h as usize {
+                            (canvas_x as usize, canvas_y as usize)
+                        } else {
+                            (0, 0)
+                        };
+                        let start = ((y * pitch_px + x) * bpp).min(init.len());
                         compose_straight(
-                            init,
+                            &mut init[start..],
                             pitch_px,
-                            dst_height,
+                            (dst_height - y).min(geom_h as usize),
                             &overlay.images,
                             overlay.video_width.max(1),
                         );

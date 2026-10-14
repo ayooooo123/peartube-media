@@ -75,10 +75,13 @@ struct PipeState {
 /// The clock's run state; `SharedState::transport` guards it.
 #[derive(Debug)]
 pub(super) struct Transport {
-    /// The user's intent: when `pause()` started, until the next `play()`.
-    paused: Option<Instant>,
-    /// Completed user pauses, excluded from decoder progress deadlines.
-    paused_for: Duration,
+    /// The user's intent: between `pause()` and the next `play()`.
+    paused: bool,
+    /// Since when decoder progress deadlines stand still: the user paused,
+    /// or the demuxer waits for bytes that peers have not sent yet.
+    idle_since: Option<Instant>,
+    /// Completed such stretches, excluded from decoder progress deadlines.
+    idle_for: Duration,
     /// Holding the clock for data. Mirrored in `State::buffering`.
     buffering: bool,
     video_late_since: Option<Instant>,
@@ -108,8 +111,9 @@ pub(super) struct Transport {
 impl Transport {
     pub(super) fn new() -> Self {
         Self {
-            paused: None,
-            paused_for: Duration::ZERO,
+            paused: false,
+            idle_since: None,
+            idle_for: Duration::ZERO,
             buffering: true,
             video_late_since: None,
             video_catchup_until: None,
@@ -135,9 +139,11 @@ impl Transport {
         self.video_catchup_until = None;
     }
 
-    /// Monotonic deadline time: user pauses stop it, buffering does not.
-    fn unpaused_now(&self) -> Instant {
-        self.paused.unwrap_or_else(Instant::now) - self.paused_for
+    /// Monotonic deadline time. User pauses and waits for network bytes
+    /// stop it; other buffering does not, so a decoder that produces no
+    /// picture from data it has still fails.
+    fn active_now(&self) -> Instant {
+        self.idle_since.unwrap_or_else(Instant::now) - self.idle_for
     }
 }
 
@@ -204,8 +210,8 @@ impl SharedState {
     }
 
     /// Decoder progress deadlines use this clock, not the held media clock.
-    pub(super) fn unpaused_now(&self) -> Instant {
-        self.transport.lock().unpaused_now()
+    pub(super) fn active_now(&self) -> Instant {
+        self.transport.lock().active_now()
     }
 
     /// Applies `f`, re-derives the hold and the clock's run state, and wakes
@@ -214,10 +220,19 @@ impl SharedState {
     fn update(&self, f: impl FnOnce(&mut Transport)) {
         let (changed, run_changed, buffering_changed) = {
             let mut t = self.transport.lock();
-            let before = (t.paused.is_some(), t.buffering, t.seek_gen);
+            let before = (t.paused, t.buffering, t.seek_gen);
             f(&mut t);
+            let idle = t.paused || t.source_starved;
+            match (idle, t.idle_since) {
+                (true, None) => t.idle_since = Some(Instant::now()),
+                (false, Some(since)) => {
+                    t.idle_for += since.elapsed();
+                    t.idle_since = None;
+                }
+                _ => {}
+            }
             self.rebuffer(&mut t);
-            let run = t.paused.is_none() && !t.buffering && !t.done && !self.stopped.load(Ordering::SeqCst);
+            let run = !t.paused && !t.buffering && !t.done && !self.stopped.load(Ordering::SeqCst);
             let run_changed = run != t.running;
             if run_changed {
                 t.running = run;
@@ -228,7 +243,7 @@ impl SharedState {
             if buffering_changed {
                 self.state.lock().buffering = t.buffering;
             }
-            let changed = run_changed || before != (t.paused.is_some(), t.buffering, t.seek_gen);
+            let changed = run_changed || before != (t.paused, t.buffering, t.seek_gen);
             (changed, run_changed, buffering_changed)
         };
         if changed {
@@ -307,16 +322,9 @@ impl SharedState {
         }
     }
 
-    /// `play()` / `pause()`: only intent transitions change pause credit.
+    /// `play()` / `pause()`: the user's intent.
     pub(super) fn set_paused(&self, paused: bool) {
-        self.update(|t| match (paused, t.paused) {
-            (true, None) => t.paused = Some(Instant::now()),
-            (false, Some(since)) => {
-                t.paused_for += since.elapsed();
-                t.paused = None;
-            }
-            _ => {}
-        });
+        self.update(|t| t.paused = paused);
     }
 
     /// `seek()`: the clock jumps to `to` and holds until the pipelines have
@@ -457,13 +465,13 @@ impl SharedState {
     /// outrunning a software decoder. User pause time never spends this budget.
     pub(super) fn video_late(&self, pts: Duration, generation: u64) {
         self.update(|t| {
-            if t.seek_gen != generation || t.paused.is_some() || t.done {
+            if t.seek_gen != generation || t.paused || t.done {
                 return;
             }
             if self.master.now().unwrap_or_default() <= pts + VIDEO_LEAD {
                 return; // A bogus timestamp beyond the tail is not CPU lateness.
             }
-            let now = t.unpaused_now();
+            let now = t.active_now();
             let since = *t.video_late_since.get_or_insert(now);
             if t.video_catchup_until.is_none() && now.duration_since(since) >= VIDEO_LATE_GRACE {
                 t.video_catchup_until = Some(now + super::READY_TIMEOUT);
@@ -475,7 +483,7 @@ impl SharedState {
     pub(super) fn video_catchup_expired(&self, generation: u64) -> bool {
         let t = self.transport.lock();
         t.seek_gen == generation
-            && t.video_catchup_until.is_some_and(|until| t.unpaused_now() >= until)
+            && t.video_catchup_until.is_some_and(|until| t.active_now() >= until)
     }
 
     pub(super) fn video_caught_up(&self, generation: u64) {
@@ -486,7 +494,7 @@ impl SharedState {
         });
     }
     /// Waits until `pipe` has output ready for seek generation `generation`
-    /// (`pipe_primed`) or `until` on `unpaused_now` passes. False when the
+    /// (`pipe_primed`) or `until` on `active_now` passes. False when the
     /// player stopped, the pipeline retired or a newer seek superseded it.
     pub(super) fn wait_primed(&self, pipe: Pipe, generation: u64, until: Instant, retired: &AtomicBool) -> bool {
         let mut t = self.transport.lock();
@@ -497,11 +505,11 @@ impl SharedState {
             if pipe == Pipe::Video && self.video_wake.load(Ordering::SeqCst) {
                 return true;
             }
-            let now = t.unpaused_now();
+            let now = t.active_now();
             if t.pipe(pipe).primed == Some(generation) || now >= until {
                 return true;
             }
-            if t.paused.is_some() {
+            if t.paused {
                 self.transport_cv.wait(&mut t);
             } else {
                 self.transport_cv.wait_for(&mut t, until - now);
@@ -770,10 +778,10 @@ impl SharedState {
     /// after a short wait. False when the caller's PCM is stale.
     pub(super) fn wait_resumed(&self, seen_seek: u64, retired: &AtomicBool) -> bool {
         let mut t = self.transport.lock();
-        if t.paused.is_none() {
+        if !t.paused {
             self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
         }
-        while t.paused.is_some() && !self.superseded(seen_seek, retired) {
+        while t.paused && !self.superseded(seen_seek, retired) {
             self.transport_cv.wait(&mut t);
         }
         !self.superseded(seen_seek, retired)
@@ -799,14 +807,14 @@ impl SharedState {
     /// parks its pipelines here instead.
     pub(super) fn wait_while_paused(&self, retired: &AtomicBool) {
         let mut t = self.transport.lock();
-        while t.paused.is_some() && !self.stopped.load(Ordering::SeqCst) && !retired.load(Ordering::SeqCst) {
+        while t.paused && !self.stopped.load(Ordering::SeqCst) && !retired.load(Ordering::SeqCst) {
             self.transport_cv.wait(&mut t);
         }
     }
 
     pub(super) fn video_wait_while_paused(&self, retired: &AtomicBool) {
         let mut t = self.transport.lock();
-        while t.paused.is_some() && !self.stopped.load(Ordering::SeqCst) && !retired.load(Ordering::SeqCst) {
+        while t.paused && !self.stopped.load(Ordering::SeqCst) && !retired.load(Ordering::SeqCst) {
             if self.video_wake.load(Ordering::SeqCst) {
                 break;
             }

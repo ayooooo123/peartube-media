@@ -131,7 +131,8 @@ pub struct VideoOutput {
 /// acquire a platform sink lock or call native APIs.
 pub trait VideoControl: Send + Sync {
     fn cancelled(&self, producer: ProducerId, seek_generation: u64) -> bool;
-    /// Monotonic time with user pauses removed. Buffering still consumes time.
+    /// Monotonic time without user pauses or waits for network bytes. Other
+    /// buffering still consumes time.
     fn active_now(&self) -> Instant;
     fn wake(&self);
 }

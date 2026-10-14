@@ -124,7 +124,8 @@ const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
 
 /// A broken platform decoder must fail visibly, not let audio run ahead
-/// without a decoded picture. User pauses do not count; buffering does.
+/// without a decoded picture. User pauses and waits for network bytes do
+/// not count; other buffering does.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Side data travels with its packet, including across equal-PTS laces.
@@ -2381,7 +2382,7 @@ impl VideoControl for PipelineVideoControl {
     }
 
     fn active_now(&self) -> Instant {
-        self.shared.upgrade().map(|s| s.unpaused_now()).unwrap_or_else(Instant::now)
+        self.shared.upgrade().map(|s| s.active_now()).unwrap_or_else(Instant::now)
     }
 
     fn wake(&self) {
@@ -2594,7 +2595,7 @@ impl VideoSession {
     }
 
     fn deadline_for_generation(shared: &SharedState, generation: u64) -> (Instant, bool) {
-        // Never hold seek_target/active_seek across unpaused_now (transport lock):
+        // Never hold seek_target/active_seek across active_now (transport lock):
         // seek_clock orders transport → seek_target.
         let active_origin = {
             let active = shared.active_seek.lock();
@@ -2603,7 +2604,7 @@ impl VideoSession {
         if let Some(origin) = active_origin {
             return match origin {
                 SeekOrigin::InternalRecovery { deadline } => (deadline, true),
-                SeekOrigin::User => (shared.unpaused_now() + READY_TIMEOUT, false),
+                SeekOrigin::User => (shared.active_now() + READY_TIMEOUT, false),
             };
         }
 
@@ -2622,10 +2623,10 @@ impl VideoSession {
         if let Some(origin) = pending_origin {
             return match origin {
                 SeekOrigin::InternalRecovery { deadline } => (deadline, true),
-                SeekOrigin::User => (shared.unpaused_now() + READY_TIMEOUT, false),
+                SeekOrigin::User => (shared.active_now() + READY_TIMEOUT, false),
             };
         }
-        (shared.unpaused_now() + READY_TIMEOUT, false)
+        (shared.active_now() + READY_TIMEOUT, false)
     }
 
     fn new_producer_for_seek(

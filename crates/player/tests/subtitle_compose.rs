@@ -1,10 +1,10 @@
-//! Deterministic no-panic test for the subtitle composition math (the
-//! contract's untrusted-input rule): fixed seed, >= 2000 mutations of the
-//! reference input, no panics, and hostile coordinates stay inside the
-//! destination buffer.
+//! Subtitle composition math (the contract's untrusted-input rule): a
+//! deterministic no-panic test with a fixed seed and >= 2000 mutations of
+//! the reference input, hostile coordinates staying inside the destination
+//! buffer, and where a canvas goes on the subtitle surface.
 
 use player::backend::SubtitleImage;
-use player::subtitle_compose::compose_straight;
+use player::subtitle_compose::{compose_straight, fit_canvas};
 
 /// xorshift64* — deterministic, no external crate.
 struct Rng(u64);
@@ -149,4 +149,21 @@ fn subtitle_compose_overwrites_inside_bounds() {
             assert_eq!(&dst[i..i + 4], &[255, 0, 0, 255]);
         }
     }
+}
+
+/// Captions go on the letterboxed picture: the canvas keeps its shape,
+/// centred in a buffer of the surface's shape that the platform scales
+/// evenly onto the slot.
+#[test]
+fn canvas_keeps_its_shape_on_the_surface() {
+    let max = 8192 * 8192;
+    // A 2.4:1 video's text canvas on a 16:9 slot: bars above and below.
+    assert_eq!(fit_canvas(1920, 800, 1080, 608, max), Some((1920, 1081, 0, 140)));
+    // A Blu-ray PGS canvas on a 16:9 slot fills it.
+    assert_eq!(fit_canvas(1920, 1080, 960, 540, max), Some((1920, 1080, 0, 0)));
+    // A 4:3 canvas: bars left and right.
+    assert_eq!(fit_canvas(640, 480, 960, 540, max), Some((853, 480, 106, 0)));
+    // No surface size yet, or a buffer too large to pad: drawn as it is.
+    assert_eq!(fit_canvas(1920, 800, 0, 0, max), None);
+    assert_eq!(fit_canvas(16, 8192, 1080, 608, max), None);
 }

@@ -363,6 +363,11 @@ struct Delivery {
     /// The second half of the file arrives this long after a response first
     /// reaches the midpoint: a stall at about the file's midpoint.
     mid_stall: Option<Duration>,
+    /// Bytes past the midpoint come only on request, as when peers fetch a
+    /// seek target: the response that reaches the midpoint trickles from
+    /// there (64 bytes every 100 ms), and a request that starts past it
+    /// sends its first body byte this long after it came in.
+    seek_fetch: Option<Duration>,
 }
 
 /// When bytes become available. Shared by every connection: peers deliver
@@ -372,6 +377,9 @@ struct Arrival {
     first_get: Option<Instant>,
     /// Start and end of the midpoint stall, once a response reached it.
     stall: Option<(Instant, Instant)>,
+    /// When the first request starting past the midpoint (`seek_fetch`)
+    /// came in, and when its first body byte left.
+    fetch: Option<(Instant, Instant)>,
     /// Body bytes written so far.
     sent: u64,
 }
@@ -435,6 +443,11 @@ impl HttpServer {
         self.peer.arrival.lock().stall
     }
 
+    /// The `seek_fetch` request's arrival and first body byte, if any came.
+    fn fetch(&self) -> Option<(Instant, Instant)> {
+        self.peer.arrival.lock().fetch
+    }
+
     /// Waits until `done` holds for what the server has delivered; fails
     /// after `limit`.
     fn wait_until(&self, limit: Duration, done: impl Fn(&Arrival) -> bool) {
@@ -485,6 +498,7 @@ fn serve(mut stream: TcpStream, bytes: &[u8], delivery: Delivery, peer: &Peer) {
             Err(_) => break,
         }
     }
+    let asked = Instant::now();
     let range = req
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("range:"))
@@ -513,6 +527,11 @@ fn serve(mut stream: TcpStream, bytes: &[u8], delivery: Delivery, peer: &Peer) {
     };
     let released = first_get + delivery.first_byte_delay.unwrap_or_default();
     let mid = len / 2;
+    if let Some(delay) = delivery.seek_fetch.filter(|_| start >= mid) {
+        std::thread::sleep(delay);
+        peer.arrival.lock().fetch.get_or_insert((asked, Instant::now()));
+        peer.changed.notify_all();
+    }
     let mut pos = start;
     let mut first = true;
     while pos <= end {
@@ -532,11 +551,15 @@ fn serve(mut stream: TcpStream, bytes: &[u8], delivery: Delivery, peer: &Peer) {
         if let Some(wait) = ready_at.checked_duration_since(Instant::now()) {
             std::thread::sleep(wait);
         }
-        let mut stop = if delivery.mid_stall.is_some() && pos < mid {
+        let mut stop = if (delivery.mid_stall.is_some() || delivery.seek_fetch.is_some()) && pos < mid {
             mid.min(end + 1)
         } else {
             end + 1
         };
+        let trickling = delivery.seek_fetch.is_some() && start < mid && pos >= mid;
+        if trickling {
+            stop = stop.min(pos + 64);
+        }
         if delivery.trickle && first && stop - pos > 8 {
             stop = pos + 8;
         }
@@ -545,8 +568,8 @@ fn serve(mut stream: TcpStream, bytes: &[u8], delivery: Delivery, peer: &Peer) {
         }
         peer.arrival.lock().sent += stop - pos;
         peer.changed.notify_all();
-        if delivery.trickle && first {
-            std::thread::sleep(Duration::from_millis(200));
+        if (delivery.trickle && first) || trickling {
+            std::thread::sleep(Duration::from_millis(if trickling { 100 } else { 200 }));
         }
         first = false;
         pos = stop;
@@ -1332,6 +1355,55 @@ fn seek_during_realtime_h264_playback() {
             assert_eq!(start + pcm.len(), ff.len(), "the audio stopped before the end");
         }
     }
+}
+
+/// A seek whose bytes arrive after the 5 s picture deadline: peers have to
+/// fetch them. Waiting on the network is buffering, not a decoder that
+/// produces no picture: the clock holds, then the video plays from the
+/// target. The player used to give up with "no presentable picture before
+/// the seek deadline" while the bytes were still on their way.
+#[test]
+fn seek_waiting_on_peers_plays_from_target() {
+    let _cpu = realtime_test();
+    let bytes = Arc::new(make_streaming_mkv());
+    let server = HttpServer::start_with(
+        Arc::clone(&bytes),
+        Delivery {
+            seek_fetch: Some(Duration::from_secs(6)),
+            ..Delivery::default()
+        },
+    );
+    let (p, backend, _) = open_realtime(&server.url());
+    p.play();
+    let (_, st) = sample_until(&p, Duration::from_secs(30), |st| {
+        finished(st) || st.position >= Duration::from_millis(500)
+    });
+    assert!(!finished(&st), "ended before the seek: {st:?}");
+    // A keyframe 554 KB in: past the midpoint and the 64 KiB an open
+    // response is drained for, so the seek needs a request of its own.
+    let target = Duration::from_millis(2400);
+    p.seek(target);
+    let sought = Instant::now();
+    let (_, state) = sample_until(&p, Duration::from_secs(40), finished);
+    drop(p);
+    assert!(state.error.is_none(), "unexpected error: {:?}", state.error);
+    assert!(state.ended);
+    let (_, answered) = server.fetch().expect("the seek did not request its bytes");
+    let waited = answered.duration_since(sought);
+    assert!(waited > Duration::from_secs(5), "the seek's bytes came after {waited:?}, inside the deadline");
+
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    assert_eq!(video.flushes.len(), 1, "video sink flushes: {:?}", video.flushes);
+    let from = video.flushes[0];
+    assert!(from < video.pts.len(), "no frame shown after the seek");
+    assert!(video.pts[from] >= target, "the first frame after the seek is at {:?}", video.pts[from]);
+    let ff = ffmpeg_video_frames(&bytes);
+    let first = ff
+        .iter()
+        .position(|(pts, _)| same_pts(*pts, video.pts[from]))
+        .unwrap_or_else(|| panic!("the frame at {:?} is not FFmpeg's", video.pts[from]));
+    assert_eq!(video.frame_md5[from], ff[first].1, "the first frame after the seek");
 }
 
 /// `select_audio` mid-playback hands the lane to the new track's pipeline
