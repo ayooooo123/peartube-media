@@ -110,8 +110,11 @@ enum InputPacket {
         reorder_n: usize,
         container_stamp: i64,
         duration: Option<i64>,
+        bytes: usize,
     },
-    NonPicture,
+    NonPicture {
+        bytes: usize,
+    },
 }
 
 struct WaitingPic {
@@ -123,6 +126,7 @@ struct ReorderHeldPic {
     id: usize,
     is_picture: bool,
     display_index: Option<usize>,
+    bytes: usize,
 }
 
 /// Standalone reordering and slot state machine.
@@ -142,6 +146,7 @@ struct Reorder {
     last_slot_step: Option<i64>,
     last_packet_duration: Option<i64>,
     display_count: usize,
+    held_bytes: usize,
 }
 
 impl Reorder {
@@ -157,6 +162,7 @@ impl Reorder {
             last_slot_step: None,
             last_packet_duration: None,
             display_count: 0,
+            held_bytes: 0,
         }
     }
 
@@ -169,10 +175,13 @@ impl Reorder {
         self.last_packet_duration = None;
         self.display_count = 0;
         self.max_poc_in_period = None;
+        self.held_bytes = 0;
         // mode and shift_d survive seek
     }
+
     fn become_trust(&mut self, releases: &mut Vec<Release>) {
         self.mode = Mode::Trust;
+        self.held_bytes = 0;
         for held in self.held_pictures.drain(..) {
             releases.push(Release {
                 packet_id: held.id,
@@ -192,11 +201,16 @@ impl Reorder {
             return;
         }
 
-        let is_picture = matches!(input, InputPacket::Picture { .. });
+        let (is_picture, bytes) = match &input {
+            InputPacket::Picture { bytes, .. } => (true, *bytes),
+            InputPacket::NonPicture { bytes } => (false, *bytes),
+        };
+        self.held_bytes += bytes;
         self.held_pictures.push_back(ReorderHeldPic {
             id: packet_id,
             is_picture,
             display_index: None,
+            bytes,
         });
 
         match input {
@@ -206,6 +220,7 @@ impl Reorder {
                 reorder_n,
                 container_stamp,
                 duration,
+                ..
             } => {
                 // Step 4: Decision while Undecided.
                 // Only compare against prior pictures in the same POC period.
@@ -239,6 +254,7 @@ impl Reorder {
                         }
                     }
                 }
+
                 if is_new_poc_period {
                     self.max_poc_in_period = Some((poc, container_stamp));
                 } else {
@@ -295,11 +311,11 @@ impl Reorder {
                     self.last_packet_duration = Some(dur);
                 }
             }
-            InputPacket::NonPicture => {}
+            InputPacket::NonPicture { .. } => {}
         }
 
-        // Rule 6: cap at 64 held packets per stream
-        if self.held_pictures.len() > 64 {
+        // Rule 6: cap at 64 held packets or VIDEO_MAX_BYTES per stream
+        if self.held_pictures.len() > 64 || self.held_bytes > super::VIDEO_MAX_BYTES {
             self.become_trust(releases);
             return;
         }
@@ -319,6 +335,7 @@ impl Reorder {
         while let Some(front) = self.held_pictures.front() {
             if !front.is_picture {
                 let held = self.held_pictures.pop_front().unwrap();
+                self.held_bytes = self.held_bytes.saturating_sub(held.bytes);
                 releases.push(Release {
                     packet_id: held.id,
                     repaired_pts: None,
@@ -335,6 +352,7 @@ impl Reorder {
                 }
                 let slot_val = self.slots[target_slot - self.slots_base];
                 let held = self.held_pictures.pop_front().unwrap();
+                self.held_bytes = self.held_bytes.saturating_sub(held.bytes);
                 let repaired = if self.mode == Mode::Repair {
                     Some(slot_val)
                 } else {
@@ -399,6 +417,7 @@ impl Reorder {
         }
 
         while let Some(held) = self.held_pictures.pop_front() {
+            self.held_bytes = self.held_bytes.saturating_sub(held.bytes);
             let repaired = if held.is_picture && self.mode == Mode::Repair {
                 if let Some(k) = held.display_index {
                     let target_slot = k + self.shift_d;
@@ -496,6 +515,7 @@ impl StreamState {
             }
         };
 
+        let charge = super::packet_charge(&packet, &metadata);
         let input = match slice_info {
             Some(info) => {
                 let container_stamp = match packet.pts.or(packet.dts) {
@@ -514,9 +534,10 @@ impl StreamState {
                     reorder_n: info.reorder_n,
                     container_stamp,
                     duration: packet.duration,
+                    bytes: charge,
                 }
             }
-            None => InputPacket::NonPicture,
+            None => InputPacket::NonPicture { bytes: charge },
         };
 
         self.held_packets.push_back((packet_id, packet, metadata));
@@ -1036,6 +1057,11 @@ mod tests {
     //   failure to fall back to Trust when a stream flipped to Repair by a corrupt stamp
     //   subsequently contradicts decode order (a smaller POC picture carrying a smaller
     //   container stamp within the same POC period).
+    //
+    // - `held_bytes_budget_exceeded_flips_to_trust_and_flushes_all`: Catches failure
+    //   to enforce VIDEO_MAX_BYTES budget on held packets, allowing untrusted peers
+    //   to exhaust memory before the engine's lane byte gate.
+
     #[test]
     fn presentation_order_not_switched_on_idr_without_reordering() {
         let mut reorder = Reorder::new();
@@ -1051,6 +1077,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 0,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1063,6 +1090,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 10,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1075,6 +1103,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 20,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1090,6 +1119,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 30,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1103,6 +1133,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 50,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1116,6 +1147,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 40,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1148,6 +1180,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 0,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1160,6 +1193,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 10,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1173,6 +1207,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 20,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1185,6 +1220,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 30,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1197,6 +1233,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 40,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1237,6 +1274,7 @@ mod tests {
                     reorder_n: 2,
                     container_stamp: (i * 10) as i64,
                     duration: Some(10),
+                    bytes: 100,
                 },
                 &mut releases,
             );
@@ -1255,6 +1293,7 @@ mod tests {
                     reorder_n: 2,
                     container_stamp: (200 + (i - 4) * 10) as i64,
                     duration: Some(10),
+                    bytes: 100,
                 },
                 &mut releases,
             );
@@ -1285,6 +1324,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 0,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1296,6 +1336,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 40,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1308,6 +1349,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 50,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1321,6 +1363,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 60,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1333,6 +1376,7 @@ mod tests {
                 reorder_n: 2,
                 container_stamp: 45,
                 duration: Some(10),
+                bytes: 100,
             },
             &mut releases,
         );
@@ -1346,6 +1390,38 @@ mod tests {
                 "packet {} after contradiction fallback must not have repaired pts",
                 rel.packet_id
             );
+        }
+    }
+
+    #[test]
+    fn held_bytes_budget_exceeded_flips_to_trust_and_flushes_all() {
+        let mut reorder = Reorder::new();
+        let mut releases = Vec::new();
+
+        // 4 pictures with N = 4 (none released by bumping), each charging 10 MiB.
+        // Sum = 40 MiB > 32 MiB VIDEO_MAX_BYTES.
+        let large_bytes = 10 * 1024 * 1024;
+        for i in 0..4 {
+            reorder.push(
+                i,
+                InputPacket::Picture {
+                    poc: (i * 2) as i32,
+                    is_new_poc_period: i == 0,
+                    reorder_n: 4,
+                    container_stamp: (i * 10) as i64,
+                    duration: Some(10),
+                    bytes: large_bytes,
+                },
+                &mut releases,
+            );
+        }
+
+        assert_eq!(reorder.mode, Mode::Trust, "exceeding held byte budget must switch mode to Trust");
+        assert_eq!(reorder.held_pictures.len(), 0, "nothing must remain held after budget breach");
+        assert_eq!(releases.len(), 4, "all held pictures must be released");
+        for (i, rel) in releases.iter().enumerate() {
+            assert_eq!(rel.packet_id, i, "releases must be in decode order");
+            assert_eq!(rel.repaired_pts, None, "releases after Trust must have no repaired pts");
         }
     }
 }

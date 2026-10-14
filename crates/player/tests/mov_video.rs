@@ -237,4 +237,11 @@ fn hevc_mp4_stamped_in_decode_order_seeks_like_its_twin() {
 
     assert!(!shown_a.is_empty(), "A's shown list after seek is non-empty");
     assert_eq!(shown_b, shown_a, "B's list == A's list");
+
+    let target_950 = Duration::from_millis(950);
+    let shown_a_950 = shown_after_seek(&path_a, target_950);
+    let shown_b_950 = shown_after_seek(&path_b, target_950);
+
+    assert!(!shown_a_950.is_empty(), "A's shown list after 950 ms seek is non-empty");
+    assert_eq!(shown_b_950, shown_a_950, "B's list == A's list after 950 ms seek");
 }

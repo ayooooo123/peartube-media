@@ -120,7 +120,7 @@ pub enum TrackKind {
 /// Queue bounds: duration paces normal playback; bytes also bound priming,
 /// when nonvideo must wait for a reordered picture without blocking input.
 const QUEUE_MAX_SECS: f64 = 2.0;
-const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
 
@@ -213,11 +213,7 @@ impl Lane {
                 first.get_or_insert(secs);
                 last = Some(secs);
             }
-            let side_bytes = p.metadata.webvtt.as_ref().map_or(0, |m| {
-                std::mem::size_of_val(m.as_ref())
-                    + m.identifier.capacity() + m.settings.capacity()
-            });
-            bytes += std::mem::size_of::<QueuedPacket>() + p.packet.data.capacity() + side_bytes;
+            bytes += packet_charge(&p.packet, &p.metadata);
         }
         let span = match (first, last) {
             (Some(a), Some(b)) => (b - a).max(0.0),
@@ -225,6 +221,7 @@ impl Lane {
         };
         (span, bytes)
     }
+
 
     /// The next packet or the end marker for seek generation `seen_seek`,
     /// waiting while there is none: packets queued before the demuxer
@@ -277,6 +274,14 @@ impl Lane {
         demux_cv.notify_one();
         popped
     }
+}
+
+/// Bytes charged for one packet in a queue or held buffer.
+pub(super) fn packet_charge(packet: &Packet, metadata: &PacketMetadata) -> usize {
+    let side_bytes = metadata.webvtt.as_ref().map_or(0, |m| {
+        std::mem::size_of_val(m.as_ref()) + m.identifier.capacity() + m.settings.capacity()
+    });
+    std::mem::size_of::<QueuedPacket>() + packet.data.capacity() + side_bytes
 }
 
 /// Marks a lane as drained by one pipeline thread, from spawn until that
@@ -1300,7 +1305,7 @@ fn run_demux_loop(run: &mut Run<'_>) {
         if let Some(stream) = streams.iter().find(|s| Some(s.index) == run.current_video) {
             if entry::checked(&stream.params)
                 && matches!(read_to_random_access(run, stream.index, &stream.params),
-                    Some((_, entry::Entry::Recovery { .. })))
+                    Some((_, _, entry::Entry::Recovery { .. })))
             {
                 if let Some(pts) = read_to_recovery(run, stream.index, &stream.params) {
                     *shared.active_seek.lock() = Some(Seek {
@@ -1547,9 +1552,12 @@ fn enter_video(run: &mut Run<'_>, video: u32, target: f64, ticks: i64) -> Option
     let mut first: Option<Option<i64>> = None;
     let mut previous: Option<i64> = None;
     loop {
-        let (pts, kind) = read_to_random_access(run, video, params)?;
+        let (key, pts, kind) = read_to_random_access(run, video, params)?;
+        let key = key?;
         let pts = pts?;
         let recovers = match kind {
+            // A Refresh landing shown after the target (decode-order files indexed by dts) must walk back like a Dependent landing.
+            entry::Entry::Refresh if pts > ticks => None,
             entry::Entry::Refresh => return None,
             entry::Entry::Recovery { .. } => match read_to_recovery(run, video, params) {
                 Some(recovered) if recovered <= ticks => return None,
@@ -1558,24 +1566,24 @@ fn enter_video(run: &mut Run<'_>, video: u32, target: f64, ticks: i64) -> Option
             entry::Entry::Dependent => None,
         };
         let first_recovers = *first.get_or_insert(recovers);
-        if tb.seconds_of(pts) <= target - entry::LOOKBACK_SECS {
+        if tb.seconds_of(key) <= target - entry::LOOKBACK_SECS {
             return late(recovers);
         }
         match previous {
             // As far back as the demuxer goes.
-            Some(e) if pts == e => return late(recovers),
+            Some(e) if key == e => return late(recovers),
             // The demuxer went forward instead: back where the seek landed
             // first.
-            Some(e) if pts > e => {
+            Some(e) if key > e => {
                 run.replay.clear();
                 seek(run, video, ticks);
                 return late(first_recovers);
             }
             _ => {}
         }
-        previous = Some(pts);
+        previous = Some(key);
         run.replay.clear();
-        if !seek(run, video, pts - 1) {
+        if !seek(run, video, key - 1) {
             run.replay.clear();
             seek(run, video, ticks);
             return late(first_recovers);
@@ -1589,18 +1597,18 @@ fn enter_video(run: &mut Run<'_>, video: u32, target: f64, ticks: i64) -> Option
 const ENTRY_READ_LIMIT: usize = 4096;
 
 /// Reads on, into `Run::replay`, to the first random-access packet of
-/// stream `video`: its container decode stamp (dts, else pts) used as the
-/// walk-back seek key and what decoding from it gives. `None` when the
-/// reads ended or reached `ENTRY_READ_LIMIT` packets or `VIDEO_MAX_BYTES`
-/// first.
-fn read_to_random_access(run: &mut Run<'_>, video: u32, params: &CodecParameters) -> Option<(Option<i64>, entry::Entry)> {
+/// stream `video`: its container decode stamp (dts, else pts), used as the
+/// walk-back seek key; its pts, the presentation time it is shown at; and
+/// what decoding from it gives. `None` when the reads ended or reached
+/// `ENTRY_READ_LIMIT` packets or `VIDEO_MAX_BYTES` first.
+fn read_to_random_access(run: &mut Run<'_>, video: u32, params: &CodecParameters) -> Option<(Option<i64>, Option<i64>, entry::Entry)> {
     let mut bytes = 0usize;
     for _ in 0..ENTRY_READ_LIMIT {
         let read = read_packet(run.demuxer);
         let found = match &read {
             Ok(Ok(q)) if q.packet.stream_index == video && (q.packet.flags.keyframe || q.metadata.container_keyframe) => {
                 // Use the container's decode stamp for walk-back seeking so repaired pts does not stall on the same keyframe.
-                Some((q.packet.dts.or(q.packet.pts), entry::entry(params, &q.packet.data)))
+                Some((q.packet.dts.or(q.packet.pts), q.packet.pts, entry::entry(params, &q.packet.data)))
             }
             Ok(Ok(q)) => {
                 bytes += q.packet.data.len();
@@ -1618,6 +1626,7 @@ fn read_to_random_access(run: &mut Run<'_>, video: u32, params: &CodecParameters
     }
     None
 }
+
 
 /// Inspect the first random-access video packet already held in `replay`
 /// without reading further from the demuxer.
