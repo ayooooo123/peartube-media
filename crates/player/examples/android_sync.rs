@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::time::{Duration, Instant};
 use player::backend::{
-    AudioSink, Backend, Clock, ProducerId, SubtitleSink, VideoError, VideoMode, VideoOutput,
-    VideoRequest, VideoSink, VideoTarget,
+    AudioSink, Backend, Clock, FrameDecision, PreparedFrameId, ProducerId, SubtitleSink,
+    VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink, VideoTarget,
 };
 use player::{AndroidBackend, Player, PlayerOptions};
 use oxideav_core::{Packet, VideoFrame};
@@ -69,6 +69,12 @@ impl VideoSink for ProbeVideo {
     }
     fn push_frame(&mut self, producer: ProducerId, frame: &mut Option<VideoFrame>, pts: Duration) -> Result<(), VideoError> {
         self.inner.push_frame(producer, frame, pts)
+    }
+    fn prepare_frame(&mut self, producer: ProducerId, frame: &mut Option<VideoFrame>, pts: Duration) -> Result<PreparedFrameId, VideoError> {
+        self.inner.prepare_frame(producer, frame, pts)
+    }
+    fn decide_frame(&mut self, producer: ProducerId, frame: PreparedFrameId, decision: FrameDecision) -> Result<(), VideoError> {
+        self.inner.decide_frame(producer, frame, decision)
     }
     fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {
         self.inner.present_from(producer, start)

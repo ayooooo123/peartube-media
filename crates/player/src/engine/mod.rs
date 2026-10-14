@@ -21,8 +21,8 @@ pub use captions::{CAPTIONS_608, CAPTIONS_708};
 
 use std::task::Poll;
 use crate::backend::{
-    AudioSink, Backend, Clock, PictureReady, ProducerId, SinkError, VideoControl,
-    VideoError, VideoMode, VideoRequest, VideoSink, VideoTarget,
+    AudioSink, Backend, Clock, FrameDecision, PictureReady, PreparedFrameId, ProducerId,
+    SinkError, VideoControl, VideoError, VideoMode, VideoRequest, VideoSink, VideoTarget,
 };
 use crate::clock::MasterClock;
 use crate::headless::find_headless;
@@ -2399,8 +2399,16 @@ fn next_producer_id() -> ProducerId {
     ProducerId(NEXT_PRODUCER_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+enum RetainedFramePayload {
+    Frame(VideoFrame),
+    Prepared {
+        token: PreparedFrameId,
+        latched_discard: bool,
+    },
+}
+
 struct RetainedFrame {
-    frame: VideoFrame,
+    payload: RetainedFramePayload,
     pts: Duration,
     seen_seek: u64,
 }
@@ -2780,18 +2788,62 @@ impl VideoSession {
             return PresentOutcome::Admitted;
         };
         let pts = retained.pts;
-        // Keep the paced wait and sink admission in one scheduling region.
-        // Restoring ordinary scheduling between them can delay a due picture.
-        // Decoder work remains outside this bounded handoff.
+
+        if matches!(retained.payload, RetainedFramePayload::Frame(_)) {
+            let mut retained_val = self.retained_frame.take().unwrap();
+            let RetainedFramePayload::Frame(frame) = retained_val.payload else { unreachable!() };
+            let mut frame_opt = Some(frame);
+            match sink.prepare_frame(self.producer, &mut frame_opt, pts) {
+                Ok(token) => {
+                    retained_val.payload = RetainedFramePayload::Prepared {
+                        token,
+                        latched_discard: false,
+                    };
+                    self.retained_frame = Some(retained_val);
+                }
+                Err(VideoError::Unsupported) => {
+                    retained_val.payload = RetainedFramePayload::Frame(frame_opt.unwrap());
+                    self.retained_frame = Some(retained_val);
+                }
+                Err(VideoError::Sink(SinkError::WouldBlock))
+                | Err(VideoError::Superseded)
+                | Err(VideoError::Sink(SinkError::Unavailable)) => {
+                    retained_val.payload = RetainedFramePayload::Frame(frame_opt.unwrap());
+                    self.retained_frame = Some(retained_val);
+                    shared.video_wait_retry();
+                    return PresentOutcome::NeedsPump;
+                }
+                Err(e) => {
+                    set_error(shared, format!("prepare_frame error: {e}"));
+                    return PresentOutcome::Aborted;
+                }
+            }
+        }
+
+        let is_prepared = matches!(
+            self.retained_frame.as_ref().unwrap().payload,
+            RetainedFramePayload::Prepared { .. }
+        );
+        let already_discarding = match &self.retained_frame.as_ref().unwrap().payload {
+            RetainedFramePayload::Prepared { latched_discard, .. } => *latched_discard,
+            _ => false,
+        };
+
         #[cfg(target_os = "macos")]
         let timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
-        // First presentable picture skips ordinary running-clock pacing; the
-        // sink callback still gates priming. Later pictures wait on the clock.
-        if realtime && self.first_picture_reported {
+
+        let mut due_late = already_discarding;
+
+        if !due_late && realtime && self.first_picture_reported {
+            let lead = if is_prepared { Duration::ZERO } else { sink.frame_lead() };
             let running = self.sink_running;
-            match shared.wait_due(pts, sink.frame_lead(), running, self.seek_generation, retired) {
+            match shared.wait_due(pts, lead, running, self.seek_generation, retired) {
                 Due::Now => {}
-                Due::Resync => return PresentOutcome::NeedsPump,
+                Due::Resync => {
+                    #[cfg(target_os = "macos")]
+                    drop(timing);
+                    return PresentOutcome::NeedsPump;
+                }
                 Due::CaughtUp => {
                     #[cfg(target_os = "macos")]
                     drop(timing);
@@ -2799,44 +2851,121 @@ impl VideoSession {
                     return PresentOutcome::NeedsPump;
                 }
                 Due::Late => {
+                    due_late = true;
+                }
+                Due::Abort => {
                     #[cfg(target_os = "macos")]
                     drop(timing);
+                    return PresentOutcome::Aborted;
+                }
+            }
+        }
+
+        if due_late {
+            #[cfg(target_os = "macos")]
+            drop(timing);
+            let mut retained_val = self.retained_frame.take().unwrap();
+            return match retained_val.payload {
+                RetainedFramePayload::Prepared { token, latched_discard } => {
+                    if !latched_discard {
+                        shared.state.lock().dropped_frames += 1;
+                        shared.video_late(pts, self.seek_generation);
+                    }
+                    match sink.decide_frame(self.producer, token, FrameDecision::Discard) {
+                        Ok(()) => {
+                            self.retained_frame = None;
+                            PresentOutcome::Admitted
+                        }
+                        Err(VideoError::Sink(SinkError::WouldBlock))
+                        | Err(VideoError::Sink(SinkError::Unavailable)) => {
+                            retained_val.payload = RetainedFramePayload::Prepared {
+                                token,
+                                latched_discard: true,
+                            };
+                            self.retained_frame = Some(retained_val);
+                            shared.video_wait_retry();
+                            PresentOutcome::NeedsPump
+                        }
+                        Err(VideoError::Superseded) => {
+                            self.retained_frame = None;
+                            shared.video_wait_retry();
+                            PresentOutcome::NeedsPump
+                        }
+                        Err(e) => {
+                            set_error(shared, format!("decide_frame discard error: {e}"));
+                            PresentOutcome::Aborted
+                        }
+                    }
+                }
+                RetainedFramePayload::Frame(_) => {
                     shared.state.lock().dropped_frames += 1;
                     shared.video_late(pts, self.seek_generation);
                     self.retained_frame = None;
-                    return PresentOutcome::Admitted;
+                    PresentOutcome::Admitted
                 }
-                Due::Abort => return PresentOutcome::Aborted,
-            }
+            };
         }
+
         if let Err(e) = self.sync_playing(sink, shared) {
             #[cfg(target_os = "macos")]
             drop(timing);
             return Self::map_control_error(shared, "set_playing failed", e);
         }
+
         let mut retained_val = self.retained_frame.take().unwrap();
-        let mut frame_opt = Some(retained_val.frame);
-        let result = sink.push_frame(self.producer, &mut frame_opt, pts);
-        #[cfg(target_os = "macos")]
-        drop(timing);
-        match result {
-            Ok(()) => {
-                self.retained_frame = None;
-                PresentOutcome::Admitted
-            }
-            Err(VideoError::Sink(SinkError::WouldBlock))
-            | Err(VideoError::Superseded)
-            | Err(VideoError::Sink(SinkError::Unavailable)) => {
-                if let Some(frame) = frame_opt {
-                    retained_val.frame = frame;
-                    self.retained_frame = Some(retained_val);
+        match retained_val.payload {
+            RetainedFramePayload::Prepared { token, latched_discard } => {
+                let result = sink.decide_frame(self.producer, token, FrameDecision::Present);
+                #[cfg(target_os = "macos")]
+                drop(timing);
+                match result {
+                    Ok(()) => {
+                        self.retained_frame = None;
+                        PresentOutcome::Admitted
+                    }
+                    Err(VideoError::Sink(SinkError::WouldBlock))
+                    | Err(VideoError::Sink(SinkError::Unavailable)) => {
+                        retained_val.payload = RetainedFramePayload::Prepared { token, latched_discard };
+                        self.retained_frame = Some(retained_val);
+                        shared.video_wait_retry();
+                        PresentOutcome::NeedsPump
+                    }
+                    Err(VideoError::Superseded) => {
+                        self.retained_frame = None;
+                        shared.video_wait_retry();
+                        PresentOutcome::NeedsPump
+                    }
+                    Err(e) => {
+                        set_error(shared, format!("decide_frame present error: {e}"));
+                        PresentOutcome::Aborted
+                    }
                 }
-                shared.video_wait_retry();
-                PresentOutcome::NeedsPump
             }
-            Err(e) => {
-                set_error(shared, format!("push_frame error: {e}"));
-                PresentOutcome::Aborted
+            RetainedFramePayload::Frame(frame) => {
+                let mut frame_opt = Some(frame);
+                let result = sink.push_frame(self.producer, &mut frame_opt, pts);
+                #[cfg(target_os = "macos")]
+                drop(timing);
+                match result {
+                    Ok(()) => {
+                        self.retained_frame = None;
+                        PresentOutcome::Admitted
+                    }
+                    Err(VideoError::Sink(SinkError::WouldBlock))
+                    | Err(VideoError::Superseded)
+                    | Err(VideoError::Sink(SinkError::Unavailable)) => {
+                        if let Some(frame) = frame_opt {
+                            retained_val.payload = RetainedFramePayload::Frame(frame);
+                            self.retained_frame = Some(retained_val);
+                        }
+                        shared.video_wait_retry();
+                        PresentOutcome::NeedsPump
+                    }
+                    Err(e) => {
+                        set_error(shared, format!("push_frame error: {e}"));
+                        PresentOutcome::Aborted
+                    }
+                }
             }
         }
     }
@@ -2888,7 +3017,7 @@ impl VideoSession {
                 }
 
                 self.retained_frame = Some(RetainedFrame {
-                    frame: vf,
+                    payload: RetainedFramePayload::Frame(vf),
                     pts,
                     seen_seek: self.seek_generation,
                 });
@@ -3417,14 +3546,27 @@ fn run_video_thread(
                             return;
                         }
                     }
-                } else {
+                } else if session.retained_frame.is_none() {
                     shared.video_caught_up(session.seek_generation);
                     session.phase = VideoPhase::SinkFinish;
+                    continue;
+                } else {
                     continue;
                 }
             }
 
             VideoPhase::SinkFinish => {
+                if session.retained_frame.is_some() {
+                    match session.try_present_retained_frame(&mut *sink, &shared, realtime, &retired)
+                    {
+                        PresentOutcome::Admitted => {}
+                        PresentOutcome::NeedsPump => continue,
+                        PresentOutcome::Aborted => return,
+                    }
+                    if session.retained_frame.is_some() {
+                        continue;
+                    }
+                }
                 match sink.poll_transition(&session.request) {
                     Poll::Ready(Err(e)) => {
                         set_error(&shared, format!("video sink error during finish: {e}"));

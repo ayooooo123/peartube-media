@@ -553,34 +553,67 @@ pub fn chroma_mc(
     no_rnd: bool,
     avg: bool,
 ) {
+    if avg {
+        chroma_rows::<true>(dst, doff, dstride, src, w, h, x, y, no_rnd);
+    } else {
+        chroma_rows::<false>(dst, doff, dstride, src, w, h, x, y, no_rnd);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chroma_rows<const AVG: bool>(
+    dst: &mut [u8], doff: usize, dstride: usize, src: &Src,
+    w: usize, h: usize, x: i32, y: i32, no_rnd: bool,
+) {
     let a = (8 - x) * (8 - y);
     let b = x * (8 - y);
     let c = (8 - x) * y;
     let d = x * y;
-    let bias = if no_rnd { 32 - 4 } else { 32 };
-    // Taps right of / below the block are only read when they are weighted.
-    let wx = if x != 0 { w + 1 } else { w };
-    for j in 0..h {
-        let jy = j as isize;
-        let s = src.row(0, jy, wx);
-        let t = if y != 0 { src.row(0, jy + 1, wx) } else { &[][..] };
-        let drow = &mut dst[doff + j * dstride..doff + j * dstride + w];
-        for (i, p) in drow.iter_mut().enumerate() {
-            let mut sum = a * s[i] as i32;
-            if b != 0 {
-                sum += b * s[i + 1] as i32;
+    let bias = if no_rnd { 28 } else { 32 };
+    let put = |p: &mut u8, sum: i32| {
+        let v = (sum + bias) >> 6;
+        *p = if AVG { ((i32::from(*p) + v + 1) >> 1) as u8 } else { v as u8 };
+    };
+    // Select weighted taps once per block. Exact row slices let each inner
+    // loop vectorize without per-pixel phase branches or speculative reads.
+    match (x == 0, y == 0) {
+        (true, true) => {
+            for j in 0..h {
+                let s = src.row(0, j as isize, w);
+                let out = &mut dst[doff + j * dstride..doff + j * dstride + w];
+                for (p, &s) in out.iter_mut().zip(s) { put(p, a * i32::from(s)); }
             }
-            if c != 0 {
-                sum += c * t[i] as i32;
+        }
+        (false, true) => {
+            for j in 0..h {
+                let s = src.row(0, j as isize, w + 1);
+                let out = &mut dst[doff + j * dstride..doff + j * dstride + w];
+                for ((p, &s0), &s1) in out.iter_mut().zip(&s[..w]).zip(&s[1..]) {
+                    put(p, a * i32::from(s0) + b * i32::from(s1));
+                }
             }
-            if d != 0 {
-                sum += d * t[i + 1] as i32;
+        }
+        (true, false) => {
+            for j in 0..h {
+                let s = src.row(0, j as isize, w);
+                let t = src.row(0, j as isize + 1, w);
+                let out = &mut dst[doff + j * dstride..doff + j * dstride + w];
+                for ((p, &s), &t) in out.iter_mut().zip(s).zip(t) {
+                    put(p, a * i32::from(s) + c * i32::from(t));
+                }
             }
-            let v = (sum + bias) >> 6;
-            if avg {
-                *p = ((*p as i32 + v + 1) >> 1) as u8;
-            } else {
-                *p = v as u8;
+        }
+        (false, false) => {
+            for j in 0..h {
+                let s = src.row(0, j as isize, w + 1);
+                let t = src.row(0, j as isize + 1, w + 1);
+                let out = &mut dst[doff + j * dstride..doff + j * dstride + w];
+                for ((((p, &s0), &s1), &t0), &t1) in out.iter_mut()
+                    .zip(&s[..w]).zip(&s[1..]).zip(&t[..w]).zip(&t[1..])
+                {
+                    put(p, a * i32::from(s0) + b * i32::from(s1)
+                        + c * i32::from(t0) + d * i32::from(t1));
+                }
             }
         }
     }
@@ -622,4 +655,53 @@ pub fn find_next_marker(buf: &[u8], from: usize) -> usize {
         i += 1;
     }
     buf.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chroma_phases_preserve_rounding_and_unweighted_edges() {
+        for w in [1usize, 4, 8, 13] {
+            for h in [1usize, 4, 8] {
+                for x in 0..8 {
+                    for y in 0..8 {
+                        let sw = w + usize::from(x != 0);
+                        let sh = h + usize::from(y != 0);
+                        let stride = sw + 3;
+                        // The final row ends at its last weighted sample.
+                        let data: Vec<u8> = (0..5 + (sh - 1) * stride + sw)
+                            .map(|i| (i * 73 + i / 7 * 191) as u8).collect();
+                        let src = Src { data: &data, off: 5, stride: stride as isize };
+                        let ds = w + 5;
+                        for no_rnd in [false, true] {
+                            for avg in [false, true] {
+                                let mut actual: Vec<u8> = (0..7 + h * ds)
+                                    .map(|i| (i * 151 + 19) as u8).collect();
+                                let mut expected = actual.clone();
+                                for row in 0..h {
+                                    for col in 0..w {
+                                        let mut sum = 0;
+                                        for (dx, wx) in [(0, 8 - x), (1, x)] {
+                                            for (dy, wy) in [(0, 8 - y), (1, y)] {
+                                                if wx * wy != 0 {
+                                                    sum += wx * wy * i32::from(data[5 + (row + dy) * stride + col + dx]);
+                                                }
+                                            }
+                                        }
+                                        let v = (sum + if no_rnd { 28 } else { 32 }) >> 6;
+                                        let p = &mut expected[7 + row * ds + col];
+                                        *p = if avg { ((i32::from(*p) + v + 1) >> 1) as u8 } else { v as u8 };
+                                    }
+                                }
+                                chroma_mc(&mut actual, 7, ds, &src, w, h, x, y, no_rnd, avg);
+                                assert_eq!(actual, expected, "{w}x{h}, phase {x}/{y}, no_rnd={no_rnd}, avg={avg}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

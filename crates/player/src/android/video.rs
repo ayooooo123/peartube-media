@@ -7,8 +7,8 @@ use super::backend::BackendShared;
 use super::surface::{SurfaceBinding, SurfaceBindingLease, SurfaceId};
 use crate::annexb::convert_packet_to_annex_b;
 use crate::backend::{
-    Clock, PictureReady, ProducerId, SinkError, VideoControl, VideoError, VideoMode, VideoOutput,
-    VideoRequest, VideoSink, VideoTarget,
+    Clock, FrameDecision, PictureReady, PreparedFrameId, ProducerId, SinkError, VideoControl,
+    VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink, VideoTarget,
 };
 use crate::clock::current_monotonic_ns;
 use crate::video_owner::{try_spawn, OwnerError, OwnerTicket};
@@ -44,6 +44,7 @@ pub(crate) enum MailboxInput {
         frame_epoch: u64,
         frame: VideoFrame,
         pts: Duration,
+        prepared: Option<PreparedFrameId>,
     },
 }
 
@@ -60,11 +61,27 @@ pub(crate) struct OwnerHeldInput {
     pub input: MailboxInput,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparationSlot {
+    pub producer: ProducerId,
+    pub token: PreparedFrameId,
+    pub decision: Option<FrameDecision>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DecisionResult {
+    Present,
+    Discard,
+    Cancelled,
+}
+
 pub(crate) struct MailboxState {
     pub current_request: Option<VideoRequest>,
     pub input: Option<MailboxInput>,
     /// False while mailbox OR owner holds the single shared credit.
     pub input_credit_available: bool,
+    pub preparation: Option<PreparationSlot>,
+    pub next_prepared_id: u64,
     pub eos_requested: Option<ProducerId>,
     pub eos_confirmed: Option<ProducerId>,
     pub transition_result: Option<(ProducerId, Result<VideoMode, VideoError>)>,
@@ -77,6 +94,44 @@ pub(crate) struct MailboxState {
     pub frame_epoch: u64,
     pub retire_requested: bool,
     pub configured: bool,
+}
+
+impl MailboxState {
+    fn validate_frame_admission(
+        &self,
+        producer: ProducerId,
+    ) -> Result<(VideoRequest, u64), VideoError> {
+        match &self.current_request {
+            Some(req) if req.producer == producer => {
+                if req.control.cancelled(producer, req.seek_generation) {
+                    return Err(VideoError::Superseded);
+                }
+            }
+            Some(_) => return Err(VideoError::Superseded),
+            None => return Err(VideoError::Superseded),
+        }
+
+        if let Some((p, err)) = &self.async_error {
+            if *p == producer {
+                return Err(err.clone());
+            }
+        }
+
+        if self.eos_requested == Some(producer) {
+            return Err(VideoError::Sink(SinkError::WouldBlock));
+        }
+
+        if !self.input_credit_available || self.input.is_some() {
+            return Err(VideoError::Sink(SinkError::WouldBlock));
+        }
+
+        let request = self.current_request.as_ref().unwrap().clone();
+        if !matches!(request.target, VideoTarget::Frames { .. }) {
+            return Err(VideoError::Unsupported);
+        }
+
+        Ok((request, self.frame_epoch))
+    }
 }
 
 pub struct VideoMailbox {
@@ -93,6 +148,8 @@ impl VideoMailbox {
                 current_request: None,
                 input: None,
                 input_credit_available: true,
+                preparation: None,
+                next_prepared_id: 1,
                 eos_requested: None,
                 eos_confirmed: None,
                 transition_result: None,
@@ -136,6 +193,7 @@ impl VideoMailbox {
             });
             if !preserving {
                 state.frame_epoch = state.frame_epoch.checked_add(1).expect("frame epoch exhausted");
+                state.preparation = None;
             }
         }
         *self.wake_frontend.lock() = Some(request.control.clone());
@@ -228,15 +286,74 @@ impl VideoMailbox {
         pts: Duration,
     ) -> Result<(), VideoError> {
         let mut state = self.state.lock();
+        let (request, frame_epoch) = state.validate_frame_admission(producer)?;
+        let f = frame.take().expect("push_frame called with Some");
+        state.input = Some(MailboxInput::Frame {
+            producer,
+            request,
+            frame_epoch,
+            frame: f,
+            pts,
+            prepared: None,
+        });
+        state.input_credit_available = false;
+        state.preparation = None;
+        self.wake_owner.notify_all();
+        Ok(())
+    }
 
-        match &state.current_request {
-            Some(req) if req.producer == producer => {
-                if req.control.cancelled(producer, req.seek_generation) {
-                    return Err(VideoError::Superseded);
-                }
-            }
-            Some(_) => return Err(VideoError::Superseded),
-            None => return Err(VideoError::Superseded),
+    pub fn prepare_frame(
+        &self,
+        producer: ProducerId,
+        frame: &mut Option<VideoFrame>,
+        pts: Duration,
+    ) -> Result<PreparedFrameId, VideoError> {
+        let mut state = self.state.lock();
+        let (request, frame_epoch) = state.validate_frame_admission(producer)?;
+
+        let token_val = state.next_prepared_id;
+        let next_id = token_val.checked_add(1).ok_or_else(|| {
+            VideoError::Sink(SinkError::Fatal("prepared frame id overflow".into()))
+        })?;
+
+        let token = PreparedFrameId(token_val);
+        state.next_prepared_id = next_id;
+
+        let f = frame.take().expect("prepare_frame called with Some");
+        state.input = Some(MailboxInput::Frame {
+            producer,
+            request,
+            frame_epoch,
+            frame: f,
+            pts,
+            prepared: Some(token),
+        });
+        state.input_credit_available = false;
+        state.preparation = Some(PreparationSlot {
+            producer,
+            token,
+            decision: None,
+        });
+        self.wake_owner.notify_all();
+        Ok(token)
+    }
+
+    pub fn decide_frame(
+        &self,
+        producer: ProducerId,
+        token: PreparedFrameId,
+        decision: FrameDecision,
+    ) -> Result<(), VideoError> {
+        let request = self.state.lock().current_request.clone()
+            .ok_or(VideoError::Superseded)?;
+        if request.control.cancelled(request.producer, request.seek_generation) {
+            return Err(VideoError::Superseded);
+        }
+        let mut state = self.state.lock();
+        if state.retire_requested
+            || state.current_request.as_ref().map(|r| r.producer) != Some(request.producer)
+        {
+            return Err(VideoError::Superseded);
         }
 
         if let Some((p, err)) = &state.async_error {
@@ -245,30 +362,27 @@ impl VideoMailbox {
             }
         }
 
-        if state.eos_requested == Some(producer) {
-            return Err(VideoError::Sink(SinkError::WouldBlock));
+        match &mut state.preparation {
+            Some(slot) if slot.token == token && slot.producer == producer => {
+                match slot.decision {
+                    Some(existing) => {
+                        if existing == decision {
+                            Ok(())
+                        } else {
+                            Err(VideoError::Sink(SinkError::Fatal(
+                                "conflicting decision for prepared frame".into(),
+                            )))
+                        }
+                    }
+                    None => {
+                        slot.decision = Some(decision);
+                        self.wake_owner.notify_all();
+                        Ok(())
+                    }
+                }
+            }
+            _ => Err(VideoError::Superseded),
         }
-
-        if !state.input_credit_available || state.input.is_some() {
-            return Err(VideoError::Sink(SinkError::WouldBlock));
-        }
-
-        let request = state.current_request.as_ref().unwrap().clone();
-        if !matches!(request.target, VideoTarget::Frames { .. }) {
-            return Err(VideoError::Unsupported);
-        }
-        let frame_epoch = state.frame_epoch;
-        let f = frame.take().expect("push_frame called with Some");
-        state.input = Some(MailboxInput::Frame {
-            producer,
-            request,
-            frame_epoch,
-            frame: f,
-            pts,
-        });
-        state.input_credit_available = false;
-        self.wake_owner.notify_all();
-        Ok(())
     }
 
     pub fn present_from(&self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {
@@ -337,6 +451,7 @@ impl VideoMailbox {
     pub fn release_input_credit(&self) {
         let mut state = self.state.lock();
         state.input_credit_available = true;
+        state.preparation = None;
         drop(state);
         self.wake_frontend_outside();
         self.wake_owner.notify_all();
@@ -454,6 +569,94 @@ impl VideoMailbox {
             }
             self.wake_owner.wait_for(&mut state, Duration::from_millis(10));
         }
+    }
+
+    /// Wait for a decision on a prepared frame token before window lock/post.
+    ///
+    /// Rechecks retirement, epoch, output revision/suspension, and request
+    /// compatibility/cancellation on wakes. Control callbacks never run under locks.
+    pub(crate) fn await_frame_decision(
+        &self,
+        token: PreparedFrameId,
+        producer: ProducerId,
+        accepted: &VideoRequest,
+        epoch: u64,
+        backend: &BackendShared,
+    ) -> DecisionResult {
+        loop {
+            let desired = {
+                let state = self.state.lock();
+                if state.retire_requested || state.frame_epoch != epoch {
+                    return DecisionResult::Cancelled;
+                }
+                state.current_request.clone()
+            };
+            let output = backend.video_output();
+            if backend.is_suspended()
+                || !output.available
+                || output.revision != accepted.output_revision
+            {
+                return DecisionResult::Cancelled;
+            }
+            let Some(desired) = desired else {
+                return DecisionResult::Cancelled;
+            };
+            let compatible = desired.producer == accepted.producer
+                || (desired.seek_generation == accepted.seek_generation
+                    && desired.output_revision == accepted.output_revision
+                    && matches!(desired.target, VideoTarget::Frames { reset: false, .. }));
+            if !compatible {
+                return DecisionResult::Cancelled;
+            }
+
+            // User control code never runs under the mailbox lock.
+            let cancelled = desired.control.cancelled(desired.producer, desired.seek_generation);
+            let expired_successor = desired.producer != accepted.producer
+                && desired.control.active_now() > desired.deadline;
+
+            let mut state = self.state.lock();
+            if state.retire_requested || state.frame_epoch != epoch {
+                return DecisionResult::Cancelled;
+            }
+            if state.current_request.as_ref().map(|r| r.producer) != Some(desired.producer) {
+                continue;
+            }
+            if expired_successor {
+                return DecisionResult::Cancelled;
+            }
+
+            match &state.preparation {
+                Some(slot) if slot.token == token && slot.producer == producer => {
+                    match slot.decision {
+                        Some(FrameDecision::Discard) => {
+                            return DecisionResult::Discard;
+                        }
+                        Some(FrameDecision::Present) => {
+                            if !cancelled {
+                                return DecisionResult::Present;
+                            }
+                            self.wake_owner.wait_for(&mut state, Duration::from_millis(10));
+                        }
+                        None => {
+                            self.wake_owner.wait_for(&mut state, Duration::from_millis(10));
+                        }
+                    }
+                }
+                _ => {
+                    return DecisionResult::Cancelled;
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn frame_epoch(&self) -> u64 {
+        self.state.lock().frame_epoch
+    }
+
+    #[cfg(test)]
+    pub fn set_next_prepared_id_for_test(&self, id: u64) {
+        self.state.lock().next_prepared_id = id;
     }
 
     pub fn codec_epoch(&self) -> u64 {
@@ -667,6 +870,24 @@ impl VideoSink for AndroidVideoSink {
         pts: Duration,
     ) -> Result<(), VideoError> {
         self.mailbox.push_frame(producer, frame, pts)
+    }
+
+    fn prepare_frame(
+        &mut self,
+        producer: ProducerId,
+        frame: &mut Option<VideoFrame>,
+        pts: Duration,
+    ) -> Result<PreparedFrameId, VideoError> {
+        self.mailbox.prepare_frame(producer, frame, pts)
+    }
+
+    fn decide_frame(
+        &mut self,
+        producer: ProducerId,
+        frame: PreparedFrameId,
+        decision: FrameDecision,
+    ) -> Result<(), VideoError> {
+        self.mailbox.decide_frame(producer, frame, decision)
     }
 
     fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {
@@ -1951,14 +2172,15 @@ fn run_video_owner(
                     };
                     if has_frame {
                         if let Some(held) = mailbox.take_input_for_owner() {
-                            let (frame, pts, producer, accepted, frame_epoch) = match held.input {
+                            let (frame, pts, producer, accepted, frame_epoch, prepared) = match held.input {
                                 MailboxInput::Frame {
                                     frame,
                                     pts,
                                     producer,
                                     request,
                                     frame_epoch,
-                                } => (frame, pts, producer, request, frame_epoch),
+                                    prepared,
+                                } => (frame, pts, producer, request, frame_epoch, prepared),
                                 other => {
                                     mailbox.discard_owner_input(OwnerHeldInput { input: other });
                                     continue;
@@ -1977,6 +2199,20 @@ fn run_video_owner(
                             if !req_ok || w == 0 || h == 0 {
                                 mailbox.release_input_credit();
                             } else {
+                                // A late frame may already have been rejected while it was queued.
+                                // Do not spend conversion time delaying the next useful picture.
+                                let discarded = prepared.is_some_and(|token| {
+                                    let state = mailbox.state.lock();
+                                    state.preparation.as_ref().is_some_and(|slot| {
+                                        slot.producer == producer
+                                            && slot.token == token
+                                            && slot.decision == Some(FrameDecision::Discard)
+                                    })
+                                });
+                                if discarded {
+                                    mailbox.release_input_credit();
+                                    continue;
+                                }
                                 let frame_info = FrameInfo::new(src_fmt, w, h);
                                 match oxideav_pixfmt::convert(
                                     &frame,
@@ -1985,8 +2221,33 @@ fn run_video_owner(
                                     &oxideav_pixfmt::ConvertOptions::default(),
                                 ) {
                                     Ok(rgba_frame) => {
-                                        if !mailbox.await_frame_policy(&accepted, frame_epoch, &backend) {
-                                            mailbox.release_input_credit();
+                                        let should_present = match prepared {
+                                            Some(token) => {
+                                                match mailbox.await_frame_decision(
+                                                    token,
+                                                    producer,
+                                                    &accepted,
+                                                    frame_epoch,
+                                                    &backend,
+                                                ) {
+                                                    DecisionResult::Present => true,
+                                                    DecisionResult::Discard
+                                                    | DecisionResult::Cancelled => {
+                                                        mailbox.release_input_credit();
+                                                        false
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                if !mailbox.await_frame_policy(&accepted, frame_epoch, &backend) {
+                                                    mailbox.release_input_credit();
+                                                    false
+                                                } else {
+                                                    true
+                                                }
+                                            }
+                                        };
+                                        if !should_present {
                                             continue;
                                         }
                                         if let Err(e) = window.set_buffers_geometry(

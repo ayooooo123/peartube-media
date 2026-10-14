@@ -6,8 +6,8 @@ use super::surface::{
 };
 use super::video::AndroidVideoSink;
 use crate::backend::{
-    AudioSink, Backend, Clock, ProducerId, SubtitleImage, SubtitleSink, VideoError, VideoMode,
-    VideoOutput, VideoRequest, VideoSink,
+    AudioSink, Backend, Clock, FrameDecision, PreparedFrameId, ProducerId, SubtitleImage,
+    SubtitleSink, VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink,
 };
 #[cfg(target_os = "android")]
 use ndk::native_window::NativeWindow;
@@ -273,6 +273,24 @@ impl VideoSink for VideoSinkWrapper {
         pts: Duration,
     ) -> Result<(), VideoError> {
         self.inner.lock().push_frame(producer, frame, pts)
+    }
+
+    fn prepare_frame(
+        &mut self,
+        producer: ProducerId,
+        frame: &mut Option<VideoFrame>,
+        pts: Duration,
+    ) -> Result<PreparedFrameId, VideoError> {
+        self.inner.lock().prepare_frame(producer, frame, pts)
+    }
+
+    fn decide_frame(
+        &mut self,
+        producer: ProducerId,
+        frame: PreparedFrameId,
+        decision: FrameDecision,
+    ) -> Result<(), VideoError> {
+        self.inner.lock().decide_frame(producer, frame, decision)
     }
 
     fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {

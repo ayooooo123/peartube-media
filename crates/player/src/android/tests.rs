@@ -10,12 +10,12 @@ use super::surface::{
     SurfaceId, SurfaceRegistry, SurfaceRetirementError, SurfaceRetirementStatus,
     TOTAL_SURFACE_CREDITS,
 };
-use super::video::VideoMailbox;
+use super::video::{DecisionResult, VideoMailbox};
 use crate::backend::{
-    Backend, PictureReady, ProducerId, SinkError, SubtitleImage, SubtitleSink, VideoControl,
-    VideoError, VideoMode, VideoRequest, VideoTarget,
+    Backend, FrameDecision, PictureReady, ProducerId, SinkError, SubtitleImage,
+    SubtitleSink, VideoControl, VideoError, VideoMode, VideoRequest, VideoTarget,
 };
-use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase};
+use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase, VideoFrame};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -57,6 +57,34 @@ fn test_params() -> Arc<CodecParameters> {
     p.width = Some(16);
     p.height = Some(16);
     Arc::new(p)
+}
+
+fn test_frame() -> VideoFrame {
+    VideoFrame {
+        pts: None,
+        planes: vec![],
+    }
+}
+
+fn test_frames_request(
+    producer: ProducerId,
+    seek_generation: u64,
+    output_revision: u64,
+    reset: bool,
+    control: Arc<dyn VideoControl>,
+) -> VideoRequest {
+    VideoRequest {
+        producer,
+        seek_generation,
+        output_revision,
+        target: VideoTarget::Frames {
+            params: test_params(),
+            ready: PictureReady::new(|_| {}),
+            reset,
+        },
+        deadline: Instant::now() + Duration::from_secs(5),
+        control,
+    }
 }
 
 #[test]
@@ -421,3 +449,292 @@ fn global_registry_exposes_fixed_credit_ceiling() {
     assert_eq!(TOTAL_SURFACE_CREDITS, 16);
     let _ = SurfaceRegistry::global();
 }
+
+#[test]
+fn prepare_frame_takes_ownership_and_charges_shared_credit() {
+    let mailbox = Arc::new(VideoMailbox::new());
+    let control = TestControl::new();
+    let producer = ProducerId(10);
+    mailbox.set_request(test_frames_request(producer, 1, 1, false, control.clone()));
+
+    let mut frame1 = Some(test_frame());
+    let token1 = mailbox
+        .prepare_frame(producer, &mut frame1, Duration::from_millis(100))
+        .expect("first prepare succeeds");
+    assert!(frame1.is_none(), "successful prepare takes frame ownership");
+
+    // Second prepare before decision/release must fail with WouldBlock without taking input
+    let mut frame2 = Some(test_frame());
+    let err = mailbox
+        .prepare_frame(producer, &mut frame2, Duration::from_millis(120))
+        .unwrap_err();
+    assert!(matches!(err, VideoError::Sink(SinkError::WouldBlock)));
+    assert!(frame2.is_some(), "unadmitted frame remains untouched with caller");
+
+    // push_frame also blocked by shared single credit
+    let mut frame3 = Some(test_frame());
+    let err_push = mailbox
+        .push_frame(producer, &mut frame3, Duration::from_millis(130))
+        .unwrap_err();
+    assert!(matches!(err_push, VideoError::Sink(SinkError::WouldBlock)));
+    assert!(frame3.is_some(), "push_frame leaves frame untouched when blocked");
+
+    // Owner takes input; credit remains charged
+    let held = mailbox.take_input_for_owner().expect("owner takes input");
+    assert!(!mailbox.is_credit_free_and_empty());
+
+    // Discard releases credit
+    mailbox
+        .decide_frame(producer, token1, FrameDecision::Discard)
+        .expect("discard decision succeeds");
+    mailbox.discard_owner_input(held);
+    assert!(mailbox.is_credit_free_and_empty());
+
+    // Next prepare succeeds with monotonic next token
+    let mut frame4 = Some(test_frame());
+    let token2 = mailbox
+        .prepare_frame(producer, &mut frame4, Duration::from_millis(140))
+        .expect("second prepare succeeds");
+    assert!(token2.0 > token1.0, "token must advance monotonically");
+    assert!(frame4.is_none());
+}
+
+#[test]
+fn prepare_frame_unsupported_on_non_frames_target_leaves_frame_untouched() {
+    let mailbox = Arc::new(VideoMailbox::new());
+    let control = TestControl::new();
+    let producer = ProducerId(20);
+    mailbox.set_request(VideoRequest {
+        producer,
+        seek_generation: 1,
+        output_revision: 1,
+        target: VideoTarget::Compressed {
+            params: test_params(),
+            ready: PictureReady::new(|_| {}),
+            present_from: Duration::ZERO,
+        },
+        deadline: Instant::now() + Duration::from_secs(5),
+        control: control.clone(),
+    });
+
+    let mut frame = Some(test_frame());
+    let err = mailbox
+        .prepare_frame(producer, &mut frame, Duration::from_millis(100))
+        .unwrap_err();
+    assert!(matches!(err, VideoError::Unsupported));
+    assert!(frame.is_some(), "frame must remain untouched on Unsupported");
+    assert!(mailbox.is_credit_free_and_empty(), "credit was not charged");
+}
+
+#[test]
+fn decide_frame_idempotence_and_conflict_rejection() {
+    let mailbox = Arc::new(VideoMailbox::new());
+    let control = TestControl::new();
+    let producer = ProducerId(30);
+    mailbox.set_request(test_frames_request(producer, 1, 1, false, control.clone()));
+
+    let mut frame = Some(test_frame());
+    let token = mailbox
+        .prepare_frame(producer, &mut frame, Duration::from_millis(100))
+        .expect("prepare frame");
+
+    // First decision
+    mailbox
+        .decide_frame(producer, token, FrameDecision::Present)
+        .expect("present decision");
+
+    // Repeating exact same decision is idempotent
+    mailbox
+        .decide_frame(producer, token, FrameDecision::Present)
+        .expect("repeat present decision is idempotent");
+
+    // Conflicting decision is rejected
+    let conflict = mailbox
+        .decide_frame(producer, token, FrameDecision::Discard)
+        .unwrap_err();
+    assert!(matches!(conflict, VideoError::Sink(SinkError::Fatal(_))));
+}
+
+#[test]
+fn stale_and_duplicate_pts_tokens_distinguished() {
+    let mailbox = Arc::new(VideoMailbox::new());
+    let control = TestControl::new();
+    let producer = ProducerId(40);
+    mailbox.set_request(test_frames_request(producer, 1, 1, false, control.clone()));
+
+    let mut frame1 = Some(test_frame());
+    let token1 = mailbox
+        .prepare_frame(producer, &mut frame1, Duration::from_millis(50))
+        .expect("frame 1 prepare");
+
+    mailbox
+        .decide_frame(producer, token1, FrameDecision::Present)
+        .expect("decide frame 1");
+    let held1 = mailbox.take_input_for_owner().expect("held 1");
+    mailbox.accept_owner_input(held1);
+
+    // Frame 2 has IDENTICAL PTS as frame 1
+    let mut frame2 = Some(test_frame());
+    let token2 = mailbox
+        .prepare_frame(producer, &mut frame2, Duration::from_millis(50))
+        .expect("frame 2 prepare");
+    assert_ne!(token1, token2, "tokens must differ even with identical PTS");
+
+    // Calling decide with stale token 1 must be rejected
+    let stale_err = mailbox
+        .decide_frame(producer, token1, FrameDecision::Present)
+        .unwrap_err();
+    assert!(matches!(stale_err, VideoError::Superseded));
+
+    // Calling decide with wrong producer must be rejected
+    let wrong_prod_err = mailbox
+        .decide_frame(ProducerId(999), token2, FrameDecision::Present)
+        .unwrap_err();
+    assert!(matches!(wrong_prod_err, VideoError::Superseded));
+
+    // Valid token 2 succeeds
+    mailbox
+        .decide_frame(producer, token2, FrameDecision::Present)
+        .expect("valid token 2 decide");
+}
+
+#[test]
+fn granted_decision_survives_compatible_preserving_format_replacement() {
+    let backend = AndroidBackend::new();
+    let (_registry, live, _slot) = install_live_binding(SurfaceId(10_090));
+    let out = backend.set_video_surface(live.clone()).expect("active surface");
+    assert!(out.available);
+
+    let mailbox = Arc::new(VideoMailbox::new());
+    let control1 = TestControl::new();
+    let producer1 = ProducerId(50);
+    let req1 = test_frames_request(producer1, 1, out.revision, false, control1.clone());
+    mailbox.set_request(req1.clone());
+
+    let mut frame = Some(test_frame());
+    let token = mailbox
+        .prepare_frame(producer1, &mut frame, Duration::from_millis(100))
+        .expect("prepare frame");
+    mailbox
+        .decide_frame(producer1, token, FrameDecision::Present)
+        .expect("decide present");
+
+    let held = mailbox.take_input_for_owner().expect("owner takes input");
+    let epoch0 = mailbox.frame_epoch();
+
+    // Preserving format replacement arrives before owner finishes posting
+    let control2 = TestControl::new();
+    let producer2 = ProducerId(51);
+    let req2 = test_frames_request(producer2, 1, out.revision, false, control2.clone());
+    mailbox.set_request(req2);
+
+    assert_eq!(mailbox.frame_epoch(), epoch0, "preserving replacement preserves frame epoch");
+
+    // Decision survives: owner awaiting frame decision observes Present
+    let decision = mailbox.await_frame_decision(token, producer1, &req1, epoch0, backend.shared());
+    assert!(matches!(decision, DecisionResult::Present));
+
+    // Owner finishes post and releases credit
+    mailbox.accept_owner_input(held);
+    assert!(mailbox.is_credit_free_and_empty());
+
+    // Now token is reaped/stale
+    let stale = mailbox
+        .decide_frame(producer1, token, FrameDecision::Present)
+        .unwrap_err();
+    assert!(matches!(stale, VideoError::Superseded));
+
+    backend.clear_video_surface();
+    let _ = live.retire();
+}
+
+#[test]
+fn non_preserving_replacement_discards_prepared_frame() {
+    let backend = AndroidBackend::new();
+    let (_registry, live, _slot) = install_live_binding(SurfaceId(10_091));
+    let out = backend.set_video_surface(live.clone()).expect("active surface");
+
+    let mailbox = Arc::new(VideoMailbox::new());
+    let control1 = TestControl::new();
+    let producer1 = ProducerId(60);
+    let req1 = test_frames_request(producer1, 1, out.revision, false, control1.clone());
+    mailbox.set_request(req1.clone());
+
+    let mut frame = Some(test_frame());
+    let token = mailbox
+        .prepare_frame(producer1, &mut frame, Duration::from_millis(100))
+        .expect("prepare frame");
+    let old_epoch = mailbox.frame_epoch();
+
+    // Non-preserving replacement (reset = true)
+    let control2 = TestControl::new();
+    let producer2 = ProducerId(61);
+    let req2 = test_frames_request(producer2, 1, out.revision, true, control2.clone());
+    mailbox.set_request(req2);
+
+    assert_ne!(mailbox.frame_epoch(), old_epoch, "epoch increments on reset");
+
+    // Stale decide call is rejected
+    let err = mailbox
+        .decide_frame(producer1, token, FrameDecision::Present)
+        .unwrap_err();
+    assert!(matches!(err, VideoError::Superseded));
+
+    // Awaiting decision returns Cancelled due to epoch mismatch
+    let decision = mailbox.await_frame_decision(token, producer1, &req1, old_epoch, backend.shared());
+    assert!(matches!(decision, DecisionResult::Cancelled));
+
+    backend.clear_video_surface();
+    let _ = live.retire();
+}
+
+#[test]
+fn eos_waits_for_prepared_frame_credit_release() {
+    let mailbox = Arc::new(VideoMailbox::new());
+    let control = TestControl::new();
+    let producer = ProducerId(70);
+    mailbox.set_request(test_frames_request(producer, 1, 1, false, control.clone()));
+
+    let mut frame = Some(test_frame());
+    let token = mailbox
+        .prepare_frame(producer, &mut frame, Duration::from_millis(100))
+        .expect("prepare frame");
+
+    // poll_finish must not complete while credit is held
+    assert!(matches!(mailbox.poll_finish(producer), Poll::Pending));
+    assert!(!mailbox.is_credit_free_and_empty());
+
+    let held = mailbox.take_input_for_owner().expect("held input");
+    assert!(matches!(mailbox.poll_finish(producer), Poll::Pending));
+    assert!(!mailbox.is_credit_free_and_empty());
+
+    // Discard and credit release
+    mailbox
+        .decide_frame(producer, token, FrameDecision::Discard)
+        .expect("decide discard");
+    mailbox.discard_owner_input(held);
+    assert!(mailbox.is_credit_free_and_empty());
+
+    // Owner confirms EOS
+    mailbox.confirm_eos(producer);
+    assert!(matches!(mailbox.poll_finish(producer), Poll::Ready(Ok(()))));
+}
+
+#[test]
+fn prepared_frame_id_overflow_fails_before_taking_input() {
+    let mailbox = Arc::new(VideoMailbox::new());
+    let control = TestControl::new();
+    let producer = ProducerId(80);
+    mailbox.set_request(test_frames_request(producer, 1, 1, false, control.clone()));
+
+    mailbox.set_next_prepared_id_for_test(u64::MAX);
+
+    let mut frame = Some(test_frame());
+    let err = mailbox
+        .prepare_frame(producer, &mut frame, Duration::ZERO)
+        .unwrap_err();
+    assert!(matches!(err, VideoError::Sink(SinkError::Fatal(_))));
+    assert!(frame.is_some(), "frame must remain untouched on token overflow");
+    assert!(mailbox.is_credit_free_and_empty(), "credit was not charged");
+}
+

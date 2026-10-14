@@ -109,6 +109,17 @@ impl PictureReady {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProducerId(pub u64);
 
+/// Sink-issued identity of one prepared frame, never reused within that sink.
+/// Decisions also name its producer; timestamps are not identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedFrameId(pub u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameDecision {
+    Present,
+    Discard,
+}
+
 /// Cached output admission state, not a native configuration or display receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoOutput {
@@ -165,7 +176,7 @@ pub enum VideoMode {
 pub enum VideoError {
     #[error("video producer superseded")]
     Superseded,
-    #[error("compressed video unsupported")]
+    #[error("video operation unsupported")]
     Unsupported,
     #[error(transparent)]
     Sink(#[from] SinkError),
@@ -186,6 +197,24 @@ pub trait VideoSink: Send {
         pts: Duration, random_access: bool) -> Result<(), VideoError>;
     fn push_frame(&mut self, producer: ProducerId, frame: &mut Option<VideoFrame>,
         pts: Duration) -> Result<(), VideoError>;
+    /// Optionally take a frame for preparation before the engine's due-time
+    /// wait. Success consumes it and keeps the shared input credit charged.
+    /// No picture may be posted until `decide_frame` grants Present. Every
+    /// error, including Unsupported, leaves the input untouched; Unsupported
+    /// selects the ordinary wait-then-push path, not decoder fallback.
+    fn prepare_frame(&mut self, _producer: ProducerId, _frame: &mut Option<VideoFrame>,
+        _pts: Duration) -> Result<PreparedFrameId, VideoError> {
+        Err(VideoError::Unsupported)
+    }
+    /// Nonblocking decision for exactly one prepared input. Repeating the same
+    /// decision is idempotent while that input remains owned; stale tokens must
+    /// not affect newer frames, including frames with identical timestamps.
+    /// Present grants submission, not display. Discard posts no picture and
+    /// reports no readiness; the owner releases its credit after discarding.
+    fn decide_frame(&mut self, _producer: ProducerId, _frame: PreparedFrameId,
+        _decision: FrameDecision) -> Result<(), VideoError> {
+        Err(VideoError::Unsupported)
+    }
     /// Keyed controls do not create a new producer or renew its deadline.
     fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError>;
     fn set_playing(&mut self, producer: ProducerId, playing: bool) -> Result<(), VideoError>;
