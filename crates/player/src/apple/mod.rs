@@ -172,6 +172,12 @@ impl AppleBackend {
         // SAFETY: setFrame is not inherently unsafe; the objc2 binding is
         // declared safe on CALayer.
         container.setFrame(cg);
+        let content = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: cg.size,
+        };
+        self.video_layer.setFrame(content);
+        self.subtitle_layer.setFrame(content);
         let _ = &self.main;
     }
 
