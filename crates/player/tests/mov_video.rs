@@ -19,6 +19,7 @@ struct Played {
     size: Option<(u32, u32)>,
     pcm: Vec<f32>,
     channels: u16,
+    writes: Vec<(Duration, usize)>,
 }
 
 fn played(path: &Path) -> Played {
@@ -40,7 +41,9 @@ fn played(path: &Path) -> Played {
     drop(player);
     assert!(state.error.is_none(), "{}: {:?}", path.display(), state.error);
     let capture = backend.capture();
-    let (pcm, channels) = capture.audio.first().map(|a| (a.pcm.clone(), a.channels)).unwrap_or_default();
+    let (pcm, channels, writes) = capture.audio.first()
+        .map(|a| (a.pcm.clone(), a.channels, a.writes.clone()))
+        .unwrap_or_default();
     let video = capture.video.first();
     Played {
         frames: video.map(|v| v.frame_md5.clone()).unwrap_or_default(),
@@ -48,6 +51,7 @@ fn played(path: &Path) -> Played {
         size: state.video_size,
         pcm,
         channels,
+        writes,
     }
 }
 
@@ -244,4 +248,62 @@ fn hevc_mp4_stamped_in_decode_order_seeks_like_its_twin() {
 
     assert!(!shown_a_950.is_empty(), "A's shown list after 950 ms seek is non-empty");
     assert_eq!(shown_b_950, shown_a_950, "B's list == A's list after 950 ms seek");
+}
+
+#[test]
+fn aac_mp4_with_millisecond_stamps_plays_contiguously() {
+    let tmp = std::env::temp_dir();
+    let path_a = tmp.join(format!("mov-audio-{}-a.mp4", std::process::id()));
+    let path_b = tmp.join(format!("mov-audio-{}-b.mp4", std::process::id()));
+    let _ga = TempFileGuard(path_a.clone());
+    let _gb = TempFileGuard(path_b.clone());
+
+    // 3.008 s is 141 full 1024-sample frames; no edit list avoids priming/padding trims so the test isolates timestamp jitter.
+    let status_a = Command::new(refcheck::system_ffmpeg())
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+            "sine=frequency=440:sample_rate=48000", "-t", "3.008",
+            "-c:a", "aac", "-ac", "2", "-use_editlist", "0", "-f", "mp4"])
+        .arg(&path_a)
+        .status()
+        .unwrap();
+    assert!(status_a.success(), "ffmpeg could not write twin A");
+
+    let status_b = Command::new(refcheck::system_ffmpeg())
+        .args(["-nostdin", "-v", "error", "-y", "-i"])
+        .arg(&path_a)
+        .args(["-c", "copy", "-bsf:a", "setts=ts=round(TS/48)*48", "-use_editlist", "0", "-f", "mp4"])
+        .arg(&path_b)
+        .status()
+        .unwrap();
+    assert!(status_b.success(), "ffmpeg could not write twin B");
+
+    let ctx = codecs::context();
+    let audio_packets = |p: &Path| -> Vec<oxideav_core::Packet> {
+        let format = refcheck::probe_container(&ctx, p).unwrap();
+        let mut demux = ctx.containers.open_demuxer(&format,
+            Box::new(std::fs::File::open(p).unwrap()), &ctx.codecs).unwrap();
+        let stream = demux.streams().iter().find(|s| s.params.media_type == oxideav_core::MediaType::Audio).unwrap().clone();
+        let mut packets = Vec::new();
+        loop {
+            match demux.next_packet() {
+                Ok(packet) if packet.stream_index == stream.index => packets.push(packet),
+                Ok(_) => {}
+                Err(oxideav_core::Error::Eof) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        packets
+    };
+    let a_pkts = audio_packets(&path_a);
+    let b_pkts = audio_packets(&path_b);
+    assert!(!a_pkts.is_empty(), "Twin A has no audio packets");
+    assert!(!b_pkts.is_empty(), "Twin B has no audio packets");
+    assert!(a_pkts.windows(2).all(|w| w[1].pts.unwrap() - w[0].pts.unwrap() == 1024), "Twin A's audio packet pts steps must all be 1024");
+    assert!(b_pkts.windows(2).any(|w| w[1].pts.unwrap() - w[0].pts.unwrap() != 1024), "Twin B's audio packet pts steps must include a step other than 1024");
+
+    let played_a = played(&path_a);
+    let played_b = played(&path_b);
+
+    assert_eq!(played_b.pcm, played_a.pcm, "B's PCM must equal A's PCM exactly");
+    assert_eq!(played_b.writes, played_a.writes, "B's writes must equal A's writes exactly");
 }

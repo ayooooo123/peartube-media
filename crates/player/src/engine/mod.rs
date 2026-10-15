@@ -129,6 +129,15 @@ const SUB_MAX_BYTES: usize = 1024 * 1024;
 /// not count; other buffering does.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Threshold for aligning audio write timestamps handed to the sink. Container
+/// stamps rounded to milliseconds, as remuxes of millisecond-timed files carry,
+/// jitter by up to a millisecond around the frames' real positions; Apple's
+/// renderer plays each write at its stamp, so they must be contiguous (Android
+/// already plays writes back to back). This aligns what the sink sees, not the
+/// engine's trims or seek cuts. 40 ms is GStreamer audiobasesink's default
+/// alignment threshold.
+const AUDIO_ALIGN_SECS: f64 = 0.040;
+
 /// Side data travels with its packet, including across equal-PTS laces.
 pub(crate) struct QueuedPacket {
     pub(crate) packet: Packet,
@@ -2182,7 +2191,11 @@ fn present_audio(
         }
         return true;
     }
-    let pts = Duration::from_secs_f64(pts_secs);
+    let chunk_pts = Duration::from_secs_f64(pts_secs);
+    let pts = match out.written.end {
+        Some(end) if (pts_secs - end.as_secs_f64()).abs() < AUDIO_ALIGN_SECS => end,
+        _ => chunk_pts,
+    };
     write_pcm(sink, shared, &pcm, layout, sample_rate, pts, seen_seek, realtime, &mut out.written, retired)
 }
 
