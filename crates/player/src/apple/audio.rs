@@ -21,6 +21,7 @@ use objc2_core_media::{
 };
 use crate::apple::clock::AppleClock;
 use crate::apple::util::{create_block_buffer_from_bytes, SendSync};
+use crate::audio_mix::StereoMix;
 use crate::backend::{AudioSink, Clock, SinkError};
 
 /// `requestMediaDataWhenReady` blocks the engine's audio thread in
@@ -33,6 +34,8 @@ pub struct AppleAudioSink {
     clock: Arc<AppleClock>,
     sample_rate: u32,
     channels: u16,
+    mix: Option<StereoMix>,
+    scratch: Vec<f32>,
     format_desc: Option<CFRetained<CMAudioFormatDescription>>,
     ready: ReadyFlag,
     requesting: std::cell::Cell<bool>,
@@ -62,6 +65,8 @@ impl AppleAudioSink {
             clock,
             sample_rate: 0,
             channels: 0,
+            mix: None,
+            scratch: Vec::new(),
             format_desc: None,
             ready: Arc::new((Mutex::new(true), Condvar::new())),
             requesting: std::cell::Cell::new(false),
@@ -125,7 +130,16 @@ impl AudioSink for AppleAudioSink {
         }
         self.sample_rate = sample_rate;
         self.channels = channels;
-        let bytes_per_frame = channels as u32 * 4;
+        // CoreAudio gets unlabeled channels from a count alone and placed 5.1
+        // dialogue on one side of 2-speaker hardware; mix surround ourselves as Android does.
+        let (output_channels, mix) = if channels > 2 {
+            let mix = StereoMix::new(layout).map_err(|e| SinkError::Fatal(e.into()))?;
+            (2, Some(mix))
+        } else {
+            (channels, None)
+        };
+        self.mix = mix;
+        let bytes_per_frame = output_channels as u32 * 4;
         let mut asbd = AudioStreamBasicDescription {
             mSampleRate: sample_rate as f64,
             mFormatID: kAudioFormatLinearPCM,
@@ -133,7 +147,7 @@ impl AudioSink for AppleAudioSink {
             mBytesPerPacket: bytes_per_frame,
             mFramesPerPacket: 1,
             mBytesPerFrame: bytes_per_frame,
-            mChannelsPerFrame: channels as u32,
+            mChannelsPerFrame: output_channels as u32,
             mBitsPerChannel: 32,
             mReserved: 0,
         };
@@ -180,8 +194,19 @@ impl AudioSink for AppleAudioSink {
             return Ok(0);
         }
 
+        let (output_pcm, output_channels) = if let Some(mix) = &self.mix {
+            let needed = frames * 2;
+            if self.scratch.len() < needed {
+                self.scratch.resize(needed, 0.0);
+            }
+            mix.mix(pcm, &mut self.scratch[..needed]);
+            (&self.scratch[..needed], 2)
+        } else {
+            (pcm, channels)
+        };
+
         let pcm_bytes =
-            unsafe { std::slice::from_raw_parts(pcm.as_ptr().cast::<u8>(), pcm.len() * 4) };
+            unsafe { std::slice::from_raw_parts(output_pcm.as_ptr().cast::<u8>(), output_pcm.len() * 4) };
         let block = unsafe { create_block_buffer_from_bytes(pcm_bytes)? };
 
         let pts_cm = CMTime {
@@ -202,7 +227,7 @@ impl AudioSink for AppleAudioSink {
         };
 
         let mut raw: *mut CMSampleBuffer = ptr::null_mut();
-        let sample_size = channels * 4;
+        let sample_size = output_channels * 4;
         let status = unsafe {
             CMSampleBuffer::create_ready(
                 None,

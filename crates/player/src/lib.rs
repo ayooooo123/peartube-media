@@ -2,7 +2,7 @@
 //! demuxers and decoders and a platform [`backend::Backend`].
 
 mod ass;
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", target_os = "macos", target_os = "ios", test))]
 mod audio_mix;
 pub mod annexb;
 pub mod backend;
