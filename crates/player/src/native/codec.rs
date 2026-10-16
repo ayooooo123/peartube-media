@@ -2125,8 +2125,13 @@ fn rpu_crc32(data: &[u8]) -> u32 {
     crc
 }
 
-/// Pre-parse allocation guard against CRC-valid crafted RPUs (32+ leading
-/// zeros on an Exp-Golomb code or a pivot count exceeding the remaining bits).
+/// Pre-parse allocation and panic guard against CRC-valid crafted RPUs:
+/// - Exp-Golomb codes with >= 32 leading zeros,
+/// - `num_pivots_minus2` or DM `num_ext_blocks` exceeding the remaining bits
+///   (which `dolby_vision` passes straight to `Vec::with_capacity`),
+/// - mixed `mapping_idc` on one curve or `poly_order_minus1 == 0` with linear
+///   interpolation,
+/// - undefined CM v4.0 block lengths for levels 8, 9, and 10.
 fn rpu_is_hostile(rbsp_after_prefix: &[u8]) -> bool {
     struct GuardBits<'a> {
         data: &'a [u8],
@@ -2167,7 +2172,54 @@ fn rpu_is_hostile(rbsp_after_prefix: &[u8]) -> bool {
             let rest = self.bits(zeros)?;
             Some(((1u64 << zeros) - 1) + rest)
         }
+        fn skip_se(&mut self) -> Option<()> {
+            self.ue().map(|_| ())
+        }
     }
+    fn check_dm_blocks(r: &mut GuardBits<'_>, compressed: bool) -> Option<bool> {
+        r.ue()?;
+        r.ue()?;
+        r.ue()?;
+        if !compressed {
+            if r.rem() < 509 {
+                return Some(false);
+            }
+            r.pos += 509;
+        }
+        for section in 0..2 {
+            if section == 1 && r.rem() < 56 {
+                return Some(false);
+            }
+            let count = r.ue()?;
+            if count > (r.rem() / 9) as u64 {
+                return Some(true);
+            }
+            while (r.pos & 7) != 0 {
+                r.bit()?;
+            }
+            for _ in 0..count {
+                let length = r.ue()?;
+                let level = r.bits(8)?;
+                if section == 1 {
+                    match level {
+                        8 if !matches!(length, 10 | 12 | 13 | 19 | 25) => return Some(true),
+                        9 if !matches!(length, 1 | 17) => return Some(true),
+                        10 if !matches!(length, 5 | 21) => return Some(true),
+                        8 | 9 | 10 | 3 | 11 | 254 => {}
+                        _ => return Some(false),
+                    }
+                } else if !matches!(level, 1 | 2 | 4 | 5 | 6 | 255) {
+                    return Some(false);
+                }
+                if length >= (1 << 20) || (length as usize) * 8 > r.rem() {
+                    return Some(false);
+                }
+                r.pos += (length as usize) * 8;
+            }
+        }
+        Some(false)
+    }
+
     let mut r = GuardBits { data: rbsp_after_prefix, pos: 0, hostile: false };
     let check = (|| -> Option<bool> {
         if r.bits(6)? != 2 {
@@ -2186,35 +2238,128 @@ fn rpu_is_hostile(rbsp_after_prefix: &[u8]) -> bool {
         }
         r.bits(3)?;
         let mut bl_depth = 0u64;
+        let mut el_depth = 0u64;
+        let mut reserved3 = 0u64;
+        let mut disable_residual = false;
         if (format & 0x700) == 0 {
             bl_depth = r.ue()?;
+            el_depth = r.ue()? & 0xFF;
             r.ue()?;
-            r.ue()?;
-            r.bits(6)?;
+            r.bit()?;
+            reserved3 = r.bits(3)?;
+            r.bit()?;
+            disable_residual = r.bit()? == 1;
         }
+        let coef_len = if data_type == 0 {
+            if denom > 32 {
+                return Some(false);
+            }
+            denom as usize
+        } else if data_type == 1 {
+            32
+        } else {
+            return Some(false);
+        };
         if bl_depth != 2 || denom > 23 {
             return Some(false);
         }
-        let _dm = r.bit()?;
-        let use_prev = r.bit()?;
-        if use_prev == 1 {
+        let dm_present = r.bit()? == 1;
+        let use_prev = r.bit()? == 1;
+        if use_prev {
             r.ue()?;
-            return Some(false);
+            if !dm_present {
+                return Some(false);
+            }
+            return check_dm_blocks(&mut r, reserved3 == 1);
         }
         r.ue()?;
         r.ue()?;
         r.ue()?;
         let depth = (bl_depth as usize) + 8;
-        for _ in 0..3 {
+        let mut pieces = [0usize; 3];
+        for c in 0..3 {
             let n = r.ue()?;
             if n > (r.rem() / depth) as u64 {
                 return Some(true);
             }
+            pieces[c] = (n as usize) + 1;
             for _ in 0..(n as usize + 2) {
                 r.bits(depth)?;
             }
         }
-        Some(false)
+        if (format & 0x700) == 0 && !disable_residual {
+            if r.bits(3)? != 0 {
+                return Some(false);
+            }
+            r.bits(depth)?;
+            r.bits(depth)?;
+        }
+        r.ue()?;
+        r.ue()?;
+        for &piece_count in &pieces {
+            let mut curve_idc: Option<u64> = None;
+            for _ in 0..piece_count {
+                let idc = r.ue()?;
+                if let Some(prev) = curve_idc {
+                    if idc <= 1 && idc != prev {
+                        return Some(true);
+                    }
+                }
+                curve_idc = Some(idc);
+                if idc == 0 {
+                    let order = r.ue()?;
+                    if order > 1 {
+                        return Some(false);
+                    }
+                    if order == 0 && r.bit()? == 1 {
+                        return Some(true);
+                    }
+                    for _ in 0..(order as usize + 2) {
+                        if data_type == 0 {
+                            r.skip_se()?;
+                        }
+                        r.bits(coef_len)?;
+                    }
+                } else if idc == 1 {
+                    let order = r.bits(2)?;
+                    if order > 2 {
+                        return Some(false);
+                    }
+                    if data_type == 0 {
+                        r.skip_se()?;
+                    }
+                    r.bits(coef_len)?;
+                    for _ in 0..=(order as usize) {
+                        for _ in 0..7 {
+                            if data_type == 0 {
+                                r.skip_se()?;
+                            }
+                            r.bits(coef_len)?;
+                        }
+                    }
+                } else {
+                    return Some(false);
+                }
+            }
+        }
+        if (format & 0x700) == 0 && !disable_residual {
+            if el_depth != 2 {
+                return Some(false);
+            }
+            for _ in 0..3 {
+                r.bits((el_depth as usize) + 8)?;
+                for _ in 0..3 {
+                    if data_type == 0 {
+                        r.skip_se()?;
+                    }
+                    r.bits(coef_len)?;
+                }
+            }
+        }
+        if !dm_present {
+            return Some(false);
+        }
+        check_dm_blocks(&mut r, reserved3 == 1)
     })();
     r.hostile || check == Some(true)
 }
@@ -3266,5 +3411,122 @@ mod tests {
         let degraded = strip_hevc_el_nals(bad_pkt, 4, true);
         let deg_nals = extract_nals(&degraded, Framing::LengthPrefixed(4));
         assert_eq!(deg_nals, vec![nalu3.as_slice()]);
+    }
+
+    #[test]
+    fn test_hostile_crc_valid_rpu_counts_are_refused_without_allocation() {
+        fn seal_rpu(payload: &[u8]) -> Vec<u8> {
+            let crc = rpu_crc32(payload);
+            let mut body = Vec::with_capacity(1 + payload.len() + 5);
+            body.push(0x19);
+            body.extend_from_slice(payload);
+            body.extend_from_slice(&crc.to_be_bytes());
+            body.push(0x80);
+            let mut nal = vec![0x7C, 0x01];
+            let mut zeros = 0;
+            for &b in &body {
+                if zeros >= 2 && b <= 3 {
+                    nal.push(3);
+                    zeros = 0;
+                }
+                nal.push(b);
+                zeros = if b == 0 { zeros + 1 } else { 0 };
+            }
+            while nal.len() < 26 {
+                nal.push(0);
+            }
+            nal
+        }
+
+        // 1. CRC-valid use_prev RPU with compressed DM metadata and huge cmv29 num_ext_blocks (0x7FFF_FFFE):
+        let mut bw1 = BitWriter::new();
+        bw1.write_bits(2, 6); // rpu_type = 2
+        bw1.write_bits(18, 11); // rpu_format = 18
+        bw1.write_bits(1, 4); // vdr_rpu_profile = 1
+        bw1.write_bits(0, 4); // vdr_rpu_level = 0
+        bw1.write_bits(1, 1); // vdr_seq_info_present = 1
+        bw1.write_bits(0, 1); // chroma_resampling = 0
+        bw1.write_bits(0, 2); // coef_data_type = 0
+        bw1.write_ue(23); // log2_denom = 23
+        bw1.write_bits(0, 2); // norm = 0
+        bw1.write_bits(0, 1); // bl_video_full_range = 0
+        bw1.write_ue(2); // bl_bit_depth_minus8 = 2
+        bw1.write_ue(2); // el_bit_depth_minus8 = 2
+        bw1.write_ue(4); // vdr_bit_depth_minus8 = 4
+        bw1.write_bits(0, 1); // spatial_resampling = 0
+        bw1.write_bits(1, 3); // reserved_zero_3bits = 1 (compressed DM)
+        bw1.write_bits(1, 1); // el_spatial_resampling = 1
+        bw1.write_bits(0, 1); // disable_residual = 0
+        bw1.write_bits(1, 1); // vdr_dm_metadata_present = 1
+        bw1.write_bits(1, 1); // use_prev_vdr_rpu = 1
+        bw1.write_ue(0); // prev_vdr_rpu_id = 0
+        bw1.write_ue(0); // affected_dm_metadata_id = 0
+        bw1.write_ue(0); // current_dm_metadata_id = 0
+        bw1.write_ue(0); // scene_refresh_flag = 0
+        bw1.write_ue(0x7FFF_FFFE); // hostile cmv29 num_ext_blocks (~2.1B blocks)
+        let hostile_dm_use_prev = seal_rpu(&bw1.finish());
+        assert!(convert_rpu_nal_to_p81(&hostile_dm_use_prev).is_none());
+
+        // 2. CRC-valid use_prev RPU with cmv29 count=0 and huge cmv40 num_ext_blocks (0x7FFF_FFFE):
+        let mut bw2 = BitWriter::new();
+        bw2.write_bits(2, 6);
+        bw2.write_bits(18, 11);
+        bw2.write_bits(1, 4);
+        bw2.write_bits(0, 4);
+        bw2.write_bits(1, 1);
+        bw2.write_bits(0, 1);
+        bw2.write_bits(0, 2);
+        bw2.write_ue(23);
+        bw2.write_bits(0, 2);
+        bw2.write_bits(0, 1);
+        bw2.write_ue(2);
+        bw2.write_ue(2);
+        bw2.write_ue(4);
+        bw2.write_bits(0, 1);
+        bw2.write_bits(1, 3);
+        bw2.write_bits(1, 1);
+        bw2.write_bits(0, 1);
+        bw2.write_bits(1, 1);
+        bw2.write_bits(1, 1);
+        bw2.write_ue(0);
+        bw2.write_ue(0);
+        bw2.write_ue(0);
+        bw2.write_ue(0);
+        bw2.write_ue(0); // cmv29 num_ext_blocks = 0
+        while bw2.bit_pos != 0 {
+            bw2.write_bits(0, 1);
+        }
+        bw2.write_ue(0x7FFF_FFFE); // hostile cmv40 num_ext_blocks
+        bw2.write_bits(0, 32); // ensure >= 56 bits available for cmv40 check
+        let hostile_cmv40 = seal_rpu(&bw2.finish());
+        assert!(convert_rpu_nal_to_p81(&hostile_cmv40).is_none());
+
+        // 3. CRC-valid non-use_prev RPU with huge num_pivots_minus2 (0x7FFF_FFFE):
+        let mut bw3 = BitWriter::new();
+        bw3.write_bits(2, 6);
+        bw3.write_bits(18, 11);
+        bw3.write_bits(1, 4);
+        bw3.write_bits(0, 4);
+        bw3.write_bits(1, 1);
+        bw3.write_bits(0, 1);
+        bw3.write_bits(0, 2);
+        bw3.write_ue(23);
+        bw3.write_bits(0, 2);
+        bw3.write_bits(0, 1);
+        bw3.write_ue(2);
+        bw3.write_ue(2);
+        bw3.write_ue(4);
+        bw3.write_bits(0, 1);
+        bw3.write_bits(1, 3);
+        bw3.write_bits(1, 1);
+        bw3.write_bits(0, 1);
+        bw3.write_bits(0, 1); // dm_present = 0
+        bw3.write_bits(0, 1); // use_prev = 0
+        bw3.write_ue(0);
+        bw3.write_ue(0);
+        bw3.write_ue(0);
+        bw3.write_ue(0x7FFF_FFFE); // hostile num_pivots_minus2
+        let hostile_pivots = seal_rpu(&bw3.finish());
+        assert!(convert_rpu_nal_to_p81(&hostile_pivots).is_none());
     }
 }
