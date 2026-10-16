@@ -186,7 +186,12 @@ impl AndroidBackend {
 
     pub fn clear_subtitle_surface(&self) {
         *self.shared.subtitle_surface.write() = None;
-        self.wake_active_subtitles_changed();
+        // A lost surface, not a changed one: with no overlay to draw, the owner
+        // otherwise keeps its lease on the old surface, which then cannot retire.
+        let weak = self.shared.active_subtitles.lock().clone();
+        if let Some(sub_sink) = weak.as_ref().and_then(|w| w.upgrade()) {
+            sub_sink.lock().on_surface_lost();
+        }
     }
 
     pub fn video_output(&self) -> VideoOutput {
