@@ -382,70 +382,6 @@ fn h264_units_are_ffmpeg_parser_units() {
     }
 }
 
-/// The Player's video sink, hashing each frame the engine presents,
-/// packed at the 720x480 4:4:4 picture FFmpeg decodes (the container
-/// declares no picture size, which the headless sink packs at).
-mod hashed {
-    use std::sync::mpsc::Sender;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use oxideav_core::{CodecParameters, Packet, VideoFrame};
-    use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleSink, VideoSink};
-    use player::Headless;
-
-    pub struct Hashing {
-        pub headless: Arc<Headless>,
-        pub md5: Sender<String>,
-    }
-
-    impl Backend for Hashing {
-        fn audio(&self) -> Box<dyn AudioSink> {
-            self.headless.audio()
-        }
-        fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
-            Box::new(HashedVideo { sink: self.headless.video(clock), md5: self.md5.clone() })
-        }
-        fn subtitles(&self) -> Box<dyn SubtitleSink> {
-            self.headless.subtitles()
-        }
-    }
-
-    struct HashedVideo {
-        sink: Box<dyn VideoSink>,
-        md5: Sender<String>,
-    }
-
-    impl VideoSink for HashedVideo {
-        fn open_compressed(&mut self, params: &CodecParameters, ready: player::backend::PictureReady) -> bool {
-            self.sink.open_compressed(params, ready)
-        }
-        fn present_from(&mut self, start: Duration) { self.sink.present_from(start); }
-        fn push_packet(&mut self, packet: &Packet, pts: Duration, random_access: bool) -> Result<(), SinkError> {
-            self.sink.push_packet(packet, pts, random_access)
-        }
-        fn open_frames(&mut self, params: &CodecParameters) -> Result<(), SinkError> {
-            self.sink.open_frames(params)
-        }
-        fn push_frame(&mut self, frame: &VideoFrame, pts: Duration) -> Result<(), SinkError> {
-            let _ = self.md5.send(refcheck::md5_hex(&refcheck::pack(frame, &[(720, 480); 3])));
-            self.sink.push_frame(frame, pts)
-        }
-        fn frame_lead(&self) -> Duration {
-            self.sink.frame_lead()
-        }
-        fn finish(&mut self) -> Result<(), SinkError> {
-            self.sink.finish()
-        }
-        fn flush(&mut self) {
-            self.sink.flush()
-        }
-        fn set_playing(&mut self, playing: bool) {
-            self.sink.set_playing(playing)
-        }
-    }
-}
-
 /// The Player (headless backend, every codec of the app) presents every
 /// frame FFmpeg decodes from the VOB, as FFmpeg decodes it, none dropped.
 /// Played as fast as the pipeline goes: the engine presents a frame at
@@ -458,10 +394,9 @@ fn player_presents_every_ffmpeg_frame_of_an_h264_vob() {
     let path = libx264_vob("h264-player.vob", &[]);
     let want = refcheck::ffmpeg_video_md5s(&path, 0, "yuv444p");
     assert_eq!(want.len(), 20, "FFmpeg's frames");
-    let (md5, presented) = std::sync::mpsc::channel();
-    let backend = Arc::new(hashed::Hashing { headless: player::Headless::new(), md5 });
+    let backend = player::Headless::new();
     let options = player::PlayerOptions { realtime: false, ..player::PlayerOptions::default() };
-    let player = player::Player::open(path.to_str().unwrap(), backend, Arc::new(codecs::context()), options, |_| {});
+    let player = player::Player::open(path.to_str().unwrap(), backend.clone(), Arc::new(codecs::context()), options, |_| {});
     let deadline = Instant::now() + Duration::from_secs(60);
     let state = loop {
         let state = player.state();
@@ -474,7 +409,7 @@ fn player_presents_every_ffmpeg_frame_of_an_h264_vob() {
     };
     drop(player);
     assert_eq!(state.dropped_frames, 0, "frames dropped");
-    assert_eq!(presented.try_iter().collect::<Vec<_>>(), want, "every presented frame");
+    assert_eq!(backend.capture().video[0].frame_md5, want, "every presented frame");
 }
 
 // ─── private stream 1 substream routing ───
