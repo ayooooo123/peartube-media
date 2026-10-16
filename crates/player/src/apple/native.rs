@@ -83,7 +83,8 @@ pub struct ApplePresenter {
     clock: Arc<PresenterClock>,
     observers: Mutex<Vec<SendSync<Retained<ProtocolObject<dyn NSObjectProtocol>>>>>,
     ended: AtomicBool,
-    notification_error: Mutex<Option<String>>,
+    /// An error notification and the item generation it came for.
+    notification_error: Mutex<Option<(u64, String)>>,
     weak_self: Mutex<Option<Weak<Self>>>,
     /// An item is open: the poller reads its status. Idle, it leaves the
     /// main thread alone.
@@ -207,7 +208,7 @@ impl ApplePresenter {
         if self.generation.load(Ordering::SeqCst) != item_gen {
             return;
         }
-        *self.notification_error.lock() = Some(err.clone());
+        *self.notification_error.lock() = Some((item_gen, err.clone()));
         let changed = {
             let mut st = self.status.lock();
             if self.generation.load(Ordering::SeqCst) != item_gen {
@@ -223,6 +224,17 @@ impl ApplePresenter {
         if changed {
             self.fire_on_change();
         }
+    }
+
+    /// The error notification for the current item; one that came for an
+    /// item `open`/`close` replaced meanwhile is not its.
+    fn current_notification_error(&self) -> Option<String> {
+        let generation = self.generation.load(Ordering::SeqCst);
+        self.notification_error
+            .lock()
+            .as_ref()
+            .filter(|(item_gen, _)| *item_gen == generation)
+            .map(|(_, err)| err.clone())
     }
 
     fn poll_on_main(&self, expected_gen: u64) {
@@ -267,7 +279,7 @@ impl ApplePresenter {
             (false, None, None)
         };
 
-        let notif_err = self.notification_error.lock().clone();
+        let notif_err = self.current_notification_error();
         let failed = failed_item.or(notif_err);
         let (playing, waiting) = if current_item.is_some() {
             let tcs = unsafe { player.timeControlStatus() };
@@ -555,9 +567,7 @@ impl NativePresenter for ApplePresenter {
             st.ended = true;
         }
         if st.failed.is_none() {
-            if let Some(err) = &*self.notification_error.lock() {
-                st.failed = Some(err.clone());
-            }
+            st.failed = self.current_notification_error();
         }
         st
     }

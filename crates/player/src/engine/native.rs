@@ -17,6 +17,9 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 const TAIL_GRACE: Duration = Duration::from_secs(3);
 /// Reloads at the position after the platform player failed mid-playback.
 const MAX_RELOADS: u32 = 2;
+/// A seek whose completion has not come this long after the item stood
+/// ready, with a picture, at its target counts as landed.
+const LANDING_GRACE: Duration = Duration::from_secs(2);
 
 pub(super) enum Outcome {
     /// The playback ended, failed or was dropped.
@@ -214,13 +217,14 @@ impl Route<'_> {
         let wake = Arc::new(Wake::default());
         let notifier = Arc::clone(&wake);
         self.presenter.set_on_change(Some(Arc::new(move || notifier.notify())));
-        if let Some(stream) = find_stream(self.streams, self.subtitle) {
-            self.start_feeder(stream, Duration::ZERO);
-        }
-
-        let start = self.position();
-        self.presenter.open(&self.playlist(), self.item(start));
+        // The generation first: a seek after it is applied below, not lost.
         let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
+        // A seek made before the route opened holds the clock at its target.
+        let start = self.position();
+        if let Some(stream) = find_stream(self.streams, self.subtitle) {
+            self.start_feeder(stream, Duration::from_secs_f64(start.max(0.0)));
+        }
+        self.presenter.open(&self.playlist(), self.item(start));
         // The open's own seek has no serial: seek again to learn when the
         // item stands at the start.
         let mut landing = Some((self.presenter.seek(self.item(start)), seen_seek));
@@ -230,6 +234,8 @@ impl Route<'_> {
         let mut play_sent: Option<bool> = None;
         let mut reloads = 0;
         let mut tail_since: Option<Instant> = None;
+        // Since when a pending landing's item stands ready at its target.
+        let mut standing_since: Option<Instant> = None;
         // The held position was taken from the item after it stopped.
         let mut reheld = false;
 
@@ -292,8 +298,18 @@ impl Route<'_> {
                 }
             }
             if let Some((serial, generation)) = landing {
-                if status.ready && status.seek_done >= serial {
+                let target = self.item(shared.master.now().map_or(position, |d| d.as_secs_f64()));
+                let standing = status.ready
+                    && status.picture
+                    && status.position.is_some_and(|at| at.abs_diff(target) < Duration::from_millis(250));
+                standing_since = if standing { standing_since.or(Some(Instant::now())) } else { None };
+                let unconfirmed = standing_since.is_some_and(|since| since.elapsed() > LANDING_GRACE);
+                if unconfirmed && status.seek_done < serial {
+                    log(&format!("seek {serial} never reported its end; the item stands at its target"));
+                }
+                if status.ready && (status.seek_done >= serial || unconfirmed) {
                     landing = None;
+                    standing_since = None;
                     if generation == shared.seek_gen.load(Ordering::SeqCst) {
                         shared.master.follow_audio(self.clock(), generation);
                         following = true;
@@ -401,7 +417,8 @@ impl Route<'_> {
             }
             self.audio = audio;
             shared.state.lock().audio = audio;
-            self.switch_item(position, landing);
+            // The old item played on while the switch read the new track.
+            self.switch_item(self.position(), landing);
         }
         if subtitle != self.subtitle {
             if let Some(feeder) = self.feeder.take() {

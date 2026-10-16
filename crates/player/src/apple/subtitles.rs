@@ -38,28 +38,25 @@ unsafe impl Sync for SendPtrHolder {}
 
 impl AppleSubtitleSink {
     pub fn new(layer: Retained<CALayer>) -> Self {
-        // CALayer mutations must happen on the main queue (AppKit/UIKit
-        // layers are main-thread-only). Hand the +1 across as a raw pointer
-        // and reclaim it here afterwards.
-        let setup_ptr = std::sync::Arc::new(SendPtr(Retained::into_raw(layer)));
+        // CALayer mutations happen on the main queue (AppKit/UIKit layers
+        // are main-thread-only), asynchronously: a playback can be made, or
+        // its subtitles switched, while the main thread waits for it (a
+        // `Player` dropped on main joins its pipeline thread). `show` runs
+        // on the same serial queue, after this.
         let main = unsafe {
             dispatch2::DispatchRetained::retain(std::ptr::NonNull::from(DispatchQueue::main()))
         };
-        let slot = setup_ptr.clone();
-        main.exec_sync(move || {
-            let layer = unsafe { Retained::from_raw(slot.0) }.expect("layer null");
+        let setup = SendPtr(Retained::into_raw(layer.clone()));
+        main.exec_async(move || {
+            let setup = setup;
+            // SAFETY: the +1 taken above, reclaimed once here.
+            let layer = unsafe { Retained::from_raw(setup.0) }.expect("layer null");
             layer.setMasksToBounds(true);
             // Contents gravity "resizeAspect" keeps the composed bitmap
             // scaled with the video rect.
             let gravity = NSString::from_str("resizeAspect");
             layer.setContentsGravity(&gravity);
-            // Hand the +1 back to the caller thread via the Arc slot.
-            std::mem::forget(layer);
         });
-        let layer = unsafe {
-            Retained::from_raw(setup_ptr.0)
-        }
-        .expect("layer null");
         Self {
             layer: SendPtrHolder(layer),
             main,

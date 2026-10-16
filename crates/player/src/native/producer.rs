@@ -4,9 +4,9 @@
 //! any other segment costs a seek. Produced segments are kept up to a byte
 //! budget, and the thread works ahead of the last request.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -28,9 +28,9 @@ pub(crate) const VIDEO_TIMESCALE: u32 = 90_000;
 const CACHE_BYTES: usize = 192 << 20;
 /// How far the thread works ahead of the last request.
 const PREFETCH_SEGMENTS: usize = 6;
-/// Stop reading past a segment's end for its audio after this many
-/// packets: an audio track that ends early must not read the rest.
-const LOOKAHEAD_PACKETS: usize = 4096;
+/// How far past a segment's end the read goes for its audio: an audio track
+/// that ends early must not read on through the rest of the title.
+const LOOKAHEAD_SECS: f64 = 4.0;
 
 /// What a session remuxes. Fixed for the producer's life.
 pub(crate) struct Streams {
@@ -72,6 +72,9 @@ struct Inner {
     served_last: AtomicBool,
     /// Some segment went out.
     served_any: AtomicBool,
+    /// The segment being made, `usize::MAX` for none: a request for it waits
+    /// instead of aborting it.
+    in_flight: AtomicUsize,
     segments: usize,
 }
 
@@ -83,6 +86,8 @@ struct State {
     /// Missed segments, newest last: a seek's request goes first.
     misses: Vec<usize>,
     last_request: usize,
+    /// Segments whose prefetch failed: made again only when asked for.
+    failed: HashSet<usize>,
 }
 
 impl Producer {
@@ -99,6 +104,7 @@ impl Producer {
             urgent: AtomicBool::new(false),
             served_last: AtomicBool::new(false),
             served_any: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(usize::MAX),
             segments: plan.len(),
         });
         let work = Work {
@@ -120,7 +126,7 @@ impl Producer {
     /// Segment `index` (`None` past the plan): ready from the cache, or a
     /// promise of it.
     pub(crate) fn request(&self, index: usize) -> Option<Body> {
-        if index >= self.inner.segments {
+        if index >= self.inner.segments || self.inner.stopped.load(Ordering::SeqCst) {
             return None;
         }
         let mut state = self.inner.state.lock();
@@ -134,9 +140,12 @@ impl Producer {
         }
         let (tx, rx) = mpsc::channel();
         state.waiters.entry(index).or_default().push(tx);
-        state.misses.retain(|&i| i != index);
-        state.misses.push(index);
-        self.inner.urgent.store(true, Ordering::SeqCst);
+        state.failed.remove(&index);
+        if self.inner.in_flight.load(Ordering::SeqCst) != index {
+            state.misses.retain(|&i| i != index);
+            state.misses.push(index);
+            self.inner.urgent.store(true, Ordering::SeqCst);
+        }
         drop(state);
         self.inner.cv.notify_all();
         Some(Body::Pending(rx))
@@ -250,7 +259,7 @@ impl Inner {
             }
             let from = state.last_request;
             let ahead = (from..self.segments.min(from + PREFETCH_SEGMENTS + 1))
-                .find(|i| !state.cache.contains_key(i));
+                .find(|i| !state.cache.contains_key(i) && !state.failed.contains(i));
             if let Some(index) = ahead {
                 let typical = state.bytes.checked_div(state.cache.len()).unwrap_or(0);
                 if state.make_room(typical, index) {
@@ -292,18 +301,28 @@ struct Gathered {
 impl Work {
     fn run(mut self, inner: &Inner) -> Box<dyn Demuxer> {
         while let Some((index, urgent)) = inner.next_job() {
+            inner.in_flight.store(index, Ordering::SeqCst);
             let abort = || inner.stopped.load(Ordering::SeqCst) || (!urgent && inner.urgent.load(Ordering::SeqCst));
             let made = std::panic::catch_unwind(AssertUnwindSafe(|| self.produce(index, &abort)))
                 .unwrap_or_else(|_| Err("segment production panicked".into()));
+            inner.in_flight.store(usize::MAX, Ordering::SeqCst);
             match made {
                 Ok(Some(bytes)) => inner.deliver(index, Ok(Arc::from(bytes))),
-                Ok(None) => {}
+                Ok(None) => {
+                    // A request that waited on this prefetch is still owed
+                    // it, after the miss that cut it short.
+                    let mut state = inner.state.lock();
+                    if state.waiters.contains_key(&index) && !state.misses.contains(&index) {
+                        state.misses.insert(0, index);
+                    }
+                }
                 Err(e) => {
                     log(&format!("segment {index}: {e}"));
                     self.next = None;
-                    if urgent {
-                        inner.deliver(index, Err(e));
-                    }
+                    // A request since then (or this one's) gets the error;
+                    // a failed prefetch is not tried again unasked.
+                    inner.state.lock().failed.insert(index);
+                    inner.deliver(index, Err(e));
                 }
             }
         }
@@ -375,13 +394,13 @@ impl Work {
         let audio_from = if index == 0 { self.streams.origin_secs() } else { video_tb.seconds_of(start) };
         let audio_to = video_tb.seconds_of(end);
         let lookahead = self.streams.video_config.reorder_depth as usize + 1;
+        let read_until = end + video_tb.ticks_of(LOOKAHEAD_SECS);
 
         let mut got = Gathered::default();
         let mut carry_out = VecDeque::new();
         let mut opened = false;
         let mut video_done = false;
         let mut audio_done = audio_index.is_none();
-        let mut past = 0usize;
         loop {
             if abort() {
                 return Ok(None);
@@ -389,15 +408,14 @@ impl Work {
             if video_done && audio_done && (got.next_video_pts.len() >= lookahead || last) {
                 break;
             }
-            if video_done && past > LOOKAHEAD_PACKETS {
-                break;
-            }
             let Some(packet) = self.read()? else { break };
-            if video_done {
-                past += 1;
-            }
             if packet.stream_index == video_index {
                 let Some(pts) = packet.pts.or(packet.dts) else { continue };
+                if video_done && pts > read_until {
+                    // The audio ended before this segment's end.
+                    carry_out.push_back(packet);
+                    break;
+                }
                 if !opened {
                     // Up to the keyframe that opens this segment: the tail
                     // of the one before.
