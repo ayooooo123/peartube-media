@@ -41,10 +41,6 @@ fn eligible_video(stream: &StreamInfo) -> bool {
     matches!(stream.params.codec_id.as_str(), "h264" | "h265" | "hevc")
 }
 
-fn eligible_audio(stream: Option<&StreamInfo>) -> bool {
-    stream.is_none_or(|s| matches!(s.params.codec_id.as_str(), "aac" | "ac3" | "eac3"))
-}
-
 fn log(message: &str) {
     eprintln!("[peartube-native] {message}");
 }
@@ -67,7 +63,7 @@ pub(super) fn play(
     let Some(video) = video.filter(eligible_video) else {
         return Outcome::Declined { demuxer, at: None };
     };
-    if !eligible_audio(audio.as_ref()) || std::env::var_os("PEARTUBE_NO_NATIVE").is_some() {
+    if std::env::var_os("PEARTUBE_NO_NATIVE").is_some() {
         return Outcome::Declined { demuxer, at: None };
     }
     let keep = |monitor: SourceMonitor| shared.native_sources.lock().push(monitor);
@@ -80,6 +76,7 @@ pub(super) fn play(
         duration.map_or(f64::NAN, |d| d.as_secs_f64()),
         &keep,
         &|demuxer| decode_order::wrap(demuxer),
+        bridge_provider(&shared.ctx),
         &shared.stopped,
     );
     let prepared = match prepared {
@@ -125,6 +122,12 @@ pub(super) fn play(
         media_direct: false,
     };
     route.run()
+}
+
+/// The engine's audio decoders, for tracks the native route bridges to FLAC.
+fn bridge_provider(ctx: &Arc<RuntimeContext>) -> session::BridgeProvider {
+    let ctx = Arc::clone(ctx);
+    Arc::new(move |stream: &StreamInfo| bridge::factory(Arc::clone(&ctx), stream.clone()))
 }
 
 fn stop_native_sources(shared: &SharedState) {
@@ -422,10 +425,6 @@ impl Route<'_> {
         let subtitle = *shared.wanted_subtitle.lock();
         if audio != self.audio {
             let stream = find_stream(self.streams, audio);
-            if !eligible_audio(stream.as_ref()) {
-                log("the chosen audio track needs the decode route");
-                return Some(self.decline(Some(position)));
-            }
             let switched = match self.session.as_mut() {
                 Some(session) => session.switch_audio(stream.as_ref(), position, &shared.stopped),
                 None => Err("no session".into()),

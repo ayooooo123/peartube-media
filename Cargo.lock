@@ -1783,6 +1783,7 @@ dependencies = [
  "objc2-quartz-core",
  "objc2-ui-kit",
  "oxideav-core",
+ "oxideav-flac",
  "oxideav-h264",
  "oxideav-h265",
  "oxideav-http",

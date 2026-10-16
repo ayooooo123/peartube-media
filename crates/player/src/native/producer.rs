@@ -11,9 +11,10 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use oxideav_core::{Demuxer, Packet, StreamInfo, TimeBase};
+use oxideav_core::{AudioTrim, Demuxer, Packet, StreamInfo, TimeBase};
 use parking_lot::{Condvar, Mutex};
 
+use super::bridge::{self, Bridge, DecoderFactory, BLOCK, PREROLL_SECS};
 use super::codec::{self, Framing};
 use super::fmp4::{self, Run, Sample};
 use super::plan::Plan;
@@ -43,9 +44,20 @@ pub(crate) struct Streams {
     /// One frame, in video ticks: extrapolates decode times.
     pub frame_ticks: i64,
     pub audio: Option<(StreamInfo, AudioConfig)>,
+    /// How the audio is made when it is not copied: decoded and encoded
+    /// as FLAC by the bridge.
+    pub bridging: Option<Bridging>,
     /// Source time, in video ticks, of item time 0: the first video decode
     /// time.
     pub origin: i64,
+}
+
+/// A bridged audio track: the engine's decoder for it, and the FLAC it
+/// becomes.
+#[derive(Clone)]
+pub(crate) struct Bridging {
+    pub factory: DecoderFactory,
+    pub output: bridge::Output,
 }
 
 impl Streams {
@@ -117,6 +129,7 @@ impl Producer {
             next: None,
             carry: VecDeque::new(),
             audio_pos: None,
+            bridge: None,
         };
         let thread_inner = Arc::clone(&inner);
         let thread = std::thread::Builder::new()
@@ -287,18 +300,22 @@ struct Work {
     plan: Plan,
     /// The segment the demuxer reads on into, after the last one made.
     next: Option<usize>,
-    /// Packets read past the last segment made, in read order.
-    carry: VecDeque<Packet>,
+    /// Packets read past the last segment made, in read order, with their
+    /// audio trims.
+    carry: VecDeque<(Packet, Option<AudioTrim>)>,
     /// Where the next audio sample starts on the item axis (samples), when
     /// the demuxer reads on from the last segment.
     audio_pos: Option<i64>,
+    /// The bridge, while production reads on from the last segment.
+    bridge: Option<Bridge>,
 }
 
 /// One segment's packets.
 #[derive(Default)]
 struct Gathered {
     video: Vec<Packet>,
-    audio: Vec<Packet>,
+    /// With their trims: the bridge's decoder applies them.
+    audio: Vec<(Packet, Option<AudioTrim>)>,
     /// Presentation times of the next segment's first video packets, in
     /// decode order: its first decode time derives from them.
     next_video_pts: Vec<i64>,
@@ -350,7 +367,14 @@ impl Work {
         };
         let Gathered { video, audio, next_video_pts, next_video_dts } = gathered;
         let video = self.video_run(index, video, &next_video_pts, next_video_dts)?;
-        let audio = self.audio_run(audio);
+        let audio = if self.streams.bridging.is_some() {
+            match self.bridged_run(index, audio, abort)? {
+                Some(run) => run,
+                None => return Ok(None),
+            }
+        } else {
+            self.audio_run(audio.into_iter().map(|(packet, _)| packet).collect())
+        };
         let mut runs = vec![Run { track_id: VIDEO_TRACK, base_decode_time: video.0, samples: &video.1 }];
         if let Some((base, samples)) = &audio {
             runs.push(Run { track_id: AUDIO_TRACK, base_decode_time: *base, samples });
@@ -373,16 +397,24 @@ impl Work {
         }
         self.carry.clear();
         self.audio_pos = None;
+        self.bridge = None;
         Ok(())
     }
 
-    fn read(&mut self) -> Result<Option<Packet>, String> {
-        if let Some(packet) = self.carry.pop_front() {
-            return Ok(Some(packet));
+    /// The next packet and its audio trim (`packet_metadata` holds only
+    /// until the next read).
+    fn read(&mut self) -> Result<Option<(Packet, Option<AudioTrim>)>, String> {
+        if let Some(read) = self.carry.pop_front() {
+            return Ok(Some(read));
         }
         let demuxer = &mut self.demuxer;
-        match std::panic::catch_unwind(AssertUnwindSafe(|| demuxer.next_packet())) {
-            Ok(Ok(packet)) => Ok(Some(packet)),
+        match std::panic::catch_unwind(AssertUnwindSafe(|| {
+            demuxer.next_packet().map(|packet| {
+                let trim = demuxer.packet_metadata().audio_trim;
+                (packet, trim)
+            })
+        })) {
+            Ok(Ok(read)) => Ok(Some(read)),
             Ok(Err(oxideav_core::Error::Eof)) => Ok(None),
             Ok(Err(e)) => Err(format!("demux error: {e}")),
             Err(_) => Err("demuxer panicked".into()),
@@ -399,8 +431,18 @@ impl Work {
         let audio_index = self.streams.audio.as_ref().map(|(s, _)| s.index);
         let video_tb = self.streams.video.time_base;
         // The first segment takes audio from item time 0, the others from
-        // their own start.
-        let audio_from = if index == 0 { self.streams.origin_secs() } else { video_tb.seconds_of(start) };
+        // their own start. A bridged track restarting here decodes from a
+        // second before its first block; reading on, it takes everything
+        // (what the last segment fed the bridge left the carry).
+        let audio_from = match &self.streams.bridging {
+            Some(bridging) if self.bridge.is_none() => {
+                let rate = f64::from(bridging.output.rate);
+                self.streams.origin_secs() + self.grid(index, bridging.output.rate) as f64 / rate - PREROLL_SECS
+            }
+            Some(_) => f64::NEG_INFINITY,
+            None if index == 0 => self.streams.origin_secs(),
+            None => video_tb.seconds_of(start),
+        };
         let audio_to = video_tb.seconds_of(end);
         let lookahead = self.streams.video_config.reorder_depth as usize + 1;
         let read_until = end + video_tb.ticks_of(LOOKAHEAD_SECS);
@@ -417,12 +459,12 @@ impl Work {
             if video_done && audio_done && (got.next_video_pts.len() >= lookahead || last) {
                 break;
             }
-            let Some(packet) = self.read()? else { break };
+            let Some((packet, trim)) = self.read()? else { break };
             if packet.stream_index == video_index {
                 let Some(pts) = packet.pts.or(packet.dts) else { continue };
                 if video_done && pts > read_until {
                     // The audio ended before this segment's end.
-                    carry_out.push_back(packet);
+                    carry_out.push_back((packet, trim));
                     break;
                 }
                 if !opened {
@@ -441,7 +483,7 @@ impl Work {
                     if got.next_video_pts.len() < lookahead {
                         got.next_video_pts.push(pts);
                     }
-                    carry_out.push_back(packet);
+                    carry_out.push_back((packet, trim));
                 } else {
                     got.video.push(packet);
                 }
@@ -453,9 +495,9 @@ impl Work {
                 }
                 if !last && at >= audio_to {
                     audio_done = true;
-                    carry_out.push_back(packet);
+                    carry_out.push_back((packet, trim));
                 } else {
-                    got.audio.push(packet);
+                    got.audio.push((packet, trim));
                 }
             }
         }
@@ -517,6 +559,75 @@ impl Work {
             });
         }
         Ok((base as u64, samples))
+    }
+
+    /// Item sample where segment `index`'s audio blocks start: the grid
+    /// point at or before the segment's start (`rate` the bridge's).
+    fn grid(&self, index: usize, rate: u32) -> i64 {
+        if index == 0 {
+            return 0;
+        }
+        let start = self.streams.video.time_base.seconds_of(self.plan.starts[index]);
+        let sample = ((start - self.streams.origin_secs()) * f64::from(rate)).round() as i64;
+        sample.div_euclid(BLOCK) * BLOCK
+    }
+
+    /// A bridged track's run: the FLAC blocks starting in this segment's
+    /// stretch of the grid. `Ok(None)`: `abort` said to give up.
+    #[allow(clippy::type_complexity)]
+    fn bridged_run(
+        &mut self,
+        index: usize,
+        audio: Vec<(Packet, Option<AudioTrim>)>,
+        abort: &dyn Fn() -> bool,
+    ) -> Result<Option<Option<(u64, Vec<Sample>)>>, String> {
+        let bridging = self.streams.bridging.clone().expect("a bridged track");
+        let rate = bridging.output.rate;
+        let from = self.grid(index, rate);
+        let last = index + 1 == self.plan.len();
+        let to = (!last).then(|| self.grid(index + 1, rate));
+        let audio_index = self.streams.audio.as_ref().map(|(s, _)| s.index);
+        if self.bridge.is_none() {
+            self.bridge = Some(Bridge::new(&bridging.factory, bridging.output, self.streams.origin_secs(), from)?);
+        }
+        let bridge = self.bridge.as_mut().expect("made above");
+        for (packet, trim) in &audio {
+            if abort() {
+                // Half fed: the next production starts it over.
+                self.bridge = None;
+                return Ok(None);
+            }
+            bridge.feed(packet, *trim);
+        }
+        let blocks = match to {
+            Some(to) => {
+                // A decoder that holds output back: decode on into the next
+                // segment's packets, taking them out of the carry (no
+                // timestamp tells them apart: Matroska stamps TrueHD's
+                // 0.83 ms access units in whole milliseconds).
+                let mut i = 0;
+                while i < self.carry.len() && bridge.decoded_to() < to {
+                    if Some(self.carry[i].0.stream_index) == audio_index {
+                        let (packet, trim) = self.carry.remove(i).expect("in range");
+                        bridge.feed(&packet, trim);
+                    } else {
+                        i += 1;
+                    }
+                }
+                bridge.blocks(to)
+            }
+            None => {
+                bridge.finish();
+                bridge.tail()
+            }
+        };
+        let Some(first) = blocks.first() else { return Ok(Some(None)) };
+        let base = first.at.max(0) as u64;
+        let samples = blocks
+            .into_iter()
+            .map(|block| Sample { data: block.data, duration: block.samples, composition_offset: 0, sync: true })
+            .collect();
+        Ok(Some(Some((base, samples))))
     }
 
     /// The audio run, or `None` without audio. Durations come from the

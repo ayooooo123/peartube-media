@@ -17,6 +17,7 @@ use oxideav_core::{
 mod captions;
 mod entry;
 mod decode_order;
+mod bridge;
 mod native;
 
 pub use captions::{CAPTIONS_608, CAPTIONS_708};

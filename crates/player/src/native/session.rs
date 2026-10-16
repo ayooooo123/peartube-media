@@ -8,14 +8,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use oxideav_core::{Demuxer, Packet, RuntimeContext, StreamInfo, TimeBase};
+use oxideav_core::{AudioTrim, ChannelLayout, Demuxer, Packet, RuntimeContext, StreamInfo, TimeBase};
 use parking_lot::Mutex;
 
+use super::bridge::{self, DecoderFactory};
 use super::codec;
 use super::fmp4::{self, Track, TrackKind};
 use super::hls::{self, Variant};
 use super::plan::{self, Plan, TARGET_SECS};
-use super::producer::{Producer, Streams, AUDIO_TRACK, VIDEO_TIMESCALE, VIDEO_TRACK};
+use super::producer::{Bridging, Producer, Streams, AUDIO_TRACK, VIDEO_TIMESCALE, VIDEO_TRACK};
 use super::server::{Body, Resources, Server};
 use super::types::{AudioConfig, VideoConfig};
 use crate::source::{open_source, SourceMonitor};
@@ -28,6 +29,15 @@ const MP4: &str = "video/mp4";
 const FIRST_PACKETS: usize = 20_000;
 /// Time allowed for probing an MP4 sample table for keyframes.
 const PROBE_BUDGET: Duration = Duration::from_secs(2);
+/// Audio read at the start: the first packet for a copied track's
+/// configuration; for a bridged one's, what its decoder needs before it
+/// sounds (mid-stream, TrueHD waits up to 128 access units of 0.83 ms for a
+/// major sync), up to a second of it.
+const FIRST_AUDIO_PACKETS: usize = 256;
+const FIRST_AUDIO_SECS: f64 = 1.0;
+
+/// The engine's decoder for an audio stream, for the bridge.
+pub(crate) type BridgeProvider = Arc<dyn Fn(&StreamInfo) -> DecoderFactory + Send + Sync>;
 
 /// Everything worked out before the first segment.
 pub(crate) struct Prepared {
@@ -35,6 +45,7 @@ pub(crate) struct Prepared {
     streams: Streams,
     plan: Plan,
     bandwidth: (u64, Option<u64>),
+    bridge: BridgeProvider,
 }
 
 impl Prepared {
@@ -46,7 +57,9 @@ impl Prepared {
 /// Opens `url` a second time for the producer and prepares the native route
 /// for `video` and `audio`; `Err` says why the playback is not eligible.
 /// `keep` receives the new source's monitor (stopping it unblocks any read);
-/// `wrap` is the engine's decode-order repair; `stopped` aborts.
+/// `wrap` is the engine's decode-order repair; `bridge` makes the engine's
+/// decoder for an audio track AVPlayer cannot take as it is; `stopped`
+/// aborts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare(
     ctx: &RuntimeContext,
@@ -57,6 +70,7 @@ pub(crate) fn prepare(
     duration_secs: f64,
     keep: &dyn Fn(SourceMonitor),
     wrap: &dyn Fn(Box<dyn Demuxer>) -> Box<dyn Demuxer>,
+    bridge: BridgeProvider,
     stopped: &AtomicBool,
 ) -> Result<Prepared, String> {
     let pts_only = matches!(container, "matroska" | "webm");
@@ -104,14 +118,12 @@ pub(crate) fn prepare(
     if video_config.interlaced {
         return Err("interlaced video".into());
     }
-    let audio = match (audio, &first.audio) {
-        (Some(stream), Some(packet)) => {
-            let mut config = codec::audio_config(&stream.params, &packet.data).ok_or("no usable audio configuration")?;
-            config.language = stream.params.language.clone();
-            Some((stream.clone(), config))
+    let (audio, bridging) = match audio {
+        Some(stream) => {
+            let (config, bridging) = audio_track(stream, &first.audio, &bridge)?;
+            (Some((stream.clone(), config)), bridging)
         }
-        (Some(_), None) => return Err("the audio track has no packets".into()),
-        _ => None,
+        None => (None, None),
     };
     let frame_ticks = video_config
         .frame_rate
@@ -144,11 +156,58 @@ pub(crate) fn prepare(
             synthesize_dts: pts_only,
             frame_ticks,
             audio,
+            bridging,
             origin,
         },
         plan,
         bandwidth,
+        bridge,
     })
+}
+
+/// An audio track's configuration: copied when AVPlayer takes it from
+/// fMP4 as it is, else made FLAC by the bridge (`Some` bridging).
+fn audio_track(
+    stream: &StreamInfo,
+    packets: &[(Packet, Option<AudioTrim>)],
+    bridge: &BridgeProvider,
+) -> Result<(AudioConfig, Option<Bridging>), String> {
+    let (first, _) = packets.first().ok_or("the audio track has no packets")?;
+    if let Some(mut config) = codec::audio_config(&stream.params, &first.data) {
+        config.language = stream.params.language.clone();
+        return Ok((config, None));
+    }
+    // Container layouts outside FLAC's channel sets would play on the
+    // wrong speakers.
+    let odd = matches!(
+        stream.params.resolved_layout(),
+        Some(ChannelLayout::Stereo21 | ChannelLayout::Surround40 | ChannelLayout::Surround41 | ChannelLayout::Surround60 | ChannelLayout::Surround70)
+    );
+    if odd {
+        return Err(format!("{:?} audio has no FLAC channel order", stream.params.resolved_layout()));
+    }
+    let factory = bridge(stream);
+    let output = bridge_output(&factory, stream, packets)?;
+    let streaminfo = bridge::streaminfo(&output);
+    let config = codec::flac_config(&streaminfo, stream.params.language.clone()).ok_or("no FLAC configuration")?;
+    Ok((config, Some(Bridging { factory, output })))
+}
+
+/// What the bridge encodes: the decoder's output for the first packets.
+fn bridge_output(factory: &DecoderFactory, stream: &StreamInfo, packets: &[(Packet, Option<AudioTrim>)]) -> Result<bridge::Output, String> {
+    let mut decoder = factory()?;
+    let mut out = Vec::new();
+    for (packet, trim) in packets {
+        let _ = decoder.packet(packet, *trim, &mut out);
+        if let Some(pcm) = out.iter().find(|pcm| !pcm.samples.is_empty()) {
+            if !(1..=8).contains(&pcm.channels) {
+                return Err(format!("{} audio channels: more than FLAC carries", pcm.channels));
+            }
+            let codec_id = stream.params.codec_id.as_str().to_string();
+            return Ok(bridge::Output { rate: pcm.rate, channels: pcm.channels, bits: bridge::bits_for(&codec_id), codec_id });
+        }
+    }
+    Err("the audio decoder gave no sound from the first packets".into())
 }
 
 fn seek(demuxer: &mut dyn Demuxer, stream: u32, ticks: i64) -> Result<i64, String> {
@@ -156,6 +215,21 @@ fn seek(demuxer: &mut dyn Demuxer, stream: u32, ticks: i64) -> Result<i64, Strin
         Ok(Ok(at)) => Ok(at),
         Ok(Err(e)) => Err(format!("seek: {e}")),
         Err(_) => Err("seek panicked".into()),
+    }
+}
+
+/// The next packet and its audio trim.
+fn next_trimmed(demuxer: &mut dyn Demuxer) -> Result<Option<(Packet, Option<AudioTrim>)>, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        demuxer.next_packet().map(|packet| {
+            let trim = demuxer.packet_metadata().audio_trim;
+            (packet, trim)
+        })
+    })) {
+        Ok(Ok(read)) => Ok(Some(read)),
+        Ok(Err(oxideav_core::Error::Eof)) => Ok(None),
+        Ok(Err(e)) => Err(format!("demux: {e}")),
+        Err(_) => Err("demuxer panicked".into()),
     }
 }
 
@@ -217,19 +291,30 @@ struct First {
     /// The earliest presentation time among the keyframe and the packets
     /// that follow it within the reorder window.
     earliest_pts: i64,
-    audio: Option<Packet>,
+    /// The first audio packets, with their trims.
+    audio: Vec<(Packet, Option<AudioTrim>)>,
 }
 
 fn first_packets(demuxer: &mut dyn Demuxer, video: &StreamInfo, audio: Option<&StreamInfo>, stopped: &AtomicBool) -> Result<First, String> {
     let mut keyframe: Option<Packet> = None;
     let mut earliest = i64::MAX;
     let mut following = 0;
-    let mut first_audio: Option<Packet> = None;
+    let mut first_audio: Vec<(Packet, Option<AudioTrim>)> = Vec::new();
+    // A copied track needs its first packet only.
+    let mut copied = false;
+    let full = |audio: &[(Packet, Option<AudioTrim>)], copied: bool| {
+        let secs = |packet: &Packet| packet.pts.or(packet.dts).map(|ticks| packet.time_base.seconds_of(ticks));
+        let span = match (audio.first(), audio.last()) {
+            (Some((first, _)), Some((last, _))) => secs(last).zip(secs(first)).map_or(0.0, |(l, f)| l - f),
+            _ => 0.0,
+        };
+        (copied && !audio.is_empty()) || audio.len() >= FIRST_AUDIO_PACKETS || span >= FIRST_AUDIO_SECS
+    };
     for _ in 0..FIRST_PACKETS {
         if stopped.load(Ordering::SeqCst) {
             return Err("stopped".into());
         }
-        let Some(packet) = next(demuxer)? else { break };
+        let Some((packet, trim)) = next_trimmed(demuxer)? else { break };
         if packet.stream_index == video.index {
             let pts = packet.pts.or(packet.dts);
             match &keyframe {
@@ -245,10 +330,13 @@ fn first_packets(demuxer: &mut dyn Demuxer, video: &StreamInfo, audio: Option<&S
                     }
                 }
             }
-        } else if audio.is_some_and(|a| a.index == packet.stream_index) && first_audio.is_none() && !packet.data.is_empty() {
-            first_audio = Some(packet);
+        } else if let Some(stream) = audio.filter(|a| a.index == packet.stream_index && !full(&first_audio, copied) && !packet.data.is_empty()) {
+            if first_audio.is_empty() {
+                copied = codec::audio_config(&stream.params, &packet.data).is_some();
+            }
+            first_audio.push((packet, trim));
         }
-        if keyframe.is_some() && following >= 16 && (audio.is_none() || first_audio.is_some()) {
+        if keyframe.is_some() && following >= 16 && (audio.is_none() || full(&first_audio, copied)) {
             break;
         }
     }
@@ -321,6 +409,9 @@ pub(crate) struct Session {
     synthesize_dts: bool,
     frame_ticks: i64,
     audio: Option<(StreamInfo, AudioConfig)>,
+    /// The audio is bridged: how.
+    bridging: Option<Bridging>,
+    bridge: BridgeProvider,
     origin: i64,
     plan: Plan,
     bandwidth: (u64, Option<u64>),
@@ -330,8 +421,8 @@ impl Session {
     pub(crate) fn start(prepared: Prepared) -> Result<Session, String> {
         let catalog = Arc::new(Catalog::default());
         let server = Server::start(Arc::clone(&catalog) as Arc<dyn Resources>).map_err(|e| format!("server: {e}"))?;
-        let Prepared { demuxer, streams, plan, bandwidth } = prepared;
-        let Streams { video, video_config, framing, synthesize_dts, frame_ticks, audio, origin } = streams;
+        let Prepared { demuxer, streams, plan, bandwidth, bridge } = prepared;
+        let Streams { video, video_config, framing, synthesize_dts, frame_ticks, audio, bridging, origin } = streams;
         let mut session = Session {
             server,
             catalog,
@@ -343,6 +434,8 @@ impl Session {
             synthesize_dts,
             frame_ticks,
             audio,
+            bridging,
+            bridge,
             origin,
             plan,
             bandwidth,
@@ -364,6 +457,7 @@ impl Session {
                 synthesize_dts: self.synthesize_dts,
                 frame_ticks: self.frame_ticks,
                 audio: self.audio.clone(),
+                bridging: self.bridging.clone(),
                 origin: self.origin,
             },
             self.plan.clone(),
@@ -443,16 +537,14 @@ impl Session {
         let mut active = vec![self.video.index];
         active.extend(audio.map(|a| a.index));
         demuxer.set_active_streams(&active);
-        self.audio = match audio {
-            None => None,
+        (self.audio, self.bridging) = match audio {
+            None => (None, None),
             Some(stream) => {
                 let start = self.plan.starts[self.plan.segment_at(self.video.time_base.ticks_of(at))];
                 seek(&mut *demuxer, self.video.index, start)?;
                 let first = first_packets(&mut *demuxer, &self.video, Some(stream), stopped)?;
-                let packet = first.audio.ok_or("the audio track has no packets")?;
-                let mut config = codec::audio_config(&stream.params, &packet.data).ok_or("no usable audio configuration")?;
-                config.language = stream.params.language.clone();
-                Some((stream.clone(), config))
+                let (config, bridging) = audio_track(stream, &first.audio, &self.bridge)?;
+                (Some((stream.clone(), config)), bridging)
             }
         };
         self.publish(demuxer);
