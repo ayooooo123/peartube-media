@@ -62,7 +62,8 @@ pub(crate) struct VideoConfig {
     pub interlaced: bool,
 }
 
-/// The audio codecs the native route copies into fMP4 unchanged.
+/// The audio codecs in the native route's fMP4, copied from the source, or
+/// FLAC made by the bridge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AudioCodec {
     /// Sample entry `mp4a`, config box `esds`.
@@ -71,6 +72,10 @@ pub(crate) enum AudioCodec {
     Ac3,
     /// Sample entry `ec-3`, config box `dec3`.
     Eac3,
+    /// Sample entry `fLaC`, config box `dfLa`.
+    Flac,
+    /// Sample entry `alac`, config box `alac`.
+    Alac,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,13 +85,18 @@ pub(crate) struct AudioConfig {
     /// AudioSpecificConfig (not the SBR output rate), the AC-3/E-AC-3 rate.
     pub sample_rate: u32,
     pub channels: u16,
+    /// The sample entry's `samplesize`: 16 for AAC/AC-3/E-AC-3, STREAMINFO bits
+    /// per sample for FLAC, the cookie's bitDepth for ALAC.
+    pub bits: u16,
     /// The config box payload: `esds` (FullBox: version and flags, then the
-    /// ES_Descriptor), `dac3` or `dec3`.
+    /// ES_Descriptor), `dac3`, `dec3`, `dfLa` (FullBox version/flags 0, then
+    /// the STREAMINFO metadata block with its last-block flag set) or `alac`
+    /// (FullBox version/flags 0, then the ALAC magic cookie).
     pub config: Vec<u8>,
-    /// RFC 6381 `CODECS` entry: `mp4a.40.2`, `mp4a.40.5`, `ac-3`, `ec-3`.
+    /// RFC 6381 `CODECS` entry: `mp4a.40.2`, `mp4a.40.5`, `ac-3`, `ec-3`, `fLaC`, `alac`.
     pub codec_string: String,
     /// Samples per access unit at `sample_rate` (AAC 1024 or 960, AC-3
-    /// 1536); 0 for E-AC-3, whose frames say it (`codec::eac3_frame_samples`).
+    /// 1536, ALAC the cookie's frameLength); 0 for E-AC-3 and FLAC (per packet).
     pub frame_samples: u32,
     /// The packets start with ADTS headers to strip.
     pub adts: bool,

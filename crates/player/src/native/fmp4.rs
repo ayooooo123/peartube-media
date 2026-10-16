@@ -399,13 +399,15 @@ fn build_audio_sample_entry(config: &AudioConfig) -> Vec<u8> {
         AudioCodec::Aac => (b"mp4a", b"esds"),
         AudioCodec::Ac3 => (b"ac-3", b"dac3"),
         AudioCodec::Eac3 => (b"ec-3", b"dec3"),
+        AudioCodec::Flac => (b"fLaC", b"dfLa"),
+        AudioCodec::Alac => (b"alac", b"alac"),
     };
     let mut body = Vec::with_capacity(28 + 8 + config.config.len());
     body.extend_from_slice(&[0u8; 6]);
     body.extend_from_slice(&1u16.to_be_bytes());
     body.extend_from_slice(&[0u8; 8]);
     body.extend_from_slice(&config.channels.to_be_bytes());
-    body.extend_from_slice(&16u16.to_be_bytes());
+    body.extend_from_slice(&config.bits.to_be_bytes());
     body.extend_from_slice(&0u16.to_be_bytes());
     body.extend_from_slice(&0u16.to_be_bytes());
     let samplerate_field: u32 = if config.sample_rate <= 65535 {
@@ -509,6 +511,7 @@ mod tests {
             codec: AudioCodec::Ac3,
             sample_rate: 48000,
             channels: 6,
+            bits: 16,
             config: b"test-dac3-payload".to_vec(),
             codec_string: "ac-3".to_string(),
             frame_samples: 1536,
@@ -1016,6 +1019,7 @@ mod tests {
             codec: AudioCodec::Aac,
             sample_rate: 96000, // > 65535 -> samplerate field must be 0
             channels: 2,
+            bits: 16,
             config: b"test-esds-config".to_vec(),
             codec_string: "mp4a.40.2".to_string(),
             frame_samples: 1024,
@@ -1048,5 +1052,96 @@ mod tests {
         // language is at body offset 20 (relative to start of box: 8 header + 20 body = 28)
         let lang = u16::from_be_bytes([init[mdhd_pos - 4 + 28], init[mdhd_pos - 4 + 29]]);
         assert_eq!(lang, pack_language(Some("fra")));
+    }
+
+    #[test]
+    fn test_audio_flac_and_alac_sample_entries() {
+        // FLAC
+        let flac_cfg = AudioConfig {
+            codec: AudioCodec::Flac,
+            sample_rate: 48000,
+            channels: 8,
+            bits: 32,
+            config: b"test-dfla-payload".to_vec(),
+            codec_string: "fLaC".to_string(),
+            frame_samples: 0,
+            adts: false,
+            language: None,
+        };
+        let tracks_flac = [Track {
+            id: 1,
+            timescale: 48000,
+            kind: TrackKind::Audio(&flac_cfg),
+        }];
+        let init_flac = init_segment(&tracks_flac);
+        let flac_pos = init_flac.windows(4).position(|w| w == b"fLaC").expect("fLaC box");
+        let flac_box_start = flac_pos - 4;
+        let channels = u16::from_be_bytes([init_flac[flac_box_start + 24], init_flac[flac_box_start + 25]]);
+        let samplesize = u16::from_be_bytes([init_flac[flac_box_start + 26], init_flac[flac_box_start + 27]]);
+        let samplerate = u32::from_be_bytes([
+            init_flac[flac_box_start + 32],
+            init_flac[flac_box_start + 33],
+            init_flac[flac_box_start + 34],
+            init_flac[flac_box_start + 35],
+        ]);
+        assert_eq!(channels, 8);
+        assert_eq!(samplesize, 32);
+        assert_eq!(samplerate, 48000 << 16);
+
+        let dfla_pos = init_flac.windows(4).position(|w| w == b"dfLa").expect("dfLa child box");
+        let dfla_size = u32::from_be_bytes([
+            init_flac[dfla_pos - 4],
+            init_flac[dfla_pos - 3],
+            init_flac[dfla_pos - 2],
+            init_flac[dfla_pos - 1],
+        ]) as usize;
+        assert_eq!(&init_flac[dfla_pos + 4..dfla_pos - 4 + dfla_size], b"test-dfla-payload");
+
+        // ALAC
+        let alac_cfg = AudioConfig {
+            codec: AudioCodec::Alac,
+            sample_rate: 48000,
+            channels: 6,
+            bits: 24,
+            config: b"test-alac-payload".to_vec(),
+            codec_string: "alac".to_string(),
+            frame_samples: 4096,
+            adts: false,
+            language: None,
+        };
+        let tracks_alac = [Track {
+            id: 1,
+            timescale: 48000,
+            kind: TrackKind::Audio(&alac_cfg),
+        }];
+        let init_alac = init_segment(&tracks_alac);
+        let alac_pos = init_alac.windows(4).position(|w| w == b"alac").expect("alac box");
+        let alac_box_start = alac_pos - 4;
+        let channels_a = u16::from_be_bytes([init_alac[alac_box_start + 24], init_alac[alac_box_start + 25]]);
+        let samplesize_a = u16::from_be_bytes([init_alac[alac_box_start + 26], init_alac[alac_box_start + 27]]);
+        let samplerate_a = u32::from_be_bytes([
+            init_alac[alac_box_start + 32],
+            init_alac[alac_box_start + 33],
+            init_alac[alac_box_start + 34],
+            init_alac[alac_box_start + 35],
+        ]);
+        assert_eq!(channels_a, 6);
+        assert_eq!(samplesize_a, 24);
+        assert_eq!(samplerate_a, 48000 << 16);
+
+        // Child alac box starts after the 36-byte preamble (8 box header + 28 audio preamble)
+        let child_alac_pos = init_alac[alac_box_start + 36..]
+            .windows(4)
+            .position(|w| w == b"alac")
+            .expect("child alac box")
+            + alac_box_start
+            + 36;
+        let child_size = u32::from_be_bytes([
+            init_alac[child_alac_pos - 4],
+            init_alac[child_alac_pos - 3],
+            init_alac[child_alac_pos - 2],
+            init_alac[child_alac_pos - 1],
+        ]) as usize;
+        assert_eq!(&init_alac[child_alac_pos + 4..child_alac_pos - 4 + child_size], b"test-alac-payload");
     }
 }

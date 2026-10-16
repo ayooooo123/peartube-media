@@ -87,12 +87,14 @@ pub(crate) fn video_config(params: &CodecParameters, first_keyframe: &[u8]) -> O
     }
 }
 
-/// None unless codec_id is "aac", "ac3" or "eac3" and the headers parse.
+/// None unless codec_id is "aac", "ac3", "eac3", "flac" or "alac" and the headers parse.
 pub(crate) fn audio_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConfig> {
     match params.codec_id.as_str() {
         "aac" => aac_config(params, first_packet),
         "ac3" => ac3_config(params, first_packet),
         "eac3" => eac3_config(params, first_packet),
+        "flac" => flac_config(&params.extradata, params.language.clone()),
+        "alac" => alac_config(params),
         _ => None,
     }
 }
@@ -113,7 +115,7 @@ pub(crate) fn audio_sample(config: &AudioConfig, mut data: Vec<u8>) -> Vec<u8> {
     }
 }
 
-/// Samples (at config.sample_rate) this packet carries: AAC frame_samples; AC-3 1536 x syncframes in the packet; E-AC-3 via eac3_frame_samples. 0 if unparseable.
+/// Samples (at config.sample_rate) this packet carries: AAC frame_samples; AC-3 1536 x syncframes in the packet; E-AC-3 via eac3_frame_samples; FLAC via frame header block size; ALAC via frame header hasSize sample count or frame_samples. 0 if unparseable.
 pub(crate) fn audio_packet_samples(config: &AudioConfig, data: &[u8]) -> u32 {
     match config.codec {
         AudioCodec::Aac => {
@@ -144,6 +146,8 @@ pub(crate) fn audio_packet_samples(config: &AudioConfig, data: &[u8]) -> u32 {
             1536 * count
         }
         AudioCodec::Eac3 => eac3_frame_samples(data).unwrap_or(0),
+        AudioCodec::Flac => flac_frame_samples(data),
+        AudioCodec::Alac => alac_frame_samples(config, data),
     }
 }
 
@@ -998,6 +1002,7 @@ fn aac_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConf
         codec: AudioCodec::Aac,
         sample_rate: core_sample_rate,
         channels,
+        bits: 16,
         config: esds,
         codec_string,
         frame_samples,
@@ -1103,6 +1108,7 @@ fn ac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConf
             codec: AudioCodec::Ac3,
             sample_rate,
             channels,
+            bits: 16,
             config: dac3,
             codec_string: "ac-3".into(),
             frame_samples: 1536,
@@ -1126,6 +1132,7 @@ fn ac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConf
             codec: AudioCodec::Ac3,
             sample_rate,
             channels,
+            bits: 16,
             config: params.extradata.clone(),
             codec_string: "ac-3".into(),
             frame_samples: 1536,
@@ -1454,6 +1461,7 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
             codec: AudioCodec::Eac3,
             sample_rate,
             channels: total_channels,
+            bits: 16,
             config: dec3,
             codec_string: "ec-3".into(),
             frame_samples: 0,
@@ -1463,6 +1471,209 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------
+// FLAC
+// ---------------------------------------------------------------------------
+
+pub(crate) fn flac_config(streaminfo: &[u8], language: Option<String>) -> Option<AudioConfig> {
+    let raw = extract_streaminfo(streaminfo)?;
+    if raw.len() != 34 {
+        return None;
+    }
+    let mut si = raw.to_vec();
+    let mut min_blocksize = u16::from_be_bytes([si[0], si[1]]);
+    let max_blocksize = u16::from_be_bytes([si[2], si[3]]);
+
+    if min_blocksize < 16 {
+        min_blocksize = max_blocksize;
+        si[0..2].copy_from_slice(&min_blocksize.to_be_bytes());
+    }
+    if min_blocksize < 192 {
+        return None;
+    }
+
+    let b = u64::from_be_bytes(si[10..18].try_into().ok()?);
+    let sample_rate = ((b >> 44) & 0xF_FFFF) as u32;
+    let channels = (((b >> 41) & 0x07) + 1) as u16;
+    let bits = (((b >> 36) & 0x1F) + 1) as u16;
+
+    if sample_rate == 0 || channels == 0 || bits == 0 {
+        return None;
+    }
+
+    let mut config = Vec::with_capacity(4 + 4 + 34);
+    config.extend_from_slice(&[0, 0, 0, 0]); // FullBox version 0, flags 0
+    config.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]); // Last metadata block, STREAMINFO (0), len 34
+    config.extend_from_slice(&si);
+
+    Some(AudioConfig {
+        codec: AudioCodec::Flac,
+        sample_rate,
+        channels,
+        bits,
+        config,
+        codec_string: "fLaC".to_string(),
+        frame_samples: 0,
+        adts: false,
+        language,
+    })
+}
+
+fn extract_streaminfo(data: &[u8]) -> Option<&[u8]> {
+    if data.len() == 34 {
+        return Some(data);
+    }
+    let mut cursor = data;
+    if cursor.starts_with(b"fLaC") {
+        cursor = &cursor[4..];
+    } else if cursor.len() >= 4 && cursor[0] == 0 && cursor[1] == 0 && cursor[2] == 0 && cursor[3] == 0 {
+        cursor = &cursor[4..];
+    }
+    while cursor.len() >= 4 {
+        let is_last = (cursor[0] & 0x80) != 0;
+        let block_type = cursor[0] & 0x7F;
+        let block_len = u32::from_be_bytes([0, cursor[1], cursor[2], cursor[3]]) as usize;
+        cursor = &cursor[4..];
+        if cursor.len() < block_len {
+            return None;
+        }
+        if block_type == 0 && block_len == 34 {
+            return Some(&cursor[..34]);
+        }
+        cursor = &cursor[block_len..];
+        if is_last {
+            break;
+        }
+    }
+    None
+}
+
+fn flac_frame_samples(data: &[u8]) -> u32 {
+    if data.len() < 4 {
+        return 0;
+    }
+    if data[0] != 0xFF || (data[1] != 0xF8 && data[1] != 0xF9) {
+        return 0;
+    }
+    let bs_code = data[2] >> 4;
+    match bs_code {
+        0 => 0,
+        1 => 192,
+        2..=5 => 576 << (bs_code - 2),
+        8..=15 => 256 << (bs_code - 8),
+        6 => {
+            let offset = match flac_uncommon_offset(data) {
+                Some(off) => off,
+                None => return 0,
+            };
+            if data.len() <= offset {
+                return 0;
+            }
+            (data[offset] as u32) + 1
+        }
+        7 => {
+            let offset = match flac_uncommon_offset(data) {
+                Some(off) => off,
+                None => return 0,
+            };
+            if data.len() < offset + 2 {
+                return 0;
+            }
+            (u16::from_be_bytes([data[offset], data[offset + 1]]) as u32) + 1
+        }
+        _ => 0,
+    }
+}
+
+fn flac_uncommon_offset(data: &[u8]) -> Option<usize> {
+    if data.len() <= 4 {
+        return None;
+    }
+    let lead = data[4];
+    let utf8_len = if (lead & 0x80) == 0 {
+        1
+    } else if (lead & 0xE0) == 0xC0 {
+        2
+    } else if (lead & 0xF0) == 0xE0 {
+        3
+    } else if (lead & 0xF8) == 0xF0 {
+        4
+    } else if (lead & 0xFC) == 0xF8 {
+        5
+    } else if (lead & 0xFE) == 0xFC {
+        6
+    } else if lead == 0xFE {
+        7
+    } else {
+        return None;
+    };
+    if data.len() < 4 + utf8_len {
+        return None;
+    }
+    Some(4 + utf8_len)
+}
+
+// ---------------------------------------------------------------------------
+// ALAC
+// ---------------------------------------------------------------------------
+
+fn alac_config(params: &CodecParameters) -> Option<AudioConfig> {
+    let cookie = if params.extradata.len() >= 12 && &params.extradata[4..8] == b"alac" {
+        &params.extradata[12..]
+    } else {
+        &params.extradata[..]
+    };
+    if cookie.len() < 24 {
+        return None;
+    }
+    let frame_length = u32::from_be_bytes(cookie[0..4].try_into().ok()?);
+    let bit_depth = cookie[5];
+    let num_channels = cookie[9];
+    let sample_rate = u32::from_be_bytes(cookie[20..24].try_into().ok()?);
+
+    if sample_rate == 0 || num_channels == 0 || bit_depth == 0 {
+        return None;
+    }
+
+    let mut config = Vec::with_capacity(4 + cookie.len());
+    config.extend_from_slice(&[0, 0, 0, 0]); // FullBox version 0, flags 0
+    config.extend_from_slice(cookie);
+
+    Some(AudioConfig {
+        codec: AudioCodec::Alac,
+        sample_rate,
+        channels: u16::from(num_channels),
+        bits: u16::from(bit_depth),
+        config,
+        codec_string: "alac".to_string(),
+        frame_samples: frame_length,
+        adts: false,
+        language: params.language.clone(),
+    })
+}
+
+fn alac_frame_samples(config: &AudioConfig, data: &[u8]) -> u32 {
+    if data.is_empty() {
+        return 0;
+    }
+    if data.len() < 3 {
+        return config.frame_samples;
+    }
+    let has_size = (data[2] & 0x10) != 0;
+    if has_size {
+        if data.len() < 7 {
+            return 0;
+        }
+        ((data[2] as u32 & 1) << 31)
+            | ((data[3] as u32) << 23)
+            | ((data[4] as u32) << 15)
+            | ((data[5] as u32) << 7)
+            | ((data[6] as u32) >> 1)
+    } else {
+        config.frame_samples
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1884,5 +2095,215 @@ mod tests {
 
         let p_vp9 = CodecParameters::video(CodecId::new("vp9"));
         assert_eq!(video_config(&p_vp9, &[]), None);
+    }
+
+    const FFMPEG_DFLA_PAYLOAD: &[u8] = &[
+        0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x22, 0x04, 0x00, 0x04, 0x00, 0x00, 0x12,
+        0x6e, 0x00, 0x41, 0x27, 0x0b, 0xb8, 0x0f, 0xf0, 0x00, 0x15, 0xf9, 0x00, 0x8f, 0x43,
+        0x3f, 0x80, 0xfb, 0xab, 0x19, 0xf0, 0xdd, 0x3a, 0x0a, 0x24, 0x5c, 0x01, 0xab, 0xec,
+    ];
+
+    const FFMPEG_ALAC_PAYLOAD: &[u8] = &[
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x18, 0x28, 0x0a, 0x0e, 0x06,
+        0x00, 0x00, 0x00, 0x01, 0x20, 0x04, 0x00, 0x69, 0x78, 0x00, 0x00, 0x00, 0xbb, 0x80,
+    ];
+
+    #[test]
+    fn test_flac_dfla_matches_ffmpeg() {
+        // 1. Matroska CodecPrivate: "fLaC" + metadata block (38 bytes)
+        let mut mkv_extradata = b"fLaC".to_vec();
+        mkv_extradata.extend_from_slice(&FFMPEG_DFLA_PAYLOAD[4..]); // 0x80, 0, 0, 0x22 + 34 bytes
+
+        let mut p = CodecParameters::audio(CodecId::new("flac"));
+        p.extradata = mkv_extradata;
+        let cfg = audio_config(&p, &[]).expect("flac config from mkv extradata");
+        assert_eq!(cfg.codec, AudioCodec::Flac);
+        assert_eq!(cfg.sample_rate, 48000);
+        assert_eq!(cfg.channels, 8);
+        assert_eq!(cfg.bits, 32);
+        assert_eq!(cfg.codec_string, "fLaC");
+        assert_eq!(cfg.frame_samples, 0);
+        assert!(!cfg.adts);
+        assert_eq!(cfg.config, FFMPEG_DFLA_PAYLOAD);
+
+        // 2. Bare 34-byte STREAMINFO via flac_config
+        let bare_streaminfo = &FFMPEG_DFLA_PAYLOAD[8..];
+        let cfg_bare = flac_config(bare_streaminfo, None).expect("flac config from bare streaminfo");
+        assert_eq!(cfg_bare.config, FFMPEG_DFLA_PAYLOAD);
+
+        // 3. MP4 dfLa payload (FullBox header + blocks)
+        let cfg_dfla = flac_config(FFMPEG_DFLA_PAYLOAD, None).expect("flac config from dfLa payload");
+        assert_eq!(cfg_dfla.config, FFMPEG_DFLA_PAYLOAD);
+    }
+
+    #[test]
+    fn test_alac_cookie_matches_ffmpeg() {
+        let cookie = &FFMPEG_ALAC_PAYLOAD[4..]; // 24 bytes ALACSpecificConfig
+
+        // 1. Bare ALACSpecificConfig
+        let mut p = CodecParameters::audio(CodecId::new("alac"));
+        p.extradata = cookie.to_vec();
+        let cfg = audio_config(&p, &[]).expect("alac config from bare cookie");
+        assert_eq!(cfg.codec, AudioCodec::Alac);
+        assert_eq!(cfg.sample_rate, 48000);
+        assert_eq!(cfg.channels, 6);
+        assert_eq!(cfg.bits, 24);
+        assert_eq!(cfg.codec_string, "alac");
+        assert_eq!(cfg.frame_samples, 4096);
+        assert!(!cfg.adts);
+        assert_eq!(cfg.config, FFMPEG_ALAC_PAYLOAD);
+
+        // 2. Wrapped in an alac atom (12 bytes atom header + 24 bytes cookie)
+        let mut atom_wrapped = vec![0, 0, 0, 36];
+        atom_wrapped.extend_from_slice(b"alac");
+        atom_wrapped.extend_from_slice(&[0, 0, 0, 0]);
+        atom_wrapped.extend_from_slice(cookie);
+        p.extradata = atom_wrapped;
+        let cfg_wrapped = audio_config(&p, &[]).expect("alac config from atom wrapped");
+        assert_eq!(cfg_wrapped.config, FFMPEG_ALAC_PAYLOAD);
+
+        // 3. Cookie followed by a chan box
+        let mut with_chan = cookie.to_vec();
+        with_chan.extend_from_slice(&[0, 0, 0, 12, b'c', b'h', b'a', b'n', 0, 0, 0, 0]);
+        p.extradata = with_chan.clone();
+        let cfg_chan = audio_config(&p, &[]).expect("alac config with chan box");
+        assert_eq!(&cfg_chan.config[..4], &[0, 0, 0, 0]);
+        assert_eq!(&cfg_chan.config[4..], with_chan.as_slice());
+    }
+
+    #[test]
+    fn test_flac_min_blocksize_rules() {
+        let mut si = FFMPEG_DFLA_PAYLOAD[8..].to_vec();
+
+        // min_blocksize < 16 -> clamped to max_blocksize (4096), accepted
+        si[0..2].copy_from_slice(&0u16.to_be_bytes());
+        si[2..4].copy_from_slice(&4096u16.to_be_bytes());
+        let cfg = flac_config(&si, None).expect("min_blocksize < 16 clamped to 4096");
+        assert_eq!(&cfg.config[8..10], &4096u16.to_be_bytes());
+
+        // min_blocksize < 16, but max_blocksize < 192 (e.g. 100) -> returns None
+        si[0..2].copy_from_slice(&0u16.to_be_bytes());
+        si[2..4].copy_from_slice(&100u16.to_be_bytes());
+        assert_eq!(flac_config(&si, None), None);
+
+        // 16 <= min_blocksize < 192 -> returns None
+        si[2..4].copy_from_slice(&4096u16.to_be_bytes());
+        for bs in [16u16, 64, 128, 191] {
+            si[0..2].copy_from_slice(&bs.to_be_bytes());
+            assert_eq!(flac_config(&si, None), None, "min_blocksize {bs} must be None");
+        }
+
+        // min_blocksize >= 192 -> accepted
+        si[0..2].copy_from_slice(&192u16.to_be_bytes());
+        assert!(flac_config(&si, None).is_some());
+    }
+
+    #[test]
+    fn test_flac_frame_header_block_sizes() {
+        let cfg = AudioConfig {
+            codec: AudioCodec::Flac,
+            sample_rate: 48000,
+            channels: 2,
+            bits: 16,
+            config: Vec::new(),
+            codec_string: "fLaC".to_string(),
+            frame_samples: 0,
+            adts: false,
+            language: None,
+        };
+
+        let fixed_cases = [
+            (1, 192),
+            (2, 576),
+            (3, 1152),
+            (4, 2304),
+            (5, 4608),
+            (8, 256),
+            (9, 512),
+            (10, 1024),
+            (11, 2048),
+            (12, 4096),
+            (13, 8192),
+            (14, 16384),
+            (15, 32768),
+        ];
+
+        for (code, expected) in fixed_cases {
+            let hdr = [0xFF, 0xF8, (code << 4) | 0x0A, 0x70, 0x00, 0x00];
+            assert_eq!(
+                audio_packet_samples(&cfg, &hdr),
+                expected,
+                "block size code {code} must be {expected}"
+            );
+        }
+
+        // Variable blocking sync 0xFFF9
+        let var_hdr = [0xFF, 0xF9, 0xC0, 0x70, 0x00, 0x00];
+        assert_eq!(audio_packet_samples(&cfg, &var_hdr), 4096);
+
+        // Non-sync
+        let non_sync = [0xFF, 0x00, 0xC0, 0x70, 0x00, 0x00];
+        assert_eq!(audio_packet_samples(&cfg, &non_sync), 0);
+
+        // Code 0 (reserved)
+        let reserved_hdr = [0xFF, 0xF8, 0x00, 0x70, 0x00, 0x00];
+        assert_eq!(audio_packet_samples(&cfg, &reserved_hdr), 0);
+
+        // Uncommon size 8-bit (code 6): 1-byte UTF-8 coded number, size-1 = 199 -> 200
+        let code6_1byte = [0xFF, 0xF8, 0x60, 0x70, 0x00, 0xC7];
+        assert_eq!(audio_packet_samples(&cfg, &code6_1byte), 200);
+
+        // Uncommon size 8-bit (code 6): 2-byte UTF-8 coded number [0xC2, 0x80], size-1 = 42 -> 43
+        let code6_2byte = [0xFF, 0xF8, 0x60, 0x70, 0xC2, 0x80, 0x2A];
+        assert_eq!(audio_packet_samples(&cfg, &code6_2byte), 43);
+
+        // Uncommon size 16-bit (code 7): 1-byte UTF-8 coded number, size-1 = 2999 (0x0BB7) -> 3000
+        let code7_1byte = [0xFF, 0xF8, 0x70, 0x70, 0x00, 0x0B, 0xB7];
+        assert_eq!(audio_packet_samples(&cfg, &code7_1byte), 3000);
+
+        // Uncommon size 16-bit (code 7): 3-byte UTF-8 coded number [0xE0, 0xA0, 0x80], size-1 = 4096 -> 4097
+        let code7_3byte = [0xFF, 0xF8, 0x70, 0x70, 0xE0, 0xA0, 0x80, 0x10, 0x00];
+        assert_eq!(audio_packet_samples(&cfg, &code7_3byte), 4097);
+    }
+
+    #[test]
+    fn test_alac_packet_samples_and_partial_frame() {
+        let cfg = AudioConfig {
+            codec: AudioCodec::Alac,
+            sample_rate: 48000,
+            channels: 6,
+            bits: 24,
+            config: Vec::new(),
+            codec_string: "alac".to_string(),
+            frame_samples: 4096,
+            adts: false,
+            language: None,
+        };
+
+        // Frame without hasSize (data[2] & 0x10 == 0) -> frame_samples (4096)
+        let normal_pkt = [0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(audio_packet_samples(&cfg, &normal_pkt), 4096);
+
+        // Actual partial frame from fixture (multi_audio.mkv last ALAC packet): 2304 samples
+        let fixture_last_pkt = [0x00, 0x00, 0x14, 0x00, 0x00, 0x12, 0x00, 0x00];
+        assert_eq!(audio_packet_samples(&cfg, &fixture_last_pkt), 2304);
+
+        // Synthetic partial frame with hasSize for arbitrary count (e.g. 1234)
+        let s: u32 = 1234;
+        let synth_pkt = [
+            0x00,
+            0x00,
+            0x10 | ((s >> 31) as u8 & 1),
+            (s >> 23) as u8,
+            (s >> 15) as u8,
+            (s >> 7) as u8,
+            ((s & 0x7F) << 1) as u8,
+        ];
+        assert_eq!(audio_packet_samples(&cfg, &synth_pkt), 1234);
+
+        // Truncated / empty
+        assert_eq!(audio_packet_samples(&cfg, &[]), 0);
+        assert_eq!(audio_packet_samples(&cfg, &[0x00, 0x00]), 4096);
+        assert_eq!(audio_packet_samples(&cfg, &[0x00, 0x00, 0x10]), 0); // hasSize but truncated
     }
 }
