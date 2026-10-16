@@ -151,3 +151,52 @@ fn mp4_sync_sample_on_a_non_idr_i_frame() {
 fn mpegts_random_access_indicator_on_a_non_idr_i_frame() {
     check("mpegts", "ts");
 }
+
+/// HEVC's open-GOP random-access point is a CRA picture. Its leading (RASL)
+/// pictures predict from pictures before it and show before it, so a
+/// decoder that starts at the CRA skips them (H.265 8.1.3, as FFmpeg does).
+/// x265 writes a CRA every 2 s; a seek to 4 s lands on one, and every
+/// picture from 4 s on must show as the uninterrupted decode has it. The
+/// software HEVC decoder failed on those RASL pictures ("reference picture
+/// is missing") and the playback stopped.
+#[test]
+fn matroska_hevc_seek_onto_a_cra_with_leading_pictures() {
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("seek_entry_hevc_cra.mkv");
+    let status = Command::new(refcheck::system_ffmpeg())
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=8",
+            "-c:v", "libx265", "-x265-params", "keyint=50:min-keyint=50:scenecut=0:open-gop=1:bframes=3:log-level=error",
+            "-f", "matroska"])
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let mut d = open(&path);
+    let video = d.streams().iter().find(|s| s.params.media_type == MediaType::Video).unwrap().clone();
+    let first = loop {
+        let p = d.next_packet().unwrap();
+        if p.stream_index == video.index {
+            break p;
+        }
+    };
+    let start = video.time_base.seconds_of(first.pts.unwrap());
+    d.seek_to(video.index, video.time_base.ticks_of(start + 4.0)).unwrap();
+    let landed = loop {
+        let p = d.next_packet().unwrap();
+        if p.stream_index == video.index {
+            break p;
+        }
+    };
+    // hvcC packets: 4-byte lengths, the type in bits 1..6 of each NAL's first byte.
+    let mut types = Vec::new();
+    let mut at = 0;
+    while at + 4 < landed.data.len() {
+        let len = u32::from_be_bytes(landed.data[at..at + 4].try_into().unwrap()) as usize;
+        types.push((landed.data[at + 4] >> 1) & 0x3F);
+        at += 4 + len;
+    }
+    assert!(types.contains(&21), "the seek must land on a CRA picture: NAL types {types:?}");
+    let full = refcheck::ffmpeg_video_md5s(&path, 0, "yuv420p");
+    assert_eq!(full.len(), 200, "FFmpeg's uninterrupted decode");
+    let shown = shown_after_seek(&path, Duration::from_secs_f64(start) + Duration::from_secs(4));
+    assert_eq!(shown, full[100..], "every picture from 4 s on, as decoded without the seek");
+}
