@@ -778,45 +778,4 @@ mod tests {
         }
         assert_eq!(packet_count, 150);
     }
-
-    #[test]
-    fn write_playable_p7_fixture_when_requested() {
-        let Some(out_path) = std::env::var_os("PEARTUBE_P7_SMOKE_OUT") else { return };
-        let Some(src_path) = std::env::var_os("PEARTUBE_P7_SMOKE_SRC") else { return };
-        let p7_rpu: Vec<u8> = (0..P7_FEL_RPU_HEX.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&P7_FEL_RPU_HEX[i..i + 2], 16).unwrap())
-            .collect();
-        let el_nal: Vec<u8> = vec![63 << 1, 0x01, 0xDE, 0xAD, 0xBE, 0xEF];
-        let mut ctx = RuntimeContext::new();
-        oxideav_mkv::register(&mut ctx);
-        let mut dmx = oxideav_mkv::demux::open_typed(Box::new(std::fs::File::open(src_path).unwrap()), &ctx.codecs).unwrap();
-        let streams = dmx.streams().to_vec();
-        let file = std::fs::File::create(out_path).unwrap();
-        let mut muxer = oxideav_mkv::mux::MkvMuxer::new_matroska(Box::new(file), &streams).unwrap();
-        let dovi_p7 = codec::build_dovi_record(7, 6, true, true, true, 6);
-        muxer.with_duration_finalization().unwrap();
-        muxer
-            .set_block_addition_mappings(
-                0,
-                vec![BlockAdditionMapping {
-                    value: Some(4),
-                    name: Some("Dolby Vision configuration".into()),
-                    addid_type: 0x6476_6343,
-                    extra_data: Some(dovi_p7.to_vec()),
-                }],
-            )
-            .unwrap();
-        muxer.write_header().unwrap();
-        while let Ok(mut pkt) = dmx.next_packet() {
-            if pkt.stream_index == 0 {
-                pkt.data.extend_from_slice(&(p7_rpu.len() as u32).to_be_bytes());
-                pkt.data.extend_from_slice(&p7_rpu);
-                pkt.data.extend_from_slice(&(el_nal.len() as u32).to_be_bytes());
-                pkt.data.extend_from_slice(&el_nal);
-            }
-            muxer.write_packet(&pkt).unwrap();
-        }
-        muxer.write_trailer().unwrap();
-    }
 }
