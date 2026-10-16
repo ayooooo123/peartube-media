@@ -85,6 +85,9 @@ pub struct ApplePresenter {
     ended: AtomicBool,
     notification_error: Mutex<Option<String>>,
     weak_self: Mutex<Option<Weak<Self>>>,
+    /// An item is open: the poller reads its status. Idle, it leaves the
+    /// main thread alone.
+    active: AtomicBool,
 }
 
 unsafe impl Send for ApplePresenter {}
@@ -111,6 +114,7 @@ impl ApplePresenter {
             ended: AtomicBool::new(false),
             notification_error: Mutex::new(None),
             weak_self: Mutex::new(None),
+            active: AtomicBool::new(false),
         });
 
         let weak = Arc::downgrade(&presenter);
@@ -122,6 +126,9 @@ impl ApplePresenter {
                 while weak.upgrade().is_some() {
                     std::thread::sleep(Duration::from_millis(100));
                     let Some(presenter) = weak.upgrade() else { break; };
+                    if !presenter.active.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     let item_gen = presenter.generation.load(Ordering::SeqCst);
                     let weak_inner = presenter.weak();
                     presenter.main.exec_async(move || {
@@ -273,10 +280,12 @@ impl ApplePresenter {
         };
         let ended = self.ended.load(Ordering::Relaxed);
         let seek_done = self.seek_done.load(Ordering::Relaxed);
+        let picture = current_item.is_some() && unsafe { self.player_layer.0.isReadyForDisplay() };
 
         let new_status = NativeStatus {
             ready,
             failed,
+            picture,
             playing,
             waiting,
             ended,
@@ -316,6 +325,7 @@ impl NativePresenter for ApplePresenter {
         self.ended.store(false, Ordering::Release);
         *self.notification_error.lock() = None;
         self.clock.clear();
+        self.active.store(true, Ordering::SeqCst);
 
         let changed = {
             let mut st = self.status.lock();
@@ -323,6 +333,7 @@ impl NativePresenter for ApplePresenter {
             st.ready = false;
             st.failed = None;
             st.ended = false;
+            st.picture = false;
             st.playing = false;
             st.waiting = false;
             st.position = None;
@@ -562,6 +573,7 @@ impl NativePresenter for ApplePresenter {
         self.clock.clear();
         self.ended.store(false, Ordering::Release);
         *self.notification_error.lock() = None;
+        self.active.store(false, Ordering::SeqCst);
 
         let changed = {
             let mut st = self.status.lock();
@@ -569,6 +581,7 @@ impl NativePresenter for ApplePresenter {
             st.ready = false;
             st.failed = None;
             st.ended = false;
+            st.picture = false;
             st.playing = false;
             st.waiting = false;
             st.position = None;

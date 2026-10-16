@@ -6,7 +6,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -815,7 +815,7 @@ mod tests {
     fn test_head_pending() {
         let (tx, rx) = mpsc::channel();
         struct HeadPendRes {
-            rx: Mutex<Option<Receiver<Result<Arc<[u8]>, String>>>>,
+            rx: Mutex<Option<mpsc::Receiver<Result<Arc<[u8]>, String>>>>,
         }
         impl Resources for HeadPendRes {
             fn get(&self, path: &str) -> Option<(Body, &'static str)> {
@@ -929,7 +929,7 @@ mod tests {
     fn test_pending_ready_within_100ms_content_length() {
         let (tx, rx) = mpsc::channel();
         struct FastRes {
-            rx: Mutex<Option<Receiver<Result<Arc<[u8]>, String>>>>,
+            rx: Mutex<Option<mpsc::Receiver<Result<Arc<[u8]>, String>>>>,
         }
         impl Resources for FastRes {
             fn get(&self, path: &str) -> Option<(Body, &'static str)> {
@@ -969,7 +969,7 @@ mod tests {
     fn test_pending_ready_after_2s_chunked() {
         let (tx, rx) = mpsc::channel();
         struct SlowRes {
-            rx: Mutex<Option<Receiver<Result<Arc<[u8]>, String>>>>,
+            rx: Mutex<Option<mpsc::Receiver<Result<Arc<[u8]>, String>>>>,
         }
         impl Resources for SlowRes {
             fn get(&self, path: &str) -> Option<(Body, &'static str)> {
@@ -1017,7 +1017,7 @@ mod tests {
     fn test_pending_dropped_no_terminating_chunk() {
         let (tx, rx) = mpsc::channel::<Result<Arc<[u8]>, String>>();
         struct DropRes {
-            rx: Mutex<Option<Receiver<Result<Arc<[u8]>, String>>>>,
+            rx: Mutex<Option<mpsc::Receiver<Result<Arc<[u8]>, String>>>>,
         }
         impl Resources for DropRes {
             fn get(&self, path: &str) -> Option<(Body, &'static str)> {
@@ -1058,7 +1058,7 @@ mod tests {
         let _never_send = tx;
 
         struct NeverRes {
-            rx: Mutex<Option<Receiver<Result<Arc<[u8]>, String>>>>,
+            rx: Mutex<Option<mpsc::Receiver<Result<Arc<[u8]>, String>>>>,
         }
         impl Resources for NeverRes {
             fn get(&self, path: &str) -> Option<(Body, &'static str)> {

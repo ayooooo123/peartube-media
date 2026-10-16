@@ -17,6 +17,7 @@ use oxideav_core::{
 mod captions;
 mod entry;
 mod decode_order;
+mod native;
 
 pub use captions::{CAPTIONS_608, CAPTIONS_708};
 
@@ -405,6 +406,9 @@ struct SharedState {
     last_changed: Mutex<Instant>,
     /// The demuxer's source, for suspend/resume.
     source: Mutex<Option<SourceMonitor>>,
+    /// Sources the native route opened besides `source` (its segment
+    /// producer's): stopped with it.
+    native_sources: Mutex<Vec<SourceMonitor>>,
     /// Monotonic counter bumped by every `seek`. The demux loop applies the
     /// newest request; decoder threads compare their local copy against it to
     /// detect a seek they have not yet honoured.
@@ -537,6 +541,7 @@ impl Player {
             on_event: on_event_arc,
             last_changed: Mutex::new(Instant::now() - Duration::from_secs(1)),
             source: Mutex::new(None),
+            native_sources: Mutex::new(Vec::new()),
             seek_gen: AtomicU64::new(0),
             seek_target: Mutex::new(None),
             active_seek: Mutex::new(None),
@@ -610,12 +615,18 @@ impl Player {
         if let Some(src) = &*self.shared.source.lock() {
             src.suspend();
         }
+        for src in self.shared.native_sources.lock().iter() {
+            src.suspend();
+        }
         self.shared.backend.suspend();
         notify_changed(&self.shared);
     }
 
     pub fn resume(&self) {
         if let Some(src) = &*self.shared.source.lock() {
+            src.resume();
+        }
+        for src in self.shared.native_sources.lock().iter() {
             src.resume();
         }
         self.shared.backend.resume();
@@ -656,6 +667,9 @@ impl Drop for Player {
             }
             None => false,
         };
+        for source in self.shared.native_sources.lock().iter() {
+            source.stop();
+        }
         self.shared.condvar.notify_all();
         if let Some(pipeline) = self.pipeline.take() {
             // Until the source exists the pipeline thread may sit in the
@@ -744,6 +758,7 @@ fn run_player_pipeline(
         return;
     }
 
+    let mut container = String::new();
     let demuxer = if vobsub.is_some() {
         // 2-3. VobSub: the index, read whole as it opens, beside the
         //    program stream (FFmpeg's vobsub demuxer pairs them the same
@@ -762,7 +777,7 @@ fn run_player_pipeline(
         }
     } else {
         // 2. Probe (rule from engine-api.md, same as refcheck), then rewind.
-        let container = match probe_container(&url, &mut source, &shared) {
+        container = match probe_container(&url, &mut source, &shared) {
             Ok(c) => c,
             Err(e) => {
                 if !shared.stopped.load(Ordering::SeqCst) {
@@ -910,6 +925,28 @@ fn run_player_pipeline(
         headless.set_clock(shared.sink_clock());
     }
 
+    // 5b. A platform player that plays H.264/HEVC itself gets the playback
+    // as HLS (see `crate::native`); what it cannot start comes back here.
+    if options.realtime && vobsub.is_none() {
+        if let Some(presenter) = shared.backend.native() {
+            let selection = native::Selection {
+                video: current_video,
+                audio: current_audio,
+                subtitle: current_subtitle,
+                select_gen,
+            };
+            match native::play(&shared, presenter, &url, &container, demuxer, &streams, selection, duration, &options) {
+                native::Outcome::Finished => return,
+                native::Outcome::Declined { demuxer: back, at } => {
+                    demuxer = back;
+                    if let Some(at) = at {
+                        shared.request_seek(at);
+                    }
+                }
+            }
+        }
+    }
+
     // 6. Lanes + sinks.
     let video_lane = Lane::new();
     let audio_lane = Lane::new();
@@ -971,7 +1008,7 @@ fn run_player_pipeline(
         audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
     shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
     run.sub_thread = find_stream(&streams, current_subtitle)
-        .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime, &options.fonts, run.demuxer.attachments()));
+        .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime, &options.fonts, run.demuxer.attachments(), false));
 
     // 8. From here the buffering hold follows the pipelines' data.
     shared.pipelines_started();
@@ -1124,6 +1161,9 @@ impl Drop for AudioOutput {
     }
 }
 
+/// `native`: the platform player plays the media, so no video or audio
+/// pipeline bounds the read-ahead; the native route's feeder does.
+#[allow(clippy::too_many_arguments)]
 fn spawn_subtitles(
     shared: &Arc<SharedState>,
     stream: StreamInfo,
@@ -1132,6 +1172,7 @@ fn spawn_subtitles(
     realtime: bool,
     fonts: &subs_render::FontOptions,
     attachments: &[oxideav_core::Attachment],
+    native: bool,
 ) -> PipelineThread {
     let consumer = Consumer::new(lane, demux_cv);
     let sink = shared.backend.subtitles();
@@ -1194,7 +1235,7 @@ fn spawn_subtitles(
             seek_generation: Box::new(move || seeks.seek_gen.load(Ordering::SeqCst)),
             // A video or audio pipeline drains its lane: the demuxer's
             // read-ahead is bounded by theirs.
-            paced: Box::new(move || lanes.iter().take(2).any(|lane| lane.consumed.load(Ordering::SeqCst))),
+            paced: Box::new(move || native || lanes.iter().take(2).any(|lane| lane.consumed.load(Ordering::SeqCst))),
             beside_media: Box::new(move || members.beside_media.load(Ordering::SeqCst)),
             stopped: shared.stopped.clone(),
             retired,
@@ -1769,7 +1810,7 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
         let stream = find_stream(run.streams, run.current_subtitle)
             .filter(|s| s.params.media_type == MediaType::Subtitle);
         if let Some(stream) = stream {
-            run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime, &run.options.fonts, run.demuxer.attachments()));
+            run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime, &run.options.fonts, run.demuxer.attachments(), false));
         }
     }
 

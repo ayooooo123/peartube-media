@@ -33,6 +33,7 @@ subs-render = { path = "../subs-render" }
 unicode-bidi = "0.3.18"
 oxideav-h264.workspace = true
 oxideav-h265.workspace = true
+oxideav-mkv.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-29"] }
@@ -75,6 +76,9 @@ required-features = ["probe"]
 
 [[example]]
 name = "apple_play"
+
+[[example]]
+name = "native_play"
 
 [[example]]
 name = "android_sync"

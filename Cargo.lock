@@ -1786,6 +1786,7 @@ dependencies = [
  "oxideav-h264",
  "oxideav-h265",
  "oxideav-http",
+ "oxideav-mkv",
  "oxideav-mp4",
  "oxideav-ogg",
  "oxideav-pixfmt",

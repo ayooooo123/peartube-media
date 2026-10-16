@@ -70,6 +70,10 @@ pub struct NativeStatus {
     pub ready: bool,
     /// The item failed: domain, code and description.
     pub failed: Option<String>,
+    /// The layer has a picture to show (AVPlayerLayer readyForDisplay):
+    /// the video decodes. A player can play the audio of a video it cannot
+    /// decode.
+    pub picture: bool,
     /// Media is moving (AVPlayer timeControlStatus playing).
     pub playing: bool,
     /// Asked to play, waiting for media (timeControlStatus

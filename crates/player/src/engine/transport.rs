@@ -392,6 +392,17 @@ impl SharedState {
         published
     }
 
+    /// The native route: the platform player's buffering is the hold
+    /// (`pipelines_started` never runs, so `rebuffer` leaves it alone).
+    pub(super) fn native_hold(&self, hold: bool) {
+        self.update(|t| t.buffering = hold);
+    }
+
+    /// The user's intent: paused.
+    pub(super) fn paused(&self) -> bool {
+        self.transport.lock().paused
+    }
+
     /// The pipelines are running: from now on the hold follows their data.
     pub(super) fn pipelines_started(&self) {
         self.update(|t| t.started = true);
