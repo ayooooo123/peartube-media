@@ -2,9 +2,13 @@
 //! take from fMP4 is decoded with the engine's decoders and served as FLAC.
 //! The FLAC blocks lie on one grid on the item axis, block n covering
 //! samples `[n * BLOCK, (n + 1) * BLOCK)` with frame number n, and a segment
-//! holds the blocks that start in it: segments made in different producer
-//! runs (on from the last one, or after a seek) meet without a gap or an
-//! overlap.
+//! holds the blocks that start in it, so the segments of one producer run
+//! meet without a gap or an overlap. A run started after a seek places its
+//! audio by the container's timestamps: Matroska's whole milliseconds put
+//! it up to half a millisecond from where a run from the start has it when
+//! frames do not end on whole milliseconds (TrueHD, DTS, Vorbis, FLAC; not
+//! MP3, Opus or AC-3 at 48 kHz). Only a segment played next to one from
+//! another run shows that, as a jump of that size.
 //!
 //! The frames are VERBATIM: the samples as they are, 16 or 24 bits. Over
 //! 127.0.0.1 compression buys nothing, and OxideAV's FLAC encoder took
@@ -23,6 +27,10 @@ const ALIGN_SECS: f64 = 0.040;
 /// A restarted segment decodes from this long before its first sample:
 /// MP3's bit reservoir, overlapped transforms, TrueHD's restart points.
 pub(crate) const PREROLL_SECS: f64 = 1.0;
+/// The most silence a gap in the decoded audio gets (`plan::trusted` allows
+/// keyframes 30 s apart); a stamp further ahead is taken as damage and the
+/// audio continues where it was.
+const MAX_GAP_SECS: f64 = 30.0;
 
 /// Decoded audio as the engine's decoders give it: interleaved f32 in the
 /// decoder's channel order, starting at `pts` (source seconds). `begins`:
@@ -58,9 +66,10 @@ pub(crate) struct Output {
 }
 
 /// 24 bits for lossless sources, 16 for the rest (a lossy decode gains
-/// nothing from more).
+/// nothing from more). DTS-HD Master Audio is lossless and shares the
+/// `dts` id with lossy DTS.
 pub(crate) fn bits_for(codec_id: &str) -> u16 {
-    let lossless = matches!(codec_id, "truehd" | "mlp" | "flac" | "alac" | "wavpack" | "tta" | "ape") || codec_id.starts_with("pcm_");
+    let lossless = matches!(codec_id, "truehd" | "mlp" | "flac" | "alac" | "wavpack" | "tta" | "ape" | "dts") || codec_id.starts_with("pcm_");
     if lossless { 24 } else { 16 }
 }
 
@@ -183,9 +192,11 @@ pub(crate) struct Bridge {
     next: Option<i64>,
     /// The decoder's tail is out: nothing more comes.
     finished: bool,
-    /// Logged once: a packet the decoder refused, a rate change.
+    /// Logged once: a packet the decoder refused, a rate change, a jump
+    /// taken as damage.
     refused: bool,
     rate_changed: bool,
+    jumped: bool,
 }
 
 impl Bridge {
@@ -205,6 +216,7 @@ impl Bridge {
             finished: false,
             refused: false,
             rate_changed: false,
+            jumped: false,
         })
     }
 
@@ -213,9 +225,11 @@ impl Bridge {
         self.buf_start + (self.buf.len() / self.output.channels) as i64
     }
 
-    /// Decodes `packet` into the buffer. A packet the decoder refuses is
-    /// silence (after a restart, TrueHD refuses what comes before its next
-    /// major sync).
+    /// Decodes `packet` into the buffer. A packet the decoder refuses leaves
+    /// silence as long as the container says it lasts; without a duration,
+    /// what follows closes up behind it (within `ALIGN_SECS`, the decode
+    /// route's rule). After a restart TrueHD refuses what comes before its
+    /// next major sync, before any output.
     pub(crate) fn feed(&mut self, packet: &Packet, trim: Option<AudioTrim>) {
         if self.finished {
             return;
@@ -225,6 +239,10 @@ impl Bridge {
             if !self.refused {
                 self.refused = true;
                 log(&format!("the audio decoder refused a packet ({e}): silence there"));
+            }
+            if let (Some(next), Some(duration)) = (self.next, packet.duration.filter(|&d| d > 0)) {
+                let span = packet.time_base.seconds_of(duration) * f64::from(self.output.rate);
+                self.next = Some(next + span.round() as i64);
             }
         }
         for pcm in out {
@@ -265,6 +283,14 @@ impl Bridge {
             return;
         }
         let mut at = ((pts - self.origin) * f64::from(rate)).round() as i64;
+        let expected = self.next.unwrap_or_else(|| self.decoded_to());
+        if at - expected > (MAX_GAP_SECS * f64::from(rate)) as i64 {
+            if !self.jumped {
+                self.jumped = true;
+                log(&format!("the audio's timestamps jump {:.1} s ahead: taken as damage", (at - expected) as f64 / f64::from(rate)));
+            }
+            at = expected;
+        }
         if pcm.rate != rate {
             if !self.rate_changed {
                 self.rate_changed = true;
@@ -333,9 +359,10 @@ impl Bridge {
         self.take(frames)
     }
 
-    /// Every block left; the last is short.
-    pub(crate) fn tail(&mut self) -> Vec<Block> {
-        let frames = self.buf.len() / self.output.channels;
+    /// The blocks left up to item sample `end` (the last picture's end); the
+    /// last is short.
+    pub(crate) fn tail(&mut self, end: i64) -> Vec<Block> {
+        let frames = (self.buf.len() / self.output.channels).min((end - self.buf_start).max(0) as usize);
         self.take(frames)
     }
 
@@ -369,7 +396,8 @@ mod tests {
     use oxideav_flac::metadata::StreamInfo;
 
     /// A decoder that turns each packet into `frames` samples of one value
-    /// per channel, stamped with the packet's pts.
+    /// per channel, stamped with the packet's pts; it refuses a packet whose
+    /// value is 0.
     struct Steady {
         frames: usize,
         channels: usize,
@@ -377,6 +405,9 @@ mod tests {
 
     impl AudioDecode for Steady {
         fn packet(&mut self, packet: &Packet, _: Option<AudioTrim>, out: &mut Vec<Pcm>) -> Result<(), String> {
+            if packet.data[0] == 0 {
+                return Err("refused".into());
+            }
             let pts = packet.time_base.seconds_of(packet.pts.unwrap());
             let value = packet.data[0] as f32 / 256.0;
             out.push(Pcm { samples: vec![value; self.frames * self.channels], channels: self.channels, rate: 48_000, pts, begins: false });
@@ -399,10 +430,37 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_packet_with_a_duration_stays_silent_and_keeps_the_rest_in_place() {
+        // MP3-sized packets; the second is refused. Closing up behind it
+        // would put everything after it 24 ms early.
+        let mut b = bridge(1, 0.0, 0);
+        let span = 1152.0 / 48_000.0;
+        for (i, value) in [9u8, 0, 9, 9].into_iter().enumerate() {
+            let mut p = packet(i as f64 * span, value);
+            p.duration = Some(1152);
+            b.feed(&p, None);
+        }
+        assert_eq!(b.decoded_to(), 4 * 1152);
+        assert!(b.buf[1152..2 * 1152].iter().all(|&v| v == 0.0));
+        assert!(b.buf[2 * 1152] > 0.0);
+    }
+
+    #[test]
+    fn a_stamp_far_ahead_is_damage_not_twenty_minutes_of_silence() {
+        let mut b = bridge(2, 0.0, 0);
+        b.feed(&packet(0.0, 9), None);
+        b.feed(&packet(1200.0, 9), None);
+        b.feed(&packet(2.0 * 1152.0 / 48_000.0, 9), None);
+        // The damaged packet's audio follows on where the stream was.
+        assert_eq!(b.decoded_to(), 3 * 1152);
+        assert_eq!(b.buf.len(), 3 * 1152 * 2);
+    }
+
+    #[test]
     fn a_restart_keeps_the_grid_a_sequential_run_has() {
         // Packets of 1152 samples (MP3) from 0 s; item 0 is source -0.084 s.
         let origin = -0.084;
-        let packets: Vec<Packet> = (0..200).map(|i| packet(i as f64 * 1152.0 / 48_000.0, (i % 200) as u8)).collect();
+        let packets: Vec<Packet> = (0..200).map(|i| packet(i as f64 * 1152.0 / 48_000.0, (i % 200) as u8 + 1)).collect();
         let mut sequential = bridge(2, origin, 0);
         for p in &packets {
             sequential.feed(p, None);

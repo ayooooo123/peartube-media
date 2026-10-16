@@ -444,6 +444,10 @@ impl Work {
             None => video_tb.seconds_of(start),
         };
         let audio_to = video_tb.seconds_of(end);
+        // A restarted bridge also takes the last packet before its pre-roll:
+        // it may run into it (TTA's 1.045 s frames, long PCM packets).
+        let mut before = None;
+        let restart = self.streams.bridging.is_some() && self.bridge.is_none();
         let lookahead = self.streams.video_config.reorder_depth as usize + 1;
         let read_until = end + video_tb.ticks_of(LOOKAHEAD_SECS);
 
@@ -491,7 +495,13 @@ impl Work {
                 let Some(pts) = packet.pts.or(packet.dts) else { continue };
                 let at = packet.time_base.seconds_of(pts);
                 if at < audio_from {
+                    if restart {
+                        before = Some((packet, trim));
+                    }
                     continue;
+                }
+                if let Some(held) = before.take() {
+                    got.audio.push(held);
                 }
                 if !last && at >= audio_to {
                     audio_done = true;
@@ -501,6 +511,7 @@ impl Work {
                 }
             }
         }
+        got.audio.extend(before);
         if got.video.is_empty() {
             return Err(format!("segment {index}: no video from its keyframe on"));
         }
@@ -587,6 +598,10 @@ impl Work {
         let last = index + 1 == self.plan.len();
         let to = (!last).then(|| self.grid(index + 1, rate));
         let audio_index = self.streams.audio.as_ref().map(|(s, _)| s.index);
+        // The last segment reads to the end of the file; audio long past the
+        // last picture would only make it huge.
+        let end_secs = self.streams.video.time_base.seconds_of(self.plan.end);
+        let end = ((end_secs - self.streams.origin_secs()) * f64::from(rate)).round() as i64;
         if self.bridge.is_none() {
             self.bridge = Some(Bridge::new(&bridging.factory, bridging.output, self.streams.origin_secs(), from)?);
         }
@@ -596,6 +611,10 @@ impl Work {
                 // Half fed: the next production starts it over.
                 self.bridge = None;
                 return Ok(None);
+            }
+            let at = packet.pts.or(packet.dts).map(|ticks| packet.time_base.seconds_of(ticks));
+            if last && at.is_some_and(|at| at > end_secs + PREROLL_SECS) {
+                break;
             }
             bridge.feed(packet, *trim);
         }
@@ -618,7 +637,7 @@ impl Work {
             }
             None => {
                 bridge.finish();
-                bridge.tail()
+                bridge.tail(end)
             }
         };
         let Some(first) = blocks.first() else { return Ok(Some(None)) };
