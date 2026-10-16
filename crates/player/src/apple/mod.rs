@@ -6,6 +6,7 @@
 
 pub mod audio;
 pub mod clock;
+pub mod native;
 pub mod subtitles;
 pub mod util;
 pub mod video;
@@ -35,7 +36,7 @@ use crate::apple::clock::AppleClock;
 use crate::apple::subtitles::AppleSubtitleSink;
 use crate::apple::util::SendSync;
 use crate::apple::video::AppleVideoSink;
-use crate::backend::{AudioSink, Backend, Clock, SubtitleSink, VideoSink};
+use crate::backend::{AudioSink, Backend, Clock, NativePresenter, SubtitleSink, VideoSink};
 
 /// A view container with the two stacked layers: the video
 /// (`AVSampleBufferDisplayLayer`) below, the subtitle layer above. Attached
@@ -52,11 +53,13 @@ pub struct AppleBackend {
     container: Mutex<Option<SendSync<Retained<CALayer>>>>,
     /// Video layer reused across playbacks.
     video_layer: SendSync<Retained<objc2_av_foundation::AVSampleBufferDisplayLayer>>,
+    player_layer: SendSync<Retained<objc2_av_foundation::AVPlayerLayer>>,
     subtitle_layer: SendSync<Retained<CALayer>>,
     frame: Mutex<[f64; 4]>,
     /// Audio renderers made from now on are muted (see `set_muted`).
     muted: AtomicBool,
     layer_lease: Arc<parking_lot::Mutex<video::LayerLeaseState>>,
+    presenter: Arc<native::ApplePresenter>,
 }
 
 /// The current playback's synchronizer: `Backend::audio` makes it, the
@@ -81,17 +84,33 @@ impl AppleBackend {
     pub fn new() -> std::sync::Arc<Self> {
         // SAFETY: plain allocation on the main thread.
         let video_layer = unsafe { objc2_av_foundation::AVSampleBufferDisplayLayer::new() };
+        let player_layer = unsafe { objc2_av_foundation::AVPlayerLayer::new() };
+        unsafe {
+            player_layer.setVideoGravity(
+                objc2_av_foundation::AVLayerVideoGravityResizeAspect
+                    .expect("AVLayerVideoGravityResizeAspect is documented"),
+            );
+            player_layer.setBackgroundColor(None);
+        }
         let subtitle_layer = CALayer::new();
         subtitle_layer.setMasksToBounds(true);
+        let main = main_queue();
+        let presenter = native::ApplePresenter::new(
+            main.clone(),
+            SendSync(player_layer.clone()),
+            false,
+        );
         std::sync::Arc::new(Self {
             playback: Arc::new(Mutex::new(None)),
-            main: main_queue(),
+            main,
             container: Mutex::new(None),
             video_layer: SendSync(video_layer),
+            player_layer: SendSync(player_layer),
             subtitle_layer: SendSync(subtitle_layer),
             frame: Mutex::new([0.0; 4]),
             muted: AtomicBool::new(false),
             layer_lease: Arc::new(parking_lot::Mutex::new(video::LayerLeaseState::new())),
+            presenter,
         })
     }
 
@@ -126,6 +145,7 @@ impl AppleBackend {
         container.setMasksToBounds(true);
         container.setBackgroundColor(Some(&black_background()));
         container.addSublayer(&*self.video_layer);
+        container.addSublayer(&*self.player_layer);
         container.addSublayer(&*self.subtitle_layer);
         // Layer-backed view so our layer tree composites.
         view.setWantsLayer(true);
@@ -143,6 +163,7 @@ impl AppleBackend {
         container.setMasksToBounds(true);
         container.setBackgroundColor(Some(&black_background()));
         container.addSublayer(&*self.video_layer);
+        container.addSublayer(&*self.player_layer);
         container.addSublayer(&*self.subtitle_layer);
         view.layer().addSublayer(&container);
         let frame = *self.frame.lock().expect("frame lock");
@@ -177,6 +198,7 @@ impl AppleBackend {
             size: cg.size,
         };
         self.video_layer.setFrame(content);
+        self.player_layer.setFrame(content);
         self.subtitle_layer.setFrame(content);
         let _ = &self.main;
     }
@@ -243,6 +265,7 @@ impl AppleBackend {
     /// harnesses on a shared machine).
     pub fn set_muted(&self, muted: bool) {
         self.muted.store(muted, Ordering::Relaxed);
+        self.presenter.set_muted(muted);
     }
 }
 
@@ -320,6 +343,9 @@ impl Backend for AppleBackend {
     }
 
     fn resume(&self) {}
+    fn native(&self) -> Option<Arc<dyn NativePresenter>> {
+        Some(self.presenter.clone())
+    }
 }
 
 /// `Retained<T>` and `CFRetained<T>` share representation (+1 pointer).
@@ -338,6 +364,11 @@ impl AppleBackend {
     /// The video layer, for examples that inspect playback state.
     pub fn video_layer(&self) -> &Retained<objc2_av_foundation::AVSampleBufferDisplayLayer> {
         &self.video_layer.0
+    }
+
+    /// The player layer, for examples that inspect playback state.
+    pub fn player_layer(&self) -> &Retained<objc2_av_foundation::AVPlayerLayer> {
+        &self.player_layer.0
     }
 
     /// Blocks until the video layer reports `isReadyForDisplay` or
