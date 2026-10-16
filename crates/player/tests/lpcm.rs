@@ -1,7 +1,8 @@
-//! Linear PCM in QuickTime, CAF, AIFF and OMA plays through the registry
-//! (`codecs::context()`) sample for sample as FFmpeg decodes it: the
-//! big-endian and signed 8-bit decoders, the MOV demuxer's choice of PCM
-//! codec (`twos`, `in24`, `in32`, `fl32`, `fl64`) and AIFF's by sample size.
+//! Linear PCM in QuickTime, CAF, AIFF, OMA and Matroska plays through the
+//! registry (`codecs::context()`) sample for sample as FFmpeg decodes it:
+//! the big-endian and signed 8-bit decoders, the MOV demuxer's choice of
+//! PCM codec (`twos`, `in24`, `in32`, `fl32`, `fl64`), AIFF's by sample size
+//! and Matroska's by `BitDepth`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -89,6 +90,19 @@ fn lpcm_in_caf() {
 fn lpcm_in_aiff() {
     for codec in ["pcm_s16be", "pcm_s24be", "pcm_s32be", "pcm_f32be"] {
         let path = tone(&format!("{codec}.aiff"), codec);
+        plays_as_ffmpeg(&path);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Matroska's `A_PCM/*` CodecIDs leave the sample size to `BitDepth`;
+/// 24-bit tracks used to be read as 16-bit and play as noise.
+#[test]
+fn lpcm_in_matroska() {
+    for codec in [
+        "pcm_u8", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_f64le", "pcm_s16be", "pcm_s24be", "pcm_s32be",
+    ] {
+        let path = tone(&format!("{codec}.mkv"), codec);
         plays_as_ffmpeg(&path);
         let _ = std::fs::remove_file(&path);
     }

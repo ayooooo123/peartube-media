@@ -204,6 +204,69 @@ fn vorbis_in_webm_plays_ffmpegs_samples() {
     assert!(snr >= 90.0, "Vorbis in WebM is {snr:.1} dB from FFmpeg's samples");
 }
 
+/// 12 s of libvorbis in Ogg, as real files have it: exact granules,
+/// different channels (OxideAV decodes the second channel of FFmpeg's
+/// experimental native encoder differently from FFmpeg), and a click every
+/// 250 ms, which makes the encoder switch to short blocks.
+fn libvorbis_ogg() -> Fixture {
+    let ogg = Fixture::new("ogg");
+    let out = Command::new(refcheck::system_ffmpeg())
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i",
+            "aevalsrc=0.4*sin(2*PI*(220+300*t)*t)+0.6*lt(mod(t\\,0.25)\\,0.002)|0.4*sin(2*PI*(330+150*t)*t):s=48000:d=12",
+            "-c:a", "libvorbis"])
+        .arg(&ogg.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "FFmpeg fixture: {}", String::from_utf8_lossy(&out.stderr));
+    ogg
+}
+
+/// Vorbis plays FFmpeg's samples from the start and from seeks, in Ogg and
+/// Matroska (millisecond stamps). OxideAV's decoder stamped each frame with
+/// a count of the samples before it, whatever the time base. In Matroska
+/// that put frames 48 times too late, and after a seek playback started
+/// where the demuxer landed, not at the target. In Ogg the count started
+/// again at a seek, every frame looked earlier than the target, and nothing
+/// played. Frames now take their packet's pts; Ogg stamps each packet where
+/// its samples start, as FFmpeg does.
+#[test]
+fn vorbis_plays_ffmpegs_samples_from_the_start_and_seeks_in_ogg_and_matroska() {
+    let ogg = libvorbis_ogg();
+    let mkv = Fixture::new("mka");
+    ffmpeg(&["-i", ogg.0.to_str().unwrap(), "-c", "copy"], &mkv.0);
+    // Matroska stamps whole milliseconds: within one tick (48 samples).
+    for (path, ticks) in [(&ogg.0, 0), (&mkv.0, 48)] {
+        let ff = refcheck::ffmpeg_audio_f32(path, 0);
+        let (played, channels) = play(path, None);
+        assert_eq!(played.len(), ff.len(), "{}: samples from the start", path.display());
+        let snr = snr_at(&ff, &played, channels, 0, 0);
+        assert!(snr >= 90.0, "{}: {snr:.1} dB from FFmpeg's samples", path.display());
+        for ms in [1500, 7500] {
+            seek_matches_ffmpeg(path, Duration::from_millis(ms), ticks);
+        }
+    }
+}
+
+/// MP3 in MP4: an `mp4a` sample entry whose esds names MPEG-1 audio (object
+/// type 0x6B). oxideav-mp4 reported it as AAC, so it played no sound. The
+/// engine's MPEG audio decoder runs one sample behind FFmpeg's.
+#[test]
+fn mp3_in_mp4_plays_ffmpegs_samples() {
+    let output = Fixture::new("mp4");
+    let out = Command::new(refcheck::system_ffmpeg())
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "aevalsrc=0.5*sin(2*PI*(220+400*t)*t):s=48000:d=3",
+            "-ac", "2", "-c:a", "libmp3lame", "-b:a", "192k"])
+        .arg(&output.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "FFmpeg fixture: {}", String::from_utf8_lossy(&out.stderr));
+    let reference = refcheck::ffmpeg_audio_f32(&output.0, 0);
+    let (played, channels) = play(&output.0, None);
+    assert_eq!(played.len(), reference.len(), "samples");
+    let snr = (-1..=1).map(|lag| snr_at(&reference, &played, channels, 0, lag)).fold(f64::NEG_INFINITY, f64::max);
+    assert!(snr >= 60.0, "MP3 in MP4 is {snr:.1} dB from FFmpeg's samples");
+}
+
 fn long_major_sync_seek(codec: &str) {
         let input = Fixture::new(if codec == "truehd" { "thd" } else { "mlp" });
         ffmpeg(&["-f", "lavfi", "-i", "sine=frequency=997:sample_rate=48000:duration=0.4",
@@ -319,6 +382,22 @@ fn ogg_opus_packets_have_ffprobes_pts_and_trims() {
     let expected = side_data(&String::from_utf8(out.stdout).unwrap(), (1, 1), true);
     assert!(expected.len() > 2 && expected[0].1 > 0, "{expected:?}");
     assert_eq!(demuxed_trims(&path, true), expected);
+}
+
+/// Every Vorbis packet in Ogg is stamped where its samples start, as
+/// ffprobe shows: long, short and mixed blocks, the first packet's priming
+/// before 0, and each page going on from the granule of the page before.
+/// FFmpeg trims none of these packets.
+#[test]
+fn ogg_vorbis_packets_have_ffprobes_pts() {
+    let ogg = libvorbis_ogg();
+    let out = Command::new(refcheck::pinned_ffprobe())
+        .args(["-v", "error", "-select_streams", "a:0", "-show_entries", "packet=pts:packet_side_data", "-of", "compact"])
+        .arg(&ogg.0).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let expected = side_data(&String::from_utf8(out.stdout).unwrap(), (1, 1), true);
+    assert!(expected.len() > 500 && expected[0].0 < 0, "{expected:?}");
+    assert_eq!(demuxed_trims(&ogg.0, true), expected);
 }
 
 /// The playback's audio writes as `pts - position`, in samples: 0
