@@ -1477,6 +1477,10 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
 // FLAC
 // ---------------------------------------------------------------------------
 
+/// The `fLaC` configuration for a STREAMINFO block (bare, after `fLaC`, or
+/// in a `dfLa` payload). `None` for what CoreMedia drops: a minimum block
+/// size under 192 (AetherEngine's finding) or more than 24 bits per sample
+/// (`-11855 Cannot Decode`); the bridge re-encodes those.
 pub(crate) fn flac_config(streaminfo: &[u8], language: Option<String>) -> Option<AudioConfig> {
     let raw = extract_streaminfo(streaminfo)?;
     if raw.len() != 34 {
@@ -1499,7 +1503,7 @@ pub(crate) fn flac_config(streaminfo: &[u8], language: Option<String>) -> Option
     let channels = (((b >> 41) & 0x07) + 1) as u16;
     let bits = (((b >> 36) & 0x1F) + 1) as u16;
 
-    if sample_rate == 0 || channels == 0 || bits == 0 {
+    if sample_rate == 0 || bits > 24 {
         return None;
     }
 
@@ -2097,9 +2101,12 @@ mod tests {
         assert_eq!(video_config(&p_vp9, &[]), None);
     }
 
+    /// FFmpeg's `dfLa` payload for the multi_audio fixture's 7.1 FLAC, with
+    /// bits per sample set to 24 (byte 21: the fixture's is 32, which
+    /// CoreMedia cannot decode).
     const FFMPEG_DFLA_PAYLOAD: &[u8] = &[
         0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x22, 0x04, 0x00, 0x04, 0x00, 0x00, 0x12,
-        0x6e, 0x00, 0x41, 0x27, 0x0b, 0xb8, 0x0f, 0xf0, 0x00, 0x15, 0xf9, 0x00, 0x8f, 0x43,
+        0x6e, 0x00, 0x41, 0x27, 0x0b, 0xb8, 0x0f, 0x70, 0x00, 0x15, 0xf9, 0x00, 0x8f, 0x43,
         0x3f, 0x80, 0xfb, 0xab, 0x19, 0xf0, 0xdd, 0x3a, 0x0a, 0x24, 0x5c, 0x01, 0xab, 0xec,
     ];
 
@@ -2120,7 +2127,7 @@ mod tests {
         assert_eq!(cfg.codec, AudioCodec::Flac);
         assert_eq!(cfg.sample_rate, 48000);
         assert_eq!(cfg.channels, 8);
-        assert_eq!(cfg.bits, 32);
+        assert_eq!(cfg.bits, 24);
         assert_eq!(cfg.codec_string, "fLaC");
         assert_eq!(cfg.frame_samples, 0);
         assert!(!cfg.adts);
@@ -2134,6 +2141,11 @@ mod tests {
         // 3. MP4 dfLa payload (FullBox header + blocks)
         let cfg_dfla = flac_config(FFMPEG_DFLA_PAYLOAD, None).expect("flac config from dfLa payload");
         assert_eq!(cfg_dfla.config, FFMPEG_DFLA_PAYLOAD);
+
+        // 4. 32 bits per sample (the fixture's own): the bridge's, not a copy.
+        let mut si32 = FFMPEG_DFLA_PAYLOAD[8..].to_vec();
+        si32[13] = 0xf0;
+        assert_eq!(flac_config(&si32, None), None);
     }
 
     #[test]
