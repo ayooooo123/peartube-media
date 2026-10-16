@@ -2019,6 +2019,7 @@ pub(crate) fn apply_dovi(
                 record: build_dovi_record(5, lvl, true, false, true, 0),
                 use_dvh1: true,
                 supplemental_codecs: None,
+                convert_p7_to_81: false,
             });
         }
         Some((7, level, _compat_id, _record)) => {
@@ -2031,6 +2032,7 @@ pub(crate) fn apply_dovi(
                 record: build_dovi_record(8, lvl, true, false, true, 1),
                 use_dvh1: false,
                 supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db1p")),
+                convert_p7_to_81: true,
             });
         }
         Some((8, level, compat_id, record)) => {
@@ -2048,6 +2050,7 @@ pub(crate) fn apply_dovi(
                         record,
                         use_dvh1: false,
                         supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db4h")),
+                        convert_p7_to_81: false,
                     });
                 }
                 _ => {
@@ -2064,6 +2067,7 @@ pub(crate) fn apply_dovi(
                         record: rec,
                         use_dvh1: false,
                         supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db1p")),
+                        convert_p7_to_81: false,
                     });
                 }
             }
@@ -2074,14 +2078,164 @@ pub(crate) fn apply_dovi(
     }
 }
 
-/// Strips any HEVC `UNSPEC63` (enhancement layer) NAL units from length-prefixed packet data.
-pub(crate) fn strip_hevc_el_nals(data: Vec<u8>, length_size: u8) -> Vec<u8> {
+/// Converts one HEVC `UNSPEC62` RPU NAL unit (with its 2-byte NAL header) to
+/// Profile 8.1 (mode 2: luma/chroma mapping curves set to no-op, EL/NLQ
+/// removed, L1/L2/L5/L8/L9/L11 display metadata kept). Returns `None` when
+/// the RPU fails CRC32 validation, hits a hostile Exp-Golomb/pivot count, or
+/// fails conversion in `dolby_vision`.
+pub(crate) fn convert_rpu_nal_to_p81(nal: &[u8]) -> Option<Vec<u8>> {
+    use dolby_vision::rpu::{ConversionMode, dovi_rpu::DoviRpu};
+
+    if nal.len() < 25 || ((nal[0] >> 1) & 0x3F) != 62 {
+        return None;
+    }
+    let mut rbsp = unescape_rbsp(&nal[2..]);
+    while rbsp.last() == Some(&0) {
+        rbsp.pop();
+    }
+    if rbsp.len() < 8 || rbsp[0] != 0x19 || *rbsp.last()? != 0x80 {
+        return None;
+    }
+    let crc_at = rbsp.len() - 5;
+    let expected_crc = u32::from_be_bytes([rbsp[crc_at], rbsp[crc_at + 1], rbsp[crc_at + 2], rbsp[crc_at + 3]]);
+    if rpu_crc32(&rbsp[1..crc_at]) != expected_crc || rpu_is_hostile(&rbsp[1..]) {
+        return None;
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut rpu = DoviRpu::parse_unspec62_nalu(nal).ok()?;
+        rpu.convert_with_mode(ConversionMode::To81).ok()?;
+        rpu.write_hevc_unspec62_nalu().ok()
+    }))
+    .ok()
+    .flatten()
+}
+
+fn rpu_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= u32::from(byte) << 24;
+        for _ in 0..8 {
+            crc = if (crc & 0x8000_0000) != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Pre-parse allocation guard against CRC-valid crafted RPUs (32+ leading
+/// zeros on an Exp-Golomb code or a pivot count exceeding the remaining bits).
+fn rpu_is_hostile(rbsp_after_prefix: &[u8]) -> bool {
+    struct GuardBits<'a> {
+        data: &'a [u8],
+        pos: usize,
+        hostile: bool,
+    }
+    impl<'a> GuardBits<'a> {
+        fn rem(&self) -> usize {
+            (self.data.len() * 8).saturating_sub(self.pos)
+        }
+        fn bit(&mut self) -> Option<u64> {
+            if self.pos >= self.data.len() * 8 {
+                return None;
+            }
+            let b = (self.data[self.pos >> 3] >> (7 - (self.pos & 7))) & 1;
+            self.pos += 1;
+            Some(u64::from(b))
+        }
+        fn bits(&mut self, n: usize) -> Option<u64> {
+            if n > 64 || self.pos + n > self.data.len() * 8 {
+                return None;
+            }
+            let mut v = 0u64;
+            for _ in 0..n {
+                v = (v << 1) | self.bit()?;
+            }
+            Some(v)
+        }
+        fn ue(&mut self) -> Option<u64> {
+            let mut zeros = 0usize;
+            while self.bit()? == 0 {
+                zeros += 1;
+                if zeros >= 32 {
+                    self.hostile = true;
+                    return None;
+                }
+            }
+            let rest = self.bits(zeros)?;
+            Some(((1u64 << zeros) - 1) + rest)
+        }
+    }
+    let mut r = GuardBits { data: rbsp_after_prefix, pos: 0, hostile: false };
+    let check = (|| -> Option<bool> {
+        if r.bits(6)? != 2 {
+            return Some(false);
+        }
+        let format = r.bits(11)?;
+        r.bits(8)?;
+        if r.bit()? != 1 {
+            return Some(false);
+        }
+        r.bit()?;
+        let data_type = r.bits(2)?;
+        let mut denom = 0u64;
+        if data_type == 0 {
+            denom = r.ue()?;
+        }
+        r.bits(3)?;
+        let mut bl_depth = 0u64;
+        if (format & 0x700) == 0 {
+            bl_depth = r.ue()?;
+            r.ue()?;
+            r.ue()?;
+            r.bits(6)?;
+        }
+        if bl_depth != 2 || denom > 23 {
+            return Some(false);
+        }
+        let _dm = r.bit()?;
+        let use_prev = r.bit()?;
+        if use_prev == 1 {
+            r.ue()?;
+            return Some(false);
+        }
+        r.ue()?;
+        r.ue()?;
+        r.ue()?;
+        let depth = (bl_depth as usize) + 8;
+        for _ in 0..3 {
+            let n = r.ue()?;
+            if n > (r.rem() / depth) as u64 {
+                return Some(true);
+            }
+            for _ in 0..(n as usize + 2) {
+                r.bits(depth)?;
+            }
+        }
+        Some(false)
+    })();
+    r.hostile || check == Some(true)
+}
+
+/// Strips any HEVC `UNSPEC63` (enhancement layer) NAL units from length-prefixed
+/// packet data, and when `convert_p7_to_81` is true, rewrites `UNSPEC62` RPU NAL
+/// units from Profile 7 to Profile 8.1 (mode 2), dropping any corrupt RPU so a
+/// stale P7 RPU never rides inside an 8.1 container.
+pub(crate) fn strip_hevc_el_nals(data: Vec<u8>, length_size: u8, convert_p7_to_81: bool) -> Vec<u8> {
     let size = length_size as usize;
     if size == 0 || data.len() < size {
         return data;
     }
+    let max_nal_len: usize = match size {
+        1 => u8::MAX as usize,
+        2 => u16::MAX as usize,
+        4 => u32::MAX as usize,
+        _ => return data,
+    };
     let mut pos = 0;
-    let mut has_el = false;
+    let mut needs_rewrite = false;
     while pos + size <= data.len() {
         let nal_len = match size {
             1 => data[pos] as usize,
@@ -2095,14 +2249,14 @@ pub(crate) fn strip_hevc_el_nals(data: Vec<u8>, length_size: u8) -> Vec<u8> {
         }
         if nal_len > 0 {
             let nal_type = (data[pos] >> 1) & 0x3F;
-            if nal_type == 63 {
-                has_el = true;
+            if nal_type == 63 || (convert_p7_to_81 && nal_type == 62) {
+                needs_rewrite = true;
                 break;
             }
         }
         pos += nal_len;
     }
-    if !has_el {
+    if !needs_rewrite {
         return data;
     }
     let mut out = Vec::with_capacity(data.len());
@@ -2126,11 +2280,25 @@ pub(crate) fn strip_hevc_el_nals(data: Vec<u8>, length_size: u8) -> Vec<u8> {
             if nal_type == 63 {
                 continue;
             }
+            if convert_p7_to_81 && nal_type == 62 {
+                if let Some(converted) = convert_rpu_nal_to_p81(nal) {
+                    if converted.len() <= max_nal_len {
+                        let len_bytes = (converted.len() as u32).to_be_bytes();
+                        out.extend_from_slice(&len_bytes[4 - size..]);
+                        out.extend_from_slice(&converted);
+                    }
+                }
+                continue;
+            }
         }
         out.extend_from_slice(header);
         out.extend_from_slice(nal);
     }
-    out
+    if out.is_empty() {
+        data
+    } else {
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3040,27 +3208,63 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_hevc_el_nals() {
+    fn test_strip_hevc_el_nals_and_convert_real_p7_rpu_to_81() {
+        use dolby_vision::rpu::dovi_rpu::DoviRpu;
+
         let nalu1 = vec![0x42, 0x01]; // SPS (nal_type 33)
         let nalu2 = vec![63 << 1, 0x01, 0xAA, 0xBB]; // UNSPEC63 (nal_type 63)
         let nalu3 = vec![19 << 1, 0x01, 0xCC]; // IDR slice (nal_type 19)
 
         let mut data = Vec::new();
-        data.extend_from_slice(&(nalu1.len() as u32).to_be_bytes());
-        data.extend_from_slice(&nalu1);
-        data.extend_from_slice(&(nalu2.len() as u32).to_be_bytes());
-        data.extend_from_slice(&nalu2);
-        data.extend_from_slice(&(nalu3.len() as u32).to_be_bytes());
-        data.extend_from_slice(&nalu3);
+        for n in [&nalu1, &nalu2, &nalu3] {
+            data.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            data.extend_from_slice(n);
+        }
 
-        let stripped = strip_hevc_el_nals(data, 4);
-
+        let stripped = strip_hevc_el_nals(data, 4, false);
         let mut expected = Vec::new();
-        expected.extend_from_slice(&(nalu1.len() as u32).to_be_bytes());
-        expected.extend_from_slice(&nalu1);
-        expected.extend_from_slice(&(nalu3.len() as u32).to_be_bytes());
-        expected.extend_from_slice(&nalu3);
-
+        for n in [&nalu1, &nalu3] {
+            expected.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            expected.extend_from_slice(n);
+        }
         assert_eq!(stripped, expected);
+
+        // Real 376-byte Profile 7 FEL UNSPEC62 RPU NAL (from fel-clip-a.mkv):
+        let p7_hex = "7c011908090840613650ae20002008020080200802007f801ffc00ffc001fffa0000030100000300d0000008000006800000400000340000030200000301a000001000000d0000030080000068000004000003034000002000000a800000800000e18618800000800000800000800000800000800000b0c30c800000800000800000800000800000800000986186800000800000800000800000800000540000040000040000070c30c4000004000004000004000004000004000005861864000004000004000004000004000004000004c30c34000004000004000004000004012000010010010000030100480000400400400000401200001001001000001c95980000d7a8959be7f3ac7095991328000004000003002000000300200000030070d8890c06182978c238145000000698f96bfffc00000300000300000300018081f73805463008015faa4900c0282183180081872b94210002020000030008050000030002261140120c1f4000641f2e1276ffb6cfda80";
+        let p7_rpu: Vec<u8> = (0..p7_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&p7_hex[i..i + 2], 16).unwrap())
+            .collect();
+        let parsed_before = DoviRpu::parse_unspec62_nalu(&p7_rpu).expect("parse P7 FEL RPU");
+        assert_eq!(parsed_before.dovi_profile, 7);
+        assert!(!parsed_before.header.disable_residual_flag);
+
+        let mut p7_pkt = Vec::new();
+        for n in [&nalu3, &p7_rpu, &nalu2] {
+            p7_pkt.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            p7_pkt.extend_from_slice(n);
+        }
+        let rewritten = strip_hevc_el_nals(p7_pkt, 4, true);
+        let out_nals = extract_nals(&rewritten, Framing::LengthPrefixed(4));
+        assert_eq!(out_nals.len(), 2, "BL and converted RPU survive; EL (63) is stripped");
+        assert_eq!(out_nals[0], nalu3.as_slice());
+        let parsed_after = DoviRpu::parse_unspec62_nalu(out_nals[1]).expect("parse converted P8.1 RPU");
+        assert_eq!(parsed_after.dovi_profile, 8);
+        assert!(parsed_after.header.disable_residual_flag);
+        assert!(!parsed_after.header.el_spatial_resampling_filter_flag);
+        assert!(parsed_after.el_type.is_none());
+
+        // Corrupt RPU is dropped (degrades cleanly to HDR10 BL without stale P7 RPU):
+        let mut bad_rpu = p7_rpu.clone();
+        let bad_idx = bad_rpu.len() - 6;
+        bad_rpu[bad_idx] ^= 0xFF;
+        let mut bad_pkt = Vec::new();
+        for n in [&nalu3, &bad_rpu, &nalu2] {
+            bad_pkt.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            bad_pkt.extend_from_slice(n);
+        }
+        let degraded = strip_hevc_el_nals(bad_pkt, 4, true);
+        let deg_nals = extract_nals(&degraded, Framing::LengthPrefixed(4));
+        assert_eq!(deg_nals, vec![nalu3.as_slice()]);
     }
 }

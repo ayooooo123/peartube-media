@@ -43,6 +43,8 @@ pub(crate) struct DoviConfig {
     pub use_dvh1: bool,
     /// HLS `SUPPLEMENTAL-CODECS` entry, e.g. `dvh1.08.06/db1p` or `dvh1.08.06/db4h`.
     pub supplemental_codecs: Option<String>,
+    /// Convert per-packet `UNSPEC62` RPU NALs from Profile 7 to Profile 8.1 (mode 2).
+    pub convert_p7_to_81: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

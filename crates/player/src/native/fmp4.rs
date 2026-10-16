@@ -1191,6 +1191,7 @@ mod tests {
                 record: p5_rec,
                 use_dvh1: true,
                 supplemental_codecs: None,
+                convert_p7_to_81: false,
             }),
         };
 
@@ -1235,6 +1236,7 @@ mod tests {
                 record: p8_rec,
                 use_dvh1: false,
                 supplemental_codecs: Some("dvh1.08.06/db1p".to_string()),
+                convert_p7_to_81: false,
             }),
         };
 

@@ -563,8 +563,8 @@ impl Work {
             let this = item(dts[i]);
             let following = item(dts.get(i + 1).copied().unwrap_or(next));
             let mut data = codec::video_sample(packet.data, streams.framing);
-            if streams.video_config.dovi.is_some() {
-                data = codec::strip_hevc_el_nals(data, streams.video_config.nal_length_size);
+            if let Some(dovi) = &streams.video_config.dovi {
+                data = codec::strip_hevc_el_nals(data, streams.video_config.nal_length_size, dovi.convert_p7_to_81);
             }
             samples.push(Sample {
                 duration: (following - this).clamp(1, i64::from(u32::MAX)) as u32,

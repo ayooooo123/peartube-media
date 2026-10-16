@@ -621,3 +621,202 @@ fn scan_mp4_dovi<R: std::io::Read + Seek>(source: &mut R) -> Option<Vec<u8>> {
     let _ = source.seek(SeekFrom::Start(0));
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dolby_vision::rpu::dovi_rpu::DoviRpu;
+    use oxideav_core::{Demuxer, Muxer};
+    use oxideav_mkv::demux::BlockAdditionMapping;
+
+    const P7_FEL_RPU_HEX: &str = "7c011908090840613650ae20002008020080200802007f801ffc00ffc001fffa0000030100000300d0000008000006800000400000340000030200000301a000001000000d0000030080000068000004000003034000002000000a800000800000e18618800000800000800000800000800000800000b0c30c800000800000800000800000800000800000986186800000800000800000800000800000540000040000040000070c30c4000004000004000004000004000004000005861864000004000004000004000004000004000004c30c34000004000004000004000004012000010010010000030100480000400400400000401200001001001000001c95980000d7a8959be7f3ac7095991328000004000003002000000300200000030070d8890c06182978c238145000000698f96bfffc00000300000300000300018081f73805463008015faa4900c0282183180081872b94210002020000030008050000030002261140120c1f4000641f2e1276ffb6cfda80";
+
+    #[test]
+    fn profile7_session_rewrites_init_and_converts_segment_rpus_to_profile81() {
+        let p7_rpu: Vec<u8> = (0..P7_FEL_RPU_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&P7_FEL_RPU_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        let el_nal: Vec<u8> = vec![63 << 1, 0x01, 0xDE, 0xAD, 0xBE, 0xEF];
+
+        let mut ctx = RuntimeContext::new();
+        oxideav_mkv::register(&mut ctx);
+        oxideav_mp4::register(&mut ctx);
+
+        // Build a 10 s Profile 7 MKV in a temp file from the HEVC HDR10 fixture's extradata:
+        let tmp = std::env::temp_dir().join(format!("peartube_p7_test_{}.mkv", std::process::id()));
+        {
+            let hvcc = vec![
+                0x01, 0x02, 0x20, 0x00, 0x00, 0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x78, 0xf0,
+                0x00, 0xfc, 0xfd, 0xfa, 0xfa, 0x00, 0x00, 0x0f, 0x03,
+                0x20, 0x00, 0x01, 0x00, 0x18, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x02, 0x20, 0x00,
+                0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0x95, 0x94,
+                0x09,
+                0x21, 0x00, 0x01, 0x00, 0x2e, 0x42, 0x01, 0x01, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00,
+                0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x11,
+                0x07, 0xca, 0xd9, 0x65, 0x65, 0x4a, 0x4c, 0x2f, 0x01, 0x6a, 0x12, 0x20, 0x12, 0x08,
+                0x00, 0x00, 0x1f, 0x48, 0x00, 0x02, 0xee, 0x00, 0x40,
+                0x22, 0x00, 0x01, 0x00, 0x06, 0x44, 0x01, 0xc0, 0x73, 0xc1, 0x89,
+            ];
+            let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("h265"));
+            params.width = Some(1920);
+            params.height = Some(1080);
+            params.extradata = hvcc;
+            let stream = StreamInfo {
+                index: 0,
+                time_base: TimeBase::new(1, 1000),
+                duration: Some(10_000),
+                start_time: Some(0),
+                params,
+            };
+            let file = std::fs::File::create(&tmp).unwrap();
+            let mut muxer = oxideav_mkv::mux::MkvMuxer::new_matroska(Box::new(file), &[stream]).unwrap();
+            let dovi_p7 = codec::build_dovi_record(7, 6, true, true, true, 6);
+            muxer
+                .set_block_addition_mappings(
+                    0,
+                    vec![BlockAdditionMapping {
+                        value: Some(4),
+                        name: Some("Dolby Vision configuration".into()),
+                        addid_type: 0x6476_6343, // 'dvcC'
+                        extra_data: Some(dovi_p7.to_vec()),
+                    }],
+                )
+                .unwrap();
+            muxer.write_header().unwrap();
+            // Write 10 seconds of frames (25 fps = 40 ms per frame), keyframes every 2 s (50 frames):
+            for i in 0..250i64 {
+                let is_key = i % 50 == 0;
+                let vcl = vec![if is_key { 19 << 1 } else { 1 << 1 }, 0x01, 0xAA, (i & 0xFF) as u8];
+                let mut payload = Vec::new();
+                for n in [&vcl, &p7_rpu, &el_nal] {
+                    payload.extend_from_slice(&(n.len() as u32).to_be_bytes());
+                    payload.extend_from_slice(n);
+                }
+                let mut pkt = Packet::new(0, TimeBase::new(1, 1000), payload);
+                pkt.pts = Some(i * 40);
+                pkt.dts = Some(i * 40);
+                pkt.duration = Some(40);
+                pkt.flags.keyframe = is_key;
+                muxer.write_packet(&pkt).unwrap();
+            }
+            muxer.write_trailer().unwrap();
+        }
+
+        let mkv = oxideav_mkv::demux::open_typed(Box::new(std::fs::File::open(&tmp).unwrap()), &ctx.codecs).unwrap();
+        let video_stream = mkv.streams()[0].clone();
+        drop(mkv);
+
+        let bridge: BridgeProvider = Arc::new(|_| Arc::new(|| Err("no audio".into())));
+        let stopped = AtomicBool::new(false);
+        let prepared = prepare(
+            &ctx,
+            tmp.to_str().unwrap(),
+            "matroska",
+            &video_stream,
+            None,
+            10.0,
+            &|_| {},
+            &|d| d,
+            bridge,
+            &stopped,
+        )
+        .expect("prepare Profile 7 MKV");
+
+        let dovi = prepared.video_config().dovi.as_ref().expect("dovi config present");
+        assert_eq!(dovi.profile, 8);
+        assert_eq!(dovi.compat_id, 1);
+        assert!(dovi.convert_p7_to_81);
+        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
+
+        let session = Session::start(prepared).expect("start session");
+        let master_body = match session.catalog.get("g1/master.m3u8").unwrap().0 {
+            Body::Ready(b) => String::from_utf8(b.to_vec()).unwrap(),
+            _ => panic!("master not ready"),
+        };
+        assert!(master_body.contains("SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\""), "master: {master_body}");
+
+        let init_bytes = match session.catalog.get("g1/init.mp4").unwrap().0 {
+            Body::Ready(b) => b.to_vec(),
+            _ => panic!("init not ready"),
+        };
+        assert!(init_bytes.windows(4).any(|w| w == b"dvvC"), "init.mp4 must carry dvvC for converted P8.1");
+
+        let seg0_bytes = match session.catalog.get("g1/seg0.m4s").unwrap().0 {
+            Body::Ready(b) => b.to_vec(),
+            Body::Pending(rx) => rx.recv().unwrap().unwrap().to_vec(),
+        };
+        session.stop();
+        let _ = std::fs::remove_file(&tmp);
+
+        // Demux init.mp4 + seg0.m4s through oxideav_mp4 and inspect every video packet's NALs:
+        let mut combined = init_bytes;
+        combined.extend_from_slice(&seg0_bytes);
+        let mut mp4 = oxideav_mp4::demux::open_typed(Box::new(std::io::Cursor::new(combined)), &ctx.codecs).unwrap();
+        let mut packet_count = 0;
+        while let Ok(pkt) = mp4.next_packet() {
+            packet_count += 1;
+            let mut pos = 0;
+            let mut saw_rpu = false;
+            while pos + 4 <= pkt.data.len() {
+                let len = u32::from_be_bytes(pkt.data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let nal = &pkt.data[pos..pos + len];
+                pos += len;
+                let nal_type = (nal[0] >> 1) & 0x3F;
+                assert_ne!(nal_type, 63, "UNSPEC63 EL NAL must be stripped from segment samples");
+                if nal_type == 62 {
+                    saw_rpu = true;
+                    let rpu = DoviRpu::parse_unspec62_nalu(nal).expect("segment RPU must be valid");
+                    assert_eq!(rpu.dovi_profile, 8, "segment RPU must be converted from P7 to P8.1");
+                    assert!(rpu.header.disable_residual_flag);
+                    assert!(!rpu.header.el_spatial_resampling_filter_flag);
+                    assert!(rpu.el_type.is_none());
+                }
+            }
+            assert!(saw_rpu, "every video sample in seg0 must carry its converted P8.1 RPU");
+        }
+        assert_eq!(packet_count, 150);
+    }
+
+    #[test]
+    fn write_playable_p7_fixture_when_requested() {
+        let Some(out_path) = std::env::var_os("PEARTUBE_P7_SMOKE_OUT") else { return };
+        let Some(src_path) = std::env::var_os("PEARTUBE_P7_SMOKE_SRC") else { return };
+        let p7_rpu: Vec<u8> = (0..P7_FEL_RPU_HEX.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&P7_FEL_RPU_HEX[i..i + 2], 16).unwrap())
+            .collect();
+        let el_nal: Vec<u8> = vec![63 << 1, 0x01, 0xDE, 0xAD, 0xBE, 0xEF];
+        let mut ctx = RuntimeContext::new();
+        oxideav_mkv::register(&mut ctx);
+        let mut dmx = oxideav_mkv::demux::open_typed(Box::new(std::fs::File::open(src_path).unwrap()), &ctx.codecs).unwrap();
+        let streams = dmx.streams().to_vec();
+        let file = std::fs::File::create(out_path).unwrap();
+        let mut muxer = oxideav_mkv::mux::MkvMuxer::new_matroska(Box::new(file), &streams).unwrap();
+        let dovi_p7 = codec::build_dovi_record(7, 6, true, true, true, 6);
+        muxer.with_duration_finalization().unwrap();
+        muxer
+            .set_block_addition_mappings(
+                0,
+                vec![BlockAdditionMapping {
+                    value: Some(4),
+                    name: Some("Dolby Vision configuration".into()),
+                    addid_type: 0x6476_6343,
+                    extra_data: Some(dovi_p7.to_vec()),
+                }],
+            )
+            .unwrap();
+        muxer.write_header().unwrap();
+        while let Ok(mut pkt) = dmx.next_packet() {
+            if pkt.stream_index == 0 {
+                pkt.data.extend_from_slice(&(p7_rpu.len() as u32).to_be_bytes());
+                pkt.data.extend_from_slice(&p7_rpu);
+                pkt.data.extend_from_slice(&(el_nal.len() as u32).to_be_bytes());
+                pkt.data.extend_from_slice(&el_nal);
+            }
+            muxer.write_packet(&pkt).unwrap();
+        }
+        muxer.write_trailer().unwrap();
+    }
+}
