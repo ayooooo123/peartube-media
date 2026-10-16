@@ -30,6 +30,58 @@ pub trait Backend: Send + Sync {
     fn suspend(&self) {}
     /// The app is back in front.
     fn resume(&self) {}
+    /// A platform player that plays H.264/HEVC itself from an HLS playlist
+    /// the engine serves on 127.0.0.1 (AVPlayer on Apple). `None`: the
+    /// engine decodes everything.
+    fn native(&self) -> Option<Arc<dyn NativePresenter>> {
+        None
+    }
+}
+
+/// A platform player the engine hands an HLS playlist to. Every time is
+/// item time: the timeline of the media in the playlist. Every method
+/// returns at once, from any thread; what happens shows in `status`.
+pub trait NativePresenter: Send + Sync {
+    /// Replaces any current item with the playlist at `url`, seeks it to
+    /// `start` with zero tolerance and leaves it paused.
+    fn open(&self, url: &str, start: Duration);
+    fn play(&self);
+    fn pause(&self);
+    /// Seeks the current item to `to` with zero tolerance. Returns the
+    /// seek's serial; `NativeStatus::seek_done` reaches it once the seek
+    /// completed or was superseded.
+    fn seek(&self, to: Duration) -> u64;
+    /// The current item's time. `now` is `None` while there is no item or
+    /// it has no time yet; `monotonic_ns_at` is `None` while it stands still.
+    fn clock(&self) -> Arc<dyn Clock>;
+    fn status(&self) -> NativeStatus;
+    /// `on_change` runs, on any thread, whenever `status` may have changed.
+    /// Replaces the previous one; `None` removes it.
+    fn set_on_change(&self, on_change: Option<Arc<dyn Fn() + Send + Sync>>);
+    /// Removes the current item: nothing plays or shows until the next
+    /// `open`. Never waits for the main thread.
+    fn close(&self);
+}
+
+/// What a [`NativePresenter`]'s current item is doing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NativeStatus {
+    /// The item is ready to play (AVPlayerItem status readyToPlay).
+    pub ready: bool,
+    /// The item failed: domain, code and description.
+    pub failed: Option<String>,
+    /// Media is moving (AVPlayer timeControlStatus playing).
+    pub playing: bool,
+    /// Asked to play, waiting for media (timeControlStatus
+    /// waitingToPlayAtSpecifiedRate).
+    pub waiting: bool,
+    /// The item played to its end.
+    pub ended: bool,
+    /// Serial of the last seek that completed or was superseded; 0 before
+    /// any.
+    pub seek_done: u64,
+    /// Item time when the status was taken.
+    pub position: Option<Duration>,
 }
 
 /// Media time, shared by every sink of one playback.

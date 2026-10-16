@@ -11,6 +11,7 @@ pub mod subtitle_compose;
 pub mod clock;
 pub mod engine;
 pub mod headless;
+mod native;
 pub mod source;
 pub mod subs;
 mod webvtt;
