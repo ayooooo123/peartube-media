@@ -205,9 +205,10 @@ fn vorbis_in_webm_plays_ffmpegs_samples() {
 }
 
 /// 12 s of libvorbis in Ogg, as real files have it: exact granules,
-/// different channels (OxideAV decodes the second channel of FFmpeg's
-/// experimental native encoder differently from FFmpeg), and a click every
-/// 250 ms, which makes the encoder switch to short blocks.
+/// different channels, and a click every 250 ms, which makes the encoder
+/// switch to short blocks. (FFmpeg's experimental native encoder writes a
+/// second channel no decoder recovers, and FFmpeg's decoder reads it
+/// differently from libvorbis and OxideAV, which agree.)
 fn libvorbis_ogg() -> Fixture {
     let ogg = Fixture::new("ogg");
     let out = Command::new(refcheck::system_ffmpeg())
