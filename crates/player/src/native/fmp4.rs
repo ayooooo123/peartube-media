@@ -344,6 +344,7 @@ fn build_dinf() -> Vec<u8> {
 fn build_video_sample_entry(config: &VideoConfig) -> Vec<u8> {
     let fourcc = match config.codec {
         VideoCodec::H264 => b"avc1",
+        VideoCodec::Hevc if config.dovi.as_ref().is_some_and(|d| d.use_dvh1) => b"dvh1",
         VideoCodec::Hevc => b"hvc1",
     };
     let mut body = Vec::with_capacity(78 + 8 + config.record.len());
@@ -365,6 +366,11 @@ fn build_video_sample_entry(config: &VideoConfig) -> Vec<u8> {
         VideoCodec::Hevc => b"hvcC",
     };
     body.extend_from_slice(&wrap_box(record_fourcc, &config.record));
+
+    if let Some(dovi) = &config.dovi {
+        let dovi_fourcc = if dovi.profile <= 7 { b"dvcC" } else { b"dvvC" };
+        body.extend_from_slice(&wrap_box(dovi_fourcc, &dovi.record));
+    }
 
     if let Some(colour) = config.colour {
         let mut colr_body = Vec::with_capacity(11);
@@ -505,6 +511,7 @@ mod tests {
             frame_rate: Some(23.976),
             reorder_depth: 2,
             interlaced: false,
+            dovi: None,
         };
 
         let audio_config = AudioConfig {
@@ -517,6 +524,7 @@ mod tests {
             frame_samples: 1536,
             adts: false,
             language: Some("eng".to_string()),
+            atmos_joc: None,
         };
 
         let tracks = [
@@ -960,6 +968,7 @@ mod tests {
             frame_rate: Some(60.0),
             reorder_depth: 3,
             interlaced: false,
+            dovi: None,
         };
 
         let tracks = [Track {
@@ -1025,6 +1034,7 @@ mod tests {
             frame_samples: 1024,
             adts: false,
             language: Some("fra".to_string()),
+            atmos_joc: None,
         };
 
         let tracks = [Track {
@@ -1067,6 +1077,7 @@ mod tests {
             frame_samples: 0,
             adts: false,
             language: None,
+            atmos_joc: None,
         };
         let tracks_flac = [Track {
             id: 1,
@@ -1108,6 +1119,7 @@ mod tests {
             frame_samples: 4096,
             adts: false,
             language: None,
+            atmos_joc: None,
         };
         let tracks_alac = [Track {
             id: 1,
@@ -1143,5 +1155,98 @@ mod tests {
             init_alac[child_alac_pos - 1],
         ]) as usize;
         assert_eq!(&init_alac[child_alac_pos + 4..child_alac_pos - 4 + child_size], b"test-alac-payload");
+    }
+
+    #[test]
+    fn test_video_dovi_profile5_and_profile8_boxes() {
+        use crate::native::types::DoviConfig;
+
+        // Profile 5: dvh1 entry + dvcC child box
+        let mut p5_rec = [0u8; 24];
+        p5_rec[0] = 1;
+        let cfg_p5 = VideoConfig {
+            codec: VideoCodec::Hevc,
+            width: 3840,
+            height: 2160,
+            record: b"test-hvcC-payload".to_vec(),
+            nal_length_size: 4,
+            codec_string: "dvh1.05.06".to_string(),
+            range: VideoRange::Pq,
+            colour: Some(Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false,
+            }),
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            frame_rate: Some(24.0),
+            reorder_depth: 2,
+            interlaced: false,
+            dovi: Some(DoviConfig {
+                profile: 5,
+                level: 6,
+                compat_id: 0,
+                record: p5_rec,
+                use_dvh1: true,
+                supplemental_codecs: None,
+            }),
+        };
+
+        let init_p5 = init_segment(&[Track {
+            id: 1,
+            timescale: 90000,
+            kind: TrackKind::Video(&cfg_p5),
+        }]);
+
+        assert!(init_p5.windows(4).any(|w| w == b"dvh1"), "must use dvh1 sample entry FourCC for Profile 5");
+        assert!(init_p5.windows(4).any(|w| w == b"hvcC"), "must contain hvcC record");
+        assert!(init_p5.windows(4).any(|w| w == b"dvcC"), "must contain dvcC box for Profile 5");
+        assert!(!init_p5.windows(4).any(|w| w == b"dvvC"), "must NOT contain dvvC box for Profile 5");
+
+        // Profile 8.1: hvc1 entry + dvvC child box
+        let mut p8_rec = [0u8; 24];
+        p8_rec[0] = 1;
+        let cfg_p8 = VideoConfig {
+            codec: VideoCodec::Hevc,
+            width: 3840,
+            height: 2160,
+            record: b"test-hvcC-payload".to_vec(),
+            nal_length_size: 4,
+            codec_string: "hvc1.2.4.L153.B0".to_string(),
+            range: VideoRange::Pq,
+            colour: Some(Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false,
+            }),
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            frame_rate: Some(24.0),
+            reorder_depth: 2,
+            interlaced: false,
+            dovi: Some(DoviConfig {
+                profile: 8,
+                level: 6,
+                compat_id: 1,
+                record: p8_rec,
+                use_dvh1: false,
+                supplemental_codecs: Some("dvh1.08.06/db1p".to_string()),
+            }),
+        };
+
+        let init_p8 = init_segment(&[Track {
+            id: 1,
+            timescale: 90000,
+            kind: TrackKind::Video(&cfg_p8),
+        }]);
+
+        assert!(init_p8.windows(4).any(|w| w == b"hvc1"), "must use hvc1 sample entry FourCC for Profile 8");
+        assert!(init_p8.windows(4).any(|w| w == b"hvcC"), "must contain hvcC record");
+        assert!(init_p8.windows(4).any(|w| w == b"dvvC"), "must contain dvvC box for Profile 8");
+        assert!(!init_p8.windows(4).any(|w| w == b"dvcC"), "must NOT contain dvcC box for Profile 8");
     }
 }

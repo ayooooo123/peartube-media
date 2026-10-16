@@ -91,6 +91,10 @@ impl AppleBackend {
                     .expect("AVLayerVideoGravityResizeAspect is documented"),
             );
             player_layer.setBackgroundColor(None);
+            let sel = objc2::sel!(setWantsExtendedDynamicRangeContent:);
+            if objc2::msg_send![&*video_layer, respondsToSelector: sel] {
+                let _: () = objc2::msg_send![&*video_layer, setWantsExtendedDynamicRangeContent: true];
+            }
         }
         let subtitle_layer = CALayer::new();
         subtitle_layer.setMasksToBounds(true);

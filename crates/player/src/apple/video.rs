@@ -23,21 +23,44 @@ use objc2_av_foundation::{
 use objc2_core_foundation::{CFNumber, CFRetained, CFType};
 use objc2_core_media::{
     CMClock, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
-    CMTimebase, CMVideoCodecType, CMVideoFormatDescription, CMVideoFormatDescriptionCreate,
+    CMTimebase, CMVideoFormatDescription,
     CMVideoFormatDescriptionCreateForImageBuffer,
     CMVideoFormatDescriptionCreateFromH264ParameterSets,
     CMVideoFormatDescriptionCreateFromHEVCParameterSets,
     CMVideoFormatDescriptionMatchesImageBuffer,
 };
 use objc2_core_video::{
-    CVImageBuffer, CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
+    CVAttachmentMode, CVBuffer, CVImageBuffer,
+    CVPixelBuffer, CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddressOfPlane,
     CVPixelBufferGetBytesPerRow, CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
     CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetPlaneCount,
     CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-    CVPixelBufferPool, CVPixelBufferUnlockBaseAddress, kCVPixelBufferHeightKey,
-    kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey,
-    kCVPixelBufferWidthKey, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+    CVPixelBufferPool, CVPixelBufferUnlockBaseAddress,
+    kCVImageBufferColorPrimaries_DCI_P3, kCVImageBufferColorPrimaries_EBU_3213,
+    kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferColorPrimaries_ITU_R_709_2,
+    kCVImageBufferColorPrimaries_P3_D65, kCVImageBufferColorPrimaries_SMPTE_C,
+    kCVImageBufferColorPrimariesKey,
+    kCVImageBufferPixelAspectRatioHorizontalSpacingKey,
+    kCVImageBufferPixelAspectRatioKey,
+    kCVImageBufferPixelAspectRatioVerticalSpacingKey,
+    kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+    kCVImageBufferTransferFunction_ITU_R_709_2,
+    kCVImageBufferTransferFunction_Linear,
+    kCVImageBufferTransferFunction_SMPTE_240M_1995,
+    kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+    kCVImageBufferTransferFunction_sRGB,
+    kCVImageBufferTransferFunctionKey,
+    kCVImageBufferYCbCrMatrix_ITU_R_2020,
+    kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+    kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+    kCVImageBufferYCbCrMatrix_SMPTE_240M_1995,
+    kCVImageBufferYCbCrMatrixKey,
+    kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey,
+    kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey,
+    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
     kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+    kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
 };
 use objc2_foundation::{NSNotification, NSNotificationCenter};
 use oxideav_core::{CodecParameters, Packet, PixelFormat, VideoFrame};
@@ -1803,6 +1826,8 @@ struct SoftwarePath {
     height: u32,
     dst_ostype: u32,
     pool: SendSync<CFRetained<CVPixelBufferPool>>,
+    color_signal: oxideav_core::ColorSignal,
+    sample_aspect_ratio: Option<oxideav_core::Rational>,
 }
 
 enum AppleDevice {
@@ -1906,13 +1931,33 @@ impl AppleDevice {
             ))));
         }
         let src_format = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
-        let dst_ostype = match src_format {
-            PixelFormat::Yuv420P10Le | PixelFormat::Yuv422P10Le | PixelFormat::Yuv444P10Le => {
-                kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            }
-            _ => kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        let is_10bit = matches!(
+            src_format,
+            PixelFormat::Yuv420P10Le
+                | PixelFormat::Yuv422P10Le
+                | PixelFormat::Yuv444P10Le
+                | PixelFormat::Yuv420P12Le
+                | PixelFormat::Yuv422P12Le
+                | PixelFormat::Yuv444P12Le
+                | PixelFormat::Yuv420P16Le
+                | PixelFormat::Yuv422P16Le
+                | PixelFormat::Yuv444P16Le
+        ) || matches!(
+            params.color_signal.transfer,
+            oxideav_core::TransferCharacteristics::SMPTE_ST2084
+                | oxideav_core::TransferCharacteristics::ARIB_STD_B67
+        );
+        let full_range = params.resolved_color_range() == oxideav_core::ColorRange::Full
+            && !matches!(
+                src_format,
+                PixelFormat::YuvJ420P | PixelFormat::YuvJ422P | PixelFormat::YuvJ444P
+            );
+        let dst_ostype = match (is_10bit, full_range) {
+            (false, false) => kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            (false, true) => kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            (true, false) => kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            (true, true) => kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
         };
-
         let pix_fmt_num = CFNumber::new_i32(dst_ostype as i32);
         let width_num = CFNumber::new_i32(width as i32);
         let height_num = CFNumber::new_i32(height as i32);
@@ -1959,6 +2004,9 @@ impl AppleDevice {
             ))));
         }
         let pool = unsafe { CFRetained::from_raw(NonNull::new_unchecked(pool_raw)) };
+        let sample_aspect_ratio = crate::native::codec::video_config(params, &[])
+            .and_then(|vc| vc.pixel_aspect)
+            .map(|(w, h)| oxideav_core::Rational::new(i64::from(w), i64::from(h)));
 
         Ok(Self::Frames {
             software: SoftwarePath {
@@ -1967,6 +2015,8 @@ impl AppleDevice {
                 height,
                 dst_ostype,
                 pool: SendSync(pool),
+                color_signal: params.color_signal,
+                sample_aspect_ratio,
             },
             ready,
             producer,
@@ -3225,13 +3275,15 @@ fn process_software_frame(
     if !mailbox.wait_for_published_request(control, inp_producer, seek_gen) {
         return Err(VideoError::Superseded);
     }
+    let conv_format = match software.dst_ostype {
+        t if t == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || t == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange => PixelFormat::Yuv420P10Le,
+        _ => PixelFormat::Nv12,
+    };
     let converted = convert::convert(
         frame,
         PixFrameInfo::new(software.src_format, software.width, software.height),
-        match software.dst_ostype {
-            t if t == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange => PixelFormat::Yuv420P10Le,
-            _ => PixelFormat::Nv12,
-        },
+        conv_format,
         &ConvertOptions::default(),
     )
     .map_err(|e| {
@@ -3239,7 +3291,19 @@ fn process_software_frame(
     })?;
     let sample = unsafe {
         let pixel = pool_pixel_buffer(&software.pool.0)?;
-        copy_planes_into_pixel_buffer(&pixel, &converted, software.width, software.height)?;
+        copy_planes_into_pixel_buffer(
+            &pixel,
+            &converted,
+            conv_format,
+            software.width,
+            software.height,
+        )?;
+        attach_frame_metadata(
+            &pixel,
+            frame,
+            software.color_signal,
+            software.sample_aspect_ratio,
+        );
         let mut raw: *mut CMSampleBuffer = ptr::null_mut();
         let timing = CMSampleTimingInfo {
             duration: objc2_core_media::kCMTimeInvalid,
@@ -3578,9 +3642,185 @@ unsafe fn pool_pixel_buffer(
     Ok(unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw)) })
 }
 
+pub(crate) fn pack_yuv420p10le_to_p010(
+    y_src: &[u8],
+    y_src_stride: usize,
+    u_src: &[u8],
+    u_src_stride: usize,
+    v_src: &[u8],
+    v_src_stride: usize,
+    y_dst: &mut [u8],
+    y_dst_stride: usize,
+    uv_dst: &mut [u8],
+    uv_dst_stride: usize,
+    width: usize,
+    height: usize,
+) {
+    for r in 0..height {
+        let src_start = r * y_src_stride;
+        let dst_start = r * y_dst_stride;
+        if src_start + width * 2 > y_src.len() || dst_start + width * 2 > y_dst.len() {
+            continue;
+        }
+        let src_row = &y_src[src_start..src_start + width * 2];
+        let dst_row = &mut y_dst[dst_start..dst_start + width * 2];
+        for c in 0..width {
+            let sample = u16::from_le_bytes([src_row[c * 2], src_row[c * 2 + 1]]);
+            let shifted = sample << 6;
+            dst_row[c * 2..c * 2 + 2].copy_from_slice(&shifted.to_ne_bytes());
+        }
+    }
+
+    let chroma_h = height.div_ceil(2);
+    let chroma_w = width.div_ceil(2);
+    for r in 0..chroma_h {
+        let u_start = r * u_src_stride;
+        let v_start = r * v_src_stride;
+        let uv_start = r * uv_dst_stride;
+        if u_start + chroma_w * 2 > u_src.len()
+            || v_start + chroma_w * 2 > v_src.len()
+            || uv_start + chroma_w * 4 > uv_dst.len()
+        {
+            continue;
+        }
+        let u_row = &u_src[u_start..u_start + chroma_w * 2];
+        let v_row = &v_src[v_start..v_start + chroma_w * 2];
+        let uv_row = &mut uv_dst[uv_start..uv_start + chroma_w * 4];
+        for c in 0..chroma_w {
+            let u_sample = u16::from_le_bytes([u_row[c * 2], u_row[c * 2 + 1]]);
+            let v_sample = u16::from_le_bytes([v_row[c * 2], v_row[c * 2 + 1]]);
+            let u_shifted = u_sample << 6;
+            let v_shifted = v_sample << 6;
+            uv_row[c * 4..c * 4 + 2].copy_from_slice(&u_shifted.to_ne_bytes());
+            uv_row[c * 4 + 2..c * 4 + 4].copy_from_slice(&v_shifted.to_ne_bytes());
+        }
+    }
+}
+
+pub(crate) fn resolve_colorimetry(
+    frame_color: Option<oxideav_core::ColorSignal>,
+    stream_color: oxideav_core::ColorSignal,
+) -> (
+    &'static objc2_core_foundation::CFString,
+    &'static objc2_core_foundation::CFString,
+    &'static objc2_core_foundation::CFString,
+) {
+    let sig = frame_color
+        .map(|s| s.or(stream_color))
+        .unwrap_or(stream_color);
+
+    let prim_cp = sig.primaries.code_point();
+    let xfer_cp = sig.transfer.code_point();
+    let mtrx_cp = sig.matrix.code_point();
+
+    unsafe {
+        let resolved_prim = match prim_cp {
+            1 => kCVImageBufferColorPrimaries_ITU_R_709_2,
+            5 => kCVImageBufferColorPrimaries_EBU_3213,
+            6 | 7 => kCVImageBufferColorPrimaries_SMPTE_C,
+            9 => kCVImageBufferColorPrimaries_ITU_R_2020,
+            11 => kCVImageBufferColorPrimaries_DCI_P3,
+            12 => kCVImageBufferColorPrimaries_P3_D65,
+            _ => match mtrx_cp {
+                5 | 6 => kCVImageBufferColorPrimaries_SMPTE_C,
+                9 | 10 => kCVImageBufferColorPrimaries_ITU_R_2020,
+                _ => kCVImageBufferColorPrimaries_ITU_R_709_2,
+            },
+        };
+
+        let resolved_xfer = match xfer_cp {
+            1 | 6 | 14 | 15 => kCVImageBufferTransferFunction_ITU_R_709_2,
+            7 => kCVImageBufferTransferFunction_SMPTE_240M_1995,
+            8 => kCVImageBufferTransferFunction_Linear,
+            13 => kCVImageBufferTransferFunction_sRGB,
+            16 => kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+            18 => kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+            _ => kCVImageBufferTransferFunction_ITU_R_709_2,
+        };
+
+        let resolved_mtrx = match mtrx_cp {
+            1 => kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            5 | 6 => kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+            7 => kCVImageBufferYCbCrMatrix_SMPTE_240M_1995,
+            9 | 10 => kCVImageBufferYCbCrMatrix_ITU_R_2020,
+            _ => match prim_cp {
+                5 | 6 | 7 => kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                9 => kCVImageBufferYCbCrMatrix_ITU_R_2020,
+                _ => kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            },
+        };
+
+        (resolved_prim, resolved_xfer, resolved_mtrx)
+    }
+}
+
+pub(crate) fn attach_frame_metadata(
+    pixel: &CVPixelBuffer,
+    frame: &VideoFrame,
+    stream_color: oxideav_core::ColorSignal,
+    stream_sar: Option<oxideav_core::Rational>,
+) {
+    let (primaries, transfer, matrix) = resolve_colorimetry(frame.color_signal(), stream_color);
+
+    unsafe {
+        CVBuffer::set_attachment(
+            pixel,
+            kCVImageBufferColorPrimariesKey,
+            primaries,
+            CVAttachmentMode::ShouldPropagate,
+        );
+        CVBuffer::set_attachment(
+            pixel,
+            kCVImageBufferTransferFunctionKey,
+            transfer,
+            CVAttachmentMode::ShouldPropagate,
+        );
+        CVBuffer::set_attachment(
+            pixel,
+            kCVImageBufferYCbCrMatrixKey,
+            matrix,
+            CVAttachmentMode::ShouldPropagate,
+        );
+    }
+
+    if let Some(sar) = stream_sar {
+        if sar.num > 0 && sar.den > 0 && sar.num != sar.den {
+            let h_num = CFNumber::new_i32(sar.num as i32);
+            let v_num = CFNumber::new_i32(sar.den as i32);
+            if let Some(par_dict) = unsafe {
+                cf_dictionary(&[
+                    (
+                        kCVImageBufferPixelAspectRatioHorizontalSpacingKey,
+                        &h_num as &objc2_core_foundation::CFType,
+                    ),
+                    (
+                        kCVImageBufferPixelAspectRatioVerticalSpacingKey,
+                        &v_num as &objc2_core_foundation::CFType,
+                    ),
+                ])
+            } {
+                unsafe {
+                    CVBuffer::set_attachment(
+                        pixel,
+                        kCVImageBufferPixelAspectRatioKey,
+                        &par_dict,
+                        CVAttachmentMode::ShouldPropagate,
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    unsafe {
+        CVBuffer::remove_attachment(pixel, kCVImageBufferPixelAspectRatioKey);
+    }
+}
+
 unsafe fn copy_planes_into_pixel_buffer(
     pixel: &CFRetained<CVPixelBuffer>,
     frame: &VideoFrame,
+    format: PixelFormat,
     width: u32,
     height: u32,
 ) -> Result<(), SinkError> {
@@ -3592,7 +3832,55 @@ unsafe fn copy_planes_into_pixel_buffer(
     }
     let result = (|| {
         let planes = CVPixelBufferGetPlaneCount(pixel);
-        let _ = (width, height);
+        let pixel_format = CVPixelBufferGetPixelFormatType(pixel);
+        let is_p010 = format == PixelFormat::Yuv420P10Le
+            || pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || pixel_format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+
+        if is_p010 && planes == 2 {
+            if frame.planes.len() < 3 {
+                return Err(SinkError::Fatal(
+                    "Yuv420P10Le frame requires 3 planes".into(),
+                ));
+            }
+            let y_plane = &frame.planes[0];
+            let u_plane = &frame.planes[1];
+            let v_plane = &frame.planes[2];
+
+            let y_base = CVPixelBufferGetBaseAddressOfPlane(pixel, 0);
+            let uv_base = CVPixelBufferGetBaseAddressOfPlane(pixel, 1);
+            if y_base.is_null() || uv_base.is_null() {
+                return Err(SinkError::Fatal("pixel buffer plane base null".into()));
+            }
+            let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0);
+            let y_h = CVPixelBufferGetHeightOfPlane(pixel, 0);
+            let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1);
+            let uv_h = CVPixelBufferGetHeightOfPlane(pixel, 1);
+
+            let y_dst = unsafe {
+                std::slice::from_raw_parts_mut(y_base as *mut u8, y_stride * y_h)
+            };
+            let uv_dst = unsafe {
+                std::slice::from_raw_parts_mut(uv_base as *mut u8, uv_stride * uv_h)
+            };
+
+            pack_yuv420p10le_to_p010(
+                &y_plane.data,
+                y_plane.stride,
+                &u_plane.data,
+                u_plane.stride,
+                &v_plane.data,
+                v_plane.stride,
+                y_dst,
+                y_stride,
+                uv_dst,
+                uv_stride,
+                width as usize,
+                height as usize,
+            );
+            return Ok(());
+        }
+
         if planes == 0 {
             let dst_stride = CVPixelBufferGetBytesPerRow(pixel);
             let dst_h = CVPixelBufferGetHeight(pixel);
@@ -3652,29 +3940,260 @@ unsafe fn copy_planes_into_pixel_buffer(
 
 unsafe fn format_for_pixel_buffer(
     pixel: &CFRetained<CVPixelBuffer>,
-    width: u32,
-    height: u32,
+    _width: u32,
+    _height: u32,
 ) -> Result<CFRetained<CMVideoFormatDescription>, SinkError> {
-    let codec: CMVideoCodecType = CVPixelBufferGetPixelFormatType(pixel);
     let mut raw: *const CMVideoFormatDescription = ptr::null();
     let status = unsafe {
-        CMVideoFormatDescriptionCreate(
+        CMVideoFormatDescriptionCreateForImageBuffer(
             None,
-            codec,
-            width as i32,
-            height as i32,
-            None,
+            pixel,
             NonNull::from(&mut raw),
         )
     };
     if status != 0 || raw.is_null() {
         return Err(SinkError::Fatal(format!(
-            "CMVideoFormatDescriptionCreate: {status}"
+            "CMVideoFormatDescriptionCreateForImageBuffer: {status}"
         )));
     }
     Ok(unsafe {
         CFRetained::from_raw(NonNull::new_unchecked(
-            raw as *mut CMVideoFormatDescription,
+            raw.cast_mut(),
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxideav_core::{
+        ColorPrimaries, ColorSignal, MatrixCoefficients, Rational, TransferCharacteristics,
+        VideoPlane,
+    };
+
+    #[test]
+    fn test_pack_yuv420p10le_to_p010_shifts_and_interleaves() {
+        let width = 4;
+        let height = 4;
+        let y_src_stride = 12; // 4 samples * 2 = 8 bytes + 4 padding
+        let u_src_stride = 8;  // 2 samples * 2 = 4 bytes + 4 padding
+        let v_src_stride = 8;
+        let y_dst_stride = 16; // padded
+        let uv_dst_stride = 16;
+
+        let mut y_src = vec![0u8; y_src_stride * height];
+        let mut u_src = vec![0u8; u_src_stride * (height / 2)];
+        let mut v_src = vec![0u8; v_src_stride * (height / 2)];
+
+        // Row 0 luma: 1023, 512, 0, 1
+        let row0_y = [1023u16, 512, 0, 1];
+        for (i, &val) in row0_y.iter().enumerate() {
+            y_src[i * 2..i * 2 + 2].copy_from_slice(&val.to_le_bytes());
+        }
+
+        // Row 1 luma: 512, 1023, 100, 200
+        let row1_y = [512u16, 1023, 100, 200];
+        for (i, &val) in row1_y.iter().enumerate() {
+            let offset = y_src_stride + i * 2;
+            y_src[offset..offset + 2].copy_from_slice(&val.to_le_bytes());
+        }
+
+        // Row 0 chroma: U = [1023, 512], V = [512, 1023]
+        u_src[0..2].copy_from_slice(&1023u16.to_le_bytes());
+        u_src[2..4].copy_from_slice(&512u16.to_le_bytes());
+        v_src[0..2].copy_from_slice(&512u16.to_le_bytes());
+        v_src[2..4].copy_from_slice(&1023u16.to_le_bytes());
+
+        let mut y_dst = vec![0xAAu8; y_dst_stride * height];
+        let mut uv_dst = vec![0xBBu8; uv_dst_stride * (height / 2)];
+
+        pack_yuv420p10le_to_p010(
+            &y_src,
+            y_src_stride,
+            &u_src,
+            u_src_stride,
+            &v_src,
+            v_src_stride,
+            &mut y_dst,
+            y_dst_stride,
+            &mut uv_dst,
+            uv_dst_stride,
+            width,
+            height,
+        );
+
+        // Verify row 0 luma:
+        // 1023 << 6 = 0xFFC0
+        let y0_0 = u16::from_ne_bytes([y_dst[0], y_dst[1]]);
+        assert_eq!(y0_0, 0xFFC0);
+        // 512 << 6 = 0x8000
+        let y0_1 = u16::from_ne_bytes([y_dst[2], y_dst[3]]);
+        assert_eq!(y0_1, 0x8000);
+        // 0 << 6 = 0x0000
+        let y0_2 = u16::from_ne_bytes([y_dst[4], y_dst[5]]);
+        assert_eq!(y0_2, 0x0000);
+        // 1 << 6 = 0x0040
+        let y0_3 = u16::from_ne_bytes([y_dst[6], y_dst[7]]);
+        assert_eq!(y0_3, 0x0040);
+        // Verify padding unaffected in row 0
+        assert_eq!(y_dst[8..16], [0xAA; 8]);
+
+        // Verify row 1 luma:
+        let y1_0 = u16::from_ne_bytes([y_dst[y_dst_stride], y_dst[y_dst_stride + 1]]);
+        assert_eq!(y1_0, 0x8000);
+        let y1_1 = u16::from_ne_bytes([y_dst[y_dst_stride + 2], y_dst[y_dst_stride + 3]]);
+        assert_eq!(y1_1, 0xFFC0);
+
+        // Verify chroma row 0: interleaved (U0, V0, U1, V1)
+        // U0 = 1023 -> 0xFFC0
+        let uv0_u0 = u16::from_ne_bytes([uv_dst[0], uv_dst[1]]);
+        assert_eq!(uv0_u0, 0xFFC0);
+        // V0 = 512 -> 0x8000
+        let uv0_v0 = u16::from_ne_bytes([uv_dst[2], uv_dst[3]]);
+        assert_eq!(uv0_v0, 0x8000);
+        // U1 = 512 -> 0x8000
+        let uv0_u1 = u16::from_ne_bytes([uv_dst[4], uv_dst[5]]);
+        assert_eq!(uv0_u1, 0x8000);
+        // V1 = 1023 -> 0xFFC0
+        let uv0_v1 = u16::from_ne_bytes([uv_dst[6], uv_dst[7]]);
+        assert_eq!(uv0_v1, 0xFFC0);
+        // Padding in UV row 0
+        assert_eq!(uv_dst[8..16], [0xBB; 8]);
+    }
+
+    #[test]
+    fn test_color_attachment_resolution() {
+        // 1. BT.2020 + SMPTE_ST2084 PQ
+        let pq_sig = ColorSignal::new(
+            oxideav_core::ColorRange::Limited,
+            ColorPrimaries::BT2020,
+            TransferCharacteristics::SMPTE_ST2084,
+            MatrixCoefficients::BT2020_NCL,
+        );
+        let (prim, xfer, mtrx) = resolve_colorimetry(None, pq_sig);
+        unsafe {
+            assert_eq!(prim, kCVImageBufferColorPrimaries_ITU_R_2020);
+            assert_eq!(xfer, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ);
+            assert_eq!(mtrx, kCVImageBufferYCbCrMatrix_ITU_R_2020);
+        }
+
+        // 2. BT.2020 + ARIB_STD_B67 HLG
+        let hlg_sig = ColorSignal::new(
+            oxideav_core::ColorRange::Limited,
+            ColorPrimaries::BT2020,
+            TransferCharacteristics::ARIB_STD_B67,
+            MatrixCoefficients::BT2020_NCL,
+        );
+        let (prim, xfer, mtrx) = resolve_colorimetry(None, hlg_sig);
+        unsafe {
+            assert_eq!(prim, kCVImageBufferColorPrimaries_ITU_R_2020);
+            assert_eq!(xfer, kCVImageBufferTransferFunction_ITU_R_2100_HLG);
+            assert_eq!(mtrx, kCVImageBufferYCbCrMatrix_ITU_R_2020);
+        }
+
+        // 3. BT.601 (unspecified primaries & transfer, BT.601 matrix => primaries default to SMPTE_C)
+        let bt601_sig = ColorSignal::new(
+            oxideav_core::ColorRange::Limited,
+            ColorPrimaries::UNSPECIFIED,
+            TransferCharacteristics::UNSPECIFIED,
+            MatrixCoefficients::BT601_525,
+        );
+        let (prim, xfer, mtrx) = resolve_colorimetry(None, bt601_sig);
+        unsafe {
+            assert_eq!(prim, kCVImageBufferColorPrimaries_SMPTE_C);
+            assert_eq!(xfer, kCVImageBufferTransferFunction_ITU_R_709_2);
+            assert_eq!(mtrx, kCVImageBufferYCbCrMatrix_ITU_R_601_4);
+        }
+
+        // 4. Unspecified -> BT.709 defaults
+        let unspec_sig = ColorSignal::unspecified();
+        let (prim, xfer, mtrx) = resolve_colorimetry(None, unspec_sig);
+        unsafe {
+            assert_eq!(prim, kCVImageBufferColorPrimaries_ITU_R_709_2);
+            assert_eq!(xfer, kCVImageBufferTransferFunction_ITU_R_709_2);
+            assert_eq!(mtrx, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+        }
+    }
+
+    #[test]
+    fn test_p010_pool_and_format_description() {
+        let width = 64u32;
+        let height = 64u32;
+        let pix_fmt_num = CFNumber::new_i32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange as i32);
+        let width_num = CFNumber::new_i32(width as i32);
+        let height_num = CFNumber::new_i32(height as i32);
+        let iosurface_empty: CFRetained<objc2_core_foundation::CFDictionary> = unsafe {
+            CFRetained::cast_unchecked(
+                objc2_core_foundation::CFDictionary::<
+                    objc2_core_foundation::CFType,
+                    objc2_core_foundation::CFType,
+                >::empty(),
+            )
+        };
+        let buf_attrs = unsafe {
+            cf_dictionary(&[
+                (
+                    kCVPixelBufferPixelFormatTypeKey,
+                    &pix_fmt_num as &objc2_core_foundation::CFType,
+                ),
+                (
+                    kCVPixelBufferWidthKey,
+                    &width_num as &objc2_core_foundation::CFType,
+                ),
+                (
+                    kCVPixelBufferHeightKey,
+                    &height_num as &objc2_core_foundation::CFType,
+                ),
+                (
+                    kCVPixelBufferIOSurfacePropertiesKey,
+                    &iosurface_empty as &objc2_core_foundation::CFType,
+                ),
+            ])
+        };
+        let mut pool_raw: *mut CVPixelBufferPool = ptr::null_mut();
+        let cvret = unsafe {
+            CVPixelBufferPool::create(
+                None,
+                None,
+                buf_attrs.as_deref(),
+                NonNull::from(&mut pool_raw),
+            )
+        };
+        assert_eq!(cvret, 0);
+        let pool = unsafe { CFRetained::from_raw(NonNull::new_unchecked(pool_raw)) };
+
+        let pixel = unsafe { pool_pixel_buffer(&pool).expect("pool pixel buffer") };
+        assert_eq!(
+            CVPixelBufferGetPixelFormatType(&pixel),
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        );
+        assert_eq!(CVPixelBufferGetPlaneCount(&pixel), 2);
+
+        let stream_color = ColorSignal::new(
+            oxideav_core::ColorRange::Limited,
+            ColorPrimaries::BT2020,
+            TransferCharacteristics::SMPTE_ST2084,
+            MatrixCoefficients::BT2020_NCL,
+        );
+        let frame = VideoFrame {
+            pts: None,
+            planes: vec![
+                VideoPlane { stride: 128, data: vec![0u8; 128 * 64] },
+                VideoPlane { stride: 64, data: vec![0u8; 64 * 32] },
+                VideoPlane { stride: 64, data: vec![0u8; 64 * 32] },
+            ],
+        };
+
+        // Attach BT.2020 PQ and 4:3 SAR
+        attach_frame_metadata(&pixel, &frame, stream_color, Some(Rational::new(4, 3)));
+
+        let fmt = unsafe {
+            format_for_pixel_buffer(&pixel, width, height)
+                .expect("format_for_pixel_buffer should succeed")
+        };
+        let _ = fmt;
+
+        // Remove SAR attachment when square (1:1)
+        attach_frame_metadata(&pixel, &frame, stream_color, Some(Rational::new(1, 1)));
+    }
 }

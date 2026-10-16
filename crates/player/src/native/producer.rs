@@ -562,11 +562,15 @@ impl Work {
         for (i, packet) in video.into_iter().enumerate() {
             let this = item(dts[i]);
             let following = item(dts.get(i + 1).copied().unwrap_or(next));
+            let mut data = codec::video_sample(packet.data, streams.framing);
+            if streams.video_config.dovi.is_some() {
+                data = codec::strip_hevc_el_nals(data, streams.video_config.nal_length_size);
+            }
             samples.push(Sample {
                 duration: (following - this).clamp(1, i64::from(u32::MAX)) as u32,
                 composition_offset: (item(pts[i]) - this).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
                 sync: packet.flags.keyframe,
-                data: codec::video_sample(packet.data, streams.framing),
+                data,
             });
         }
         Ok((base as u64, samples))

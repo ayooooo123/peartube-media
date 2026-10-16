@@ -31,6 +31,20 @@ pub(crate) struct Colour {
     pub full_range: bool,
 }
 
+/// Dolby Vision configuration (`dvcC` for profile <= 7, `dvvC` for profile > 7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DoviConfig {
+    pub profile: u8,
+    pub level: u8,
+    pub compat_id: u8,
+    /// 24-byte DOVIDecoderConfigurationRecord payload.
+    pub record: [u8; 24],
+    /// Sample entry FourCC is `dvh1` (Profile 5) instead of `hvc1`.
+    pub use_dvh1: bool,
+    /// HLS `SUPPLEMENTAL-CODECS` entry, e.g. `dvh1.08.06/db1p` or `dvh1.08.06/db4h`.
+    pub supplemental_codecs: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct VideoConfig {
     pub codec: VideoCodec,
@@ -60,6 +74,7 @@ pub(crate) struct VideoConfig {
     pub reorder_depth: u32,
     /// Field-coded or interlaced: AVPlayer does not deinterlace.
     pub interlaced: bool,
+    pub dovi: Option<DoviConfig>,
 }
 
 /// The audio codecs in the native route's fMP4, copied from the source, or
@@ -102,4 +117,6 @@ pub(crate) struct AudioConfig {
     pub adts: bool,
     /// ISO 639-2/T language for `mdhd`, e.g. `eng`.
     pub language: Option<String>,
+    /// E-AC-3 Dolby Atmos (JOC) object count / complexity index.
+    pub atmos_joc: Option<u8>,
 }

@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 use oxideav_core::{CodecId, CodecParameters, Packet, PacketMetadata, StreamInfo, TimeBase};
 use subs_cc::{CaptionCarrier, CaptionTimeline, CcExtractor};
 
-use super::{notify_changed, QueuedPacket, Run, Track, TrackKind};
+use super::{notify_changed, QueuedPacket, Run, SharedState, Track, TrackKind};
 
 /// Stream index of the EIA-608 caption track (field 1 or 2, the first seen,
 /// as FFmpeg's decoder picks it). Above any demuxed index (at most 64).
@@ -113,12 +113,11 @@ fn selected_captions(run: &Run<'_>) -> Option<u32> {
 
 /// Lists the caption tracks whose service `triplets` carry, once each
 /// ([`subs_cc::Services`]).
-fn list_tracks(run: &Run<'_>, triplets: &[[u8; 3]]) {
+pub(super) fn list_tracks_shared(shared: &SharedState, triplets: &[[u8; 3]]) {
     let services = subs_cc::Services::of(triplets);
     if !services.eia608 && !services.cea708 {
         return;
     }
-    let shared = run.shared;
     let mut changed = false;
     {
         let mut state = shared.state.lock();
@@ -142,4 +141,8 @@ fn list_tracks(run: &Run<'_>, triplets: &[[u8; 3]]) {
     if changed && !shared.stopped.load(Ordering::SeqCst) {
         notify_changed(shared);
     }
+}
+
+fn list_tracks(run: &Run<'_>, triplets: &[[u8; 3]]) {
+    list_tracks_shared(run.shared, triplets);
 }

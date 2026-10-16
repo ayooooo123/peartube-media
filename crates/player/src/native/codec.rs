@@ -586,6 +586,7 @@ fn h264_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         frame_rate,
         reorder_depth,
         interlaced,
+        dovi: None,
     })
 }
 
@@ -863,7 +864,7 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         }
     }
 
-    Some(VideoConfig {
+    let config = VideoConfig {
         codec: VideoCodec::Hevc,
         width,
         height,
@@ -878,7 +879,9 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         frame_rate,
         reorder_depth,
         interlaced,
-    })
+        dovi: None,
+    };
+    Some(config)
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1011,7 @@ fn aac_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConf
         frame_samples,
         adts,
         language: None,
+        atmos_joc: None,
     })
 }
 
@@ -1114,6 +1118,7 @@ fn ac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConf
             frame_samples: 1536,
             adts: false,
             language: None,
+            atmos_joc: None,
         });
     }
 
@@ -1138,6 +1143,7 @@ fn ac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConf
             frame_samples: 1536,
             adts: false,
             language: None,
+            atmos_joc: None,
         });
     }
 
@@ -1164,6 +1170,7 @@ struct EAc3SyncframeInfo {
     lfeon: u8,
     chanmap: u16,
     channels: u16,
+    joc_complexity: Option<u8>,
 }
 
 fn parse_eac3_syncframe(data: &[u8]) -> Option<EAc3SyncframeInfo> {
@@ -1220,71 +1227,70 @@ fn parse_eac3_syncframe(data: &[u8]) -> Option<EAc3SyncframeInfo> {
         if chanmape {
             chanmap = br.read(16)? as u16;
         }
-    } else {
-        let mixmdate = br.read(1)? != 0;
-        if mixmdate {
-            if acmod > 2 {
-                br.skip(2)?; // dmixmod
+    }
+    let mixmdate = br.read(1)? != 0;
+    if mixmdate {
+        if acmod > 2 {
+            br.skip(2)?; // dmixmod
+        }
+        if acmod & 1 != 0 && acmod > 2 {
+            br.skip(6)?; // ltrtcmixlev, lorocmixlev
+        }
+        if acmod & 4 != 0 {
+            br.skip(6)?; // ltrtsurmixlev, lorosurmixlev
+        }
+        if lfeon != 0 {
+            let lfemixlevcode = br.read(1)? != 0;
+            if lfemixlevcode {
+                br.skip(5)?;
             }
-            if acmod & 1 != 0 && acmod > 2 {
-                br.skip(6)?; // ltrtcmixlev, lorocmixlev
+        }
+        if strmtyp == 0 {
+            let pgmscle = br.read(1)? != 0;
+            if pgmscle {
+                br.skip(6)?;
             }
-            if acmod & 4 != 0 {
-                br.skip(6)?; // ltrtsurmixlev, lorosurmixlev
-            }
-            if lfeon != 0 {
-                let lfemixlevcode = br.read(1)? != 0;
-                if lfemixlevcode {
-                    br.skip(5)?;
+            if acmod == 0 {
+                let pgmscl2e = br.read(1)? != 0;
+                if pgmscl2e {
+                    br.skip(6)?;
                 }
             }
-            if strmtyp == 0 {
-                let pgmscle = br.read(1)? != 0;
-                if pgmscle {
-                    br.skip(6)?;
+            let extpgmscle = br.read(1)? != 0;
+            if extpgmscle {
+                br.skip(6)?;
+            }
+            let mixdef = br.read(2)?;
+            if mixdef == 1 {
+                br.skip(3)?;
+            } else if mixdef == 2 {
+                br.skip(12)?;
+            } else if mixdef == 3 {
+                let mixdatalen = br.read(5)? as usize;
+                br.skip((mixdatalen + 2) * 8)?;
+            }
+            if acmod < 2 {
+                let paninfoe = br.read(1)? != 0;
+                if paninfoe {
+                    br.skip(14)?;
                 }
                 if acmod == 0 {
-                    let pgmscl2e = br.read(1)? != 0;
-                    if pgmscl2e {
-                        br.skip(6)?;
-                    }
-                }
-                let extpgmscle = br.read(1)? != 0;
-                if extpgmscle {
-                    br.skip(6)?;
-                }
-                let mixdef = br.read(2)?;
-                if mixdef == 1 {
-                    br.skip(3)?;
-                } else if mixdef == 2 {
-                    br.skip(12)?;
-                } else if mixdef == 3 {
-                    let mixdatalen = br.read(5)? as usize;
-                    br.skip((mixdatalen + 2) * 8)?;
-                }
-                if acmod < 2 {
-                    let paninfoe = br.read(1)? != 0;
-                    if paninfoe {
+                    let paninfo2e = br.read(1)? != 0;
+                    if paninfo2e {
                         br.skip(14)?;
                     }
-                    if acmod == 0 {
-                        let paninfo2e = br.read(1)? != 0;
-                        if paninfo2e {
-                            br.skip(14)?;
-                        }
-                    }
                 }
-                if mixdef != 0 {
-                    let frmmixcfginfoe = br.read(1)? != 0;
-                    if frmmixcfginfoe {
-                        if numblks == 1 {
-                            br.skip(5)?;
-                        } else {
-                            for _ in 0..numblks {
-                                let blkmixcfginfoe = br.read(1)? != 0;
-                                if blkmixcfginfoe {
-                                    br.skip(5)?;
-                                }
+            }
+            if mixdef != 0 {
+                let frmmixcfginfoe = br.read(1)? != 0;
+                if frmmixcfginfoe {
+                    if numblks == 1 {
+                        br.skip(5)?;
+                    } else {
+                        for _ in 0..numblks {
+                            let blkmixcfginfoe = br.read(1)? != 0;
+                            if blkmixcfginfoe {
+                                br.skip(5)?;
                             }
                         }
                     }
@@ -1299,6 +1305,7 @@ fn parse_eac3_syncframe(data: &[u8]) -> Option<EAc3SyncframeInfo> {
     } else {
         0
     };
+    let joc_complexity = parse_eac3_joc(&mut br, strmtyp, numblks, fscod, acmod, infomdate);
 
     Some(EAc3SyncframeInfo {
         strmtyp,
@@ -1313,7 +1320,65 @@ fn parse_eac3_syncframe(data: &[u8]) -> Option<EAc3SyncframeInfo> {
         lfeon,
         chanmap,
         channels: base_channels,
+        joc_complexity,
     })
+}
+
+fn parse_eac3_joc(
+    br: &mut BitReader<'_>,
+    strmtyp: u8,
+    numblks: u32,
+    fscod: u8,
+    acmod: u8,
+    infomdate: bool,
+) -> Option<u8> {
+    if infomdate {
+        br.skip(2)?; // copyrightb, origbs
+        if acmod == 2 {
+            br.skip(4)?; // dsurmod, dheadphonmod
+        }
+        if acmod >= 6 {
+            br.skip(2)?; // dsurexmod
+        }
+        if br.read(1)? != 0 {
+            br.skip(8)?; // audprodie
+        }
+        if acmod == 0 && br.read(1)? != 0 {
+            br.skip(8)?; // audprodi2e
+        }
+        if fscod < 3 {
+            br.skip(1)?; // sourcefscod
+        }
+    }
+    if strmtyp == 0 && numblks != 6 {
+        br.skip(1)?; // convsync
+    }
+    if strmtyp == 2 {
+        let blkid = if numblks == 6 { 1 } else { br.read(1)? };
+        if blkid != 0 {
+            br.skip(6)?;
+        }
+    }
+    let addbsie = br.read(1)? != 0;
+    if !addbsie {
+        return None;
+    }
+    let addbsil = br.read(6)? as usize + 1;
+    let mut b0 = 0u8;
+    let mut b1 = 0u8;
+    for i in 0..addbsil {
+        let b = br.read(8)? as u8;
+        if i == 0 {
+            b0 = b;
+        } else if i == 1 {
+            b1 = b;
+        }
+    }
+    if addbsil >= 2 && (b0 & 0x01) != 0 {
+        Some(b1)
+    } else {
+        None
+    }
 }
 
 fn chanmap_to_chan_loc(chanmap: u16) -> (u16, u16) {
@@ -1421,6 +1486,7 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
 
         let num_ind_sub = (ind_substreams.len() as u32).saturating_sub(1);
 
+        let atmos_joc = syncframes.iter().find_map(|sf| sf.joc_complexity);
         let mut bw = BitWriter::new();
         bw.write_bits(data_rate_kbit, 13);
         bw.write_bits(num_ind_sub, 3);
@@ -1454,6 +1520,11 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
             }
         }
 
+        if let Some(joc) = atmos_joc {
+            bw.write_bits(0x01, 8); // reserved(7) = 0, flag_ec3_extension_type_a(1) = 1
+            bw.write_bits(u32::from(joc), 8); // complexity_index_type_a
+        }
+
         let dec3 = bw.finish();
         let sample_rate = ind_substreams[0].0.sample_rate;
 
@@ -1467,6 +1538,7 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
             frame_samples: 0,
             adts: false,
             language: None,
+            atmos_joc,
         });
     }
 
@@ -1522,6 +1594,7 @@ pub(crate) fn flac_config(streaminfo: &[u8], language: Option<String>) -> Option
         frame_samples: 0,
         adts: false,
         language,
+        atmos_joc: None,
     })
 }
 
@@ -1655,6 +1728,7 @@ fn alac_config(params: &CodecParameters) -> Option<AudioConfig> {
         frame_samples: frame_length,
         adts: false,
         language: params.language.clone(),
+        atmos_joc: None,
     })
 }
 
@@ -1711,6 +1785,13 @@ impl BitWriter {
         }
     }
 
+    fn write_ue(&mut self, val: u32) {
+        let v = val + 1;
+        let total_bits = 32 - v.leading_zeros() as usize;
+        self.write_bits(0, total_bits - 1);
+        self.write_bits(v, total_bits);
+    }
+
     fn finish(self) -> Vec<u8> {
         self.bytes
     }
@@ -1748,6 +1829,308 @@ impl<'a> BitReader<'a> {
         self.bit_pos += count;
         Some(())
     }
+    fn read_ue(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0;
+        while self.read(1)? == 0 {
+            leading_zeros += 1;
+            if leading_zeros > 31 {
+                return None;
+            }
+        }
+        if leading_zeros == 0 {
+            Some(0)
+        } else {
+            let val = self.read(leading_zeros)?;
+            Some((1 << leading_zeros) - 1 + val)
+        }
+    }
+}
+
+/// Parses a 24-byte `DOVIDecoderConfigurationRecord`.
+pub(crate) fn parse_dovi_record(bytes: &[u8]) -> Option<(u8, u8, u8, [u8; 24])> {
+    if bytes.len() < 24 || bytes[0] != 1 {
+        return None;
+    }
+    let w = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let profile = ((w >> 9) & 0x7F) as u8;
+    let level = ((w >> 3) & 0x3F) as u8;
+    let compat_id = (bytes[4] >> 4) & 0x0F;
+    let mut record = [0u8; 24];
+    record.copy_from_slice(&bytes[..24]);
+    Some((profile, level, compat_id, record))
+}
+
+/// Builds a 24-byte `DOVIDecoderConfigurationRecord`.
+pub(crate) fn build_dovi_record(
+    profile: u8,
+    level: u8,
+    rpu: bool,
+    el: bool,
+    bl: bool,
+    compat_id: u8,
+) -> [u8; 24] {
+    let mut rec = [0u8; 24];
+    rec[0] = 1;
+    rec[1] = 0;
+    let w: u16 = ((profile as u16 & 0x7F) << 9)
+        | ((level as u16 & 0x3F) << 3)
+        | ((rpu as u16) << 2)
+        | ((el as u16) << 1)
+        | (bl as u16);
+    rec[2..4].copy_from_slice(&w.to_be_bytes());
+    rec[4] = (compat_id & 0x0F) << 4;
+    rec
+}
+
+/// Finds a `dvcC` or `dvvC` box body in a byte slice.
+pub(crate) fn find_dovi_box(bytes: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+    while i + 8 <= bytes.len() {
+        if &bytes[i + 4..i + 8] == b"dvcC" || &bytes[i + 4..i + 8] == b"dvvC" {
+            let size = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+            if size >= 32 && i + size <= bytes.len() {
+                return Some(&bytes[i + 8..i + size]);
+            } else if bytes.len() >= i + 8 + 24 {
+                return Some(&bytes[i + 8..i + 8 + 24]);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Inspects HEVC `NAL_UNSPEC62` in keyframe NAL units and guesses the Dolby Vision profile.
+pub(crate) fn parse_hevc_rpu_profile(nals: &[&[u8]]) -> Option<u8> {
+    let nal = nals
+        .iter()
+        .find(|nal| nal.len() >= 8 && ((nal[0] >> 1) & 0x3F) == 62)?;
+    let mut rbsp = unescape_rbsp(&nal[2..]);
+    while rbsp.last() == Some(&0) {
+        rbsp.pop();
+    }
+    if rbsp.len() < 6 || rbsp[0] != 0x19 || *rbsp.last()? != 0x80 {
+        return None;
+    }
+    let mut br = BitReader::new(&rbsp[1..]);
+    let rpu_type = br.read(6)?;
+    if rpu_type != 2 {
+        return None;
+    }
+    let rpu_format = br.read(11)?;
+    let vdr_rpu_profile = br.read(4)?;
+    let _vdr_rpu_level = br.read(4)?;
+    let vdr_seq_info_present = br.read(1)? != 0;
+    if !vdr_seq_info_present {
+        return None;
+    }
+    let _chroma_resampling = br.read(1)?;
+    let coef_data_type = br.read(2)?;
+    if coef_data_type == 0 {
+        br.read_ue()?;
+    }
+    let _norm = br.read(2)?;
+    let bl_video_full_range = br.read(1)? != 0;
+    if vdr_rpu_profile == 0 && bl_video_full_range {
+        Some(5)
+    } else if vdr_rpu_profile == 1 {
+        if (rpu_format & 0x700) == 0 {
+            let _bl = br.read_ue()?;
+            let _el = br.read_ue()?;
+            let _vdr = br.read_ue()?;
+            let _srf = br.read(1)?;
+            let _rz = br.read(3)?;
+            let _esrf = br.read(1)?;
+            let disable_residual_flag = br.read(1)? != 0;
+            if !disable_residual_flag {
+                Some(7)
+            } else {
+                Some(8)
+            }
+        } else {
+            Some(8)
+        }
+    } else {
+        None
+    }
+}
+
+/// Applies Dolby Vision configuration to a `VideoConfig`.
+pub(crate) fn apply_dovi(
+    config: &mut VideoConfig,
+    raw_dovi_record: Option<&[u8]>,
+    first_keyframe: &[u8],
+    framing: Framing,
+) {
+    if config.codec != VideoCodec::Hevc {
+        config.dovi = None;
+        return;
+    }
+    if raw_dovi_record.is_none() && config.dovi.is_some() {
+        return;
+    }
+
+    let nals = extract_nals(first_keyframe, framing);
+    let rpu_profile = parse_hevc_rpu_profile(&nals);
+
+    let record_payload = raw_dovi_record.and_then(|r| find_dovi_box(r).or(Some(r)));
+    let parsed = record_payload.and_then(parse_dovi_record);
+
+    let resolved = match parsed {
+        None => {
+            let unspecified_colour = config.colour.is_none()
+                || config.colour.is_some_and(|c| c.primaries == 2 && c.transfer == 2 && c.matrix == 2);
+            if unspecified_colour && rpu_profile == Some(5) {
+                Some((5u8, 6u8, 0u8, build_dovi_record(5, 6, true, false, true, 0)))
+            } else {
+                None
+            }
+        }
+        Some((mut profile, level, mut compat_id, mut record)) => {
+            if profile == 5
+                && matches!(config.range, VideoRange::Pq | VideoRange::Hlg)
+                && matches!(rpu_profile, Some(7 | 8))
+            {
+                profile = rpu_profile.unwrap();
+                compat_id = if config.range == VideoRange::Hlg { 4 } else { 1 };
+                record = build_dovi_record(8, if level > 0 { level } else { 6 }, true, false, true, compat_id);
+            }
+            Some((profile, level, compat_id, record))
+        }
+    };
+    match resolved {
+        Some((5, level, _compat_id, _record)) => {
+            let lvl = if level > 0 { level } else { 6 };
+            config.codec_string = format!("dvh1.05.{lvl:02}");
+            config.range = VideoRange::Pq;
+            if config.colour.is_none()
+                || config.colour.is_some_and(|c| c.primaries == 2 && c.transfer == 2 && c.matrix == 2)
+            {
+                config.colour = Some(Colour {
+                    primaries: 9,
+                    transfer: 16,
+                    matrix: 9,
+                    full_range: false,
+                });
+            }
+            config.dovi = Some(DoviConfig {
+                profile: 5,
+                level: lvl,
+                compat_id: 0,
+                record: build_dovi_record(5, lvl, true, false, true, 0),
+                use_dvh1: true,
+                supplemental_codecs: None,
+            });
+        }
+        Some((7, level, _compat_id, _record)) => {
+            let lvl = if level > 0 { level } else { 6 };
+            config.range = VideoRange::Pq;
+            config.dovi = Some(DoviConfig {
+                profile: 8,
+                level: lvl,
+                compat_id: 1,
+                record: build_dovi_record(8, lvl, true, false, true, 1),
+                use_dvh1: false,
+                supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db1p")),
+            });
+        }
+        Some((8, level, compat_id, record)) => {
+            let lvl = if level > 0 { level } else { 6 };
+            match compat_id {
+                2 => {
+                    config.dovi = None;
+                }
+                4 => {
+                    config.range = VideoRange::Hlg;
+                    config.dovi = Some(DoviConfig {
+                        profile: 8,
+                        level: lvl,
+                        compat_id: 4,
+                        record,
+                        use_dvh1: false,
+                        supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db4h")),
+                    });
+                }
+                _ => {
+                    let rec = if compat_id == 1 {
+                        record
+                    } else {
+                        build_dovi_record(8, lvl, true, false, true, 1)
+                    };
+                    config.range = VideoRange::Pq;
+                    config.dovi = Some(DoviConfig {
+                        profile: 8,
+                        level: lvl,
+                        compat_id: 1,
+                        record: rec,
+                        use_dvh1: false,
+                        supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db1p")),
+                    });
+                }
+            }
+        }
+        _ => {
+            config.dovi = None;
+        }
+    }
+}
+
+/// Strips any HEVC `UNSPEC63` (enhancement layer) NAL units from length-prefixed packet data.
+pub(crate) fn strip_hevc_el_nals(data: Vec<u8>, length_size: u8) -> Vec<u8> {
+    let size = length_size as usize;
+    if size == 0 || data.len() < size {
+        return data;
+    }
+    let mut pos = 0;
+    let mut has_el = false;
+    while pos + size <= data.len() {
+        let nal_len = match size {
+            1 => data[pos] as usize,
+            2 => u16::from_be_bytes([data[pos], data[pos + 1]]) as usize,
+            4 => u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize,
+            _ => break,
+        };
+        pos += size;
+        if pos + nal_len > data.len() {
+            break;
+        }
+        if nal_len > 0 {
+            let nal_type = (data[pos] >> 1) & 0x3F;
+            if nal_type == 63 {
+                has_el = true;
+                break;
+            }
+        }
+        pos += nal_len;
+    }
+    if !has_el {
+        return data;
+    }
+    let mut out = Vec::with_capacity(data.len());
+    let mut pos = 0;
+    while pos + size <= data.len() {
+        let nal_len = match size {
+            1 => data[pos] as usize,
+            2 => u16::from_be_bytes([data[pos], data[pos + 1]]) as usize,
+            4 => u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize,
+            _ => break,
+        };
+        let header = &data[pos..pos + size];
+        pos += size;
+        if pos + nal_len > data.len() {
+            break;
+        }
+        let nal = &data[pos..pos + nal_len];
+        pos += nal_len;
+        if nal_len > 0 {
+            let nal_type = (nal[0] >> 1) & 0x3F;
+            if nal_type == 63 {
+                continue;
+            }
+        }
+        out.extend_from_slice(header);
+        out.extend_from_slice(nal);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2222,6 +2605,7 @@ mod tests {
             frame_samples: 0,
             adts: false,
             language: None,
+            atmos_joc: None,
         };
 
         let fixed_cases = [
@@ -2290,6 +2674,7 @@ mod tests {
             frame_samples: 4096,
             adts: false,
             language: None,
+            atmos_joc: None,
         };
 
         // Frame without hasSize (data[2] & 0x10 == 0) -> frame_samples (4096)
@@ -2317,5 +2702,365 @@ mod tests {
         assert_eq!(audio_packet_samples(&cfg, &[]), 0);
         assert_eq!(audio_packet_samples(&cfg, &[0x00, 0x00]), 4096);
         assert_eq!(audio_packet_samples(&cfg, &[0x00, 0x00, 0x10]), 0); // hasSize but truncated
+    }
+
+    #[test]
+    fn test_parse_and_build_dovi_record() {
+        let rec = build_dovi_record(5, 6, true, false, true, 0);
+        let parsed = parse_dovi_record(&rec).expect("parse dovi profile 5");
+        assert_eq!(parsed.0, 5); // profile
+        assert_eq!(parsed.1, 6); // level
+        assert_eq!(parsed.2, 0); // compat_id
+        assert_eq!(parsed.3, rec);
+
+        let rec8 = build_dovi_record(8, 7, true, false, true, 4);
+        let parsed8 = parse_dovi_record(&rec8).expect("parse dovi profile 8");
+        assert_eq!(parsed8.0, 8);
+        assert_eq!(parsed8.1, 7);
+        assert_eq!(parsed8.2, 4);
+        assert_eq!(parsed8.3, rec8);
+    }
+
+    #[test]
+    fn test_apply_dovi_profile5() {
+        let mut cfg = VideoConfig {
+            codec: VideoCodec::Hevc,
+            width: 3840,
+            height: 2160,
+            record: vec![1, 2, 3],
+            nal_length_size: 4,
+            codec_string: "hvc1.2.4.L153.B0".into(),
+            range: VideoRange::Sdr,
+            colour: None,
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            frame_rate: Some(24.0),
+            reorder_depth: 2,
+            interlaced: false,
+            dovi: None,
+        };
+        let rec = build_dovi_record(5, 6, true, false, true, 0);
+        apply_dovi(&mut cfg, Some(&rec), &[], Framing::LengthPrefixed(4));
+
+        assert_eq!(cfg.codec_string, "dvh1.05.06");
+        assert_eq!(cfg.range, VideoRange::Pq);
+        assert_eq!(
+            cfg.colour,
+            Some(Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false,
+            })
+        );
+        let dovi = cfg.dovi.expect("dovi config");
+        assert_eq!(dovi.profile, 5);
+        assert_eq!(dovi.level, 6);
+        assert_eq!(dovi.compat_id, 0);
+        assert!(dovi.use_dvh1);
+        assert_eq!(dovi.supplemental_codecs, None);
+    }
+
+    #[test]
+    fn test_apply_dovi_profile81() {
+        let mut cfg = VideoConfig {
+            codec: VideoCodec::Hevc,
+            width: 3840,
+            height: 2160,
+            record: vec![1, 2, 3],
+            nal_length_size: 4,
+            codec_string: "hvc1.2.4.L153.B0".into(),
+            range: VideoRange::Pq,
+            colour: Some(Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false,
+            }),
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            frame_rate: Some(24.0),
+            reorder_depth: 2,
+            interlaced: false,
+            dovi: None,
+        };
+        let rec = build_dovi_record(8, 6, true, false, true, 1);
+        apply_dovi(&mut cfg, Some(&rec), &[], Framing::LengthPrefixed(4));
+
+        assert_eq!(cfg.codec_string, "hvc1.2.4.L153.B0");
+        assert_eq!(cfg.range, VideoRange::Pq);
+        let dovi = cfg.dovi.expect("dovi config");
+        assert_eq!(dovi.profile, 8);
+        assert_eq!(dovi.level, 6);
+        assert_eq!(dovi.compat_id, 1);
+        assert!(!dovi.use_dvh1);
+        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
+    }
+
+    #[test]
+    fn test_apply_dovi_profile84_hlg() {
+        let mut cfg = VideoConfig {
+            codec: VideoCodec::Hevc,
+            width: 3840,
+            height: 2160,
+            record: vec![1, 2, 3],
+            nal_length_size: 4,
+            codec_string: "hvc1.2.4.L153.B0".into(),
+            range: VideoRange::Sdr,
+            colour: None,
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            frame_rate: Some(24.0),
+            reorder_depth: 2,
+            interlaced: false,
+            dovi: None,
+        };
+        let rec = build_dovi_record(8, 6, true, false, true, 4);
+        apply_dovi(&mut cfg, Some(&rec), &[], Framing::LengthPrefixed(4));
+
+        assert_eq!(cfg.range, VideoRange::Hlg);
+        let dovi = cfg.dovi.expect("dovi config");
+        assert_eq!(dovi.profile, 8);
+        assert_eq!(dovi.level, 6);
+        assert_eq!(dovi.compat_id, 4);
+        assert!(!dovi.use_dvh1);
+        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db4h"));
+    }
+
+    #[test]
+    fn test_apply_dovi_profile7_rewrite_to_81() {
+        let mut cfg = VideoConfig {
+            codec: VideoCodec::Hevc,
+            width: 3840,
+            height: 2160,
+            record: vec![1, 2, 3],
+            nal_length_size: 4,
+            codec_string: "hvc1.2.4.L153.B0".into(),
+            range: VideoRange::Pq,
+            colour: Some(Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false,
+            }),
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            frame_rate: Some(24.0),
+            reorder_depth: 2,
+            interlaced: false,
+            dovi: None,
+        };
+        let rec7 = build_dovi_record(7, 6, true, true, true, 0);
+        apply_dovi(&mut cfg, Some(&rec7), &[], Framing::LengthPrefixed(4));
+
+        assert_eq!(cfg.range, VideoRange::Pq);
+        let dovi = cfg.dovi.expect("dovi config");
+        assert_eq!(dovi.profile, 8); // Profile 7 rewritten to 8.1
+        assert_eq!(dovi.level, 6);
+        assert_eq!(dovi.compat_id, 1);
+        assert!(!dovi.use_dvh1);
+        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
+        let parsed = parse_dovi_record(&dovi.record).expect("rewritten record parses");
+        assert_eq!(parsed.0, 8);
+        assert_eq!(parsed.2, 1);
+    }
+
+    #[test]
+    fn test_apply_dovi_recordless_profile5_from_rpu() {
+        // Build synthetic RPU NAL for Profile 5
+        let mut bw = BitWriter::new();
+        bw.write_bits(2, 6); // rpu_type = 2
+        bw.write_bits(0, 11); // rpu_format = 0
+        bw.write_bits(0, 4); // vdr_rpu_profile = 0
+        bw.write_bits(0, 4); // vdr_rpu_level = 0
+        bw.write_bits(1, 1); // vdr_seq_info_present = 1
+        bw.write_bits(0, 1); // chroma_resampling = 0
+        bw.write_bits(0, 2); // coef_data_type = 0
+        bw.write_ue(0); // log2_denom = 0
+        bw.write_bits(0, 2); // norm = 0
+        bw.write_bits(1, 1); // bl_video_full_range = 1
+        let payload = bw.finish();
+
+        let mut rbsp = vec![0x19];
+        rbsp.extend_from_slice(&payload);
+        rbsp.push(0x80);
+
+        let mut nal = vec![62 << 1, 0x01]; // UNSPEC62 NAL header
+        nal.extend_from_slice(&rbsp);
+
+        let mut keyframe = Vec::new();
+        keyframe.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        keyframe.extend_from_slice(&nal);
+
+        let mut cfg = VideoConfig {
+            codec: VideoCodec::Hevc,
+            width: 3840,
+            height: 2160,
+            record: vec![1, 2, 3],
+            nal_length_size: 4,
+            codec_string: "hvc1.2.4.L153.B0".into(),
+            range: VideoRange::Sdr,
+            colour: None,
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            frame_rate: Some(24.0),
+            reorder_depth: 2,
+            interlaced: false,
+            dovi: None,
+        };
+
+        apply_dovi(&mut cfg, None, &keyframe, Framing::LengthPrefixed(4));
+        // Idempotent when called a second time with None:
+        apply_dovi(&mut cfg, None, &keyframe, Framing::LengthPrefixed(4));
+        assert_eq!(cfg.codec_string, "dvh1.05.06");
+        assert_eq!(cfg.range, VideoRange::Pq);
+        assert_eq!(
+            cfg.colour,
+            Some(Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false,
+            })
+        );
+        let dovi = cfg.dovi.expect("synthesized dovi config");
+        assert_eq!(dovi.profile, 5);
+        assert_eq!(dovi.level, 6);
+        assert_eq!(dovi.compat_id, 0);
+        assert!(dovi.use_dvh1);
+        assert_eq!(dovi.supplemental_codecs, None);
+    }
+
+    #[test]
+    fn test_apply_dovi_contradicted_profile5_to_81() {
+        // Build synthetic RPU NAL for Profile 8: vdr_rpu_profile = 1, rpu_format = 0x700
+        let mut bw = BitWriter::new();
+        bw.write_bits(2, 6); // rpu_type = 2
+        bw.write_bits(0x700, 11); // rpu_format = 0x700 -> profile 8
+        bw.write_bits(1, 4); // vdr_rpu_profile = 1
+        bw.write_bits(0, 4); // vdr_rpu_level = 0
+        bw.write_bits(1, 1); // vdr_seq_info_present = 1
+        bw.write_bits(0, 1); // chroma_resampling = 0
+        bw.write_bits(0, 2); // coef_data_type = 0
+        bw.write_ue(0); // log2_denom = 0
+        bw.write_bits(0, 2); // norm = 0
+        bw.write_bits(0, 1); // bl_video_full_range = 0
+        let payload = bw.finish();
+
+        let mut rbsp = vec![0x19];
+        rbsp.extend_from_slice(&payload);
+        rbsp.push(0x80);
+
+        let mut nal = vec![62 << 1, 0x01]; // UNSPEC62 NAL header
+        nal.extend_from_slice(&rbsp);
+
+        let mut keyframe = Vec::new();
+        keyframe.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+        keyframe.extend_from_slice(&nal);
+
+        // VUI declares BT.2020 PQ, but container claims Profile 5
+        let mut cfg = VideoConfig {
+            codec: VideoCodec::Hevc,
+            width: 3840,
+            height: 2160,
+            record: vec![1, 2, 3],
+            nal_length_size: 4,
+            codec_string: "hvc1.2.4.L153.B0".into(),
+            range: VideoRange::Pq,
+            colour: Some(Colour {
+                primaries: 9,
+                transfer: 16,
+                matrix: 9,
+                full_range: false,
+            }),
+            mastering_display: None,
+            content_light: None,
+            pixel_aspect: None,
+            frame_rate: Some(24.0),
+            reorder_depth: 2,
+            interlaced: false,
+            dovi: None,
+        };
+
+        let rec5 = build_dovi_record(5, 6, true, false, true, 0);
+        apply_dovi(&mut cfg, Some(&rec5), &keyframe, Framing::LengthPrefixed(4));
+
+        // Overridden from Profile 5 to Profile 8.1
+        let dovi = cfg.dovi.expect("overridden dovi config");
+        assert_eq!(dovi.profile, 8);
+        assert_eq!(dovi.compat_id, 1);
+        assert!(!dovi.use_dvh1);
+        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
+    }
+
+    #[test]
+    fn test_eac3_atmos_joc_detection_and_dec3() {
+        // Construct E-AC-3 syncframe with Atmos JOC:
+        // 0x0B, 0x77
+        // strmtyp=0, substreamid=0, frmsiz=383 (frame_size = 768)
+        // fscod=0 (48kHz), numblkscod=3 (6 blks), acmod=7 (3/2), lfeon=1
+        // bsid=16, dialnorm=31, compre=0, mixmdate=0, infomdate=0
+        // addbsie=1, addbsil=1 (2 bytes), b0=0x01 (extension type A), b1=16 (complexity 16)
+        let mut frame = vec![0x0B, 0x77];
+        let frmsiz: u16 = 383; // 768 bytes total
+        frame.push(((frmsiz >> 8) & 0x07) as u8); // strmtyp=0, substreamid=0
+        frame.push((frmsiz & 0xFF) as u8);
+        frame.push((0 << 6) | (3 << 4) | (7 << 1) | 1); // fscod=0, numblkscod=3, acmod=7, lfeon=1
+
+        let mut bw = BitWriter::new();
+        bw.write_bits(16, 5); // bsid = 16
+        bw.write_bits(31, 5); // dialnorm = 31
+        bw.write_bits(0, 1); // compre = 0
+        bw.write_bits(0, 1); // mixmdate = 0
+        bw.write_bits(0, 1); // infomdate = 0
+        // parse_eac3_joc fields:
+        bw.write_bits(1, 1); // addbsie = 1
+        bw.write_bits(1, 6); // addbsil = 1 (2 bytes)
+        bw.write_bits(0x01, 8); // b0 = 0x01 (flag_ec3_extension_type_a = 1)
+        bw.write_bits(16, 8); // b1 = 16 (complexity_index_type_a = 16)
+        let bsi_bytes = bw.finish();
+        frame.extend_from_slice(&bsi_bytes);
+        frame.resize(768, 0);
+
+        let info = parse_eac3_syncframe(&frame).expect("parse eac3 syncframe with joc");
+        assert_eq!(info.joc_complexity, Some(16));
+
+        let p = CodecParameters::audio(CodecId::new("eac3"));
+        let cfg = audio_config(&p, &frame).expect("eac3 audio config");
+        assert_eq!(cfg.atmos_joc, Some(16));
+        // Verify dec3 box ends with the 2-byte extension: 0x01, 0x10
+        let dec3 = &cfg.config;
+        assert!(dec3.len() >= 2);
+        assert_eq!(&dec3[dec3.len() - 2..], &[0x01, 0x10]);
+    }
+
+    #[test]
+    fn test_strip_hevc_el_nals() {
+        let nalu1 = vec![0x42, 0x01]; // SPS (nal_type 33)
+        let nalu2 = vec![63 << 1, 0x01, 0xAA, 0xBB]; // UNSPEC63 (nal_type 63)
+        let nalu3 = vec![19 << 1, 0x01, 0xCC]; // IDR slice (nal_type 19)
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&(nalu1.len() as u32).to_be_bytes());
+        data.extend_from_slice(&nalu1);
+        data.extend_from_slice(&(nalu2.len() as u32).to_be_bytes());
+        data.extend_from_slice(&nalu2);
+        data.extend_from_slice(&(nalu3.len() as u32).to_be_bytes());
+        data.extend_from_slice(&nalu3);
+
+        let stripped = strip_hevc_el_nals(data, 4);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(nalu1.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&nalu1);
+        expected.extend_from_slice(&(nalu3.len() as u32).to_be_bytes());
+        expected.extend_from_slice(&nalu3);
+
+        assert_eq!(stripped, expected);
     }
 }

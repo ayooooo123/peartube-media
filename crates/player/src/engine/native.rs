@@ -8,6 +8,7 @@
 use super::*;
 use crate::backend::{NativePresenter, NativeStatus};
 use crate::native::session::{self, Session};
+use subs_cc::{CaptionCarrier, CaptionTimeline, CcExtractor};
 
 /// From opening a playlist to AVPlayer's first segment request, and from
 /// the first segment handed to it to its first picture.
@@ -225,6 +226,9 @@ impl Route<'_> {
         let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
         // A seek made before the route opened holds the clock at its target.
         let start = self.position();
+        if let Some(demuxer) = self.demuxer.as_mut() {
+            discover_captions(&mut **demuxer, &self.video, shared);
+        }
         if let Some(stream) = find_stream(self.streams, self.subtitle) {
             self.start_feeder(stream, Duration::from_secs_f64(start.max(0.0)));
         }
@@ -530,7 +534,12 @@ impl Feeder {
         let generation = shared.seek_gen.load(Ordering::SeqCst);
         lane.clear_for_seek(generation);
         let pipeline = spawn_subtitles(shared, stream.clone(), &lane, &demux_cv, true, &options.fonts, demuxer.attachments(), true);
-        demuxer.set_active_streams(&[stream.index]);
+        let is_caption = stream.index == captions::CAPTIONS_608 || stream.index == captions::CAPTIONS_708;
+        if is_caption {
+            demuxer.set_active_streams(&[video.index]);
+        } else {
+            demuxer.set_active_streams(&[stream.index]);
+        }
         let control = Arc::new(FeedControl {
             stop: AtomicBool::new(false),
             seek: Mutex::new(Some((generation, at))),
@@ -538,9 +547,23 @@ impl Feeder {
         });
         let (shared, feed_lane, feed_control) = (Arc::clone(shared), Arc::clone(&lane), Arc::clone(&control));
         let (video_index, video_tb) = (video.index, video.time_base);
+        let video_codec = video.params.codec_id.as_str().to_string();
+        let video_extradata = video.params.extradata.clone();
         let thread = std::thread::Builder::new()
             .name("peartube-native-subtitles".into())
-            .spawn(move || feed(&shared, demuxer, stream.index, video_index, video_tb, &feed_lane, &feed_control))
+            .spawn(move || {
+                feed(
+                    &shared,
+                    demuxer,
+                    stream.index,
+                    video_index,
+                    video_tb,
+                    &video_codec,
+                    &video_extradata,
+                    &feed_lane,
+                    &feed_control,
+                )
+            })
             .expect("failed to spawn the subtitle feeder");
         Feeder { control, thread, pipeline, lane }
     }
@@ -558,18 +581,76 @@ impl Feeder {
     }
 }
 
+fn discover_captions(demuxer: &mut dyn Demuxer, video: &StreamInfo, shared: &SharedState) {
+    if CaptionCarrier::from_codec_id(video.params.codec_id.as_str()).is_none() {
+        return;
+    }
+    {
+        let state = shared.state.lock();
+        let has_608 = state.tracks.iter().any(|t| t.stream == captions::CAPTIONS_608);
+        let has_708 = state.tracks.iter().any(|t| t.stream == captions::CAPTIONS_708);
+        if has_608 && has_708 {
+            return;
+        }
+    }
+    let Some(mut extractor) = CcExtractor::new(video.params.codec_id.as_str(), &video.params.extradata) else {
+        return;
+    };
+    demuxer.set_active_streams(&[video.index]);
+    let mut timeline = CaptionTimeline::new();
+    let mut packets_read = 0;
+    while packets_read < 64 {
+        if shared.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        match read_packet(demuxer) {
+            Ok(Ok(queued)) => {
+                if queued.packet.stream_index != video.index {
+                    continue;
+                }
+                packets_read += 1;
+                let triplets = extractor.extract(&queued.packet.data);
+                for (_pts, triplets) in timeline.push(queued.packet.pts, queued.packet.dts, triplets) {
+                    captions::list_tracks_shared(shared, &triplets);
+                }
+                let state = shared.state.lock();
+                let has_608 = state.tracks.iter().any(|t| t.stream == captions::CAPTIONS_608);
+                let has_708 = state.tracks.iter().any(|t| t.stream == captions::CAPTIONS_708);
+                if has_608 && has_708 {
+                    break;
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    for (_pts, triplets) in timeline.finish() {
+        captions::list_tracks_shared(shared, &triplets);
+    }
+    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| demuxer.seek_to(video.index, 0)));
+}
+
+#[allow(clippy::too_many_arguments)]
 fn feed(
     shared: &SharedState,
     mut demuxer: Box<dyn Demuxer>,
     stream: u32,
     video: u32,
     video_tb: TimeBase,
+    video_codec: &str,
+    video_extradata: &[u8],
     lane: &Lane,
     control: &FeedControl,
 ) -> Box<dyn Demuxer> {
     let clock = shared.sink_clock();
     let mut eof = false;
     let mut pushed_to: Option<f64> = None;
+    let is_caption = stream == captions::CAPTIONS_608 || stream == captions::CAPTIONS_708;
+    let mut extractor = if is_caption {
+        CcExtractor::new(video_codec, video_extradata)
+    } else {
+        None
+    };
+    let mut timeline = CaptionTimeline::new();
     loop {
         if control.stop.load(Ordering::SeqCst) || shared.stopped.load(Ordering::SeqCst) {
             return demuxer;
@@ -581,6 +662,10 @@ fn feed(
             let ticks = video_tb.ticks_of(target.as_secs_f64());
             let demux = &mut demuxer;
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| demux.seek_to(video, ticks)));
+            if let Some(ext) = extractor.as_mut() {
+                ext.reset();
+            }
+            timeline.reset();
             eof = false;
             pushed_to = None;
             continue;
@@ -596,15 +681,49 @@ fn feed(
         }
         match read_packet(&mut *demuxer) {
             Ok(Ok(queued)) => {
-                if queued.packet.stream_index != stream {
-                    continue;
+                if is_caption {
+                    if queued.packet.stream_index != video {
+                        continue;
+                    }
+                    let triplets = match extractor.as_mut() {
+                        Some(ext) => ext.extract(&queued.packet.data),
+                        None => Vec::new(),
+                    };
+                    let released = timeline.push(queued.packet.pts, queued.packet.dts, triplets);
+                    for (pts, triplets) in released {
+                        captions::list_tracks_shared(shared, &triplets);
+                        let mut packet = Packet::new(stream, video_tb, triplets.into_iter().flatten().collect());
+                        packet.pts = pts;
+                        packet.dts = pts;
+                        if let Some(ticks) = pts {
+                            pushed_to = Some(video_tb.seconds_of(ticks));
+                        }
+                        lane.push(QueuedPacket { packet, metadata: PacketMetadata::default() });
+                    }
+                } else {
+                    if queued.packet.stream_index != stream {
+                        continue;
+                    }
+                    if let Some(ticks) = queued.packet.pts.or(queued.packet.dts) {
+                        pushed_to = Some(queued.packet.time_base.seconds_of(ticks));
+                    }
+                    lane.push(queued);
                 }
-                if let Some(ticks) = queued.packet.pts.or(queued.packet.dts) {
-                    pushed_to = Some(queued.packet.time_base.seconds_of(ticks));
-                }
-                lane.push(queued);
             }
             Ok(Err(oxideav_core::Error::Eof)) => {
+                if is_caption {
+                    let released = timeline.finish();
+                    for (pts, triplets) in released {
+                        captions::list_tracks_shared(shared, &triplets);
+                        let mut packet = Packet::new(stream, video_tb, triplets.into_iter().flatten().collect());
+                        packet.pts = pts;
+                        packet.dts = pts;
+                        if let Some(ticks) = pts {
+                            pushed_to = Some(video_tb.seconds_of(ticks));
+                        }
+                        lane.push(QueuedPacket { packet, metadata: PacketMetadata::default() });
+                    }
+                }
                 lane.push_eof();
                 eof = true;
             }

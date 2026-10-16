@@ -11,6 +11,8 @@ pub(crate) struct Variant<'a> {
     pub resolution: Option<(u32, u32)>,
     pub frame_rate: Option<f64>,
     pub range: VideoRange,
+    /// HLS `SUPPLEMENTAL-CODECS`, e.g. `dvh1.08.06/db1p` or `dvh1.08.06/db4h`.
+    pub supplemental_codecs: Option<&'a str>,
 }
 
 pub(crate) fn master_playlist(variant: &Variant, media_uri: &str) -> String {
@@ -25,6 +27,12 @@ pub(crate) fn master_playlist(variant: &Variant, media_uri: &str) -> String {
     out.push_str(",CODECS=\"");
     out.push_str(&variant.codecs.join(","));
     out.push('"');
+
+    if let Some(supp) = variant.supplemental_codecs {
+        out.push_str(",SUPPLEMENTAL-CODECS=\"");
+        out.push_str(supp);
+        out.push('"');
+    }
 
     if let Some((w, h)) = variant.resolution {
         out.push_str(&format!(",RESOLUTION={}x{}", w, h));
@@ -115,6 +123,7 @@ mod tests {
             resolution: Some((1280, 720)),
             frame_rate: Some(23.976),
             range: VideoRange::Sdr,
+            supplemental_codecs: None,
         };
         let m3u8 = master_playlist(&variant, "media.m3u8");
         let expected = "#EXTM3U\n\
@@ -134,6 +143,7 @@ mod tests {
             resolution: None,
             frame_rate: None,
             range: VideoRange::Pq,
+            supplemental_codecs: None,
         };
         let m3u8 = master_playlist(&variant, "hdr.m3u8");
         let expected = "#EXTM3U\n\
@@ -153,6 +163,7 @@ mod tests {
             resolution: Some((1920, 1080)),
             frame_rate: Some(50.0),
             range: VideoRange::Hlg,
+            supplemental_codecs: None,
         };
         let m3u8 = master_playlist(&variant, "hlg.m3u8");
         let expected = "#EXTM3U\n\
@@ -160,6 +171,26 @@ mod tests {
                         #EXT-X-INDEPENDENT-SEGMENTS\n\
                         #EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS=\"hvc1.2.4.L153.B0\",RESOLUTION=1920x1080,FRAME-RATE=50.000,VIDEO-RANGE=HLG\n\
                         hlg.m3u8\n";
+        assert_eq!(m3u8, expected);
+    }
+
+    #[test]
+    fn test_master_playlist_supplemental_codecs() {
+        let variant = Variant {
+            bandwidth: 15_000_000,
+            average_bandwidth: None,
+            codecs: &["hvc1.2.4.L153.B0", "ec-3"],
+            resolution: Some((3840, 2160)),
+            frame_rate: Some(23.976),
+            range: VideoRange::Pq,
+            supplemental_codecs: Some("dvh1.08.06/db1p"),
+        };
+        let m3u8 = master_playlist(&variant, "dovi.m3u8");
+        let expected = "#EXTM3U\n\
+                        #EXT-X-VERSION:7\n\
+                        #EXT-X-INDEPENDENT-SEGMENTS\n\
+                        #EXT-X-STREAM-INF:BANDWIDTH=15000000,CODECS=\"hvc1.2.4.L153.B0,ec-3\",SUPPLEMENTAL-CODECS=\"dvh1.08.06/db1p\",RESOLUTION=3840x2160,FRAME-RATE=23.976,VIDEO-RANGE=PQ\n\
+                        dovi.m3u8\n";
         assert_eq!(m3u8, expected);
     }
 

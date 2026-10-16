@@ -84,13 +84,25 @@ pub(crate) fn prepare(
     keep(source.monitor());
     let length = source.seek(SeekFrom::End(0)).ok();
     source.seek(SeekFrom::Start(0)).map_err(|e| format!("rewind: {e}"))?;
-    let (demuxer, cues) = if pts_only {
+    let (demuxer, cues, dovi_record) = if pts_only {
         let mkv = oxideav_mkv::demux::open_typed(Box::new(source), &ctx.codecs).map_err(|e| format!("demuxer: {e}"))?;
         let keys = mkv_keyframes(&mkv, video.index);
-        (Box::new(mkv) as Box<dyn Demuxer>, Some(keys))
+        let dovi = mkv
+            .block_addition_mappings(video.index)
+            .iter()
+            .find(|m| {
+                (m.addid_type == 0x6476_6343
+                    || m.addid_type == 0x6476_7643
+                    || m.name.as_deref().is_some_and(|n| n.contains("Dolby Vision")))
+                    && m.extra_data.as_ref().is_some_and(|d| d.len() >= 24)
+            })
+            .and_then(|m| m.extra_data.clone())
+            .or_else(|| codec::find_dovi_box(&video.params.extradata).map(|b| b.to_vec()));
+        (Box::new(mkv) as Box<dyn Demuxer>, Some(keys), dovi)
     } else {
+        let dovi = scan_mp4_dovi(&mut source).or_else(|| codec::find_dovi_box(&video.params.extradata).map(|b| b.to_vec()));
         let demuxer = ctx.containers.open_demuxer(container, Box::new(source), &ctx.codecs).map_err(|e| format!("demuxer: {e}"))?;
-        (demuxer, None)
+        (demuxer, None, dovi)
     };
     let mut demuxer = wrap(demuxer);
     let mut active = vec![video.index];
@@ -114,7 +126,13 @@ pub(crate) fn prepare(
     // The first keyframe and audio packet: the codec configurations.
     seek(&mut *demuxer, video.index, first_key)?;
     let first = first_packets(&mut *demuxer, video, audio, stopped)?;
-    let video_config = codec::video_config(&video.params, &first.keyframe.data).ok_or("no usable H.264/HEVC configuration")?;
+    let mut video_config = codec::video_config(&video.params, &first.keyframe.data).ok_or("no usable H.264/HEVC configuration")?;
+    codec::apply_dovi(
+        &mut video_config,
+        dovi_record.as_deref(),
+        &first.keyframe.data,
+        codec::video_framing(&video.params),
+    );
     if video_config.interlaced {
         return Err("interlaced video".into());
     }
@@ -477,6 +495,7 @@ impl Session {
                 resolution: Some((self.video_config.width, self.video_config.height)),
                 frame_rate: self.video_config.frame_rate,
                 range: self.video_config.range,
+                supplemental_codecs: self.video_config.dovi.as_ref().and_then(|d| d.supplemental_codecs.as_deref()),
             },
             "media.m3u8",
         );
@@ -560,4 +579,45 @@ impl Session {
             producer.stop();
         }
     }
+}
+
+/// Scans an MP4/MOV source for a `dvcC` or `dvvC` box body of >= 24 bytes in the `moov` box.
+fn scan_mp4_dovi<R: std::io::Read + Seek>(source: &mut R) -> Option<Vec<u8>> {
+    let _ = source.seek(SeekFrom::Start(0));
+    let mut header = [0u8; 8];
+    while source.read_exact(&mut header).is_ok() {
+        let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        let fourcc = &header[4..8];
+        let (box_size, header_len) = if size == 1 {
+            let mut large = [0u8; 8];
+            if source.read_exact(&mut large).is_err() {
+                break;
+            }
+            (u64::from_be_bytes(large), 16)
+        } else if size == 0 {
+            break;
+        } else {
+            (size, 8)
+        };
+        if box_size < header_len {
+            break;
+        }
+        if fourcc == b"moov" {
+            let body_len = (box_size - header_len).min(32 * 1024 * 1024) as usize;
+            let mut moov_data = vec![0u8; body_len];
+            if source.read_exact(&mut moov_data).is_ok() {
+                let rec = codec::find_dovi_box(&moov_data).map(|b| b.to_vec());
+                let _ = source.seek(SeekFrom::Start(0));
+                return rec;
+            }
+            break;
+        } else {
+            let skip = box_size - header_len;
+            if source.seek(SeekFrom::Current(skip as i64)).is_err() {
+                break;
+            }
+        }
+    }
+    let _ = source.seek(SeekFrom::Start(0));
+    None
 }
