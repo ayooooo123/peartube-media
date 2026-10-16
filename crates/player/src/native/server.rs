@@ -1034,8 +1034,10 @@ mod tests {
         let server = Server::start(resources).unwrap();
         let port = server.port;
 
+        // Dropped well after the 1.5 s chunked header (the request comes
+        // after this thread starts; a loaded machine stretches both).
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(1600));
+            thread::sleep(Duration::from_millis(2500));
             drop(tx);
         });
 
