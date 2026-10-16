@@ -84,8 +84,9 @@ impl crate::backend::SubtitleSink for AppleSubtitleSink {
                 let contents: Option<&objc2::runtime::AnyObject> = composed
                     .as_deref()
                     .map(|i| i.as_ref() as &objc2::runtime::AnyObject);
+                // No setNeedsDisplay: the layer has no drawing of its own,
+                // and a display pass would replace these contents.
                 layer.setContents(contents);
-                layer.setNeedsDisplay();
             }
         });
     }
