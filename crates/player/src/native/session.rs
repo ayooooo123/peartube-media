@@ -403,6 +403,13 @@ impl Session {
         self.server.url(&format!("g{}/master.m3u8", self.generation))
     }
 
+    /// The media playlist's URL for the current generation: what AVPlayer
+    /// gets when it refuses the master (an HDR `VIDEO-RANGE` on a display
+    /// without HDR fails with -11868).
+    pub(crate) fn media_url(&self) -> String {
+        self.server.url(&format!("g{}/media.m3u8", self.generation))
+    }
+
     /// Source time, in seconds, of item time 0.
     pub(crate) fn origin_secs(&self) -> f64 {
         self.video.time_base.seconds_of(self.origin)

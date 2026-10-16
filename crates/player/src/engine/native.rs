@@ -118,6 +118,7 @@ pub(super) fn play(
         demuxer: Some(demuxer),
         feeder: None,
         options,
+        media_direct: false,
     };
     route.run()
 }
@@ -183,11 +184,17 @@ struct Route<'a> {
     demuxer: Option<Box<dyn Demuxer>>,
     feeder: Option<Feeder>,
     options: &'a PlayerOptions,
+    /// AVPlayer refused the master playlist: it gets the media playlist.
+    media_direct: bool,
 }
 
 impl Route<'_> {
     fn session(&self) -> &Session {
         self.session.as_ref().expect("the session runs until teardown")
+    }
+
+    fn playlist(&self) -> String {
+        if self.media_direct { self.session().media_url() } else { self.session().url() }
     }
 
     fn item(&self, source: f64) -> Duration {
@@ -212,7 +219,7 @@ impl Route<'_> {
         }
 
         let start = self.position();
-        self.presenter.open(&self.session().url(), self.item(start));
+        self.presenter.open(&self.playlist(), self.item(start));
         let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
         // The open's own seek has no serial: seek again to learn when the
         // item stands at the start.
@@ -235,6 +242,15 @@ impl Route<'_> {
             let position = self.position();
 
             if let Some(error) = &status.failed {
+                if !first_picture && !self.media_direct {
+                    log(&format!("AVPlayer refused the master playlist ({error}): the media playlist"));
+                    self.media_direct = true;
+                    self.switch_item(position, &mut landing);
+                    following = false;
+                    play_sent = None;
+                    served_at = None;
+                    continue;
+                }
                 if !first_picture {
                     log(&format!("AVPlayer failed before the first picture ({error}): decode route"));
                     return self.decline(Some(position));
@@ -338,7 +354,7 @@ impl Route<'_> {
     /// Loads the current playlist again at `position`.
     fn reopen(&mut self, position: f64, seen_seek: &mut u64, landing: &mut Option<(u64, u64)>) {
         let at = Duration::from_secs_f64(position.max(0.0));
-        self.presenter.open(&self.session().url(), self.item(position));
+        self.presenter.open(&self.playlist(), self.item(position));
         // Hold the clock at the position until the new item landed there.
         self.shared.request_seek(at);
         *seen_seek = self.shared.seek_gen.load(Ordering::SeqCst);
@@ -355,7 +371,7 @@ impl Route<'_> {
         let shared = self.shared;
         shared.native_hold(true);
         shared.master.release_audio();
-        self.presenter.open(&self.session().url(), self.item(position));
+        self.presenter.open(&self.playlist(), self.item(position));
         let generation = shared.seek_gen.load(Ordering::SeqCst);
         *landing = Some((self.presenter.seek(self.item(position)), generation));
     }
