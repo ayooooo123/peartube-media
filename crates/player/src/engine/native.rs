@@ -9,7 +9,8 @@ use super::*;
 use crate::backend::{NativePresenter, NativeStatus};
 use crate::native::session::{self, Session};
 
-/// From the first segment handed to AVPlayer to its first picture.
+/// From opening a playlist to AVPlayer's first segment request, and from
+/// the first segment handed to it to its first picture.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
 /// At the end, AVPlayer waiting this long for media past the last segment
 /// means the playback is over (it never posts its end for a VOD playlist
@@ -231,6 +232,8 @@ impl Route<'_> {
         let mut following = false;
         let mut first_picture = false;
         let mut served_at: Option<Instant> = None;
+        // When the playlist AVPlayer starts from was opened.
+        let mut opened_at = Instant::now();
         let mut play_sent: Option<bool> = None;
         let mut reloads = 0;
         let mut tail_since: Option<Instant> = None;
@@ -255,6 +258,7 @@ impl Route<'_> {
                     following = false;
                     play_sent = None;
                     served_at = None;
+                    opened_at = Instant::now();
                     continue;
                 }
                 if !first_picture {
@@ -277,6 +281,21 @@ impl Route<'_> {
             if !first_picture {
                 if served_at.is_none() && self.session().served_any() {
                     served_at = Some(Instant::now());
+                }
+                // Parked on the playlists: no segment asked for at all.
+                let parked = !self.session().requested_any() && opened_at.elapsed() > STARTUP_TIMEOUT;
+                if parked && !self.media_direct {
+                    log("AVPlayer asked for no segment from the master playlist: the media playlist");
+                    self.media_direct = true;
+                    self.switch_item(position, &mut landing);
+                    following = false;
+                    play_sent = None;
+                    opened_at = Instant::now();
+                    continue;
+                }
+                if parked {
+                    log("AVPlayer asked for no segment: decode route");
+                    return self.decline(Some(position));
                 }
                 if served_at.is_some_and(|at| at.elapsed() > STARTUP_TIMEOUT) {
                     log("AVPlayer showed no picture: decode route");

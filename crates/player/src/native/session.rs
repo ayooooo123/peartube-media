@@ -424,6 +424,10 @@ impl Session {
         self.producer.as_ref().is_some_and(|p| p.served_any())
     }
 
+    pub(crate) fn requested_any(&self) -> bool {
+        self.producer.as_ref().is_some_and(|p| p.requested_any())
+    }
+
     pub(crate) fn served_last(&self) -> bool {
         self.producer.as_ref().is_some_and(|p| p.served_last())
     }

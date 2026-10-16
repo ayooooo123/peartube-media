@@ -72,6 +72,8 @@ struct Inner {
     served_last: AtomicBool,
     /// Some segment went out.
     served_any: AtomicBool,
+    /// AVPlayer asked for some segment.
+    requested_any: AtomicBool,
     /// The segment being made, `usize::MAX` for none: a request for it waits
     /// instead of aborting it.
     in_flight: AtomicUsize,
@@ -104,6 +106,7 @@ impl Producer {
             urgent: AtomicBool::new(false),
             served_last: AtomicBool::new(false),
             served_any: AtomicBool::new(false),
+            requested_any: AtomicBool::new(false),
             in_flight: AtomicUsize::new(usize::MAX),
             segments: plan.len(),
         });
@@ -129,6 +132,7 @@ impl Producer {
         if index >= self.inner.segments || self.inner.stopped.load(Ordering::SeqCst) {
             return None;
         }
+        self.inner.requested_any.store(true, Ordering::SeqCst);
         let mut state = self.inner.state.lock();
         state.last_request = index;
         if let Some(bytes) = state.cache.get(&index) {
@@ -174,6 +178,11 @@ impl Producer {
     /// A segment has gone out: AVPlayer has the media it starts with.
     pub(crate) fn served_any(&self) -> bool {
         self.inner.served_any.load(Ordering::SeqCst)
+    }
+
+    /// AVPlayer has asked for a segment: it got past the playlists.
+    pub(crate) fn requested_any(&self) -> bool {
+        self.inner.requested_any.load(Ordering::SeqCst)
     }
 
     fn halt(&self) {
