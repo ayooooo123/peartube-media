@@ -225,6 +225,11 @@ impl Bridge {
         self.buf_start + (self.buf.len() / self.output.channels) as i64
     }
 
+    /// `MAX_GAP_SECS` in output samples.
+    fn max_gap(&self) -> i64 {
+        (MAX_GAP_SECS * f64::from(self.output.rate)) as i64
+    }
+
     /// Decodes `packet` into the buffer. A packet the decoder refuses leaves
     /// silence as long as the container says it lasts; without a duration,
     /// what follows closes up behind it (within `ALIGN_SECS`, the decode
@@ -242,7 +247,12 @@ impl Bridge {
             }
             if let (Some(next), Some(duration)) = (self.next, packet.duration.filter(|&d| d > 0)) {
                 let span = packet.time_base.seconds_of(duration) * f64::from(self.output.rate);
-                self.next = Some(next + span.round() as i64);
+                if span.is_finite() && span > 0.0 {
+                    // Never further than a gap may reach past the buffer's
+                    // end: a damaged duration, or many, cannot grow it.
+                    let limit = self.decoded_to().saturating_add(self.max_gap());
+                    self.next = Some(next.saturating_add(span.round() as i64).min(limit));
+                }
             }
         }
         for pcm in out {
@@ -283,11 +293,15 @@ impl Bridge {
             return;
         }
         let mut at = ((pts - self.origin) * f64::from(rate)).round() as i64;
-        let expected = self.next.unwrap_or_else(|| self.decoded_to());
-        if at - expected > (MAX_GAP_SECS * f64::from(rate)) as i64 {
+        // The silence a gap gets is counted from the buffer's end, where
+        // `write` fills from, whatever `next` says.
+        let end = self.decoded_to();
+        let limit = end.saturating_add(self.max_gap());
+        let expected = self.next.unwrap_or(end).min(limit);
+        if at.saturating_sub(expected) > self.max_gap() || at > limit {
             if !self.jumped {
                 self.jumped = true;
-                log(&format!("the audio's timestamps jump {:.1} s ahead: taken as damage", (at - expected) as f64 / f64::from(rate)));
+                log(&format!("the audio's timestamps jump {:.1} s ahead: taken as damage", at.saturating_sub(expected) as f64 / f64::from(rate)));
             }
             at = expected;
         }
@@ -454,6 +468,41 @@ mod tests {
         // The damaged packet's audio follows on where the stream was.
         assert_eq!(b.decoded_to(), 3 * 1152);
         assert_eq!(b.buf.len(), 3 * 1152 * 2);
+    }
+
+    #[test]
+    fn a_refused_duration_cannot_carry_the_silence_past_the_cap() {
+        // A refused packet claiming 100 s, then audio stamped where that
+        // claim ends: the cap counts from the buffer's end, so at most
+        // MAX_GAP_SECS of silence comes before the audio.
+        let mut b = bridge(1, 0.0, 0);
+        b.feed(&packet(0.0, 9), None);
+        let mut p = packet(0.024, 0);
+        p.duration = Some(100 * 48_000);
+        b.feed(&p, None);
+        b.feed(&packet(100.024, 9), None);
+        let cap = (MAX_GAP_SECS * 48_000.0) as i64;
+        assert_eq!(b.decoded_to(), 1152 + cap + 1152);
+        assert!(b.buf[(1152 + cap) as usize] > 0.0);
+    }
+
+    #[test]
+    fn refused_durations_neither_add_up_nor_overflow() {
+        // Two refused packets of 20 min, one of i64::MAX ticks, then audio.
+        let mut b = bridge(2, 0.0, 0);
+        b.feed(&packet(0.0, 9), None);
+        let mut at = 0.024;
+        for duration in [1200 * 48_000, 1200 * 48_000, i64::MAX] {
+            let mut p = packet(at, 0);
+            p.duration = Some(duration);
+            b.feed(&p, None);
+            at += 1200.0;
+        }
+        b.feed(&packet(at, 9), None);
+        let cap = (MAX_GAP_SECS * 48_000.0) as i64;
+        assert_eq!(b.decoded_to(), 1152 + cap + 1152);
+        assert_eq!(b.buf.len() as i64, b.decoded_to() * 2);
+        assert!(b.buf[((1152 + cap) * 2) as usize] > 0.0);
     }
 
     #[test]
