@@ -325,7 +325,7 @@ impl Route<'_> {
             let select_gen = shared.select_gen.load(Ordering::SeqCst);
             if select_gen != self.select_gen {
                 self.select_gen = select_gen;
-                if let Some(outcome) = self.apply_selection(position, &mut seen_seek, &mut landing) {
+                if let Some(outcome) = self.apply_selection(position, &mut landing) {
                     return outcome;
                 }
                 following = following && landing.is_none();
@@ -348,9 +348,21 @@ impl Route<'_> {
         }
     }
 
+    /// Loads the session's new playlist at `position` without a seek: the
+    /// clock holds where the old item stood, and the subtitles (their
+    /// pipeline and feeder follow seek generations) carry on.
+    fn switch_item(&mut self, position: f64, landing: &mut Option<(u64, u64)>) {
+        let shared = self.shared;
+        shared.native_hold(true);
+        shared.master.release_audio();
+        self.presenter.open(&self.session().url(), self.item(position));
+        let generation = shared.seek_gen.load(Ordering::SeqCst);
+        *landing = Some((self.presenter.seek(self.item(position)), generation));
+    }
+
     /// Applies `select_audio` / `select_subtitle`. `Some`: the playback
     /// leaves the native route.
-    fn apply_selection(&mut self, position: f64, seen_seek: &mut u64, landing: &mut Option<(u64, u64)>) -> Option<Outcome> {
+    fn apply_selection(&mut self, position: f64, landing: &mut Option<(u64, u64)>) -> Option<Outcome> {
         let shared = self.shared;
         let audio = match *shared.wanted_audio.lock() {
             AudioChoice::Default => self.audio,
@@ -373,7 +385,7 @@ impl Route<'_> {
             }
             self.audio = audio;
             shared.state.lock().audio = audio;
-            self.reopen(position, seen_seek, landing);
+            self.switch_item(position, landing);
         }
         if subtitle != self.subtitle {
             if let Some(feeder) = self.feeder.take() {
