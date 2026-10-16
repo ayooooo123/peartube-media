@@ -1524,7 +1524,7 @@ dependencies = [
 [[package]]
 name = "oxideav-mpeg4video"
 version = "0.1.8"
-source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=0bba55307a7e3e331148f64a9d68c50ee993c918#0bba55307a7e3e331148f64a9d68c50ee993c918"
+source = "git+https://github.com/ayooooo123/oxideav-mpeg4video?rev=666e9915fa31dfb79dd841a4f6b28977e1e5cf71#666e9915fa31dfb79dd841a4f6b28977e1e5cf71"
 dependencies = [
  "oxideav-core",
 ]
