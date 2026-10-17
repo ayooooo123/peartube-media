@@ -33,7 +33,7 @@ fn play(path: &Path, seek: Option<Duration>) -> (Vec<f32>, usize) {
     let state = p.wait();
     drop(p);
     assert!(state.error.is_none(), "{}: {:?}", path.display(), state.error);
-    assert_eq!(state.audio, Some(0));
+    assert!(state.audio.is_some(), "{}: no audio track playing", path.display());
     let mut capture = backend.capture();
     let mut audio = capture.audio.remove(0);
     let from = audio.flushes.last().map_or(0, |&w| audio.writes.get(w).map_or(audio.pcm.len(), |&(_, at)| at));
@@ -246,6 +246,43 @@ fn vorbis_plays_ffmpegs_samples_from_the_start_and_seeks_in_ogg_and_matroska() {
             seek_matches_ffmpeg(path, Duration::from_millis(ms), ticks);
         }
     }
+}
+
+/// Theora and Vorbis in one Ogg file, played from the start and seeked
+/// into its last second, against FFmpeg's uninterrupted decode. From the
+/// start, the last packet's end padding played (288320 samples for
+/// FFmpeg's 288000): the demuxer declared no trim for Vorbis. The seek
+/// lands on a video page; when the next Vorbis page was the stream's
+/// end-of-stream page, its packets had no timestamp, the Player took them
+/// for audio before the target, and the rest never played (0 of 24000
+/// samples). FFmpeg's own `-ss` seek is no oracle here: it gives 36544
+/// samples for the last 0.5 s, matching the signal nowhere.
+#[test]
+fn vorbis_plays_ffmpegs_samples_from_the_start_and_after_a_seek_into_the_last_second_of_an_ogg_video() {
+    let ogv = Fixture::new("ogv");
+    let out = Command::new(refcheck::system_ffmpeg())
+        .args(["-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=25",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "6",
+            "-c:v", "libtheora", "-c:a", "libvorbis", "-shortest"])
+        .arg(&ogv.0)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "FFmpeg fixture: {}", String::from_utf8_lossy(&out.stderr));
+    let full = refcheck::ffmpeg_audio_f32(&ogv.0, 0);
+    let (whole, channels) = play(&ogv.0, None);
+    assert_eq!(whole.len(), full.len(), "samples from the start");
+    let snr = snr_at(&full, &whole, channels, 0, 0);
+    assert!(snr >= 90.0, "{snr:.2} dB from FFmpeg's samples from the start");
+    let (played, _) = play(&ogv.0, Some(Duration::from_millis(5500)));
+    let rest = &full[5500 * 48 * channels..];
+    let (lag, snr) = (-2048..=2048)
+        .map(|lag| (lag, snr_at(rest, &played, channels, 3840, lag)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    eprintln!("from 5.5 s: played {} of {} samples/channel; {snr:.2} dB at lag {lag} after 80 ms",
+        played.len() / channels, rest.len() / channels);
+    assert_eq!(played.len(), rest.len(), "post-seek samples");
+    assert!(snr >= 90.0 && lag == 0, "post-seek audio is {snr:.2} dB from FFmpeg's decode (best lag {lag})");
 }
 
 /// MP3 in MP4: an `mp4a` sample entry whose esds names MPEG-1 audio (object
