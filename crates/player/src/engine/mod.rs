@@ -1832,17 +1832,22 @@ fn audio_failed(shared: &SharedState, message: String) {
 
 fn video_decoder_failed(shared: &SharedState, error: oxideav_core::Error) {
     if matches!(error, oxideav_core::Error::CodecNotFound(_)) {
-        // A missing decoder retires only this stream, as for unsupported audio.
-        // Consumer/Live teardown releases its queue and readiness hold.
-        let mut state = shared.state.lock();
-        state.error.get_or_insert_with(|| format!("no video decoder found: {error}"));
-        state.video = None;
-        state.video_size = None;
-        drop(state);
-        notify_changed_now(shared);
+        retire_video(shared, format!("no video decoder found: {error}"));
     } else {
         set_error(shared, format!("video software decoder fallback failed: {error}"));
     }
+}
+
+/// Retires only the video stream, as for unsupported audio: the warning
+/// stays in `State.error` and decodable audio plays on. Consumer/Live
+/// teardown releases its queue and readiness hold.
+fn retire_video(shared: &SharedState, message: String) {
+    let mut state = shared.state.lock();
+    state.error.get_or_insert(message);
+    state.video = None;
+    state.video_size = None;
+    drop(state);
+    notify_changed_now(shared);
 }
 
 fn record_trim_fallbacks(shared: &SharedState, trimmer: &mut Trimmer<Chunk>) {
@@ -2535,6 +2540,8 @@ struct VideoSession {
     phase: VideoPhase,
     /// Decoder flush issued once per EOF episode.
     decoder_flushed: bool,
+    /// Packets the software decoder refused in a row (damaged input).
+    refused_packets: u32,
     /// Sink finish sealed once per EOF episode.
     sink_finish_sealed: bool,
 }
@@ -2610,6 +2617,7 @@ impl VideoSession {
             pending_format_change: None,
             phase: VideoPhase::Feeding,
             decoder_flushed: false,
+            refused_packets: 0,
             sink_finish_sealed: false,
         }
     }
@@ -2728,6 +2736,7 @@ impl VideoSession {
         self.frame_clock = FrameClock::default();
         self.packet_pts_seed = None;
         self.need_keyframe = true;
+        self.refused_packets = 0;
         self.phase = VideoPhase::Feeding;
         self.decoder_flushed = false;
         self.sink_finish_sealed = false;
@@ -3563,6 +3572,7 @@ fn run_video_thread(
                     match send_res {
                         Ok(Ok(())) => {
                             session.need_keyframe = false;
+                            session.refused_packets = 0;
                             match session.drain_one_decoder_frame(&shared, &stream) {
                                 Ok(_) => {}
                                 Err(e) => {
@@ -3571,10 +3581,15 @@ fn run_video_thread(
                                 }
                             }
                         }
+                        // A damaged packet is dropped, as FFmpeg drops one it
+                        // cannot decode; need_keyframe stays until a packet is
+                        // accepted. Three in a row retire the video stream.
                         Ok(Err(e)) => {
-                            // Keep need_keyframe until a packet is actually accepted.
-                            set_error(&shared, format!("video decoder send_packet failed: {e}"));
-                            return;
+                            session.refused_packets += 1;
+                            if session.refused_packets >= 3 {
+                                retire_video(&shared, format!("video decoder refused 3 packets in a row: {e}"));
+                                return;
+                            }
                         }
                         Err(_) => {
                             set_error(&shared, "video decoder send_packet panicked".into());
