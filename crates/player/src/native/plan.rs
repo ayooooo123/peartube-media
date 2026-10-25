@@ -64,6 +64,73 @@ pub(crate) fn trusted(keyframes: &[i64], tb: TimeBase, duration_secs: f64) -> bo
     !keys.windows(2).any(|pair| secs(pair[1]) - secs(pair[0]) > max_gap)
 }
 
+/// Ceiling on a single GOP or static end-credits stretch in an otherwise
+/// complete container index (`--keyint 720` at 23.976 fps is 30.030 s; UHD
+/// studio logos and end credits routinely hold 60–180 s without a cut).
+const MAX_USABLE_GAP_SECS: f64 = 120.0;
+const MAX_USABLE_TAIL_SECS: f64 = 300.0;
+const MAX_PLAN_SEGMENTS: usize = 200_000;
+
+/// Whether a container's own Cues/stss table spans the title cleanly enough
+/// for an exact keyframe plan even when long UHD GOPs (e.g. 30.03 s) or static
+/// end credits trip `trusted`'s strict 30 s / 60 s thresholds.
+pub(crate) fn usable_cues(keyframes: &[i64], tb: TimeBase, duration_secs: f64) -> bool {
+    if trusted(keyframes, tb, duration_secs) {
+        return true;
+    }
+    if !duration_secs.is_finite() || duration_secs <= 0.0 {
+        return false;
+    }
+    let mut keys = keyframes.to_vec();
+    keys.sort_unstable();
+    keys.dedup();
+    let (Some(&first), Some(&last)) = (keys.first(), keys.last()) else {
+        return false;
+    };
+    let secs = |ticks: i64| tb.seconds_of(ticks);
+    let coverage = secs(last) - secs(first);
+    if keys.len() < 2 || coverage < TARGET_SECS {
+        return false;
+    }
+    if duration_secs - secs(last) > MAX_USABLE_TAIL_SECS {
+        return false;
+    }
+    !keys.windows(2).any(|pair| secs(pair[1]) - secs(pair[0]) > MAX_USABLE_GAP_SECS)
+}
+
+/// Uniform-stride fallback plan (AetherEngine's `buildUniformSegmentPlan`):
+/// anchored at `first_key` when Cues are missing, cut short, or absent
+/// (`mpegts`), so AVPlayer still rides the native route while the producer
+/// snaps every segment cut to the first real keyframe at or past its boundary.
+pub(crate) fn uniform(first_key: i64, end: i64, stride_secs: f64, tb: TimeBase) -> Option<Plan> {
+    if end <= first_key {
+        return None;
+    }
+    let span_secs = tb.seconds_of(end - first_key);
+    if !span_secs.is_finite() || span_secs <= 0.0 {
+        return None;
+    }
+    let mut stride = if stride_secs.is_finite() && stride_secs > 0.0 {
+        stride_secs.max(TARGET_SECS)
+    } else {
+        TARGET_SECS
+    };
+    if span_secs / stride > MAX_PLAN_SEGMENTS as f64 {
+        stride = span_secs / MAX_PLAN_SEGMENTS as f64;
+    }
+    let step = tb.ticks_of(stride).max(1);
+    let mut starts = Vec::new();
+    let mut at = first_key;
+    while at < end && starts.len() < MAX_PLAN_SEGMENTS {
+        starts.push(at);
+        at = at.saturating_add(step);
+    }
+    if starts.len() > 1 && tb.seconds_of(end - *starts.last().expect("one start")) < TARGET_SECS {
+        starts.pop();
+    }
+    Some(Plan { starts, end })
+}
+
 /// The plan for trusted `keyframes` whose last video picture ends at
 /// `end`: a segment starts at the first keyframe at least `TARGET_SECS`
 /// after the previous start, and a last segment shorter than that joins
@@ -163,5 +230,25 @@ mod tests {
         // Origin 84 ms before the first keyframe (B-frame reorder delay).
         let pos = positions_ms(&p, MS, -84);
         assert_eq!(pos, vec![0, 4_088, 8_092, 12_429]);
+    }
+
+    #[test]
+    fn usable_cues_accepts_720_frame_23976_gops_and_credits_tail_but_rejects_partial_scans() {
+        // 720-frame GOPs at 23.976 fps = 30.030 s (> 30.0 s strict cap), plus a 150 s credits card.
+        let mut k: Vec<f64> = (0..100).map(|i| i as f64 * 30.030).collect();
+        let dur = *k.last().unwrap() + 150.0;
+        assert!(!trusted(&keys(&k), MS, dur));
+        assert!(usable_cues(&keys(&k), MS, dur));
+        // Partial scan stopping 10 minutes short still fails so uniform fallback takes over.
+        k.truncate(20);
+        assert!(!usable_cues(&keys(&k), MS, dur));
+    }
+
+    #[test]
+    fn uniform_plan_anchors_at_first_key_and_merges_short_tail() {
+        let p = uniform(11_600, 33_000, 10.0, MS).unwrap();
+        // 11.6 s, 21.6 s; 31.6..33.0 s is < 4 s so it merges into segment 1.
+        assert_eq!(p.starts, vec![11_600, 21_600]);
+        assert_eq!(p.bounds(1), (21_600, 33_000));
     }
 }

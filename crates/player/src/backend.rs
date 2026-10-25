@@ -138,6 +138,12 @@ pub trait AudioSink: Send {
     /// Drops everything queued (seek). The clock restarts at the next
     /// `write`'s `pts`.
     fn flush(&mut self);
+    /// Pushes any sub-threshold coalesced tail to the device at stream end.
+    /// `Ok(true)` once nothing pending remains; `Ok(false)` when a full or
+    /// paused output still holds room back so the caller should retry.
+    fn drain(&mut self) -> Result<bool, SinkError> {
+        Ok(true)
+    }
     /// The output's clock: the media time of the sample being heard. The
     /// playback's master clock while audio plays.
     fn clock(&self) -> Arc<dyn Clock>;

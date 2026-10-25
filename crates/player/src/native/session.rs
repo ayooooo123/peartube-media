@@ -33,9 +33,13 @@ const PROBE_BUDGET: Duration = Duration::from_secs(2);
 /// configuration; for a bridged one's, what its decoder needs before it
 /// sounds (mid-stream, TrueHD waits up to 128 access units of 0.83 ms for a
 /// major sync), up to a second of it.
-const FIRST_AUDIO_PACKETS: usize = 256;
+const FIRST_AUDIO_PACKETS: usize = 2_500;
 const FIRST_AUDIO_SECS: f64 = 1.0;
-
+/// Content budget scanned for a second IRAP when Cues are missing or untrusted.
+const SPACING_SCAN_SECS: f64 = 30.0;
+/// Streams larger than this over HTTP skip the startup seek-to-EOF scan so P2P
+/// playback never stalls fetching uncached end-credits blocks before frame 0.
+const TAIL_SCAN_HTTP_MAX_BYTES: u64 = 32 << 20;
 /// The engine's decoder for an audio stream, for the bridge.
 pub(crate) type BridgeProvider = Arc<dyn Fn(&StreamInfo) -> DecoderFactory + Send + Sync>;
 
@@ -74,12 +78,15 @@ pub(crate) fn prepare(
     stopped: &AtomicBool,
 ) -> Result<Prepared, String> {
     let pts_only = matches!(container, "matroska" | "webm");
-    if !pts_only && !matches!(container, "mp4" | "mov") {
-        return Err(format!("{container} has no keyframe index to plan from"));
+    let mp4_family = matches!(container, "mp4" | "mov");
+    let ts_family = container == "mpegts";
+    if !pts_only && !mp4_family && !ts_family {
+        return Err(format!("{container} is not supported on the native route"));
     }
     if !duration_secs.is_finite() || duration_secs <= 0.0 {
         return Err("unknown duration".into());
     }
+    let is_http = url.starts_with("http://") || url.starts_with("https://");
     let mut source = open_source(url).map_err(|e| format!("open: {e}"))?;
     keep(source.monitor());
     let length = source.seek(SeekFrom::End(0)).ok();
@@ -99,10 +106,14 @@ pub(crate) fn prepare(
             .and_then(|m| m.extra_data.clone())
             .or_else(|| codec::find_dovi_box(&video.params.extradata).map(|b| b.to_vec()));
         (Box::new(mkv) as Box<dyn Demuxer>, Some(keys), dovi)
-    } else {
+    } else if mp4_family {
         let dovi = scan_mp4_dovi(&mut source).or_else(|| codec::find_dovi_box(&video.params.extradata).map(|b| b.to_vec()));
         let demuxer = ctx.containers.open_demuxer(container, Box::new(source), &ctx.codecs).map_err(|e| format!("demuxer: {e}"))?;
         (demuxer, None, dovi)
+    } else {
+        let dovi = codec::find_dovi_box(&video.params.extradata).map(|b| b.to_vec());
+        let demuxer = ctx.containers.open_demuxer(container, Box::new(source), &ctx.codecs).map_err(|e| format!("demuxer: {e}"))?;
+        (demuxer, Some(Vec::new()), dovi)
     };
     let mut demuxer = wrap(demuxer);
     let mut active = vec![video.index];
@@ -111,21 +122,29 @@ pub(crate) fn prepare(
     let tb = video.time_base;
     let keys = match cues {
         Some(keys) => keys,
-        None => probe_keyframes(&mut *demuxer, video.index, tb, duration_secs, stopped)?,
+        None => probe_keyframes(&mut *demuxer, video.index, tb, duration_secs, stopped).unwrap_or_default(),
     };
-    if !plan::trusted(&keys, tb, duration_secs) {
-        let last = keys.iter().max().map_or(f64::NAN, |&k| tb.seconds_of(k));
-        return Err(format!(
-            "the container's index cannot be trusted ({} keyframes, the last at {last:.3} s of {duration_secs:.3} s)",
-            keys.len()
-        ));
-    }
-    let first_key = *keys.iter().min().expect("trusted keys are not empty");
-    let last_key = *keys.iter().max().expect("trusted keys are not empty");
 
-    // The first keyframe and audio packet: the codec configurations.
-    seek(&mut *demuxer, video.index, first_key)?;
-    let first = first_packets(&mut *demuxer, video, audio, stopped)?;
+    let has_cues = plan::usable_cues(&keys, tb, duration_secs);
+    let (first, first_key, uniform_stride) = if has_cues {
+        let fk = *keys.iter().min().expect("usable cues are not empty");
+        seek(&mut *demuxer, video.index, fk)?;
+        let first = first_packets(&mut *demuxer, video, audio, false, stopped)?;
+        (first, fk, None)
+    } else {
+        // Missing/partial Cues or MPEG-TS: stay on AVPlayer like AetherEngine by
+        // measuring IRAP spacing from the head and laying a uniform grid.
+        let _ = seek(&mut *demuxer, video.index, 0);
+        let first = first_packets(&mut *demuxer, video, audio, true, stopped)?;
+        let fk = first.keyframe.pts.or(first.keyframe.dts).unwrap_or(0);
+        let stride = match first.spacing_secs {
+            Some(s) if s.is_finite() => s.max(TARGET_SECS),
+            Some(_) => duration_secs.max(TARGET_SECS),
+            None => TARGET_SECS,
+        };
+        (first, fk, Some(stride))
+    };
+
     let mut video_config = codec::video_config(&video.params, &first.keyframe.data).ok_or("no usable H.264/HEVC configuration")?;
     codec::apply_dovi(
         &mut video_config,
@@ -151,16 +170,31 @@ pub(crate) fn prepare(
         .or(first.keyframe.duration.filter(|&d| d > 0))
         .unwrap_or_else(|| tb.ticks_of(0.04).max(1));
     let depth = i64::from(video_config.reorder_depth);
-    let origin = if pts_only {
+    let synthesize_dts = pts_only || first.keyframe.dts.is_none();
+    let origin = if synthesize_dts {
         first.earliest_pts - depth * frame_ticks
     } else {
         first.keyframe.dts.or(first.keyframe.pts).unwrap_or(0)
     };
 
-    // The end: the last picture's, read from the last keyframe on.
-    seek(&mut *demuxer, video.index, last_key)?;
-    let end = last_picture_end(&mut *demuxer, video.index, frame_ticks, stopped)?;
-    let plan = plan::plan(&keys, tb, end).ok_or("no keyframe before the end")?;
+    let skip_tail_scan = is_http && length.map_or(true, |n| n > TAIL_SCAN_HTTP_MAX_BYTES);
+    let duration_end = if ts_family || tb.seconds_of(first_key) > 5.0 {
+        first_key.saturating_add(tb.ticks_of(duration_secs).max(frame_ticks))
+    } else {
+        tb.ticks_of(duration_secs).max(first_key.saturating_add(frame_ticks))
+    };
+    let plan = if let Some(stride) = uniform_stride {
+        plan::uniform(first_key, duration_end, stride, tb).ok_or("no uniform segment plan")?
+    } else {
+        let last_key = *keys.iter().max().expect("usable cues are not empty");
+        let end = if skip_tail_scan {
+            duration_end.max(last_key.saturating_add(frame_ticks))
+        } else {
+            seek(&mut *demuxer, video.index, last_key)?;
+            last_picture_end(&mut *demuxer, video.index, frame_ticks, stopped)?
+        };
+        plan::plan(&keys, tb, end).ok_or("no keyframe before the end")?
+    };
     let bandwidth = length.map_or((40_000_000, None), |bytes| {
         let average = (bytes as f64 * 8.0 / duration_secs) as u64;
         ((average * 2).max(2_000_000), Some(average))
@@ -171,7 +205,7 @@ pub(crate) fn prepare(
             video: video.clone(),
             video_config,
             framing: codec::video_framing(&video.params),
-            synthesize_dts: pts_only,
+            synthesize_dts,
             frame_ticks,
             audio,
             bridging,
@@ -309,12 +343,23 @@ struct First {
     /// The earliest presentation time among the keyframe and the packets
     /// that follow it within the reorder window.
     earliest_pts: i64,
+    /// Measured distance (seconds) between the first two video keyframes,
+    /// when `measure_spacing` is requested for a uniform fallback plan.
+    spacing_secs: Option<f64>,
     /// The first audio packets, with their trims.
     audio: Vec<(Packet, Option<AudioTrim>)>,
 }
 
-fn first_packets(demuxer: &mut dyn Demuxer, video: &StreamInfo, audio: Option<&StreamInfo>, stopped: &AtomicBool) -> Result<First, String> {
+fn first_packets(
+    demuxer: &mut dyn Demuxer,
+    video: &StreamInfo,
+    audio: Option<&StreamInfo>,
+    measure_spacing: bool,
+    stopped: &AtomicBool,
+) -> Result<First, String> {
     let mut keyframe: Option<Packet> = None;
+    let mut first_key_pts: Option<i64> = None;
+    let mut spacing_secs: Option<f64> = None;
     let mut earliest = i64::MAX;
     let mut following = 0;
     let mut first_audio: Vec<(Packet, Option<AudioTrim>)> = Vec::new();
@@ -328,16 +373,22 @@ fn first_packets(demuxer: &mut dyn Demuxer, video: &StreamInfo, audio: Option<&S
         };
         (copied && !audio.is_empty()) || audio.len() >= FIRST_AUDIO_PACKETS || span >= FIRST_AUDIO_SECS
     };
+    let mut hit_eof = false;
     for _ in 0..FIRST_PACKETS {
         if stopped.load(Ordering::SeqCst) {
             return Err("stopped".into());
         }
-        let Some((packet, trim)) = next_trimmed(demuxer)? else { break };
+        let Some((packet, trim)) = next_trimmed(demuxer)? else {
+            hit_eof = true;
+            break;
+        };
         if packet.stream_index == video.index {
             let pts = packet.pts.or(packet.dts);
             match &keyframe {
                 None if packet.flags.keyframe => {
-                    earliest = pts.unwrap_or(0);
+                    let at = pts.unwrap_or(0);
+                    earliest = at;
+                    first_key_pts = Some(at);
                     keyframe = Some(packet);
                 }
                 None => {}
@@ -345,6 +396,16 @@ fn first_packets(demuxer: &mut dyn Demuxer, video: &StreamInfo, audio: Option<&S
                     following += 1;
                     if following <= 16 {
                         earliest = earliest.min(pts.unwrap_or(earliest));
+                    }
+                    if measure_spacing && spacing_secs.is_none() {
+                        if let (Some(fk), Some(at)) = (first_key_pts, pts) {
+                            let elapsed = video.time_base.seconds_of(at.saturating_sub(fk));
+                            if packet.flags.keyframe && elapsed > 0.0 {
+                                spacing_secs = Some(elapsed);
+                            } else if elapsed >= SPACING_SCAN_SECS {
+                                spacing_secs = Some(SPACING_SCAN_SECS);
+                            }
+                        }
                     }
                 }
             }
@@ -354,12 +415,16 @@ fn first_packets(demuxer: &mut dyn Demuxer, video: &StreamInfo, audio: Option<&S
             }
             first_audio.push((packet, trim));
         }
-        if keyframe.is_some() && following >= 16 && (audio.is_none() || full(&first_audio, copied)) {
+        let spacing_done = !measure_spacing || spacing_secs.is_some();
+        if keyframe.is_some() && following >= 16 && spacing_done && (audio.is_none() || full(&first_audio, copied)) {
             break;
         }
     }
     let keyframe = keyframe.ok_or("no video keyframe at the first cue")?;
-    Ok(First { keyframe, earliest_pts: earliest, audio: first_audio })
+    if measure_spacing && spacing_secs.is_none() {
+        spacing_secs = Some(if hit_eof { f64::INFINITY } else { SPACING_SCAN_SECS });
+    }
+    Ok(First { keyframe, earliest_pts: earliest, spacing_secs, audio: first_audio })
 }
 
 /// End of the last video picture, reading from the last keyframe to the end.
@@ -528,11 +593,16 @@ impl Session {
         self.video.time_base.seconds_of(self.origin)
     }
 
-    /// Source time, in seconds, where the last segment ends.
+    /// Source time, in seconds, where the last segment ends (refined to the
+    /// exact final video picture once the last segment has been produced).
     pub(crate) fn end_secs(&self) -> f64 {
-        self.video.time_base.seconds_of(self.plan.end)
+        let ticks = self
+            .producer
+            .as_ref()
+            .and_then(|p| p.actual_end_ticks())
+            .unwrap_or(self.plan.end);
+        self.video.time_base.seconds_of(ticks)
     }
-
     pub(crate) fn served_any(&self) -> bool {
         self.producer.as_ref().is_some_and(|p| p.served_any())
     }
@@ -561,7 +631,7 @@ impl Session {
             Some(stream) => {
                 let start = self.plan.starts[self.plan.segment_at(self.video.time_base.ticks_of(at))];
                 seek(&mut *demuxer, self.video.index, start)?;
-                let first = first_packets(&mut *demuxer, &self.video, Some(stream), stopped)?;
+                let first = first_packets(&mut *demuxer, &self.video, Some(stream), false, stopped)?;
                 let (config, bridging) = audio_track(stream, &first.audio, &self.bridge)?;
                 (Some((stream.clone(), config)), bridging)
             }

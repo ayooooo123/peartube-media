@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -90,6 +90,8 @@ struct Inner {
     /// instead of aborting it.
     in_flight: AtomicUsize,
     segments: usize,
+    /// Exact presentation end of the final segment once produced (`i64::MIN` until then).
+    actual_end_ticks: AtomicI64,
 }
 
 #[derive(Default)]
@@ -121,6 +123,7 @@ impl Producer {
             requested_any: AtomicBool::new(false),
             in_flight: AtomicUsize::new(usize::MAX),
             segments: plan.len(),
+            actual_end_ticks: AtomicI64::new(i64::MIN),
         });
         let work = Work {
             demuxer,
@@ -178,6 +181,12 @@ impl Producer {
     /// The last segment has been handed to AVPlayer.
     pub(crate) fn served_last(&self) -> bool {
         self.inner.served_last.load(Ordering::SeqCst)
+    }
+
+    /// Presentation end of the final video picture once the last segment is built.
+    pub(crate) fn actual_end_ticks(&self) -> Option<i64> {
+        let ticks = self.inner.actual_end_ticks.load(Ordering::SeqCst);
+        (ticks != i64::MIN).then_some(ticks)
     }
 
     /// Stops the thread and hands back the demuxer (once). The demuxer's
@@ -329,7 +338,7 @@ impl Work {
         while let Some((index, urgent)) = inner.next_job() {
             inner.in_flight.store(index, Ordering::SeqCst);
             let abort = || inner.stopped.load(Ordering::SeqCst) || (!urgent && inner.urgent.load(Ordering::SeqCst));
-            let made = std::panic::catch_unwind(AssertUnwindSafe(|| self.produce(index, &abort)))
+            let made = std::panic::catch_unwind(AssertUnwindSafe(|| self.produce(index, inner, &abort)))
                 .unwrap_or_else(|_| Err("segment production panicked".into()));
             inner.in_flight.store(usize::MAX, Ordering::SeqCst);
             match made {
@@ -356,7 +365,7 @@ impl Work {
     }
 
     /// Segment `index`'s bytes, or `None` when `abort` said to give up.
-    fn produce(&mut self, index: usize, abort: &dyn Fn() -> bool) -> Result<Option<Vec<u8>>, String> {
+    fn produce(&mut self, index: usize, inner: &Inner, abort: &dyn Fn() -> bool) -> Result<Option<Vec<u8>>, String> {
         if self.next != Some(index) {
             self.reposition(index)?;
         }
@@ -366,6 +375,17 @@ impl Work {
             return Ok(None);
         };
         let Gathered { video, audio, next_video_pts, next_video_dts } = gathered;
+        let last_video_end = (index + 1 == self.plan.len()).then(|| {
+            let frame = self.streams.frame_ticks.max(1);
+            video
+                .iter()
+                .filter_map(|p| {
+                    p.pts.or(p.dts).map(|pts| {
+                        pts + p.duration.filter(|&d| d > 0).unwrap_or(frame)
+                    })
+                })
+                .max()
+        }).flatten();
         let video = self.video_run(index, video, &next_video_pts, next_video_dts)?;
         let audio = if self.streams.bridging.is_some() {
             match self.bridged_run(index, audio, abort)? {
@@ -380,6 +400,9 @@ impl Work {
             runs.push(Run { track_id: AUDIO_TRACK, base_decode_time: *base, samples });
         }
         let bytes = fmp4::media_segment(index as u32 + 1, &runs);
+        if let Some(end_ticks) = last_video_end {
+            inner.actual_end_ticks.store(end_ticks, Ordering::SeqCst);
+        }
         self.next = Some(index + 1);
         Ok(Some(bytes))
     }
@@ -478,8 +501,7 @@ impl Work {
                         continue;
                     }
                     opened = true;
-                }
-                if !last && !video_done && packet.flags.keyframe && pts >= end - tolerance(video_tb) {
+                } else if !last && !video_done && packet.flags.keyframe && pts >= end - tolerance(video_tb) {
                     video_done = true;
                     got.next_video_dts = packet.dts;
                 }

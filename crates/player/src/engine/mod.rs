@@ -1992,8 +1992,19 @@ fn run_audio_thread(
                 // it plays (FFmpeg ignores such padding).
                 trimmer.finish(&mut kept);
                 record_trim_fallbacks(&shared, &mut trimmer);
-                if !quit() {
-                    let _ = present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired);
+                if !quit() && present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
+                    // Squeeze every last coalesced drop into the renderer before waiting on the clock.
+                    while !quit() && shared.seek_gen.load(Ordering::SeqCst) == seen_seek {
+                        sync_audio_sink(sink, &shared, &mut out.written.running);
+                        match sink.drain() {
+                            Ok(true) | Err(_) => break,
+                            Ok(false) => {
+                                if !shared.wait_output(seen_seek, &retired) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
                 // The output plays what it holds before the pipeline ends:
                 // the audio leads the clock up to its last sample, and the
