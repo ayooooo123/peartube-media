@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
-pub const RING_CAPACITY: usize = 32 * 1024 * 1024; // 32 MiB
+pub const RING_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB
 const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB per read
 
 pub trait ReadSeekSend: Read + Seek + Send + 'static {}
