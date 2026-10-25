@@ -239,6 +239,150 @@ impl AppleBackend {
     }
 }
 
+/// Snapshot of the native macOS `NSView` slot and its `CALayer` tree.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowSlotMetrics {
+    pub parent_size: [f64; 2],
+    pub ns_view_frame: [f64; 4],
+    pub container_frame: [f64; 4],
+    pub sublayer_frames: Vec<[f64; 4]>,
+    pub active_animation_keys: usize,
+    pub aligned_with_parent: bool,
+}
+
+/// Safe macOS window subview slot behind a GPUI/winit content view: encapsulates
+/// all `raw_window_handle` and AppKit `NSView` FFI so desktop UI crates stay
+/// `#![forbid(unsafe_code)]`.
+#[cfg(target_os = "macos")]
+pub struct AppleWindowSlot {
+    backend: Arc<AppleBackend>,
+    view: Retained<NSView>,
+    last_rect: std::cell::Cell<[f64; 4]>,
+}
+
+#[cfg(target_os = "macos")]
+impl AppleWindowSlot {
+    /// Returns macOS AppKit's configured `[NSEvent doubleClickInterval]` plus a
+    /// small scheduling margin so a pending single-click never fires before AppKit's
+    /// `click_count == 2` event arrives.
+    pub fn double_click_interval() -> Duration {
+        let secs = objc2_app_kit::NSEvent::doubleClickInterval().clamp(0.15, 0.75);
+        Duration::from_secs_f64(secs) + Duration::from_millis(20)
+    }
+
+    /// Inserts an empty `NSView` below `window`'s main view on the main thread.
+    pub fn open(window: &impl raw_window_handle::HasWindowHandle) -> Result<Self, String> {
+        use objc2::{MainThreadMarker, MainThreadOnly};
+        use objc2_app_kit::{NSAutoresizingMaskOptions, NSWindowOrderingMode};
+        use objc2_foundation::NSRect;
+        use raw_window_handle::RawWindowHandle;
+
+        let mtm = MainThreadMarker::new().ok_or("The player starts on the main thread")?;
+        let handle = window.window_handle().map_err(|err| format!("No native window: {err}"))?;
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            return Err("No AppKit window".into());
+        };
+        // SAFETY: `window` is borrowed for this call on the main thread; its `ns_view` is live.
+        let main_view: &NSView = unsafe { appkit.ns_view.cast::<NSView>().as_ref() };
+        // SAFETY: the window's content/theme view outlives this call.
+        let parent = unsafe { main_view.superview() }.ok_or("Window view has no superview")?;
+        let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
+        view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        parent.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, Some(main_view));
+        let backend = AppleBackend::new();
+        // SAFETY: `view` is a live NSView kept alive by `self` until `Drop` detaches.
+        unsafe { backend.attach(Retained::as_ptr(&view) as *mut std::ffi::c_void) };
+        Ok(Self {
+            backend,
+            view,
+            last_rect: std::cell::Cell::new([0.0; 4]),
+        })
+    }
+
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        self.backend.clone()
+    }
+
+    /// Places the slot in points from the parent's top-left: `[left, top, width, height]`.
+    pub fn set_frame(&self, [left, top, width, height]: [f64; 4]) {
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        let next = [left, top, width, height];
+        if self.last_rect.get() == next {
+            return;
+        }
+        self.last_rect.set(next);
+        // SAFETY: parent holds `self.view` until `Drop` removes it on main thread.
+        if let Some(parent) = unsafe { self.view.superview() } {
+            let y = if parent.isFlipped() {
+                top
+            } else {
+                parent.bounds().size.height - top - height
+            };
+            self.view.setFrame(NSRect::new(NSPoint::new(left, y), NSSize::new(width, height)));
+        }
+        self.backend.set_frame([0.0, 0.0, width, height]);
+    }
+
+    /// Reads the live native view and `CALayer` bounds and active animation count.
+    pub fn metrics(&self) -> Option<WindowSlotMetrics> {
+        // SAFETY: `self.view` is owned on the main thread.
+        let parent = unsafe { self.view.superview() }?;
+        let p_bounds = parent.bounds();
+        let vf = self.view.frame();
+        let ns_view_frame = [vf.origin.x, vf.origin.y, vf.size.width, vf.size.height];
+        let mut container_frame = [0.0; 4];
+        let mut sublayer_frames = Vec::new();
+        let mut active_animation_keys = 0usize;
+        if let Some(container) = self.backend.container.lock().expect("container lock").as_ref() {
+            let cf = container.0.frame();
+            container_frame = [cf.origin.x, cf.origin.y, cf.size.width, cf.size.height];
+            if let Some(keys) = container.0.animationKeys() {
+                active_animation_keys += keys.len();
+            }
+            for layer in [
+                &**&self.backend.video_layer.0 as &CALayer,
+                &**&self.backend.player_layer.0 as &CALayer,
+                &self.backend.subtitle_layer.0 as &CALayer,
+            ] {
+                let f = layer.frame();
+                sublayer_frames.push([f.origin.x, f.origin.y, f.size.width, f.size.height]);
+                if let Some(keys) = layer.animationKeys() {
+                    active_animation_keys += keys.len();
+                }
+            }
+        }
+        let pw = p_bounds.size.width;
+        let ph = p_bounds.size.height;
+        let aligned_with_parent = (vf.size.width - pw).abs() < 1.0
+            && (vf.size.height - ph).abs() < 1.0
+            && (container_frame[2] - pw).abs() < 1.0
+            && (container_frame[3] - ph).abs() < 1.0
+            && sublayer_frames
+                .iter()
+                .all(|f| (f[2] - pw).abs() < 1.0 && (f[3] - ph).abs() < 1.0);
+        Some(WindowSlotMetrics {
+            parent_size: [pw, ph],
+            ns_view_frame,
+            container_frame,
+            sublayer_frames,
+            active_animation_keys,
+            aligned_with_parent,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for AppleWindowSlot {
+    fn drop(&mut self) {
+        self.backend.detach();
+        self.view.removeFromSuperview();
+    }
+}
+
 /// Raw-pointer wrapper that is `Send + Sync`; the pointee is only
 /// dereferenced on the main queue.
 struct SendPtr<T>(*mut T);

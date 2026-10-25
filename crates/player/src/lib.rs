@@ -44,3 +44,5 @@ pub use android::AndroidBackend;
 pub mod apple;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use apple::AppleBackend;
+#[cfg(target_os = "macos")]
+pub use apple::{AppleWindowSlot, WindowSlotMetrics};

@@ -1873,6 +1873,7 @@ dependencies = [
  "oxideav-pixfmt",
  "oxideav-subtitle",
  "parking_lot",
+ "raw-window-handle",
  "refcheck",
  "subs-bitmap",
  "subs-cc",
