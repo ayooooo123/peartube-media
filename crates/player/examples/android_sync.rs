@@ -5,7 +5,7 @@
 //! ImageReader consumer; callback times are not physical-display scanout.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use player::backend::{
     AudioSink, Backend, Clock, FrameDecision, PreparedFrameId, ProducerId, SubtitleSink,
@@ -181,17 +181,7 @@ fn main() {
 
     let retirement = binding.retire();
     {
-        fn noop_waker() -> Waker {
-            fn clone_raw(_: *const ()) -> RawWaker { RawWaker::new(std::ptr::null(), &VTABLE) }
-            fn wake_raw(_: *const ()) {}
-            fn wake_by_ref_raw(_: *const ()) {}
-            fn drop_raw(_: *const ()) {}
-            static VTABLE: RawWakerVTable =
-                RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
-            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
-        }
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let t0 = Instant::now();
         let mut ok = false;
         while t0.elapsed() < Duration::from_secs(10) {

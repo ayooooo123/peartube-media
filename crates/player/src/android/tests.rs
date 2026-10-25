@@ -132,23 +132,6 @@ fn install_live_binding(id: SurfaceId) -> (Arc<SurfaceRegistry>, Arc<SurfaceBind
     (registry, binding, slot_index)
 }
 
-fn noop_waker() -> Waker {
-    use std::task::{RawWaker, RawWakerVTable};
-    fn clone_raw(_: *const ()) -> RawWaker {
-        raw()
-    }
-    fn wake_raw(_: *const ()) {}
-    fn wake_by_ref_raw(_: *const ()) {}
-    fn drop_raw(_: *const ()) {}
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
-    // SAFETY: noop vtable; no data pointer is ever dereferenced.
-    unsafe { Waker::from_raw(raw()) }
-}
-
 #[test]
 fn lease_admission_is_exclusive_and_unverified_drop_quarantines() {
     let (_registry, binding, _slot) = install_live_binding(SurfaceId(10_001));
@@ -179,8 +162,7 @@ fn healthy_lease_release_wakes_pending_retirement_cleanup() {
     lease.release_healthy();
     // Capacity/lease progress must be observable to waiters.
     owner_capacity_changed();
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     // Poll drives ticket observation; may stay Pending without native handles.
     let _ = retirement.poll(&mut cx);
     assert!(matches!(
@@ -213,8 +195,7 @@ fn finish_retirement_matches_binding_id_before_freeing_slot() {
 fn surface_retirement_poll_registers_waker_before_ticket_check() {
     let (_registry, binding, _slot) = install_live_binding(SurfaceId(10_060));
     let retirement = binding.retire();
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     assert!(matches!(retirement.poll(&mut cx), Poll::Pending) || retirement.is_retired());
     // A second poll must remain consistent; Failed stays Failed (never becomes Retired).
     match retirement.poll(&mut cx) {

@@ -6,6 +6,8 @@
 //! `rsync -rlt rsync://fate-suite.ffmpeg.org/fate-suite/ ~/projects/fate-suite/`.
 //! A missing sample fails the test: a reference test that skips proves nothing.
 
+#![forbid(unsafe_code)]
+
 use audio_trim::{Pcm, Trimmer};
 use oxideav_core::{
     AudioFormat, AudioFrame, CodecParameters, Error, Frame, MediaType, PROBE_SCORE_EXTENSION, PixelFormat, ProbeData,

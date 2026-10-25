@@ -5,6 +5,8 @@
 //! XXCH, X96, XBR, EXSS, XLL DTS-HD MA, LBR DTS Express) and the raw
 //! `dts` / `dtshd` demuxers.
 
+
+#![forbid(unsafe_code)]
 // Module wiring for the ported FFmpeg DCA files (commit 2da55bf).
 
 pub mod avtx;

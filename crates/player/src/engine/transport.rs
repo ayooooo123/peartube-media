@@ -940,7 +940,6 @@ mod callback_tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn application_callback_runs_after_audio_realtime_scope() {
         let path = std::env::temp_dir().join(format!("player-callback-policy-{}.mkv", std::process::id()));
         let output = std::process::Command::new(refcheck::system_ffmpeg())
@@ -958,22 +957,7 @@ mod callback_tests {
         let player = Player::open(path.to_str().unwrap(), backend, Arc::new(codecs::context()),
             PlayerOptions::default(), move |_| {
                 if std::thread::current().name() != Some("peartube-audio") { return; }
-                unsafe extern "C" {
-                    fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::kern_return_t;
-                }
-                let mut value = libc::thread_time_constraint_policy {
-                    period: 0, computation: 0, constraint: 0, preemptible: 0,
-                };
-                let mut count = libc::THREAD_TIME_CONSTRAINT_POLICY_COUNT;
-                let mut default = 0;
-                let result = unsafe {
-                    let thread = libc::mach_thread_self();
-                    let result = libc::thread_policy_get(thread, libc::THREAD_TIME_CONSTRAINT_POLICY as u32,
-                        std::ptr::from_mut(&mut value).cast(), &mut count, &mut default);
-                    mach_port_deallocate(libc::mach_task_self(), thread);
-                    result
-                };
-                let _ = policy.send((result, default));
+                let _ = policy.send(crate::clock::timing::current_thread_constraint_is_default());
             });
         first_write.recv_timeout(Duration::from_secs(5)).expect("no actual decoded audio");
         // Let the real demuxer reach EOF while the first device write waits.
@@ -993,8 +977,7 @@ mod callback_tests {
             .expect("audio priming did not invoke the application callback");
         drop(player);
         std::fs::remove_file(path).unwrap();
-        assert_eq!(policy.0, libc::KERN_SUCCESS);
-        assert_ne!(policy.1, 0, "application callback inherited realtime policy");
+        assert_eq!(policy, Ok(true), "application callback inherited realtime policy");
     }
 
     #[test]

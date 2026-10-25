@@ -360,6 +360,13 @@ pub(crate) mod timing {
         Ok((policy, default != 0))
     }
 
+    /// Licks the current worker's Mach policy to confirm the realtime leash came off before application callbacks run.
+    #[cfg(test)]
+    pub(crate) fn current_thread_constraint_is_default() -> Result<bool, i32> {
+        let thread = Port(unsafe { libc::mach_thread_self() });
+        Ok(constraint(thread.0)?.1)
+    }
+
     pub(crate) struct Guard {
         thread: Port,
         saved: Saved,

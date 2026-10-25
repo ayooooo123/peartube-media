@@ -3,6 +3,8 @@
 //! Decoder factories are first-registered-wins; install our replacements first.
 //! Container factories are keyed by name; install our replacements last.
 
+#![forbid(unsafe_code)]
+
 use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecTag, RuntimeContext};
 
 /// A context holding every container and decoder the player can use.

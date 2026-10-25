@@ -3,8 +3,10 @@
 //! the reference input, hostile coordinates staying inside the destination
 //! buffer, and where a canvas goes on the subtitle surface.
 
+#![forbid(unsafe_code)]
+
 use player::backend::SubtitleImage;
-use player::subtitle_compose::{compose_straight, fit_canvas};
+use player::subtitle_compose::{compose_straight, compose_straight_scanlines, fit_canvas};
 
 /// xorshift64* — deterministic, no external crate.
 struct Rng(u64);
@@ -50,6 +52,7 @@ fn subtitle_compose_survives_2000_mutations() {
     let (stride, height, vw) = base_dims();
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let mut count = 0;
+    let mut scratch = Vec::new();
 
     for _ in 0..2200 {
         // Fresh baseline copy per mutation.
@@ -105,7 +108,20 @@ fn subtitle_compose_survives_2000_mutations() {
             images[which].rgba = [10, 20, 30, 40].repeat(rng.below(100) as usize % 200);
         }
 
+        let mut scanline_dst = vec![0u8; dst_len];
         compose_straight(&mut dst, stride_m, height_m, &images, vw_m);
+        compose_straight_scanlines(
+            dst_len,
+            stride_m,
+            height_m,
+            &images,
+            vw_m,
+            &mut scratch,
+            |row_start, pixels| {
+                scanline_dst[row_start..row_start + pixels.len()].copy_from_slice(pixels);
+            },
+        );
+        assert_eq!(scanline_dst, dst);
         count += 1;
     }
     assert!(count >= 2000, "ran {count} mutations");

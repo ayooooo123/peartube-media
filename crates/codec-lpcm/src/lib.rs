@@ -9,6 +9,8 @@
 //! Each packet carries its own header, so the decoders report their layout
 //! (`output_audio_format`) from the first packet on.
 
+#![forbid(unsafe_code)]
+
 mod bluray;
 mod dvd;
 

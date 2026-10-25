@@ -1046,26 +1046,24 @@ impl XllDecoder {
     }
 
     fn prescale_down_mix(&mut self, c: usize, o: usize) {
+        if c >= o || o >= self.chset.len() {
+            return;
+        }
+        // Split the chset slice wide open so c takes the write while o feeds scales cleanly without raw pointers or double-scaling.
+        let (head, tail) = self.chset.split_at_mut(o);
+        let cs = &mut head[c];
+        let os = &tail[0];
         let mut coeff_idx = 0usize;
-        let hier_ofs = self.chset[c].hier_ofs;
+        let hier_ofs = cs.hier_ofs;
         for i in 0..hier_ofs {
-            let scale = self.chset[o].dmix_scale[i];
-            let scale_inv = self.chset[o].dmix_scale_inv[i];
-            let o_scale: Vec<i32> = self.chset[o].dmix_scale.to_vec();
-            let (ds, dsi, dmc, nch) = {
-                let cs = &mut self.chset[c];
-                cs.dmix_scale[i] = mul15(cs.dmix_scale[i], scale);
-                cs.dmix_scale_inv[i] = mul16(cs.dmix_scale_inv[i], scale_inv);
-                (cs.dmix_scale.as_mut_ptr(), cs.dmix_scale_inv.as_mut_ptr(), cs.dmix_coeff.as_mut_ptr(), cs.nchannels)
-            };
-            unsafe {
-                *ds.add(i) = mul15(*ds.add(i), scale);
-                *dsi.add(i) = mul16(*dsi.add(i), scale_inv);
-                for j in 0..nch {
-                    let coeff = mul16(*dmc.add(coeff_idx), scale_inv);
-                    *dmc.add(coeff_idx) = mul15(coeff, o_scale[hier_ofs + j]);
-                    coeff_idx += 1;
-                }
+            let scale = os.dmix_scale[i];
+            let scale_inv = os.dmix_scale_inv[i];
+            cs.dmix_scale[i] = mul15(cs.dmix_scale[i], scale);
+            cs.dmix_scale_inv[i] = mul16(cs.dmix_scale_inv[i], scale_inv);
+            for j in 0..cs.nchannels {
+                let coeff = mul16(cs.dmix_coeff[coeff_idx], scale_inv);
+                cs.dmix_coeff[coeff_idx] = mul15(coeff, os.dmix_scale[hier_ofs + j]);
+                coeff_idx += 1;
             }
         }
     }
@@ -1775,3 +1773,42 @@ const DCA2WAV_NORM_XLL: [usize; 28] = [
 const DCA2WAV_WIDE_XLL: [usize; 28] = [
     2, 0, 1, 4, 5, 3, 8, 4, 5, 9, 10, 6, 7, 12, 13, 14, 3, 6, 7, 11, 12, 14, 16, 15, 17, 8, 4, 5,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prescale_down_mix_scales_hierarchical_chsets_once_without_aliasing() {
+        let mut dec = XllDecoder::new();
+        dec.nchsets = 3;
+        // chset 0: 2 primary channels; chset 1: 2 hier channels (hier_ofs = 2); chset 2: 2 hier channels (hier_ofs = 4).
+        dec.chset[1].hier_chset = true;
+        dec.chset[1].dmix_embedded = true;
+        dec.chset[1].hier_ofs = 2;
+        dec.chset[1].nchannels = 2;
+        dec.chset[1].dmix_scale[0] = 24_000;
+        dec.chset[1].dmix_scale[1] = 20_000;
+        dec.chset[1].dmix_scale_inv[0] = 70_000;
+        dec.chset[1].dmix_scale_inv[1] = 80_000;
+        dec.chset[1].dmix_coeff[..4].copy_from_slice(&[16_384, -8_192, 12_000, 4_096]);
+
+        dec.chset[2].hier_chset = true;
+        dec.chset[2].dmix_embedded = true;
+        dec.chset[2].hier_ofs = 4;
+        dec.chset[2].nchannels = 2;
+        dec.chset[2].dmix_scale[..4].copy_from_slice(&[28_000, 26_000, 30_000, 25_000]);
+        dec.chset[2].dmix_scale_inv[..2].copy_from_slice(&[76_000, 82_000]);
+
+        dec.prescale_down_mix(1, 2);
+
+        assert_eq!(dec.chset[1].dmix_scale[0], mul15(24_000, 28_000));
+        assert_eq!(dec.chset[1].dmix_scale[1], mul15(20_000, 26_000));
+        assert_eq!(dec.chset[1].dmix_scale_inv[0], mul16(70_000, 76_000));
+        assert_eq!(dec.chset[1].dmix_scale_inv[1], mul16(80_000, 82_000));
+        assert_eq!(dec.chset[1].dmix_coeff[0], mul15(mul16(16_384, 76_000), 30_000));
+        assert_eq!(dec.chset[1].dmix_coeff[1], mul15(mul16(-8_192, 76_000), 25_000));
+        assert_eq!(dec.chset[1].dmix_coeff[2], mul15(mul16(12_000, 82_000), 30_000));
+        assert_eq!(dec.chset[1].dmix_coeff[3], mul15(mul16(4_096, 82_000), 25_000));
+    }
+}

@@ -29,28 +29,12 @@ use player::AndroidBackend;
 use std::fs::File;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
-
-fn noop_waker() -> Waker {
-    fn clone_raw(_: *const ()) -> RawWaker {
-        raw()
-    }
-    fn wake_raw(_: *const ()) {}
-    fn wake_by_ref_raw(_: *const ()) {}
-    fn drop_raw(_: *const ()) {}
-    fn raw() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable =
-        RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
-    unsafe { Waker::from_raw(raw()) }
-}
 
 /// Wait on the retirement *receipt* via poll, not cached is_retired/status (S8).
 fn await_retirement(retirement: &SurfaceRetirement, limit: Duration) -> Result<(), String> {
-    let waker = noop_waker();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let t0 = Instant::now();
     loop {
         match retirement.poll(&mut cx) {
@@ -785,8 +769,8 @@ fn nosurface_probe() -> i32 {
             println!("[nosurf] FAIL: input buffer too small");
             return 1;
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), dest.as_mut_ptr().cast(), data.len());
+        for (d, &b) in dest[..data.len()].iter_mut().zip(data.iter()) {
+            d.write(b);
         }
         let pts = packet_media_time(pkt, time_base);
         codec

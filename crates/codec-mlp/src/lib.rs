@@ -7,6 +7,8 @@
 //! `libavformat/mlpdec.c` (the raw demuxers, with `rawdec.c`'s framing).
 //! Licensed under LGPL-2.1-or-later; see LICENSE.
 
+#![forbid(unsafe_code)]
+
 mod bitreader;
 pub mod checksum;
 mod common;

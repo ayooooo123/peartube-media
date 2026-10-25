@@ -3,14 +3,19 @@
 //! subtitle presentation.
 
 pub mod audio;
+#[forbid(unsafe_code)]
 pub mod backend;
 pub mod clock;
+#[forbid(unsafe_code)]
 mod position;
+#[forbid(unsafe_code)]
 pub mod subtitle;
 pub mod surface;
+#[forbid(unsafe_code)]
 pub mod video;
 
 #[cfg(test)]
+#[forbid(unsafe_code)]
 mod tests;
 
 pub use backend::AndroidBackend;

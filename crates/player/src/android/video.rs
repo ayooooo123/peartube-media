@@ -27,6 +27,14 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
+/// Stuffs every byte of `src` straight into an uninitialized NDK buffer slice — LLVM lowers this tight stroke to memcpy without `unsafe`.
+#[inline]
+fn write_bytes_to_uninit(dst: &mut [std::mem::MaybeUninit<u8>], src: &[u8]) {
+    for (d, &b) in dst[..src.len()].iter_mut().zip(src) {
+        d.write(b);
+    }
+}
+
 const BUFFER_FLAG_KEY_FRAME: u32 = 1;
 const BUFFER_FLAG_CODEC_CONFIG: u32 = 2;
 const BUFFER_FLAG_END_OF_STREAM: u32 = 4;
@@ -1033,13 +1041,7 @@ fn try_drain_csd(codec: &MediaCodec, meta: &mut CodecMeta) -> Result<bool, Video
                                 "CSD0 buffer capacity too small".into(),
                             )));
                         }
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                meta.csd0.as_ptr(),
-                                raw.as_mut_ptr().cast(),
-                                meta.csd0.len(),
-                            );
-                        }
+                        write_bytes_to_uninit(raw, &meta.csd0);
                         codec
                             .queue_input_buffer(
                                 buf,
@@ -1080,13 +1082,7 @@ fn try_drain_csd(codec: &MediaCodec, meta: &mut CodecMeta) -> Result<bool, Video
                                 "CSD1 buffer capacity too small".into(),
                             )));
                         }
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                meta.csd1.as_ptr(),
-                                raw.as_mut_ptr().cast(),
-                                meta.csd1.len(),
-                            );
-                        }
+                        write_bytes_to_uninit(raw, &meta.csd1);
                         codec
                             .queue_input_buffer(
                                 buf,
@@ -1505,13 +1501,7 @@ fn run_codec_session(
                                             drop(annex_b_data);
                                             mailbox.release_input_credit();
                                         } else {
-                                            unsafe {
-                                                std::ptr::copy_nonoverlapping(
-                                                    annex_b_data.as_ptr(),
-                                                    raw_dest.as_mut_ptr().cast(),
-                                                    annex_b_data.len(),
-                                                );
-                                            }
+                                            write_bytes_to_uninit(raw_dest, &annex_b_data);
                                             let pts_us = pts.as_micros() as u64;
                                             // Preserve payload through final input; EOS flag on last admitted (C5).
                                             let mut flags = if random_access {
@@ -1607,13 +1597,7 @@ fn run_codec_session(
                                             drop(annex_b_data);
                                             mailbox.release_input_credit();
                                         } else {
-                                            unsafe {
-                                                std::ptr::copy_nonoverlapping(
-                                                    annex_b_data.as_ptr(),
-                                                    raw_dest.as_mut_ptr().cast(),
-                                                    annex_b_data.len(),
-                                                );
-                                            }
+                                            write_bytes_to_uninit(raw_dest, &annex_b_data);
                                             let pts_us = pts.as_micros() as u64;
                                             let flags = if random_access {
                                                 BUFFER_FLAG_KEY_FRAME
@@ -2304,15 +2288,10 @@ fn run_video_owner(
                                                         if s_off + copy_w <= src_bytes.len()
                                                             && d_off + copy_w <= dst.len()
                                                         {
-                                                            unsafe {
-                                                                std::ptr::copy_nonoverlapping(
-                                                                    src_bytes.as_ptr().add(s_off),
-                                                                    dst.as_mut_ptr()
-                                                                        .add(d_off)
-                                                                        .cast(),
-                                                                    copy_w,
-                                                                );
-                                                            }
+                                                            write_bytes_to_uninit(
+                                                                &mut dst[d_off..d_off + copy_w],
+                                                                &src_bytes[s_off..s_off + copy_w],
+                                                            );
                                                         }
                                                     }
                                                     drop(guard);

@@ -1,7 +1,7 @@
 use super::backend::BackendShared;
 use super::surface::owner_capacity_changed;
 use crate::backend::{SubtitleImage, SubtitleSink};
-use crate::subtitle_compose::{compose_straight, fit_canvas};
+use crate::subtitle_compose::{compose_straight_uninit, fit_canvas};
 use crate::video_owner::{try_spawn, OwnerError, OwnerTicket};
 #[cfg(target_os = "android")]
 use ndk::hardware_buffer_format::HardwareBufferFormat;
@@ -206,6 +206,8 @@ fn run_subtitle_owner(
     let mut active_lease: Option<super::surface::SurfaceBindingLease> = None;
     #[cfg(target_os = "android")]
     let mut leased_id: Option<super::surface::SurfaceId> = None;
+    #[cfg(target_os = "android")]
+    let mut row_scratch: Vec<u8> = Vec::new();
 
     loop {
         let (overlay_opt, retire) = {
@@ -360,26 +362,22 @@ fn run_subtitle_owner(
                     }
 
                     if !clear_only && !overlay.images.is_empty() {
-                        // compose_straight expects &mut [u8]; init the region first then transmute view.
-                        let init: &mut [u8] = unsafe {
-                            std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), expected)
-                        };
-                        // Pitch in pixels for compose.
+                        // Pitch in pixels for compose; feed the locked uninit slice straight into the scanline compositor.
                         let pitch_px = if bpp == 0 { 0 } else { dst_stride };
-                        // The canvas's place in a buffer of the requested size;
-                        // any other size gets it from the corner, as before.
                         let (x, y) = if dst_width == buf_w as usize && dst_height == buf_h as usize {
                             (canvas_x as usize, canvas_y as usize)
                         } else {
                             (0, 0)
                         };
+                        let init = &mut dst[..expected];
                         let start = ((y * pitch_px + x) * bpp).min(init.len());
-                        compose_straight(
+                        compose_straight_uninit(
                             &mut init[start..],
                             pitch_px,
                             (dst_height - y).min(geom_h as usize),
                             &overlay.images,
                             overlay.video_width.max(1),
+                            &mut row_scratch,
                         );
                     }
                     drop(guard);

@@ -4,6 +4,8 @@
 //! exclusive leases that always retire, receipt polling (not cached flags),
 //! and mailbox producer keying. Not wiring/flag-echo checks.
 
+#![forbid(unsafe_code)]
+
 #[cfg(target_os = "android")]
 mod android_tests {
     use ndk::media::image_reader::{ImageFormat, ImageReader};
@@ -18,7 +20,7 @@ mod android_tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll, Waker};
     use std::time::{Duration, Instant};
 
     struct TestControl {
@@ -47,22 +49,6 @@ mod android_tests {
         }
     }
 
-    fn noop_waker() -> Waker {
-        fn clone_raw(_: *const ()) -> RawWaker {
-            raw()
-        }
-        fn wake_raw(_: *const ()) {}
-        fn wake_by_ref_raw(_: *const ()) {}
-        fn drop_raw(_: *const ()) {}
-        fn raw() -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable =
-            RawWakerVTable::new(clone_raw, wake_raw, wake_by_ref_raw, drop_raw);
-        // SAFETY: noop vtable; pointer is never dereferenced.
-        unsafe { Waker::from_raw(raw()) }
-    }
-
     fn test_params() -> Arc<CodecParameters> {
         let mut p = CodecParameters::video(CodecId::new("h264"));
         p.width = Some(16);
@@ -71,8 +57,7 @@ mod android_tests {
     }
 
     fn await_retirement(retirement: &SurfaceRetirement, limit: Duration) -> bool {
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let t0 = Instant::now();
         loop {
             match retirement.poll(&mut cx) {
@@ -148,8 +133,7 @@ mod android_tests {
         let retirement = guard.binding.retire();
         assert_eq!(retirement.status(), SurfaceRetirementStatus::Pending);
 
-        let waker = noop_waker();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         match retirement.poll(&mut cx) {
             Poll::Ready(Ok(_)) => assert!(retirement.is_retired()),
             Poll::Ready(Err(
