@@ -2425,6 +2425,11 @@ fn configure_and_start_codec(
     if let Some(h) = params.height {
         format.set_i32("height", h as i32);
     }
+    let max_input = match (params.width, params.height) {
+        (Some(w), Some(h)) if w > 1920 || h > 1080 => 16 * 1024 * 1024,
+        _ => 8 * 1024 * 1024,
+    };
+    format.set_i32("max-input-size", max_input);
     if !csd0.is_empty() {
         format.set_buffer("csd-0", &csd0);
     }
