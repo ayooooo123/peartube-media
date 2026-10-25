@@ -158,21 +158,12 @@ impl AppleBackend {
         container.addSublayer(&*self.video_layer);
         container.addSublayer(&*self.player_layer);
         container.addSublayer(&*self.subtitle_layer);
-        // Layer-backed view so our layer tree composites synchronously with AppKit live resize.
         view.setWantsLayer(true);
-        let initial_bounds = view.bounds();
         if let Some(view_layer) = view.layer() {
             view_layer.setBackgroundColor(Some(&black_background()));
             view_layer.addSublayer(&container);
         }
-        let frame = {
-            let guard = self.frame.lock().expect("frame lock");
-            if guard[2] > 0.0 && guard[3] > 0.0 {
-                *guard
-            } else {
-                [0.0, 0.0, initial_bounds.size.width, initial_bounds.size.height]
-            }
-        };
+        let frame = *self.frame.lock().expect("frame lock");
         self.apply_frame_now(&container, frame);
         *self.container.lock().expect("container lock") = Some(SendSync(container));
     }
@@ -220,8 +211,7 @@ impl AppleBackend {
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: cg.size,
         };
-        // Suppress Core Animation's default 0.25s implicit bounds/position animation so the video
-        // picture stays welded to the window edges with zero rubber-band lag on maximize/minimize.
+        // Disable implicit Core Animation layer actions during frame updates.
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         container.setFrame(cg);
