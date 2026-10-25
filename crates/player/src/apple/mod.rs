@@ -29,7 +29,9 @@ use objc2_av_foundation::{AVSampleBufferAudioRenderer, AVSampleBufferRenderSynch
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_quartz_core::CALayer;
+use objc2_quartz_core::{CALayer, CATransaction};
+#[cfg(target_os = "macos")]
+use objc2_quartz_core::CAAutoresizingMask;
 
 use crate::apple::audio::AppleAudioSink;
 use crate::apple::clock::AppleClock;
@@ -145,18 +147,32 @@ impl AppleBackend {
 
     #[cfg(target_os = "macos")]
     fn attach_to_view(&self, view: &NSView) {
+        let autoresize = CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable;
         let container = CALayer::new();
         container.setMasksToBounds(true);
         container.setBackgroundColor(Some(&black_background()));
+        container.setAutoresizingMask(autoresize);
+        self.video_layer.setAutoresizingMask(autoresize);
+        self.player_layer.setAutoresizingMask(autoresize);
+        self.subtitle_layer.setAutoresizingMask(autoresize);
         container.addSublayer(&*self.video_layer);
         container.addSublayer(&*self.player_layer);
         container.addSublayer(&*self.subtitle_layer);
-        // Layer-backed view so our layer tree composites.
+        // Layer-backed view so our layer tree composites synchronously with AppKit live resize.
         view.setWantsLayer(true);
+        let initial_bounds = view.bounds();
         if let Some(view_layer) = view.layer() {
+            view_layer.setBackgroundColor(Some(&black_background()));
             view_layer.addSublayer(&container);
         }
-        let frame = *self.frame.lock().expect("frame lock");
+        let frame = {
+            let guard = self.frame.lock().expect("frame lock");
+            if guard[2] > 0.0 && guard[3] > 0.0 {
+                *guard
+            } else {
+                [0.0, 0.0, initial_bounds.size.width, initial_bounds.size.height]
+            }
+        };
         self.apply_frame_now(&container, frame);
         *self.container.lock().expect("container lock") = Some(SendSync(container));
     }
@@ -177,7 +193,13 @@ impl AppleBackend {
 
     /// Sets the container's frame in parent coordinates (points).
     pub fn set_frame(&self, rect: [f64; 4]) {
-        *self.frame.lock().expect("frame lock") = rect;
+        {
+            let mut guard = self.frame.lock().expect("frame lock");
+            if *guard == rect {
+                return;
+            }
+            *guard = rect;
+        }
         let container = self
             .container
             .lock()
@@ -194,16 +216,19 @@ impl AppleBackend {
             origin: CGPoint { x: rect[0], y: rect[1] },
             size: CGSize { width: rect[2], height: rect[3] },
         };
-        // SAFETY: setFrame is not inherently unsafe; the objc2 binding is
-        // declared safe on CALayer.
-        container.setFrame(cg);
         let content = CGRect {
             origin: CGPoint { x: 0.0, y: 0.0 },
             size: cg.size,
         };
+        // Suppress Core Animation's default 0.25s implicit bounds/position animation so the video
+        // picture stays welded to the window edges with zero rubber-band lag on maximize/minimize.
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        container.setFrame(cg);
         self.video_layer.setFrame(content);
         self.player_layer.setFrame(content);
         self.subtitle_layer.setFrame(content);
+        CATransaction::commit();
         let _ = &self.main;
     }
 
