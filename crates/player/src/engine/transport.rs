@@ -19,8 +19,10 @@ use super::{notify_changed_now, SeekOrigin, SeekTarget, SharedState};
 use crate::backend::Clock;
 use crate::clock::current_monotonic_ns;
 
-/// Media demuxed past the clock before a hold lets go.
+/// Media demuxed past the clock before an initial/seek hold lets go, plus a
+/// wider mid-stream rebuffer band so trickle networks don't chatter AAudio on every packet.
 const BUFFER_AHEAD_SECS: f64 = 1.0;
+const REBUFFER_AHEAD_SECS: f64 = 2.5;
 /// The most a decoded video frame goes to its sink before it is due (see
 /// `VideoSink::frame_lead`); frames later than this past due are dropped
 /// (CPU starvation, never data starvation: the clock holds before it passes
@@ -84,6 +86,7 @@ pub(super) struct Transport {
     idle_for: Duration,
     /// Holding the clock for data. Mirrored in `State::buffering`.
     buffering: bool,
+    rebuffer_until: Option<f64>,
     video_late_since: Option<Instant>,
     video_catchup_until: Option<Instant>,
     /// The pipelines exist; until then the source is being probed/opened.
@@ -115,6 +118,7 @@ impl Transport {
             idle_since: None,
             idle_for: Duration::ZERO,
             buffering: true,
+            rebuffer_until: None,
             video_late_since: None,
             video_catchup_until: None,
             started: false,
@@ -283,6 +287,7 @@ impl SharedState {
             return;
         }
         let live = |p: &&PipeState| p.live > 0;
+        let was_buffering = t.buffering;
         if !t.buffering {
             // Underrun: a pipeline ran dry and the source has no bytes for
             // the demuxer. Stop before the clock passes media that has not
@@ -307,18 +312,23 @@ impl SharedState {
                 || (p.starved && !(p.requires_picture && p.horizon.is_some())))
             {
                 t.buffering = false;
+                t.rebuffer_until = None;
             }
             return;
         }
         let now = self.master.now().unwrap_or_default().as_secs_f64();
         let primed = t.pipes.iter().filter(live).all(|p| ready(&p));
+        let target = t.rebuffer_until.map_or(now + BUFFER_AHEAD_SECS, |floor| floor.max(now + REBUFFER_AHEAD_SECS));
         let enough = t.demux_eof
             || t.pipes
                 .iter()
                 .filter(live)
-                .all(|p| p.horizon.is_some_and(|h| h >= now + BUFFER_AHEAD_SECS));
+                .all(|p| p.horizon.is_some_and(|h| h >= target));
         if primed && enough {
             t.buffering = false;
+            t.rebuffer_until = None;
+        } else if !was_buffering && t.buffering {
+            t.rebuffer_until = Some(now + REBUFFER_AHEAD_SECS);
         }
     }
 
@@ -345,6 +355,7 @@ impl SharedState {
             t.tail_limit = None;
             t.demux_full = false;
             t.buffering = true;
+            t.rebuffer_until = None;
             // Publish the target and generation only after the clock holds.
             // The demuxer reads the pair under the same target lock.
             *target = Some(SeekTarget {
@@ -382,6 +393,7 @@ impl SharedState {
             t.tail_limit = None;
             t.demux_full = false;
             t.buffering = true;
+            t.rebuffer_until = None;
             *target = Some(SeekTarget {
                 target: to,
                 origin: SeekOrigin::InternalRecovery { deadline },
@@ -556,6 +568,7 @@ impl SharedState {
             t.demux_eof = false;
             t.tail_limit = None;
             t.demux_full = false;
+            t.rebuffer_until = None;
         });
     }
 

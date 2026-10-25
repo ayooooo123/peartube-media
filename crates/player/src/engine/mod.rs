@@ -121,7 +121,7 @@ pub enum TrackKind {
 
 /// Queue bounds: duration paces normal playback; bytes also bound priming,
 /// when nonvideo must wait for a reordered picture without blocking input.
-const QUEUE_MAX_SECS: f64 = 2.0;
+const QUEUE_MAX_SECS: f64 = 3.5;
 pub(super) const VIDEO_MAX_BYTES: usize = 32 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
 const SUB_MAX_BYTES: usize = 1024 * 1024;
