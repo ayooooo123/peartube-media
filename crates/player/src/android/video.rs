@@ -12,6 +12,7 @@ use crate::backend::{
 };
 use crate::clock::current_monotonic_ns;
 use crate::video_owner::{try_spawn, OwnerError, OwnerTicket};
+use ndk::data_space::{DataSpace, DataSpaceRange, DataSpaceStandard, DataSpaceTransfer};
 use ndk::hardware_buffer_format::HardwareBufferFormat;
 use ndk::media::media_codec::{
     DequeuedInputBufferResult, DequeuedOutputBufferInfoResult, MediaCodec, MediaCodecDirection,
@@ -19,8 +20,11 @@ use ndk::media::media_codec::{
 };
 use ndk::media::media_format::MediaFormat;
 use ndk::native_window::NativeWindow;
-use oxideav_core::{CodecParameters, Packet, PixelFormat, VideoFrame};
-use oxideav_pixfmt::FrameInfo;
+use oxideav_core::{
+    CodecParameters, ColorPrimaries, ColorRange, MatrixCoefficients, Packet, PixelFormat,
+    TransferCharacteristics, VideoFrame,
+};
+use oxideav_pixfmt::{ColorSpace, FrameInfo};
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -33,6 +37,92 @@ fn write_bytes_to_uninit(dst: &mut [std::mem::MaybeUninit<u8>], src: &[u8]) {
     for (d, &b) in dst[..src.len()].iter_mut().zip(src) {
         d.write(b);
     }
+}
+
+/// Resolves Android's `ADataSpace` for `HAL_PIXEL_FORMAT_YV12` and `oxideav_pixfmt::ColorSpace`
+/// for `RGBA` fallback so studio-range `Y=16..235` HD/SD video maps `Y=16` to true `0,0,0` black
+/// instead of washed-out full-range grey (`V0_SRGB`).
+fn resolve_sw_color(
+    params: &CodecParameters,
+    frame: &VideoFrame,
+    src_fmt: PixelFormat,
+    w: u32,
+    h: u32,
+) -> (DataSpace, ColorSpace, bool) {
+    let fsig = frame.color_signal().unwrap_or_default();
+    let full_range = matches!(
+        src_fmt,
+        PixelFormat::YuvJ420P | PixelFormat::YuvJ422P | PixelFormat::YuvJ444P
+    ) || fsig.range == ColorRange::Full
+        || (fsig.range.is_unspecified() && params.resolved_color_range() == ColorRange::Full);
+
+    let matrix = if !fsig.matrix.is_unspecified() {
+        fsig.matrix
+    } else {
+        params.color_signal.matrix
+    };
+    let primaries = if !fsig.primaries.is_unspecified() {
+        fsig.primaries
+    } else {
+        params.color_signal.primaries
+    };
+    let transfer = if !fsig.transfer.is_unspecified() {
+        fsig.transfer
+    } else {
+        params.color_signal.transfer
+    };
+
+    let (ds_std, rgba_cs) = if matches!(
+        matrix,
+        MatrixCoefficients::BT2020_NCL | MatrixCoefficients::BT2020_CL
+    ) || primaries == ColorPrimaries::BT2020
+    {
+        (
+            DataSpaceStandard::Bt2020,
+            if full_range { ColorSpace::Bt2020Full } else { ColorSpace::Bt2020Limited },
+        )
+    } else if matrix == MatrixCoefficients::BT709 || primaries == ColorPrimaries::BT709 {
+        (
+            DataSpaceStandard::Bt709,
+            if full_range { ColorSpace::Bt709Full } else { ColorSpace::Bt709Limited },
+        )
+    } else if matches!(
+        matrix,
+        MatrixCoefficients::BT601_525 | MatrixCoefficients::SMPTE_ST240 | MatrixCoefficients::FCC
+    ) || matches!(
+        primaries,
+        ColorPrimaries::BT601_525 | ColorPrimaries::SMPTE_ST240 | ColorPrimaries::BT470_SYSTEM_M
+    ) {
+        (
+            DataSpaceStandard::Bt601_525,
+            if full_range { ColorSpace::Bt601Full } else { ColorSpace::Bt601Limited },
+        )
+    } else if matrix == MatrixCoefficients::BT470_SYSTEM_BG
+        || primaries == ColorPrimaries::BT470_SYSTEM_BG
+    {
+        (
+            DataSpaceStandard::Bt601_625,
+            if full_range { ColorSpace::Bt601Full } else { ColorSpace::Bt601Limited },
+        )
+    } else if w >= 1280 || h >= 720 {
+        (
+            DataSpaceStandard::Bt709,
+            if full_range { ColorSpace::Bt709Full } else { ColorSpace::Bt709Limited },
+        )
+    } else {
+        (
+            DataSpaceStandard::Bt601_625,
+            if full_range { ColorSpace::Bt601Full } else { ColorSpace::Bt601Limited },
+        )
+    };
+
+    let ds_trc = match transfer {
+        TransferCharacteristics::SMPTE_ST2084 => DataSpaceTransfer::St2084,
+        TransferCharacteristics::ARIB_STD_B67 => DataSpaceTransfer::HLG,
+        _ => DataSpaceTransfer::Smpte170M,
+    };
+    let ds_range = if full_range { DataSpaceRange::Full } else { DataSpaceRange::Limited };
+    (DataSpace::from_parts(ds_std, ds_trc, ds_range), rgba_cs, full_range)
 }
 
 const BUFFER_FLAG_KEY_FRAME: u32 = 1;
@@ -1256,174 +1346,191 @@ fn run_codec_session(
             }
         }
 
-        // Present or discard held output with validity checks (C6).
-        if let Some(held) = &held_output {
-            if !req_opt.as_ref().is_some_and(|req| {
-                req.producer == held.producer
-                    && request_still_valid(backend, mailbox, req, meta.bound_surface_id, held.codec_epoch)
-            }) {
-                let held_buf = held_output.take().unwrap();
-                if let Err(error) = codec.release_output_buffer(held_buf.buffer, false) {
-                    mailbox.set_async_error(meta.current_producer, VideoError::Sink(
-                        SinkError::Fallback(format!("discard cancelled output: {error:?}")),
-                    ));
-                    return SessionOutcome::Reconfigure;
-                }
-            } else {
-                let pts = held.pts;
-                let producer = held.producer;
-                let is_eos = held.eos;
-                let now = current_monotonic_ns();
-                if playing {
-                    if let Some(target) = clock.monotonic_ns_at(pts) {
-                        // Clock mapping is an external call. Cancellation/retirement
-                        // can become visible while it is running.
-                        if !req_opt.as_ref().is_some_and(|req| {
-                            request_still_valid(backend, mailbox, req, meta.bound_surface_id, meta.codec_epoch)
-                        }) {
-                            let held_buf = held_output.take().unwrap();
-                            if let Err(error) = codec.release_output_buffer(held_buf.buffer, false) {
-                                mailbox.set_async_error(producer, VideoError::Sink(
-                                    SinkError::Fallback(format!("discard cancelled output: {error:?}")),
-                                ));
-                                return SessionOutcome::Reconfigure;
-                            }
-                            continue;
-                        }
-                        if target < now - 30_000_000 {
-                            let held_buf = held_output.take().unwrap();
-                            if let Err(e) = codec.release_output_buffer(held_buf.buffer, false) {
-                                mailbox.set_async_error(
-                                    producer,
-                                    VideoError::Sink(SinkError::Fallback(format!(
-                                        "release buffer: {e:?}"
-                                    ))),
-                                );
-                            }
-                            if is_eos {
-                                *accepted_in_flight = false;
-                                if mailbox.is_credit_free_and_empty() {
-                                    mailbox.confirm_eos(producer);
-                                }
-                            }
-                        } else if target <= now + 5_000_000 {
-                            let held_buf = held_output.take().unwrap();
-                            if let Err(e) =
-                                codec.release_output_buffer_at_time(held_buf.buffer, target)
-                            {
-                                mailbox.set_async_error(
-                                    producer,
-                                    VideoError::Sink(SinkError::Fallback(format!(
-                                        "release buffer at time: {e:?}"
-                                    ))),
-                                );
-                            }
-                            if is_eos {
-                                *accepted_in_flight = false;
-                                if mailbox.is_credit_free_and_empty() {
-                                    mailbox.confirm_eos(producer);
-                                }
-                            }
-                        }
+        // Drain ready decoded frames and hand anything within 50 ms of VSYNC straight to
+        // SurfaceFlinger's BLASTBufferQueue so hardware VSYNC latches cleanly and rpivid's
+        // 4K output buffer pool never sits hostage in userspace.
+        let mut next_release_wait: Option<Duration> = None;
+        for _ in 0..4 {
+            let mut dequeued_any = false;
+            if held_output.is_none() {
+                if let Some(req) = &req_opt {
+                    if !request_still_valid(
+                        backend,
+                        mailbox,
+                        req,
+                        meta.bound_surface_id,
+                        meta.codec_epoch,
+                    ) {
+                        break;
                     }
                 }
-            }
-        }
+                match codec.dequeue_output_buffer(Duration::ZERO) {
+                    Ok(DequeuedOutputBufferInfoResult::Buffer(out_buf)) => {
+                        dequeued_any = true;
+                        // Validate after native dequeue (C6).
+                        if let Some(req) = &req_opt {
+                            if req.producer != meta.current_producer
+                                || !request_still_valid(backend, mailbox, req, meta.bound_surface_id, meta.codec_epoch)
+                            {
+                                let _ = codec.release_output_buffer(out_buf, false);
+                            } else {
+                                meta.has_seen_output = true;
+                                let info = *out_buf.info();
+                                let flags = info.flags();
+                                let size = info.size();
+                                let pts_us = info.presentation_time_us().max(0) as u64;
+                                let pts = Duration::from_micros(pts_us);
+                                let eos = flags & BUFFER_FLAG_END_OF_STREAM != 0;
 
-        if held_output.is_none() {
-            if let Some(req) = &req_opt {
-                if !request_still_valid(
-                    backend,
-                    mailbox,
-                    req,
-                    meta.bound_surface_id,
-                    meta.codec_epoch,
-                ) {
-                    mailbox.wait_owner(Duration::from_millis(10));
-                    continue;
-                }
-            }
-            match codec.dequeue_output_buffer(Duration::ZERO) {
-                Ok(DequeuedOutputBufferInfoResult::Buffer(out_buf)) => {
-                    // Validate after native dequeue (C6).
-                    if let Some(req) = &req_opt {
-                        if req.producer != meta.current_producer
-                            || !request_still_valid(backend, mailbox, req, meta.bound_surface_id, meta.codec_epoch)
-                        {
-                            let _ = codec.release_output_buffer(out_buf, false);
-                        } else {
-                            meta.has_seen_output = true;
-                            let info = *out_buf.info();
-                            let flags = info.flags();
-                            let size = info.size();
-                            let pts_us = info.presentation_time_us().max(0) as u64;
-                            let pts = Duration::from_micros(pts_us);
-                            let eos = flags & BUFFER_FLAG_END_OF_STREAM != 0;
-
-                            if eos {
-                                // Payload-bearing EOS: preserve final picture (C5).
-                                if size > 0 && pts >= present_from {
+                                if eos {
+                                    // Payload-bearing EOS: preserve final picture (C5).
+                                    if size > 0 && pts >= present_from {
+                                        mailbox.publish_picture_ready(meta.current_producer, pts);
+                                        held_output = Some(HeldOutput {
+                                            buffer: out_buf,
+                                            pts,
+                                            producer: meta.current_producer,
+                                            codec_epoch: meta.codec_epoch,
+                                            eos: true,
+                                        });
+                                    } else {
+                                        if let Err(e) = codec.release_output_buffer(out_buf, false) {
+                                            mailbox.set_async_error(
+                                                meta.current_producer,
+                                                VideoError::Sink(SinkError::Fallback(format!(
+                                                    "release eos: {e:?}"
+                                                ))),
+                                            );
+                                        }
+                                        *accepted_in_flight = false;
+                                        if mailbox.is_credit_free_and_empty()
+                                            && held_output.is_none()
+                                        {
+                                            mailbox.confirm_eos(meta.current_producer);
+                                        }
+                                    }
+                                } else if pts < present_from {
+                                    if let Err(e) = codec.release_output_buffer(out_buf, false) {
+                                        mailbox.set_async_error(
+                                            meta.current_producer,
+                                            VideoError::Sink(SinkError::Fallback(format!(
+                                                "release early: {e:?}"
+                                            ))),
+                                        );
+                                    }
+                                } else {
                                     mailbox.publish_picture_ready(meta.current_producer, pts);
                                     held_output = Some(HeldOutput {
                                         buffer: out_buf,
                                         pts,
                                         producer: meta.current_producer,
                                         codec_epoch: meta.codec_epoch,
-                                        eos: true,
+                                        eos: false,
                                     });
-                                } else {
-                                    if let Err(e) = codec.release_output_buffer(out_buf, false) {
-                                        mailbox.set_async_error(
-                                            meta.current_producer,
-                                            VideoError::Sink(SinkError::Fallback(format!(
-                                                "release eos: {e:?}"
-                                            ))),
-                                        );
-                                    }
-                                    *accepted_in_flight = false;
-                                    if mailbox.is_credit_free_and_empty()
-                                        && held_output.is_none()
-                                    {
-                                        mailbox.confirm_eos(meta.current_producer);
-                                    }
                                 }
-                            } else if pts < present_from {
-                                if let Err(e) = codec.release_output_buffer(out_buf, false) {
-                                    mailbox.set_async_error(
-                                        meta.current_producer,
-                                        VideoError::Sink(SinkError::Fallback(format!(
-                                            "release early: {e:?}"
-                                        ))),
-                                    );
-                                }
-                            } else {
-                                mailbox.publish_picture_ready(meta.current_producer, pts);
-                                held_output = Some(HeldOutput {
-                                    buffer: out_buf,
-                                    pts,
-                                    producer: meta.current_producer,
-                                    codec_epoch: meta.codec_epoch,
-                                    eos: false,
-                                });
                             }
+                        } else {
+                            let _ = codec.release_output_buffer(out_buf, false);
                         }
-                    } else {
-                        let _ = codec.release_output_buffer(out_buf, false);
+                    }
+                    Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => break,
+                    Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
+                        meta.has_seen_output = true;
+                        continue;
+                    }
+                    Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged) => continue,
+                    Err(e) => {
+                        mailbox.set_async_error(
+                            meta.current_producer,
+                            VideoError::Sink(SinkError::Fallback(format!(
+                                "dequeue_output_buffer: {e:?}"
+                            ))),
+                        );
+                        break;
                     }
                 }
-                Ok(DequeuedOutputBufferInfoResult::TryAgainLater) => {}
-                Ok(DequeuedOutputBufferInfoResult::OutputFormatChanged) => {
-                    meta.has_seen_output = true;
+            }
+
+            // Present or discard held output with validity checks (C6).
+            if let Some(held) = &held_output {
+                if !req_opt.as_ref().is_some_and(|req| {
+                    req.producer == held.producer
+                        && request_still_valid(backend, mailbox, req, meta.bound_surface_id, held.codec_epoch)
+                }) {
+                    let held_buf = held_output.take().unwrap();
+                    if let Err(error) = codec.release_output_buffer(held_buf.buffer, false) {
+                        mailbox.set_async_error(meta.current_producer, VideoError::Sink(
+                            SinkError::Fallback(format!("discard cancelled output: {error:?}")),
+                        ));
+                        return SessionOutcome::Reconfigure;
+                    }
+                    continue;
                 }
-                Ok(DequeuedOutputBufferInfoResult::OutputBuffersChanged) => {}
-                Err(e) => {
-                    mailbox.set_async_error(
-                        meta.current_producer,
-                        VideoError::Sink(SinkError::Fallback(format!(
-                            "dequeue_output_buffer: {e:?}"
-                        ))),
-                    );
+                let pts = held.pts;
+                let producer = held.producer;
+                let is_eos = held.eos;
+                let now = current_monotonic_ns();
+                if !playing {
+                    break;
                 }
+                let Some(target) = clock.monotonic_ns_at(pts) else {
+                    break;
+                };
+                // Clock mapping is an external call. Cancellation/retirement
+                // can become visible while it is running.
+                if !req_opt.as_ref().is_some_and(|req| {
+                    request_still_valid(backend, mailbox, req, meta.bound_surface_id, meta.codec_epoch)
+                }) {
+                    let held_buf = held_output.take().unwrap();
+                    if let Err(error) = codec.release_output_buffer(held_buf.buffer, false) {
+                        mailbox.set_async_error(producer, VideoError::Sink(
+                            SinkError::Fallback(format!("discard cancelled output: {error:?}")),
+                        ));
+                        return SessionOutcome::Reconfigure;
+                    }
+                    continue;
+                }
+                if target < now - 65_000_000 {
+                    let held_buf = held_output.take().unwrap();
+                    if let Err(e) = codec.release_output_buffer(held_buf.buffer, false) {
+                        mailbox.set_async_error(
+                            producer,
+                            VideoError::Sink(SinkError::Fallback(format!(
+                                "release buffer: {e:?}"
+                            ))),
+                        );
+                    }
+                    if is_eos {
+                        *accepted_in_flight = false;
+                        if mailbox.is_credit_free_and_empty() {
+                            mailbox.confirm_eos(producer);
+                        }
+                    }
+                } else if target <= now + 28_000_000 {
+                    let held_buf = held_output.take().unwrap();
+                    if let Err(e) =
+                        codec.release_output_buffer_at_time(held_buf.buffer, target)
+                    {
+                        mailbox.set_async_error(
+                            producer,
+                            VideoError::Sink(SinkError::Fallback(format!(
+                                "release buffer at time: {e:?}"
+                            ))),
+                        );
+                    }
+                    if is_eos {
+                        *accepted_in_flight = false;
+                        if mailbox.is_credit_free_and_empty() {
+                            mailbox.confirm_eos(producer);
+                        }
+                    }
+                } else {
+                    let wait_ns = ((target - 24_000_000).max(now + 1_000_000) - now) as u64;
+                    next_release_wait = Some(Duration::from_nanos(wait_ns).min(Duration::from_millis(8)));
+                    break;
+                }
+            } else if !dequeued_any {
+                break;
             }
         }
 
@@ -1706,10 +1813,12 @@ fn run_codec_session(
             }
         }
 
-        let wait_timeout = if held_output.is_some() {
-            Duration::from_millis(2)
-        } else if mailbox.has_pending_input() {
+        let wait_timeout = if mailbox.has_pending_input() {
             Duration::from_millis(1)
+        } else if let Some(wait) = next_release_wait {
+            wait
+        } else if held_output.is_some() || playing {
+            Duration::from_millis(3)
         } else {
             Duration::from_millis(10)
         };
@@ -1793,6 +1902,8 @@ fn run_video_owner(
     let mut applied_request_key: Option<RequestKey> = None;
     let mut eos_input_queued: Option<(ProducerId, u64)> = None;
     let mut accepted_in_flight = false;
+    let mut applied_sw_geometry: Option<(u32, u32, i32, i32)> = None;
+    let mut yv12_rejected = false;
 
     loop {
         if mailbox.state.lock().retire_requested {
@@ -1820,6 +1931,8 @@ fn run_video_owner(
             teardown_codec_resources(None, &mut current_window, &mut active_lease, false)?;
             drop(current_binding.take());
             sw_frame_info = None;
+            applied_sw_geometry = None;
+            yv12_rejected = false;
             if let Some(key) = applied_request_key.take() {
                 mailbox.set_transition_result(
                     key.producer,
@@ -1860,6 +1973,8 @@ fn run_video_owner(
                     }
                     drop(current_binding.take());
                     sw_frame_info = None;
+                    applied_sw_geometry = None;
+                    yv12_rejected = false;
                     applied_request_key = None;
                     eos_input_queued = None;
                     accepted_in_flight = false;
@@ -1933,6 +2048,8 @@ fn run_video_owner(
                                 }
                                 drop(current_binding.take());
                                 sw_frame_info = None;
+                                applied_sw_geometry = None;
+                                yv12_rejected = false;
                             }
 
                             let surface_binding = backend.video_surface_binding();
@@ -2062,6 +2179,8 @@ fn run_video_owner(
                                         continue;
                                     }
                                     drop(current_binding.take());
+                                    applied_sw_geometry = None;
+                                    yv12_rejected = false;
                                 }
                             }
                             sw_frame_info = Some(new_info);
@@ -2090,6 +2209,8 @@ fn run_video_owner(
                                                     active_lease = Some(lease);
                                                     current_binding = Some(binding.clone());
                                                     current_window = Some(window);
+                                                    applied_sw_geometry = None;
+                                                    yv12_rejected = false;
                                                     mailbox.bump_codec_epoch();
                                                     // Frames must NOT report Configured without window/lease.
                                                     mailbox.set_transition_result(
@@ -2170,8 +2291,9 @@ fn run_video_owner(
                                     continue;
                                 }
                             };
-                            let (src_fmt, w, h, ready) = match &accepted.target {
+                            let (sw_params, src_fmt, w, h, ready) = match &accepted.target {
                                 VideoTarget::Frames { params, ready, .. } => (
+                                    params,
                                     params.pixel_format.unwrap_or(PixelFormat::Yuv420P),
                                     params.width.unwrap_or(0),
                                     params.height.unwrap_or(0),
@@ -2197,48 +2319,204 @@ fn run_video_owner(
                                     mailbox.release_input_credit();
                                     continue;
                                 }
+                                let (yv12_ds, rgba_cs, full_range) =
+                                    resolve_sw_color(sw_params, &frame, src_fmt, w, h);
+                                let mut decision_checked = false;
+                                let can_try_yv12 = !yv12_rejected
+                                    && src_fmt == PixelFormat::Yuv420P
+                                    && frame.planes.len() >= 3
+                                    && super::surface::yuv420p_planes_valid_for_yv12(
+                                        w,
+                                        h,
+                                        (&frame.planes[0].data, frame.planes[0].stride),
+                                        (&frame.planes[1].data, frame.planes[1].stride),
+                                        (&frame.planes[2].data, frame.planes[2].stride),
+                                    );
+                                if can_try_yv12 {
+                                    let should_present = match prepared {
+                                        Some(token) => match mailbox.await_frame_decision(
+                                            token,
+                                            producer,
+                                            &accepted,
+                                            frame_epoch,
+                                            &backend,
+                                        ) {
+                                            DecisionResult::Present => true,
+                                            DecisionResult::Discard | DecisionResult::Cancelled => {
+                                                mailbox.release_input_credit();
+                                                false
+                                            }
+                                        },
+                                        None => {
+                                            if !mailbox.await_frame_policy(&accepted, frame_epoch, &backend) {
+                                                mailbox.release_input_credit();
+                                                false
+                                            } else {
+                                                true
+                                            }
+                                        }
+                                    };
+                                    if !should_present {
+                                        continue;
+                                    }
+                                    decision_checked = true;
+                                    let yv12_fmt = super::surface::HAL_PIXEL_FORMAT_YV12;
+                                    let yv12_ds_id = i32::from(yv12_ds);
+                                    if applied_sw_geometry != Some((w, h, yv12_fmt, yv12_ds_id)) {
+                                        match window.set_buffers_geometry(
+                                            w as i32,
+                                            h as i32,
+                                            Some(HardwareBufferFormat::from(yv12_fmt)),
+                                        ) {
+                                            Ok(()) => {
+                                                let _ = window.set_buffers_data_space(yv12_ds);
+                                                applied_sw_geometry =
+                                                    Some((w, h, yv12_fmt, yv12_ds_id));
+                                            }
+                                            Err(_) => {
+                                                yv12_rejected = true;
+                                                applied_sw_geometry = None;
+                                            }
+                                        }
+                                    }
+                                    if !yv12_rejected {
+                                        let _ = window.set_buffers_data_space(yv12_ds);
+                                        match window.lock(None) {
+                                            Ok(mut guard) => {
+                                                if super::surface::write_yv12_locked_guard(
+                                                    &mut guard,
+                                                    w,
+                                                    h,
+                                                    full_range,
+                                                    (&frame.planes[0].data, frame.planes[0].stride),
+                                                    (&frame.planes[1].data, frame.planes[1].stride),
+                                                    (&frame.planes[2].data, frame.planes[2].stride),
+                                                ) {
+                                                    drop(guard);
+                                                    ready.ready(pts);
+                                                    mailbox.release_input_credit();
+                                                    continue;
+                                                }
+                                                if let (Some(bpp), Ok(rgba_frame)) = (
+                                                    guard.format().bytes_per_pixel(),
+                                                    oxideav_pixfmt::convert(
+                                                        &frame,
+                                                        FrameInfo::new(src_fmt, w, h),
+                                                        PixelFormat::Rgba,
+                                                        &oxideav_pixfmt::ConvertOptions {
+                                                            color_space: rgba_cs,
+                                                            ..Default::default()
+                                                        },
+                                                    ),
+                                                ) && guard.width() >= w as usize
+                                                    && guard.height() >= h as usize
+                                                {
+                                                    let dst_stride_bytes = guard.stride() * bpp;
+                                                    if let Some(dst) = guard.bytes() {
+                                                        let src_stride = rgba_frame.planes[0].stride;
+                                                        let src_bytes = &rgba_frame.planes[0].data;
+                                                    let row_bytes = w as usize * bpp;
+                                                    if dst_stride_bytes >= row_bytes
+                                                        && src_stride >= row_bytes
+                                                        && (h as usize - 1) * src_stride + row_bytes
+                                                            <= src_bytes.len()
+                                                        && (h as usize - 1) * dst_stride_bytes
+                                                            + row_bytes
+                                                            <= dst.len()
+                                                    {
+                                                        for y in 0..h as usize {
+                                                            let s_off = y * src_stride;
+                                                            let d_off = y * dst_stride_bytes;
+                                                            write_bytes_to_uninit(
+                                                                &mut dst[d_off..d_off + row_bytes],
+                                                                &src_bytes[s_off..s_off + row_bytes],
+                                                            );
+                                                        }
+                                                        drop(guard);
+                                                        yv12_rejected = true;
+                                                        applied_sw_geometry = None;
+                                                        ready.ready(pts);
+                                                        mailbox.release_input_credit();
+                                                        continue;
+                                                        }
+                                                    }
+                                                }
+                                                // Locked YV12 geometry mismatched: neutral black was written;
+                                                // drop guard and fall through to reconfigure as RGBA for this frame.
+                                                drop(guard);
+                                                yv12_rejected = true;
+                                                applied_sw_geometry = None;
+                                            }
+                                            Err(_) => {
+                                                yv12_rejected = true;
+                                                applied_sw_geometry = None;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let frame_info = FrameInfo::new(src_fmt, w, h);
                                 match oxideav_pixfmt::convert(
                                     &frame,
                                     frame_info,
                                     PixelFormat::Rgba,
-                                    &oxideav_pixfmt::ConvertOptions::default(),
+                                    &oxideav_pixfmt::ConvertOptions {
+                                        color_space: rgba_cs,
+                                        ..Default::default()
+                                    },
                                 ) {
                                     Ok(rgba_frame) => {
-                                        let should_present = match prepared {
-                                            Some(token) => {
-                                                match mailbox.await_frame_decision(
-                                                    token,
-                                                    producer,
-                                                    &accepted,
-                                                    frame_epoch,
-                                                    &backend,
-                                                ) {
-                                                    DecisionResult::Present => true,
-                                                    DecisionResult::Discard
-                                                    | DecisionResult::Cancelled => {
-                                                        mailbox.release_input_credit();
-                                                        false
+                                        if !decision_checked {
+                                            let should_present = match prepared {
+                                                Some(token) => {
+                                                    match mailbox.await_frame_decision(
+                                                        token,
+                                                        producer,
+                                                        &accepted,
+                                                        frame_epoch,
+                                                        &backend,
+                                                    ) {
+                                                        DecisionResult::Present => true,
+                                                        DecisionResult::Discard
+                                                        | DecisionResult::Cancelled => {
+                                                            mailbox.release_input_credit();
+                                                            false
+                                                        }
                                                     }
                                                 }
-                                            }
-                                            None => {
-                                                if !mailbox.await_frame_policy(&accepted, frame_epoch, &backend) {
-                                                    mailbox.release_input_credit();
-                                                    false
-                                                } else {
-                                                    true
+                                                None => {
+                                                    if !mailbox.await_frame_policy(&accepted, frame_epoch, &backend) {
+                                                        mailbox.release_input_credit();
+                                                        false
+                                                    } else {
+                                                        true
+                                                    }
                                                 }
+                                            };
+                                            if !should_present {
+                                                continue;
                                             }
-                                        };
-                                        if !should_present {
-                                            continue;
                                         }
-                                        if let Err(e) = window.set_buffers_geometry(
-                                            w as i32,
-                                            h as i32,
-                                            Some(HardwareBufferFormat::R8G8B8A8_UNORM),
-                                        ) {
+                                        let rgba_fmt_id = i32::from(HardwareBufferFormat::R8G8B8A8_UNORM);
+                                        let srgb_ds_id = i32::from(DataSpace::Srgb);
+                                        let geom_res = if applied_sw_geometry
+                                            == Some((w, h, rgba_fmt_id, srgb_ds_id))
+                                        {
+                                            Ok(())
+                                        } else {
+                                            let r = window.set_buffers_geometry(
+                                                w as i32,
+                                                h as i32,
+                                                Some(HardwareBufferFormat::R8G8B8A8_UNORM),
+                                            );
+                                            if r.is_ok() {
+                                                let _ = window.set_buffers_data_space(DataSpace::Srgb);
+                                                applied_sw_geometry =
+                                                    Some((w, h, rgba_fmt_id, srgb_ds_id));
+                                            }
+                                            r
+                                        };
+                                        if let Err(e) = geom_res {
                                             mailbox.set_async_error(
                                                 producer,
                                                 VideoError::Sink(SinkError::Fatal(format!(

@@ -109,8 +109,8 @@ fn fits(len: usize, off: isize, stride: usize, w: usize, h: usize) -> bool {
 impl Vc1Decoder {
     fn ref_pic(&self, sel: RefSel) -> Option<&VPic> {
         match sel {
-            RefSel::Last => self.last.as_ref(),
-            RefSel::Next => self.next.as_ref(),
+            RefSel::Last => self.last.as_deref(),
+            RefSel::Next => self.next.as_deref(),
             RefSel::Cur => self.cur.as_ref(),
         }
     }
@@ -253,6 +253,95 @@ impl Vc1Decoder {
         }
     }
 
+    /// Direct zero-copy 1-MV luma + chroma prediction straight from the reference picture planes
+    /// whenever the block lies strictly inside the frame without range reduction, IC, or interlacing.
+    #[allow(clippy::too_many_arguments)]
+    fn try_put_1mv_direct(
+        &mut self,
+        sel: RefSel,
+        use_ic: bool,
+        interlace: bool,
+        src_x: i32,
+        src_y: i32,
+        uvsrc_x: i32,
+        uvsrc_y: i32,
+        mx: i32,
+        my: i32,
+        uvmx: i32,
+        uvmy: i32,
+        avg: bool,
+    ) -> bool {
+        if self.rangeredfrm || use_ic || self.field_mode || interlace || matches!(sel, RefSel::Cur) {
+            return false;
+        }
+        let ms = self.mspel as i32;
+        let k = 17 + 2 * ms;
+        let (hmax, vmax) = (self.h_edge_pos, self.v_edge_pos);
+        let (chmax, cvmax) = (hmax >> 1, vmax >> 1);
+        if src_x - ms < 0
+            || src_x - ms + k > hmax
+            || src_y - ms < 0
+            || src_y - ms + k > vmax
+            || uvsrc_x < 0
+            || uvsrc_x + 9 > chmax
+            || uvsrc_y < 0
+            || uvsrc_y + 9 > cvmax
+        {
+            return false;
+        }
+        let rnd = self.rnd;
+        let (ls, uvls) = (self.linesize, self.uvlinesize);
+        let dest = self.dest;
+        let mspel = self.mspel;
+        let pic_opt = match sel {
+            RefSel::Last => self.last.as_deref(),
+            RefSel::Next => self.next.as_deref(),
+            RefSel::Cur => None,
+        };
+        let (Some(pic), Some(cur)) = (pic_opt, self.cur.as_mut()) else {
+            return false;
+        };
+        let rls0 = pic.pic.linesize[0];
+        let y_end = (src_y - ms + k - 1) as usize * rls0 + (src_x - ms + k) as usize;
+        if y_end > pic.pic.data[0].len() {
+            return false;
+        }
+        let c_end1 = (uvsrc_y + 8) as usize * pic.pic.linesize[1] + (uvsrc_x + 9) as usize;
+        let c_end2 = (uvsrc_y + 8) as usize * pic.pic.linesize[2] + (uvsrc_x + 9) as usize;
+        if c_end1 > pic.pic.data[1].len() || c_end2 > pic.pic.data[2].len() {
+            return false;
+        }
+        let ysrc = Src {
+            data: &pic.pic.data[0],
+            off: src_y as isize * rls0 as isize + src_x as isize,
+            stride: rls0 as isize,
+        };
+        let d0 = &mut cur.pic.data[0];
+        if fits(d0.len(), dest[0], ls, 16, 16) {
+            if mspel {
+                let dxy = (((my & 3) << 2) | (mx & 3)) as usize;
+                dsp::vc1_mspel_mc(d0, dest[0] as usize, ls, &ysrc, 16, dxy, rnd, avg);
+            } else {
+                let dxy = ((my & 2) | ((mx & 2) >> 1)) as usize;
+                dsp::hpel(d0, dest[0] as usize, ls, &ysrc, 16, dxy, rnd != 0, avg);
+            }
+        }
+        let (cx, cy) = ((uvmx & 3) << 1, (uvmy & 3) << 1);
+        for p in [1usize, 2usize] {
+            let rls_c = pic.pic.linesize[p];
+            let src = Src {
+                data: &pic.pic.data[p],
+                off: uvsrc_y as isize * rls_c as isize + uvsrc_x as isize,
+                stride: rls_c as isize,
+            };
+            let d = &mut cur.pic.data[p];
+            if fits(d.len(), dest[p], uvls, 8, 8) {
+                dsp::chroma_mc(d, dest[p] as usize, uvls, &src, 8, 8, cx, cy, rnd != 0, avg);
+            }
+        }
+        true
+    }
+
     /// `ff_vc1_mc_1mv`.
     pub(crate) fn mc_1mv(&mut self, dir: usize) {
         if (!self.field_mode || (self.ref_field_type[dir] == 1 && self.cur_field_type == 1)) && self.last.is_none() {
@@ -285,6 +374,9 @@ impl Vc1Decoder {
         let mut uvsrc_y = self.mb_y as i32 * 8 + (uvmy >> 2);
         self.clip_src_1mv(&mut src_x, &mut src_y, &mut uvsrc_x, &mut uvsrc_y);
 
+        if self.try_put_1mv_direct(sel, use_ic, interlace, src_x, src_y, uvsrc_x, uvsrc_y, mx, my, uvmx, uvmy, false) {
+            return;
+        }
         let mut ybuf = [0u8; 19 * 19];
         let mut ubuf = [0u8; 81];
         let mut vbuf = [0u8; 81];
@@ -422,6 +514,46 @@ impl Vc1Decoder {
             }
         }
 
+        if !self.rangeredfrm && !use_ic && !self.field_mode && !interlace && !fieldmv && !matches!(sel, RefSel::Cur) {
+            let ms = self.mspel as i32;
+            let k = 9 + 2 * ms;
+            if src_x - ms >= 0
+                && src_x - ms + k <= self.h_edge_pos
+                && src_y - ms >= 0
+                && src_y - ms + k <= self.v_edge_pos
+            {
+                let rnd = self.rnd;
+                let mspel = self.mspel;
+                let dst_off = self.dest[0] + off;
+                let pic_opt = match sel {
+                    RefSel::Last => self.last.as_deref(),
+                    RefSel::Next => self.next.as_ref().map(std::ops::Deref::deref),
+                    RefSel::Cur => None,
+                };
+                if let (Some(pic), Some(cur)) = (pic_opt, self.cur.as_mut()) {
+                    let rls0 = pic.pic.linesize[0];
+                    let y_end = (src_y - ms + k - 1) as usize * rls0 + (src_x - ms + k) as usize;
+                    if y_end <= pic.pic.data[0].len() {
+                        let src = Src {
+                            data: &pic.pic.data[0],
+                            off: src_y as isize * rls0 as isize + src_x as isize,
+                            stride: rls0 as isize,
+                        };
+                        let d0 = &mut cur.pic.data[0];
+                        if mspel {
+                            if fits(d0.len(), dst_off, ls as usize, 8, 8) {
+                                let dxy = (((my & 3) << 2) | (mx & 3)) as usize;
+                                dsp::vc1_mspel_mc(d0, dst_off as usize, ls as usize, &src, 8, dxy, rnd, avg);
+                            }
+                        } else if fits(d0.len(), dst_off, ls as usize, 8, 8) {
+                            let dxy = ((my & 2) | ((mx & 2) >> 1)) as usize;
+                            dsp::hpel(d0, dst_off as usize, ls as usize, &src, 8, dxy, rnd != 0, avg);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         let ms = self.mspel as i32;
         let k = (9 + 2 * ms) as usize;
         let mut ybuf = [0u8; 11 * 11];
@@ -456,7 +588,7 @@ impl Vc1Decoder {
             }
         } else if fits(d0.len(), dst_off, ls as usize, 8, 8) {
             let dxy = ((my & 2) | ((mx & 2) >> 1)) as usize;
-            dsp::hpel(d0, dst_off as usize, ls as usize, &src, 8, dxy, rnd != 0, false);
+            dsp::hpel(d0, dst_off as usize, ls as usize, &src, 8, dxy, rnd != 0, avg);
         }
     }
 
@@ -509,6 +641,39 @@ impl Vc1Decoder {
             uvsrc_y = uvsrc_y.clamp(-8, self.coded_height >> 1);
         }
         let (sel, lut_owner, use_ic, interlace) = self.select_ref(dir, chroma_ref_type);
+        if !self.rangeredfrm && !use_ic && !self.field_mode && !interlace && !matches!(sel, RefSel::Cur) {
+            let (chmax, cvmax) = (self.h_edge_pos >> 1, self.v_edge_pos >> 1);
+            if uvsrc_x >= 0 && uvsrc_x + 9 <= chmax && uvsrc_y >= 0 && uvsrc_y + 9 <= cvmax {
+                let (cx, cy) = ((uvmx & 3) << 1, (uvmy & 3) << 1);
+                let rnd = self.rnd;
+                let uvls = self.uvlinesize;
+                let dest = self.dest;
+                let pic_opt = match sel {
+                    RefSel::Last => self.last.as_deref(),
+                    RefSel::Next => self.next.as_deref(),
+                    RefSel::Cur => None,
+                };
+                if let (Some(pic), Some(cur)) = (pic_opt, self.cur.as_mut()) {
+                    let c_end1 = (uvsrc_y + 8) as usize * pic.pic.linesize[1] + (uvsrc_x + 9) as usize;
+                    let c_end2 = (uvsrc_y + 8) as usize * pic.pic.linesize[2] + (uvsrc_x + 9) as usize;
+                    if c_end1 <= pic.pic.data[1].len() && c_end2 <= pic.pic.data[2].len() {
+                        for p in [1usize, 2usize] {
+                            let rls_c = pic.pic.linesize[p];
+                            let src = Src {
+                                data: &pic.pic.data[p],
+                                off: uvsrc_y as isize * rls_c as isize + uvsrc_x as isize,
+                                stride: rls_c as isize,
+                            };
+                            let d = &mut cur.pic.data[p];
+                            if fits(d.len(), dest[p], uvls, 8, 8) {
+                                dsp::chroma_mc(d, dest[p] as usize, uvls, &src, 8, 8, cx, cy, rnd != 0, false);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         let mut ubuf = [0u8; 81];
         let mut vbuf = [0u8; 81];
         let geom = self.fetch_geom(uvsrc_x, uvsrc_y, chroma_ref_type, 9, interlace, true, false);
@@ -653,6 +818,9 @@ impl Vc1Decoder {
         let mut uvsrc_x = self.mb_x as i32 * 8 + (uvmx >> 2);
         let mut uvsrc_y = self.mb_y as i32 * 8 + (uvmy >> 2);
         self.clip_src_1mv(&mut src_x, &mut src_y, &mut uvsrc_x, &mut uvsrc_y);
+        if self.try_put_1mv_direct(RefSel::Next, use_ic, interlace, src_x, src_y, uvsrc_x, uvsrc_y, mx, my, uvmx, uvmy, true) {
+            return;
+        }
         let mut ybuf = [0u8; 19 * 19];
         let mut ubuf = [0u8; 81];
         let mut vbuf = [0u8; 81];

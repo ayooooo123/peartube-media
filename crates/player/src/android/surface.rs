@@ -1504,3 +1504,117 @@ impl Drop for NativeSurfaceReservation {
     }
 }
 
+
+/// Android's planar YVU 4:2:0 `ANativeWindow` format (`HAL_PIXEL_FORMAT_YV12`).
+/// Per Android CDD (`<system/graphics.h>`), `YV12` requires even dimensions, unaligned height,
+/// luma stride aligned to 16 bytes, and chroma stride `align(y_stride / 2, 16)` in `Y, V, U` order.
+pub(crate) const HAL_PIXEL_FORMAT_YV12: i32 = 0x3231_5659;
+
+/// Prevalidates that all three `Yuv420P` source planes completely cover an even `w x h` picture
+/// before `set_buffers_geometry` or `window.lock` is ever attempted on the `YV12` fast path.
+pub(crate) fn yuv420p_planes_valid_for_yv12(
+    w: u32,
+    h: u32,
+    y_plane: (&[u8], usize),
+    u_plane: (&[u8], usize),
+    v_plane: (&[u8], usize),
+) -> bool {
+    let (w_usz, h_usz) = (w as usize, h as usize);
+    if w_usz < 2 || h_usz < 2 || (w_usz & 1) != 0 || (h_usz & 1) != 0 {
+        return false;
+    }
+    let (cw, ch) = (w_usz / 2, h_usz / 2);
+    let check = |(data, stride): (&[u8], usize), row_w: usize, rows: usize| -> bool {
+        stride >= row_w
+            && rows
+                .checked_sub(1)
+                .and_then(|last| last.checked_mul(stride))
+                .and_then(|off| off.checked_add(row_w))
+                .is_some_and(|need| need <= data.len())
+    };
+    check(y_plane, w_usz, h_usz) && check(u_plane, cw, ch) && check(v_plane, cw, ch)
+}
+
+/// Writes a prevalidated `Yuv420P` (`Y, U, V`) picture into a locked `HAL_PIXEL_FORMAT_YV12`
+/// (`Y, V, U`) window buffer after verifying exact active dimensions, 16-byte luma/chroma stride
+/// alignment, source spans, and destination capacity up front. If the locked buffer is `YV12`
+/// with mismatched gralloc dimensions, fills neutral black `(Y=16, V=128, U=128)` before returning
+/// `false` so `unlockAndPost` never exposes uninitialized memory prior to `RGBA` fallback.
+pub(crate) fn write_yv12_locked_guard(
+    guard: &mut ndk::native_window::NativeWindowBufferLockGuard<'_>,
+    w: u32,
+    h: u32,
+    full_range: bool,
+    y_plane: (&[u8], usize),
+    u_plane: (&[u8], usize),
+    v_plane: (&[u8], usize),
+) -> bool {
+    if i32::from(guard.format()) != HAL_PIXEL_FORMAT_YV12 {
+        return false;
+    }
+    let bits = guard.bits();
+    if bits.is_null() {
+        return false;
+    }
+    let buf_w = guard.width();
+    let buf_h = guard.height();
+    let y_stride = guard.stride();
+    let c_stride = (y_stride / 2 + 15) & !15;
+    let c_h_total = buf_h / 2;
+    let exact_geom = (w as usize, h as usize) == (buf_w, buf_h)
+        && buf_w >= 2
+        && buf_h >= 2
+        && (buf_w & 1) == 0
+        && (buf_h & 1) == 0
+        && y_stride >= buf_w
+        && (y_stride & 15) == 0
+        && c_stride >= buf_w / 2
+        && yuv420p_planes_valid_for_yv12(w, h, y_plane, u_plane, v_plane);
+    let Some(y_bytes) = y_stride.checked_mul(buf_h) else { return false };
+    let Some(c_bytes) = c_stride.checked_mul(c_h_total) else { return false };
+    let Some(uv_bytes) = c_bytes.checked_mul(2) else { return false };
+    let Some(total_bytes) = y_bytes.checked_add(uv_bytes) else { return false };
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(bits.cast::<std::mem::MaybeUninit<u8>>(), total_bytes)
+    };
+    let black_y = if full_range { 0u8 } else { 16u8 };
+    if !exact_geom {
+        if (buf_h & 1) == 0 && y_stride >= buf_w {
+            for out in &mut dst[..y_bytes] {
+                out.write(black_y);
+            }
+            for out in &mut dst[y_bytes..total_bytes] {
+                out.write(128);
+            }
+        }
+        return false;
+    }
+    let (w_usz, h_usz) = (buf_w, buf_h);
+    let (cw, ch) = (w_usz / 2, h_usz / 2);
+    let (y_src, y_src_stride) = y_plane;
+    for row in 0..h_usz {
+        let s = row * y_src_stride;
+        let d = row * y_stride;
+        for (out, &b) in dst[d..d + w_usz].iter_mut().zip(&y_src[s..s + w_usz]) {
+            out.write(b);
+        }
+        for out in &mut dst[d + w_usz..d + y_stride] {
+            out.write(black_y);
+        }
+    }
+    let v_base = y_bytes;
+    let u_base = y_bytes + c_bytes;
+    for ((c_src, c_src_stride), base) in [(v_plane, v_base), (u_plane, u_base)] {
+        for row in 0..ch {
+            let s = row * c_src_stride;
+            let d = base + row * c_stride;
+            for (out, &b) in dst[d..d + cw].iter_mut().zip(&c_src[s..s + cw]) {
+                out.write(b);
+            }
+            for out in &mut dst[d + cw..d + c_stride] {
+                out.write(128);
+            }
+        }
+    }
+    true
+}

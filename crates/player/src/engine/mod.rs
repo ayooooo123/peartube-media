@@ -95,6 +95,7 @@ pub struct State {
     pub video: Option<u32>,
     pub subtitle: Option<u32>,
     pub video_size: Option<(u32, u32)>,
+    pub video_fps: Option<f64>,
     pub video_decoder: Option<String>,
     pub dropped_frames: u64,
     /// Trim work lost to input limits. Playback continues with untrimmed
@@ -146,10 +147,50 @@ pub(crate) struct QueuedPacket {
     pub(crate) metadata: PacketMetadata,
 }
 
+#[derive(Default)]
+pub(crate) struct PacketQueue {
+    packets: VecDeque<QueuedPacket>,
+    timestamps: VecDeque<i64>,
+    bytes: usize,
+}
+
+impl PacketQueue {
+    fn push_back(&mut self, packet: QueuedPacket) {
+        self.bytes += packet_charge(&packet.packet, &packet.metadata);
+        if let Some(ticks) = packet.packet.pts.or(packet.packet.dts) {
+            self.timestamps.push_back(ticks);
+        }
+        self.packets.push_back(packet);
+    }
+
+    pub(crate) fn pop_front(&mut self) -> Option<QueuedPacket> {
+        let packet = self.packets.pop_front()?;
+        self.bytes -= packet_charge(&packet.packet, &packet.metadata);
+        if packet.packet.pts.or(packet.packet.dts).is_some() {
+            self.timestamps.pop_front();
+        }
+        Some(packet)
+    }
+
+    fn clear(&mut self) {
+        self.packets.clear();
+        self.timestamps.clear();
+        self.bytes = 0;
+    }
+}
+
+impl std::ops::Deref for PacketQueue {
+    type Target = VecDeque<QueuedPacket>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.packets
+    }
+}
+
 /// One decoder lane. A lane owns its packet queue and wakes the demux loop
 /// whenever it drains, so the demuxer never stalls behind a slow sink.
 pub(crate) struct Lane {
-    pub(crate) queue: Mutex<Vec<QueuedPacket>>,
+    pub(crate) queue: Mutex<PacketQueue>,
     pub(crate) cv: Condvar,
     /// Seek generation the queued packets belong to; changed only with
     /// `queue` locked, when the demuxer empties the lane for a seek.
@@ -158,6 +199,7 @@ pub(crate) struct Lane {
     /// `queue` locked. Without one, packets for the lane are dropped:
     /// queued, they would fill it and park the demuxer for good.
     consumed: AtomicBool,
+    // VecDeque avoids O(N) memmove on 1200 Hz TrueHD packet pops.
 }
 
 /// What a pipeline got from its lane.
@@ -173,7 +215,7 @@ enum Pop {
 impl Lane {
     fn new() -> Arc<Lane> {
         Arc::new(Lane {
-            queue: Mutex::new(Vec::new()),
+            queue: Mutex::new(PacketQueue::default()),
             cv: Condvar::new(),
             seek_gen: AtomicU64::new(0),
             consumed: AtomicBool::new(false),
@@ -185,7 +227,7 @@ impl Lane {
         if !self.consumed.load(Ordering::SeqCst) {
             return;
         }
-        q.push(packet);
+        q.push_back(packet);
         drop(q);
         self.cv.notify_one();
     }
@@ -213,24 +255,32 @@ impl Lane {
     /// Media span (seconds between the first and last pts) and bytes queued.
     fn queued(&self, time_base: TimeBase) -> (f64, usize) {
         let q = self.queue.lock();
-        let mut first: Option<f64> = None;
-        let mut last: Option<f64> = None;
-        let mut bytes = 0;
-        for p in q.iter() {
-            // An untimed packet (B-pictures only carry a PTS in some raw
-            // streams) says nothing about the queued span.
-            if let Some(ticks) = p.packet.pts.or(p.packet.dts) {
-                let secs = time_base.seconds_of(ticks);
-                first.get_or_insert(secs);
-                last = Some(secs);
+        let span = match (q.timestamps.front(), q.timestamps.back()) {
+            (Some(&first), Some(&last)) => {
+                (time_base.seconds_of(last) - time_base.seconds_of(first)).max(0.0)
             }
-            bytes += packet_charge(&p.packet, &p.metadata);
-        }
-        let span = match (first, last) {
-            (Some(a), Some(b)) => (b - a).max(0.0),
             _ => 0.0,
         };
-        (span, bytes)
+        #[cfg(debug_assertions)]
+        {
+            let mut first = None;
+            let mut last = None;
+            let mut bytes = 0;
+            for packet in q.iter() {
+                if let Some(ticks) = packet.packet.pts.or(packet.packet.dts) {
+                    let secs = time_base.seconds_of(ticks);
+                    first.get_or_insert(secs);
+                    last = Some(secs);
+                }
+                bytes += packet_charge(&packet.packet, &packet.metadata);
+            }
+            let scanned_span = match (first, last) {
+                (Some(a), Some(b)) => (b - a).max(0.0),
+                _ => 0.0,
+            };
+            debug_assert_eq!((span, q.bytes), (scanned_span, bytes), "packet queue accounting diverged");
+        }
+        (span, q.bytes)
     }
 
 
@@ -261,12 +311,12 @@ impl Lane {
                 break Pop::Wake;
             }
             let current = generation == seen_seek;
-            match q.first() {
+            match q.front() {
                 Some(p) if current && p.packet.stream_index == u32::MAX => {
-                    q.remove(0);
+                    q.pop_front();
                     break Pop::Eof;
                 }
-                Some(_) if current => break Pop::Packet(q.remove(0)),
+                Some(_) if current => break Pop::Packet(q.pop_front().unwrap()),
                 _ if !*starved => {
                     *starved = true;
                     MutexGuard::unlocked(&mut q, || report(true));
@@ -367,10 +417,10 @@ impl PipelineThread {
 trait PushEof {
     fn push_eof_marker(&mut self);
 }
-impl PushEof for Vec<QueuedPacket> {
+impl PushEof for PacketQueue {
     fn push_eof_marker(&mut self) {
         // EOF marker: a packet with stream_index == u32::MAX.
-        self.push(QueuedPacket {
+        self.push_back(QueuedPacket {
             packet: Packet {
                 stream_index: u32::MAX,
                 time_base: TimeBase::new(1, 1000),
@@ -897,6 +947,17 @@ fn run_player_pipeline(
                 (w > 0 && h > 0).then_some((w, h))
             })
         });
+        st.video_fps = current_video.and_then(|idx| {
+            streams.iter().find(|s| s.index == idx).and_then(|s| {
+                s.params
+                    .frame_rate
+                    .filter(|r| r.num > 0 && r.den > 0)
+                    .map(|r| r.num as f64 / r.den as f64)
+                    .or_else(|| crate::native::codec::video_config(&s.params, &[]).and_then(|c| c.frame_rate))
+                    .or_else(|| vc1_extradata_fps(&s.params))
+                    .filter(|fps| (1.0..=240.0).contains(fps))
+            })
+        });
         st.video_decoder = current_video.map(|idx| {
             streams
                 .iter()
@@ -1058,21 +1119,27 @@ fn find_stream(streams: &[StreamInfo], index: Option<u32>) -> Option<StreamInfo>
 /// reads only avcC extradata, while FFmpeg's accepts both forms.
 fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
     let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        if params.codec_id.as_str() != "h264" || !is_annex_b(&params.extradata) {
-            return ctx.codecs.first_decoder(params);
+        let mut decoder = if params.codec_id.as_str() != "h264" || !is_annex_b(&params.extradata) {
+            ctx.codecs.first_decoder(params)?
+        } else {
+            let mut bare = params.clone();
+            let parameter_sets = std::mem::take(&mut bare.extradata);
+            let mut d = ctx.codecs.first_decoder(&bare)?;
+            d.send_packet(&Packet {
+                stream_index: 0,
+                time_base: TimeBase::new(1, 1000),
+                pts: None,
+                dts: None,
+                duration: None,
+                flags: Default::default(),
+                data: parameter_sets,
+            })?;
+            d
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if params.codec_id.as_str() == "vc1" {
+            decoder.set_execution_context(&oxideav_core::ExecutionContext::auto());
         }
-        let mut bare = params.clone();
-        let parameter_sets = std::mem::take(&mut bare.extradata);
-        let mut decoder = ctx.codecs.first_decoder(&bare)?;
-        decoder.send_packet(&Packet {
-            stream_index: 0,
-            time_base: TimeBase::new(1, 1000),
-            pts: None,
-            dts: None,
-            duration: None,
-            flags: Default::default(),
-            data: parameter_sets,
-        })?;
         Ok(decoder)
     }));
     built.unwrap_or_else(|_| Err(oxideav_core::Error::Other("decoder panicked while opening".into())))
@@ -1846,6 +1913,7 @@ fn retire_video(shared: &SharedState, message: String) {
     state.error.get_or_insert(message);
     state.video = None;
     state.video_size = None;
+    state.video_fps = None;
     drop(state);
     notify_changed_now(shared);
 }
@@ -2555,6 +2623,10 @@ struct VideoSession {
     refused_packets: u32,
     /// Sink finish sealed once per EOF episode.
     sink_finish_sealed: bool,
+    /// Tracks the first 12 output frame timestamps to populate `video_fps` when neither container
+    /// nor sequence header carried it, letting TV displays lock HDMI VSYNC (e.g. 23.976 Hz).
+    fps_probe: Option<(Duration, u32)>,
+    fps_resolved: bool,
 }
 
 impl VideoSession {
@@ -2630,6 +2702,8 @@ impl VideoSession {
             decoder_flushed: false,
             refused_packets: 0,
             sink_finish_sealed: false,
+            fps_probe: None,
+            fps_resolved: shared.state.lock().video_fps.is_some(),
         }
     }
 
@@ -2751,6 +2825,7 @@ impl VideoSession {
         self.phase = VideoPhase::Feeding;
         self.decoder_flushed = false;
         self.sink_finish_sealed = false;
+        self.fps_probe = None;
         self.sink_running = None;
         shared.pipe_pending(Pipe::Video, new_seek);
 
@@ -3103,6 +3178,37 @@ impl VideoSession {
 
                 if before_seek_target(shared, frame_pts_secs, self.seek_generation, &mut self.shown_seek) {
                     return Ok(true);
+                }
+                if !self.fps_resolved {
+                    match self.fps_probe {
+                        None => self.fps_probe = Some((pts, 0)),
+                        Some((start_pts, n)) if pts > start_pts => {
+                            let n = n + 1;
+                            if n >= 12 {
+                                self.fps_resolved = true;
+                                let dt = (pts - start_pts).as_secs_f64();
+                                if dt > 0.04 {
+                                    let fps = snap_standard_fps((n as f64) / dt);
+                                    if (1.0..=240.0).contains(&fps) {
+                                        let mut should_notify = false;
+                                        {
+                                            let mut st = shared.state.lock();
+                                            if st.video_fps.is_none() {
+                                                st.video_fps = Some(fps);
+                                                should_notify = true;
+                                            }
+                                        }
+                                        if should_notify {
+                                            notify_changed(shared);
+                                        }
+                                    }
+                                }
+                            } else {
+                                self.fps_probe = Some((start_pts, n));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
 
                 self.retained_frame = Some(RetainedFrame {
@@ -3812,4 +3918,199 @@ fn skips_before_target(shared: &SharedState, stream: &StreamInfo, packet: &Packe
 fn show_from(shared: &SharedState, generation: u64) -> Option<Duration> {
     let seek = (*shared.active_seek.lock())?;
     (seek.generation == generation).then(|| Duration::from_secs_f64(seek.show_from.max(0.0)))
+}
+
+/// Snaps a measured PTS-delta framerate onto an exact broadcast/cinema cadence when within 0.25%.
+fn snap_standard_fps(raw: f64) -> f64 {
+    const STANDARD: &[f64] = &[
+        24_000.0 / 1_001.0,
+        24.0,
+        25.0,
+        30_000.0 / 1_001.0,
+        30.0,
+        50.0,
+        60_000.0 / 1_001.0,
+        60.0,
+    ];
+    let mut nearest = raw;
+    let mut nearest_error = f64::INFINITY;
+    for &cand in STANDARD {
+        let error = ((raw - cand) / cand).abs();
+        if error <= 0.0025 && error < nearest_error {
+            nearest = cand;
+            nearest_error = error;
+        }
+    }
+    nearest
+}
+
+/// Parses SMPTE 421M `SEQHDR` (`00 00 01 0F`) display-extension framerate (`frameratenr`/`dr` or
+/// `framerateexp`) from VC-1 extradata (supporting raw start codes and Matroska `V_MS/VFW/FOURCC`).
+fn vc1_extradata_fps(params: &CodecParameters) -> Option<f64> {
+    if params.codec_id.as_str() != "vc1" || params.extradata.len() < 8 {
+        return None;
+    }
+    let ext = &params.extradata;
+    let seq_start = (0..ext.len().saturating_sub(4))
+        .find(|&i| ext[i] == 0 && ext[i + 1] == 0 && ext[i + 2] == 1 && ext[i + 3] == 0x0F)?;
+    let body = &ext[seq_start + 4..];
+    let body_end = (0..body.len().saturating_sub(3))
+        .find(|&i| body[i] == 0 && body[i + 1] == 0 && body[i + 2] == 1)
+        .unwrap_or(body.len());
+    let raw = &body[..body_end];
+    let mut rbsp = [0u8; 64];
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < raw.len() && n < rbsp.len() {
+        if raw[i] == 3
+            && i >= 2
+            && raw[i - 1] == 0
+            && raw[i - 2] == 0
+            && i + 1 < raw.len()
+            && raw[i + 1] < 4
+        {
+            rbsp[n] = raw[i + 1];
+            n += 1;
+            i += 2;
+        } else {
+            rbsp[n] = raw[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    struct Bits<'a> {
+        buf: &'a [u8],
+        pos: usize,
+    }
+    impl Bits<'_> {
+        fn read(&mut self, count: usize) -> Option<u32> {
+            if self.pos + count > self.buf.len() * 8 {
+                return None;
+            }
+            let mut v = 0u32;
+            for _ in 0..count {
+                let b = (self.buf[self.pos >> 3] >> (7 - (self.pos & 7))) & 1;
+                v = (v << 1) | u32::from(b);
+                self.pos += 1;
+            }
+            Some(v)
+        }
+    }
+    let mut gb = Bits { buf: &rbsp[..n], pos: 0 };
+    let profile = gb.read(2)?;
+    if profile != 3 {
+        return None;
+    }
+    // level(3), chroma(2), frmrtq(3), bitrtq(5), postproc(1), max_w(12), max_h(12),
+    // broadcast(1), interlace(1), tfcntr(1), finterp(1), reserved(1), psf(1) = 44 bits.
+    gb.read(24)?;
+    gb.read(20)?;
+    if gb.read(1)? == 0 {
+        return None;
+    }
+    // disp_horiz_size(14) + disp_vert_size(14)
+    gb.read(28)?;
+    if gb.read(1)? != 0 {
+        let ar = gb.read(4)?;
+        if ar == 15 {
+            gb.read(16)?;
+        }
+    }
+    if gb.read(1)? == 0 {
+        return None;
+    }
+    if gb.read(1)? != 0 {
+        let exp = gb.read(16)?;
+        Some(f64::from(exp + 1) / 32.0)
+    } else {
+        let nr = match gb.read(8)? {
+            1 => 24_000.0,
+            2 => 25_000.0,
+            3 => 30_000.0,
+            4 => 50_000.0,
+            5 => 60_000.0,
+            6 => 48_000.0,
+            7 => 72_000.0,
+            _ => return None,
+        };
+        let dr = match gb.read(4)? {
+            1 => 1_000.0,
+            2 => 1_001.0,
+            _ => return None,
+        };
+        Some(nr / dr)
+    }
+}
+
+#[cfg(test)]
+mod vc1_fps_tests {
+    use super::*;
+
+    #[test]
+    fn measured_fps_uses_the_nearest_standard_cadence() {
+        for (measured, expected) in [
+            (24.0, 24.0),
+            (30.0, 30.0),
+            (60.0, 60.0),
+            (24_000.0 / 1_001.0, 24_000.0 / 1_001.0),
+            (30_000.0 / 1_001.0, 30_000.0 / 1_001.0),
+            (60_000.0 / 1_001.0, 60_000.0 / 1_001.0),
+            (23.98, 24_000.0 / 1_001.0),
+            (29.98, 30_000.0 / 1_001.0),
+            (59.95, 60_000.0 / 1_001.0),
+            (24.01, 24.0),
+            (30.01, 30.0),
+            (60.01, 60.0),
+            (27.0, 27.0),
+            (72.0, 72.0),
+        ] {
+            assert_eq!(snap_standard_fps(measured), expected, "measured {measured}");
+        }
+    }
+
+    #[test]
+    fn parses_23_976_fps_from_vc1_vfw_extradata() {
+        let mut bits = Vec::<u8>::new();
+        let mut push = |val: u32, n: usize| {
+            for i in (0..n).rev() {
+                bits.push(((val >> i) & 1) as u8);
+            }
+        };
+        push(3, 2); // PROFILE_ADVANCED
+        push(3, 3); // level
+        push(1, 2); // chromaformat 4:2:0
+        push(0, 8); // frmrtq + bitrtq
+        push(0, 1); // postproc
+        push(959, 12); // max_w = 1920
+        push(539, 12); // max_h = 1080
+        push(1, 1); // broadcast
+        push(0, 1); // interlace
+        push(0, 1); // tfcntr
+        push(0, 1); // finterp
+        push(1, 1); // reserved
+        push(0, 1); // psf
+        push(1, 1); // display_ext
+        push(1919, 14); // disp_w
+        push(1079, 14); // disp_h
+        push(1, 1); // aspect_ratio_flag
+        push(1, 4); // 1:1 square
+        push(1, 1); // framerate_flag
+        push(0, 1); // framerateind = nr/dr
+        push(1, 8); // nr = 24000
+        push(2, 4); // dr = 1001
+        while !bits.len().is_multiple_of(8) {
+            bits.push(0);
+        }
+        // Prepend 41-byte Matroska V_MS/VFW/FOURCC BITMAPINFOHEADER + 00 00 01 0F start code
+        let mut ext = vec![0u8; 41];
+        ext.extend_from_slice(&[0x00, 0x00, 0x01, 0x0F]);
+        for chunk in bits.chunks_exact(8) {
+            let b = chunk.iter().fold(0u8, |acc, &bit| (acc << 1) | bit);
+            ext.push(b);
+        }
+        let mut params = CodecParameters::video(oxideav_core::CodecId::new("vc1"));
+        params.extradata = ext;
+        let fps = vc1_extradata_fps(&params).expect("vc1 fps");
+        assert!((fps - 24_000.0 / 1_001.0).abs() < 1e-6, "got {fps}");
+    }
 }

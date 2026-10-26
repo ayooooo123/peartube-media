@@ -117,7 +117,9 @@ opt-level = 3
 # more instructions (16 KB). The Matroska demuxer at 3 changed nothing.
 [profile.release.package.oxideav-ogg]
 opt-level = 3
-# Hot workspace crates (player, codec-wmv, codec-dca, codec-dv) keep the
+[profile.release.package.oxideav-flac]
+opt-level = 3
+# Hot workspace crates (player, codec-wmv, codec-dca, codec-mlp, codec-dv, subs-cc) keep the
 # default 3. DV at "s" decodes DVCPRO HD 1080 at 2.2x real time under load,
 # at the 2x floor for HD; 3 takes 28% fewer instructions.
 [profile.release.package.audio-trim]
@@ -133,7 +135,7 @@ opt-level = "s"
 [profile.release.package.codec-midi]
 opt-level = "s"
 [profile.release.package.codec-mlp]
-opt-level = "s"
+opt-level = 3
 [profile.release.package.codec-mp1]
 opt-level = "s"
 [profile.release.package.codec-mp2]
@@ -171,7 +173,7 @@ opt-level = "s"
 [profile.release.package.subs-bitmap]
 opt-level = "s"
 [profile.release.package.subs-cc]
-opt-level = "s"
+opt-level = 3
 [profile.release.package.subs-render]
 opt-level = "s"
 [profile.release.package.subs-text]

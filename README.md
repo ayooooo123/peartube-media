@@ -135,13 +135,23 @@ OxideAV crates are used at pinned git revisions; their crates.io releases lag th
 
 The player never encodes or muxes. `crates/codecs` turns on the core fork's `decode-only` feature: `CodecInfo::encoder` and `ContainerRegistry::register_muxer` drop their factories, so nothing references OxideAV's encoders and muxers and LTO removes them (Android `libmain.so`: 27.3 MB to 21.0 MB stripped, 13.2 MB to 9.9 MB deflated in the APK).
 
-Release builds compile dependencies and this workspace's cold crates at `opt-level = "s"`. The speed-critical set stays at 3: H.264, HEVC, AV1, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, VC-1/WMV (`codec-wmv`), DV (`codec-dv`), AAC, MP3 and DTS (`codec-dca`), plus `oxideav-core`, `oxideav-pixfmt`, the Ogg demuxer and `player`. Opus and AC-3 retain ample measured audio headroom at `"s"`. Binaries stay at 3 because fat LTO optimises the whole program at the final crate's level; `"s"` there disables loop and SLP vectorization throughout.
+Release builds compile dependencies and this workspace's cold crates at `opt-level = "s"`. The speed-critical set stays at 3: H.264, HEVC, AV1, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, VC-1/WMV (`codec-wmv`), DV (`codec-dv`), AAC, MP3, DTS (`codec-dca`), TrueHD (`codec-mlp`) and FLAC, plus `oxideav-core`, `oxideav-pixfmt`, the Ogg demuxer, the A/53 caption parser (`subs-cc`) and `player`. Opus and AC-3 retain ample measured audio headroom at `"s"`. Binaries stay at 3 because fat LTO optimises the whole program at the final crate's level; `"s"` there disables loop and SLP vectorization throughout.
 
 The app's `mobile/Cargo.toml` and this manifest must keep the same effective profiles. App dependencies default to `"s"`, but workspace crates default to 3, so new cold workspace crates need explicit entries here. `codec-midi`, `codec-mp2`, `codec-tracker` and `subs-render` now match the app's `"s"` setting. The earlier profile split saved 1.5 MB raw and 1.1 MB deflated; that historical library measurement is not a new APK size claim.
 
 VC-1's scalar loop-filter helpers are forced inline so optimized builds can specialize the along-edge and across-edge strides. The filter arithmetic, third-line admission gate, and lazy boundary reads remain unchanged. Correct decoded pixels do not by themselves establish real-time playback on a device; verify sustained software decoding together with peer streaming and selected subtitles.
 
 VC-1 chroma motion compensation selects its phase and averaging path once per block, keeping the weighted taps, rounding bias and destination averaging unchanged. Zero-weight right/bottom neighbors remain unread. The kernel regression covers all fractional phases, both rounding/averaging modes and exact source boundaries. On a Pixel 5a, the paired native kernel measurement was about 2.1× faster; one 1,802-frame movie decode fell from 49.291 s to 48.077 s, with every output frame and timestamp unchanged. This isolated decoder result is not a sustained app-presentation or stutter-free-playback claim.
+
+VC-1's asynchronous coordinator drains completed B pictures while packet input
+is idle, with independent startup-wait and lookahead limits. Android software
+YV12 output carries the source color range and dataspace, and packet lanes
+maintain buffered duration and byte totals incrementally instead of repeatedly
+scanning high-rate TrueHD queues. Debug builds compare the cached totals with
+the original full scan. On the Pi 4, the final VC-1/TrueHD hard-scene seek run
+added one initial dropped frame, then kept the drop counter flat for more than
+a minute. That forced-HTTP run does not prove zero-drop startup, every format,
+or autonomous P2P playback; final Pixel 9 playback checks remain pending.
 
 Leaving TLS out (rustls, ring and the webpki roots, through `oxideav-http`'s `tls` feature) saves another 0.86 MB raw, 0.54 MB deflated, in the Android `libmain.so`.
 

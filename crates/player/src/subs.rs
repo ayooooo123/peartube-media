@@ -623,13 +623,13 @@ impl SubtitlePipeline {
             return Woke::Other;
         }
         if take && self.lane.seek_gen.load(Ordering::SeqCst) == seen_seek {
-            match q.first() {
+            match q.front() {
                 Some(p) if p.packet.stream_index == u32::MAX => {
-                    q.remove(0);
+                    q.pop_front();
                     return Woke::Eof;
                 }
                 Some(_) => {
-                    let queued = q.remove(0);
+                    let queued = q.pop_front().unwrap();
                     drop(q);
                     self.demux_cv.notify_one();
                     return Woke::Packet(queued.packet, queued.metadata);

@@ -30,10 +30,12 @@ const REBUFFER_AHEAD_SECS: f64 = 2.5;
 const VIDEO_LEAD: Duration = Duration::from_millis(100);
 /// Isolated late pictures are dropped; sustained lateness holds both tracks.
 const VIDEO_LATE_GRACE: Duration = Duration::from_millis(250);
-/// While the clock stands still, audio and compressed video are handed to
-/// their sinks at most this far past it: enough to have the output primed,
-/// short of filling a paused output so far that `write`/`push_packet` block.
+/// While the clock stands still, audio is handed to its sink at most this far
+/// past it: enough to have the output primed without blocking a paused sink.
 const PREROLL: Duration = Duration::from_millis(100);
+/// Compressed video needs enough lookahead while priming to admit a full HEVC/H.264
+/// B-frame reference pyramid into MediaCodec before the first due picture emerges.
+const VIDEO_PREROLL: Duration = Duration::from_millis(450);
 /// The longest timed wait for a media time: it is re-evaluated at least
 /// this often, whatever the clock's mapping said.
 const MAX_WAIT: Duration = Duration::from_millis(100);
@@ -724,7 +726,7 @@ impl SharedState {
                 }
                 return Preroll::Go;
             }
-            if pts <= now + PREROLL {
+            if pts <= now + VIDEO_PREROLL {
                 return Preroll::Go;
             }
             self.transport_cv.wait(&mut t);

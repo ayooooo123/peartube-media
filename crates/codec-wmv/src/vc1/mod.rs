@@ -14,9 +14,10 @@ mod lf;
 mod mc;
 mod pred;
 
-use std::sync::LazyLock;
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, LazyLock, Mutex, mpsc};
 
-use oxideav_core::{CodecId, CodecParameters, Decoder, Error, Frame, Packet, PixelFormat, Result};
+use oxideav_core::{CodecId, CodecParameters, Decoder, Error, ExecutionContext, Frame, Packet, PixelFormat, Result};
 
 use crate::bits::BitReader;
 use crate::mpv::Picture;
@@ -243,6 +244,7 @@ pub(crate) struct VPic {
     pub mb_type: Vec<u8>,
     pub field_picture: bool,
     pub interlaced: bool,
+    pub pts: Option<i64>,
 }
 
 /// Transform selection (the WMV3 `res_fasttx == 0` path uses the simple
@@ -449,8 +451,8 @@ pub struct Vc1Decoder {
     pub(crate) coded_block: Vec<u8>,
     pub(crate) qscale_table: Vec<i8>,
     pub(crate) cur: Option<VPic>,
-    pub(crate) last: Option<VPic>,
-    pub(crate) next: Option<VPic>,
+    pub(crate) last: Option<Arc<VPic>>,
+    pub(crate) next: Option<Arc<VPic>>,
     spare: Vec<VPic>,
     pub(crate) mb_x: usize,
     pub(crate) mb_y: usize,
@@ -473,9 +475,12 @@ pub struct Vc1Decoder {
     /// Output frames not yet returned, each with the size it was cropped
     /// to (the size in force when it was output; `init_context` drops the
     /// references when the coded size changes).
-    pending: std::collections::VecDeque<(Frame, (u32, u32))>,
+    pending: VecDeque<(Frame, (u32, u32))>,
     /// Size of the frame `receive_frame` last returned.
     last_output: Option<(u32, u32)>,
+    pts_guess: Vc1PtsGuess,
+    /// Optional multi-core lookahead + B-frame worker pipeline enabled via `set_execution_context`.
+    async_pipe: Option<Vc1AsyncPipe>,
 }
 
 /// Index helpers for the arrays allocated "so they can be used with
@@ -735,8 +740,10 @@ impl Vc1Decoder {
             pict_type: 0,
             low_delay: true,
             x8: None,
-            pending: std::collections::VecDeque::new(),
+            pending: VecDeque::new(),
             last_output: None,
+            pts_guess: Vc1PtsGuess::default(),
+            async_pipe: None,
         }
     }
 
@@ -824,7 +831,8 @@ impl Vc1Decoder {
     }
 
     fn alloc_vpic(&mut self) -> VPic {
-        if let Some(p) = self.spare.pop() {
+        if let Some(mut p) = self.spare.pop() {
+            p.pts = None;
             return p;
         }
         let mvlen = self.mvo() as usize + self.b8_stride * (2 * self.alloc_mb_height + 2) + 8;
@@ -834,6 +842,13 @@ impl Vc1Decoder {
             mb_type: vec![0; self.mb_stride * self.alloc_mb_height + 2],
             field_picture: false,
             interlaced: false,
+            pts: None,
+        }
+    }
+
+    fn recycle_vpic(&mut self, pic: Arc<VPic>) {
+        if let Ok(p) = Arc::try_unwrap(pic) {
+            self.spare.push(p);
         }
     }
 
@@ -1826,7 +1841,7 @@ impl Vc1Decoder {
 
     /// `ff_mpv_frame_start` for VC-1: new current picture, reference
     /// rotation and dummy references.
-    fn frame_start(&mut self) {
+    fn frame_start(&mut self, pts: Option<i64>) {
         let mut cur = self.alloc_vpic();
         // The motion_val pool is AV_REFSTRUCT_POOL_FLAG_ZERO_EVERY_TIME.
         for mv in cur.motion_val.iter_mut() {
@@ -1834,9 +1849,10 @@ impl Vc1Decoder {
         }
         cur.field_picture = self.field_mode;
         cur.interlaced = self.fcm != PROGRESSIVE;
+        cur.pts = pts;
         if self.pict_type != PICT_B {
             if let Some(old) = self.last.take() {
-                self.spare.push(old);
+                self.recycle_vpic(old);
             }
             self.last = self.next.take();
         }
@@ -1851,7 +1867,7 @@ impl Vc1Decoder {
                 mv.fill([0, 0]);
             }
             dummy.mb_type.fill(0);
-            self.last = Some(dummy);
+            self.last = Some(Arc::new(dummy));
         }
         self.cur = Some(cur);
     }
@@ -1986,7 +2002,7 @@ impl Vc1Decoder {
             return Ok(());
         }
 
-        self.frame_start();
+        self.frame_start(pts);
         self.last_interlaced = self.last.as_ref().is_some_and(|p| p.interlaced);
         self.next_interlaced = self.next.as_ref().is_some_and(|p| p.interlaced);
 
@@ -2083,15 +2099,15 @@ impl Vc1Decoder {
         let size = (self.width as usize, self.height as usize);
         let reported = (self.width as u32, self.height as u32);
         if self.pict_type == PICT_B {
-            self.pending.push_back((cur.pic.to_frame(size.0, size.1, pts), reported));
+            self.pending.push_back((cur.pic.to_frame(size.0, size.1, cur.pts), reported));
             self.spare.push(cur);
         } else {
             if self.low_delay {
-                self.pending.push_back((cur.pic.to_frame(size.0, size.1, pts), reported));
+                self.pending.push_back((cur.pic.to_frame(size.0, size.1, cur.pts), reported));
             } else if let Some(last) = self.last.as_ref() {
-                self.pending.push_back((last.pic.to_frame(size.0, size.1, pts), reported));
+                self.pending.push_back((last.pic.to_frame(size.0, size.1, last.pts), reported));
             }
-            self.next = Some(cur);
+            self.next = Some(Arc::new(cur));
         }
         Ok(())
     }
@@ -2156,16 +2172,815 @@ pub(crate) fn init_lut(lumscale: i32, lumshift: i32, luty: &mut [u8; 256], lutuv
     }
 }
 
+/// Per-slot FFmpeg `guess_correct_pts` tracker so multi-packet lookahead preserves exact
+/// `(emitted_frame.pts, current_packet.dts)` pairing before frames leave `vc1-dec`.
+#[derive(Default)]
+struct Vc1PtsGuess {
+    last_pts: Option<i64>,
+    last_dts: Option<i64>,
+    faulty_pts: u64,
+    faulty_dts: u64,
+}
+
+impl Vc1PtsGuess {
+    fn resolve(&mut self, frame_pts: Option<i64>, packet_dts: Option<i64>) -> Option<i64> {
+        if let Some(d) = packet_dts {
+            if self.last_dts.is_some_and(|ld| d <= ld) {
+                self.faulty_dts += 1;
+            }
+            self.last_dts = Some(d);
+        }
+        if let Some(p) = frame_pts {
+            if self.last_pts.is_some_and(|lp| p <= lp) {
+                self.faulty_pts += 1;
+            }
+            self.last_pts = Some(p);
+        }
+        if (self.faulty_pts <= self.faulty_dts || packet_dts.is_none()) && frame_pts.is_some() {
+            frame_pts
+        } else {
+            packet_dts
+        }
+    }
+
+    fn resolve_tail(&mut self, frame_pts: Option<i64>) -> Option<i64> {
+        // With no new packet DTS at EOF, decode-order PTS must not win merely
+        // because the fallback is absent. Leave unreliable timing unset so the
+        // consumer continues the display clock; keep valid reordered PTS.
+        self.resolve(frame_pts, None).filter(|_| self.faulty_pts <= self.faulty_dts)
+    }
+}
+
+fn stamp_resolved_frames(
+    pts_guess: &mut Vc1PtsGuess,
+    frames: &mut [(Frame, (u32, u32))],
+    mut packet_dts: Option<i64>,
+) {
+    for (frame, _) in frames.iter_mut() {
+        if let Frame::Video(vf) = frame {
+            vf.pts = pts_guess.resolve(vf.pts, packet_dts.take());
+        }
+    }
+}
+
+/// Immutable sequence + entry-point + reference snapshot handed to a progressive `PICT_B` worker.
+struct Vc1BJob {
+    data: Vec<u8>,
+    pts: Option<i64>,
+    is_vc1: bool,
+    coded_width: i32,
+    coded_height: i32,
+    transform: TransformKind,
+    profile: i32,
+    res_sprite: bool,
+    res_y411: bool,
+    res_x8: bool,
+    multires: bool,
+    res_fasttx: bool,
+    rangered: bool,
+    res_rtm_flag: bool,
+    level: i32,
+    chromaformat: i32,
+    postprocflag: bool,
+    broadcast: bool,
+    interlace: bool,
+    tfcntrflag: bool,
+    panscanflag: bool,
+    refdist_flag: bool,
+    extended_dmv: bool,
+    hrd_param_flag: bool,
+    hrd_num_leaky_buckets: i32,
+    psf: bool,
+    loop_filter: bool,
+    max_coded_width: i32,
+    max_coded_height: i32,
+    fastuvmc: bool,
+    extended_mv: bool,
+    dquant: i32,
+    vstransform: bool,
+    overlap: bool,
+    max_b_frames: i32,
+    quantizer_mode: i32,
+    finterpflag: bool,
+    resync_marker: bool,
+    broken_link: bool,
+    closed_entry: bool,
+    zz_8x8: [[u8; 64]; 4],
+    left_blk_sh: u32,
+    top_blk_sh: u32,
+    zz_8x4: [u8; 64],
+    zz_4x8: [u8; 64],
+    zzi_8x8: [u8; 64],
+    respic: i32,
+    last_luty: [[u8; 256]; 2],
+    last_lutuv: [[u8; 256]; 2],
+    next_luty: [[u8; 256]; 2],
+    next_lutuv: [[u8; 256]; 2],
+    last_use_ic: bool,
+    next_use_ic: bool,
+    rnd: i32,
+    tff: bool,
+    refdist: i32,
+    ref_field_type: [i32; 2],
+    last: Arc<VPic>,
+    next: Arc<VPic>,
+}
+
+impl Vc1Decoder {
+    fn snapshot_for_b_worker(&self, data: Vec<u8>, pts: Option<i64>) -> Box<Vc1BJob> {
+        let last = Arc::clone(self.last.as_ref().expect("b-frame requires last"));
+        let next = Arc::clone(self.next.as_ref().expect("b-frame requires next"));
+        Box::new(Vc1BJob {
+            data,
+            pts,
+            is_vc1: self.is_vc1,
+            coded_width: self.coded_width,
+            coded_height: self.coded_height,
+            transform: self.transform,
+            profile: self.profile,
+            res_sprite: self.res_sprite,
+            res_y411: self.res_y411,
+            res_x8: self.res_x8,
+            multires: self.multires,
+            res_fasttx: self.res_fasttx,
+            rangered: self.rangered,
+            res_rtm_flag: self.res_rtm_flag,
+            level: self.level,
+            chromaformat: self.chromaformat,
+            postprocflag: self.postprocflag,
+            broadcast: self.broadcast,
+            interlace: self.interlace,
+            tfcntrflag: self.tfcntrflag,
+            panscanflag: self.panscanflag,
+            refdist_flag: self.refdist_flag,
+            extended_dmv: self.extended_dmv,
+            hrd_param_flag: self.hrd_param_flag,
+            hrd_num_leaky_buckets: self.hrd_num_leaky_buckets,
+            psf: self.psf,
+            loop_filter: self.loop_filter,
+            max_coded_width: self.max_coded_width,
+            max_coded_height: self.max_coded_height,
+            fastuvmc: self.fastuvmc,
+            extended_mv: self.extended_mv,
+            dquant: self.dquant,
+            vstransform: self.vstransform,
+            overlap: self.overlap,
+            max_b_frames: self.max_b_frames,
+            quantizer_mode: self.quantizer_mode,
+            finterpflag: self.finterpflag,
+            resync_marker: self.resync_marker,
+            broken_link: self.broken_link,
+            closed_entry: self.closed_entry,
+            zz_8x8: self.zz_8x8,
+            left_blk_sh: self.left_blk_sh,
+            top_blk_sh: self.top_blk_sh,
+            zz_8x4: self.zz_8x4,
+            zz_4x8: self.zz_4x8,
+            zzi_8x8: self.zzi_8x8,
+            respic: self.respic,
+            last_luty: self.last_luty,
+            last_lutuv: self.last_lutuv,
+            next_luty: self.next_luty,
+            next_lutuv: self.next_lutuv,
+            last_use_ic: self.last_use_ic,
+            next_use_ic: self.next_use_ic,
+            rnd: self.rnd,
+            tff: self.tff,
+            refdist: self.refdist,
+            ref_field_type: self.ref_field_type,
+            last,
+            next,
+        })
+    }
+
+    fn run_b_job(&mut self, job: Box<Vc1BJob>) -> Result<Vec<(Frame, (u32, u32))>> {
+        let need_reinit = !self.seq_initialized
+            || self.is_vc1 != job.is_vc1
+            || self.coded_width != job.coded_width
+            || self.coded_height != job.coded_height
+            || self.profile != job.profile
+            || self.dc_val.is_empty();
+        self.is_vc1 = job.is_vc1;
+        self.coded_width = job.coded_width;
+        self.coded_height = job.coded_height;
+        self.seq_initialized = true;
+        self.ep_initialized = true;
+        self.transform = job.transform;
+        self.profile = job.profile;
+        self.res_sprite = job.res_sprite;
+        self.res_y411 = job.res_y411;
+        self.res_x8 = job.res_x8;
+        self.multires = job.multires;
+        self.res_fasttx = job.res_fasttx;
+        self.rangered = job.rangered;
+        self.res_rtm_flag = job.res_rtm_flag;
+        self.level = job.level;
+        self.chromaformat = job.chromaformat;
+        self.postprocflag = job.postprocflag;
+        self.broadcast = job.broadcast;
+        self.interlace = job.interlace;
+        self.tfcntrflag = job.tfcntrflag;
+        self.panscanflag = job.panscanflag;
+        self.refdist_flag = job.refdist_flag;
+        self.extended_dmv = job.extended_dmv;
+        self.hrd_param_flag = job.hrd_param_flag;
+        self.hrd_num_leaky_buckets = job.hrd_num_leaky_buckets;
+        self.psf = job.psf;
+        self.loop_filter = job.loop_filter;
+        self.max_coded_width = job.max_coded_width;
+        self.max_coded_height = job.max_coded_height;
+        self.fastuvmc = job.fastuvmc;
+        self.extended_mv = job.extended_mv;
+        self.dquant = job.dquant;
+        self.vstransform = job.vstransform;
+        self.overlap = job.overlap;
+        self.max_b_frames = job.max_b_frames;
+        self.quantizer_mode = job.quantizer_mode;
+        self.finterpflag = job.finterpflag;
+        self.resync_marker = job.resync_marker;
+        self.broken_link = job.broken_link;
+        self.closed_entry = job.closed_entry;
+        self.zz_8x8 = job.zz_8x8;
+        self.left_blk_sh = job.left_blk_sh;
+        self.top_blk_sh = job.top_blk_sh;
+        self.zz_8x4 = job.zz_8x4;
+        self.zz_4x8 = job.zz_4x8;
+        self.zzi_8x8 = job.zzi_8x8;
+        if need_reinit {
+            self.finish_init()?;
+        }
+        self.low_delay = false;
+        self.respic = job.respic;
+        self.last_luty = job.last_luty;
+        self.last_lutuv = job.last_lutuv;
+        self.next_luty = job.next_luty;
+        self.next_lutuv = job.next_lutuv;
+        self.last_use_ic = job.last_use_ic;
+        self.next_use_ic = job.next_use_ic;
+        self.rnd = job.rnd;
+        self.tff = job.tff;
+        self.refdist = job.refdist;
+        self.ref_field_type = job.ref_field_type;
+        self.last = Some(job.last);
+        self.next = Some(job.next);
+        self.pending.clear();
+        let res = self.decode_frame(&job.data, job.pts);
+        self.last = None;
+        self.next = None;
+        res?;
+        Ok(self.pending.drain(..).collect())
+    }
+
+    /// Peeks the first ~16 header bits without mutating decoder state to check whether `data`
+    /// is a self-contained progressive non-BI `PICT_B` frame safe for concurrent worker execution.
+    fn peek_progressive_b_frame(&self, data: &[u8]) -> bool {
+        if !self.seq_initialized
+            || !self.ep_initialized
+            || self.low_delay
+            || self.res_sprite
+            || self.width != self.coded_width
+            || self.height != self.coded_height
+            || self.dc_val.is_empty()
+            || self.last.is_none()
+            || self.next.is_none()
+        {
+            return false;
+        }
+        let mut buf_size = data.len();
+        if buf_size >= 4
+            && u32::from_be_bytes([data[buf_size - 4], data[buf_size - 3], data[buf_size - 2], data[buf_size - 1]])
+                == VC1_CODE_ENDOFSEQ
+        {
+            buf_size -= 4;
+        }
+        let buf = &data[..buf_size];
+        if buf.is_empty() {
+            return false;
+        }
+        let mut hdr_scratch = [0u8; 32];
+        let hdr: &[u8] = if self.is_vc1 {
+            let byte = |i: usize| buf.get(i).copied().unwrap_or(0);
+            let first = u32::from_be_bytes([byte(0), byte(1), byte(2), byte(3)]);
+            let frame_payload: &[u8] = if buf.len() >= 4 && (first & !0xFF) == 0x100 {
+                let end = buf.len();
+                let mut start = 0usize;
+                let mut next = 0usize;
+                let mut found_frame: Option<&[u8]> = None;
+                while next < end {
+                    next = dsp::find_next_marker(buf, start + 4);
+                    let size = next as isize - start as isize - 4;
+                    if size > 0 {
+                        let code = u32::from_be_bytes([buf[start], buf[start + 1], buf[start + 2], buf[start + 3]]);
+                        match code {
+                            VC1_CODE_FRAME => {
+                                if found_frame.is_some() {
+                                    return false;
+                                }
+                                found_frame = Some(&buf[start + 4..next]);
+                            }
+                            VC1_CODE_SLICE => {}
+                            _ => return false,
+                        }
+                    }
+                    start = next;
+                }
+                let Some(fp) = found_frame else { return false };
+                fp
+            } else if self.interlace && (buf[0] & 0xC0) == 0xC0 {
+                return false;
+            } else {
+                buf
+            };
+            let n = dsp::unescape_prefix(frame_payload, &mut hdr_scratch);
+            &hdr_scratch[..n]
+        } else {
+            &buf[..buf.len().min(32)]
+        };
+        if hdr.is_empty() {
+            return false;
+        }
+        let mut gb = BitReader::new(hdr);
+        if self.profile < PROFILE_ADVANCED {
+            if self.finterpflag {
+                gb.skip(1);
+            }
+            gb.skip(2);
+            if self.rangered {
+                gb.skip(1);
+            }
+            if gb.read_bit() != 0 {
+                return false;
+            }
+            if self.max_b_frames == 0 || gb.read_bit() != 0 {
+                return false;
+            }
+            let mut idx = gb.read(3) as usize;
+            if idx == 7 {
+                idx = 7 + gb.read(4) as usize;
+            }
+            idx < 21 && VC1_BFRACTION_LUT[idx] != 0
+        } else {
+            let fcm = if self.interlace { gb.decode012() as u8 } else { PROGRESSIVE };
+            if fcm == ILACE_FRAME {
+                return gb.get_unary(0, 4) == 1;
+            }
+            if fcm != PROGRESSIVE {
+                return false;
+            }
+            if gb.get_unary(0, 4) != 1 {
+                return false;
+            }
+            if self.tfcntrflag {
+                gb.skip(8);
+            }
+            if self.broadcast {
+                gb.skip(2);
+            }
+            gb.skip(1);
+            if self.interlace {
+                gb.skip(1);
+            }
+            if self.finterpflag {
+                gb.skip(1);
+            }
+            let mut idx = gb.read(3) as usize;
+            if idx == 7 {
+                idx = 7 + gb.read(4) as usize;
+            }
+            idx < 21 && VC1_BFRACTION_LUT[idx] != 0
+        }
+    }
+
+    fn clone_config_for_coordinator(&self) -> Self {
+        let id_str = if self.is_vc1 { CODEC_ID_VC1 } else { CODEC_ID_WMV3 };
+        let mut d = Self::blank(id_str, self.is_vc1);
+        d.coded_width = self.coded_width;
+        d.coded_height = self.coded_height;
+        d.seq_initialized = self.seq_initialized;
+        d.ep_initialized = self.ep_initialized;
+        d.transform = self.transform;
+        d.profile = self.profile;
+        d.res_sprite = self.res_sprite;
+        d.res_y411 = self.res_y411;
+        d.res_x8 = self.res_x8;
+        d.multires = self.multires;
+        d.res_fasttx = self.res_fasttx;
+        d.rangered = self.rangered;
+        d.res_rtm_flag = self.res_rtm_flag;
+        d.level = self.level;
+        d.chromaformat = self.chromaformat;
+        d.postprocflag = self.postprocflag;
+        d.broadcast = self.broadcast;
+        d.interlace = self.interlace;
+        d.tfcntrflag = self.tfcntrflag;
+        d.panscanflag = self.panscanflag;
+        d.refdist_flag = self.refdist_flag;
+        d.extended_dmv = self.extended_dmv;
+        d.hrd_param_flag = self.hrd_param_flag;
+        d.hrd_num_leaky_buckets = self.hrd_num_leaky_buckets;
+        d.psf = self.psf;
+        d.loop_filter = self.loop_filter;
+        d.max_coded_width = self.max_coded_width;
+        d.max_coded_height = self.max_coded_height;
+        d.fastuvmc = self.fastuvmc;
+        d.extended_mv = self.extended_mv;
+        d.dquant = self.dquant;
+        d.vstransform = self.vstransform;
+        d.overlap = self.overlap;
+        d.max_b_frames = self.max_b_frames;
+        d.quantizer_mode = self.quantizer_mode;
+        d.finterpflag = self.finterpflag;
+        d.resync_marker = self.resync_marker;
+        d.broken_link = self.broken_link;
+        d.closed_entry = self.closed_entry;
+        d.zz_8x8 = self.zz_8x8;
+        d.left_blk_sh = self.left_blk_sh;
+        d.top_blk_sh = self.top_blk_sh;
+        d.zz_8x4 = self.zz_8x4;
+        d.zz_4x8 = self.zz_4x8;
+        d.zzi_8x8 = self.zzi_8x8;
+        if d.seq_initialized && d.ep_initialized && d.coded_width > 0 && d.coded_height > 0 {
+            let _ = d.finish_init();
+        }
+        d
+    }
+
+    fn flush_serial(&mut self) -> Result<()> {
+        let prev_len = self.pending.len();
+        if !self.low_delay {
+            if let Some(next) = self.next.take() {
+                let size = (self.width as u32, self.height as u32);
+                let flushed_pts = next.pts;
+                self.pending
+                    .push_back((next.pic.to_frame(self.width as usize, self.height as usize, flushed_pts), size));
+                self.recycle_vpic(next);
+            }
+        }
+        for (frame, _) in self.pending.iter_mut().skip(prev_len) {
+            if let Frame::Video(vf) = frame {
+                vf.pts = self.pts_guess.resolve_tail(vf.pts);
+            }
+        }
+        if let Some(l) = self.last.take() {
+            self.recycle_vpic(l);
+        }
+        Ok(())
+    }
+}
+
+struct BWorkerTask {
+    job: Box<Vc1BJob>,
+    reply: mpsc::Sender<Result<Vec<(Frame, (u32, u32))>>>,
+}
+
+struct BPoolQueue {
+    tasks: VecDeque<BWorkerTask>,
+    closed: bool,
+}
+
+struct Vc1BPool {
+    shared: Arc<(Mutex<BPoolQueue>, Condvar)>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Vc1BPool {
+    fn new(n_workers: usize, is_vc1: bool) -> Self {
+        let shared = Arc::new((
+            Mutex::new(BPoolQueue { tasks: VecDeque::new(), closed: false }),
+            Condvar::new(),
+        ));
+        let id_str = if is_vc1 { CODEC_ID_VC1 } else { CODEC_ID_WMV3 };
+        let mut handles = Vec::with_capacity(n_workers);
+        for idx in 0..n_workers {
+            let sh = Arc::clone(&shared);
+            let h = std::thread::Builder::new()
+                .name(format!("vc1-b-{idx}"))
+                .spawn(move || {
+                    let mut worker_dec = Vc1Decoder::blank(id_str, is_vc1);
+                    loop {
+                        let task = {
+                            let (lock, cv) = &*sh;
+                            let mut q = lock.lock().unwrap();
+                            while q.tasks.is_empty() && !q.closed {
+                                q = cv.wait(q).unwrap();
+                            }
+                            if let Some(t) = q.tasks.pop_front() {
+                                t
+                            } else {
+                                return;
+                            }
+                        };
+                        let res = worker_dec.run_b_job(task.job);
+                        let _ = task.reply.send(res);
+                    }
+                })
+                .expect("spawn vc1-b worker");
+            handles.push(h);
+        }
+        Self { shared, handles }
+    }
+
+    fn submit(&self, job: Box<Vc1BJob>) -> mpsc::Receiver<Result<Vec<(Frame, (u32, u32))>>> {
+        let (tx, rx) = mpsc::channel();
+        let (lock, cv) = &*self.shared;
+        let mut q = lock.lock().unwrap();
+        q.tasks.push_back(BWorkerTask { job, reply: tx });
+        cv.notify_one();
+        rx
+    }
+}
+
+impl Drop for Vc1BPool {
+    fn drop(&mut self) {
+        {
+            let (lock, cv) = &*self.shared;
+            if let Ok(mut q) = lock.lock() {
+                q.closed = true;
+                q.tasks.clear();
+                cv.notify_all();
+            }
+        }
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+enum PipeCmd {
+    Packet { data: Vec<u8>, pts: Option<i64>, dts: Option<i64> },
+    Flush,
+}
+
+enum PipeMsg {
+    PacketDone(Result<Vec<(Frame, (u32, u32))>>),
+    Flushed(Vec<(Frame, (u32, u32))>),
+}
+
+enum CoordinatorSlot {
+    Sync {
+        res: Result<Vec<(Frame, (u32, u32))>>,
+        dts: Option<i64>,
+    },
+    AsyncB {
+        rx: mpsc::Receiver<Result<Vec<(Frame, (u32, u32))>>>,
+        dts: Option<i64>,
+    },
+}
+
+const VC1_LOOKAHEAD_PACKETS: usize = 12;
+const VC1_WAIT_PACKETS: usize = 4;
+
+struct Vc1AsyncPipe {
+    cmd_tx: Option<mpsc::SyncSender<PipeCmd>>,
+    msg_rx: mpsc::Receiver<PipeMsg>,
+    unanswered: usize,
+    ready_out: VecDeque<(Frame, (u32, u32))>,
+    deferred_err: Option<Error>,
+    coord_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Vc1AsyncPipe {
+    fn spawn(mut inner: Vc1Decoder, b_workers: usize) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PipeCmd>(VC1_LOOKAHEAD_PACKETS);
+        let (msg_tx, msg_rx) = mpsc::channel::<PipeMsg>();
+        let is_vc1 = inner.is_vc1;
+        let coord_handle = std::thread::Builder::new()
+            .name("vc1-dec".into())
+            .spawn(move || {
+                let pool = (b_workers > 0).then(|| Vc1BPool::new(b_workers, is_vc1));
+                let mut slots: VecDeque<CoordinatorSlot> = VecDeque::new();
+                let mut pts_guess = Vc1PtsGuess::default();
+                let max_in_flight = b_workers + 4;
+                let drain_ready = |slots: &mut VecDeque<CoordinatorSlot>,
+                                   pts_guess: &mut Vc1PtsGuess,
+                                   force_all: bool,
+                                   msg_tx: &mpsc::Sender<PipeMsg>|
+                 -> bool {
+                    while let Some(front) = slots.front() {
+                        let (mut resolved, pkt_dts) = match front {
+                            CoordinatorSlot::Sync { .. } => {
+                                let Some(CoordinatorSlot::Sync { res, dts }) = slots.pop_front() else {
+                                    unreachable!()
+                                };
+                                (res, dts)
+                            }
+                            CoordinatorSlot::AsyncB { rx, .. } => {
+                                if force_all || slots.len() > max_in_flight {
+                                    let Some(CoordinatorSlot::AsyncB { rx, dts }) = slots.pop_front() else {
+                                        unreachable!()
+                                    };
+                                    let r = rx
+                                        .recv()
+                                        .unwrap_or_else(|_| Err(Error::Other("vc1 B-worker exited".into())));
+                                    (r, dts)
+                                } else {
+                                    match rx.try_recv() {
+                                        Ok(r) => {
+                                            let Some(CoordinatorSlot::AsyncB { dts, .. }) = slots.pop_front() else {
+                                                unreachable!()
+                                            };
+                                            (r, dts)
+                                        }
+                                        Err(mpsc::TryRecvError::Empty) => break,
+                                        Err(mpsc::TryRecvError::Disconnected) => {
+                                            let Some(CoordinatorSlot::AsyncB { dts, .. }) = slots.pop_front() else {
+                                                unreachable!()
+                                            };
+                                            (Err(Error::Other("vc1 B-worker disconnected".into())), dts)
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        if let Ok(frames) = &mut resolved {
+                            stamp_resolved_frames(pts_guess, frames, pkt_dts);
+                        }
+                        if msg_tx.send(PipeMsg::PacketDone(resolved)).is_err() {
+                            return false;
+                        }
+                    }
+                    true
+                };
+
+                loop {
+                    if !drain_ready(&mut slots, &mut pts_guess, false, &msg_tx) {
+                        return;
+                    }
+                    let cmd = if slots.is_empty() {
+                        match cmd_rx.recv() {
+                            Ok(cmd) => cmd,
+                            Err(_) => break,
+                        }
+                    } else {
+                        // Keep accepting packets while B-workers finish; do not strand their output.
+                        match cmd_rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                            Ok(cmd) => cmd,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    };
+                    match cmd {
+                        PipeCmd::Packet { data, pts, dts } => {
+                            if let Some(b_pool) = &pool
+                                && inner.peek_progressive_b_frame(&data)
+                            {
+                                let job = inner.snapshot_for_b_worker(data, pts);
+                                slots.push_back(CoordinatorSlot::AsyncB {
+                                    rx: b_pool.submit(job),
+                                    dts,
+                                });
+                            } else {
+                                inner.pending.clear();
+                                let res = inner.decode_frame(&data, pts).map(|()| inner.pending.drain(..).collect());
+                                slots.push_back(CoordinatorSlot::Sync { res, dts });
+                            }
+                            if !drain_ready(&mut slots, &mut pts_guess, false, &msg_tx) {
+                                return;
+                            }
+                        }
+                        PipeCmd::Flush => {
+                            if !drain_ready(&mut slots, &mut pts_guess, true, &msg_tx) {
+                                return;
+                            }
+                            inner.pending.clear();
+                            let _ = inner.flush_serial();
+                            let mut tail: Vec<_> = inner.pending.drain(..).collect();
+                            for (frame, _) in &mut tail {
+                                if let Frame::Video(vf) = frame {
+                                    vf.pts = pts_guess.resolve_tail(vf.pts);
+                                }
+                            }
+                            if msg_tx.send(PipeMsg::Flushed(tail)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn vc1-dec");
+
+        Self {
+            cmd_tx: Some(cmd_tx),
+            msg_rx,
+            unanswered: 0,
+            ready_out: VecDeque::new(),
+            deferred_err: None,
+            coord_handle: Some(coord_handle),
+        }
+    }
+
+    fn harvest_nonblocking(&mut self) {
+        while let Ok(msg) = self.msg_rx.try_recv() {
+            self.apply_msg(msg);
+        }
+    }
+
+    fn apply_msg(&mut self, msg: PipeMsg) {
+        match msg {
+            PipeMsg::PacketDone(Ok(frames)) => {
+                self.unanswered = self.unanswered.saturating_sub(1);
+                self.ready_out.extend(frames);
+            }
+            PipeMsg::PacketDone(Err(e)) => {
+                self.unanswered = self.unanswered.saturating_sub(1);
+                if self.deferred_err.is_none() {
+                    self.deferred_err = Some(e);
+                }
+            }
+            PipeMsg::Flushed(frames) => {
+                self.unanswered = 0;
+                self.ready_out.extend(frames);
+            }
+        }
+    }
+}
+
+impl Drop for Vc1AsyncPipe {
+    fn drop(&mut self) {
+        drop(self.cmd_tx.take());
+        if let Some(h) = self.coord_handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 impl Decoder for Vc1Decoder {
     fn codec_id(&self) -> &CodecId {
         &self.codec_id
     }
 
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let total = ctx.effective_workers(4);
+            if total >= 2
+                && self.async_pipe.is_none()
+                && self.pending.is_empty()
+                && self.last.is_none()
+                && self.next.is_none()
+            {
+                let b_workers = total - 1;
+                let inner = self.clone_config_for_coordinator();
+                self.async_pipe = Some(Vc1AsyncPipe::spawn(inner, b_workers));
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = ctx;
+    }
+
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.decode_frame(&packet.data, packet.pts)
+        if let Some(pipe) = self.async_pipe.as_mut() {
+            pipe.harvest_nonblocking();
+            if let Some(e) = pipe.deferred_err.take() {
+                return Err(e);
+            }
+            if let Some(tx) = pipe.cmd_tx.as_ref() {
+                tx.send(PipeCmd::Packet {
+                    data: packet.data.clone(),
+                    pts: packet.pts,
+                    dts: packet.dts,
+                })
+                .map_err(|_| Error::Other("vc1 async decoder closed".into()))?;
+                pipe.unanswered += 1;
+            }
+            pipe.harvest_nonblocking();
+            if let Some(e) = pipe.deferred_err.take() {
+                return Err(e);
+            }
+            return Ok(());
+        }
+        let prev_len = self.pending.len();
+        self.decode_frame(&packet.data, packet.pts)?;
+        let mut pkt_dts = packet.dts;
+        for (frame, _) in self.pending.iter_mut().skip(prev_len) {
+            if let Frame::Video(vf) = frame {
+                vf.pts = self.pts_guess.resolve(vf.pts, pkt_dts.take());
+            }
+        }
+        Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
+        if let Some(pipe) = self.async_pipe.as_mut() {
+            pipe.harvest_nonblocking();
+            if let Some(e) = pipe.deferred_err.take() {
+                return Err(e);
+            }
+            while pipe.ready_out.is_empty() && pipe.unanswered >= VC1_WAIT_PACKETS {
+                match pipe.msg_rx.recv() {
+                    Ok(msg) => {
+                        pipe.apply_msg(msg);
+                        if let Some(e) = pipe.deferred_err.take() {
+                            return Err(e);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let (frame, size) = pipe.ready_out.pop_front().ok_or(Error::NeedMore)?;
+            self.last_output = Some(size);
+            return Ok(frame);
+        }
         let (frame, size) = self.pending.pop_front().ok_or(Error::NeedMore)?;
         self.last_output = Some(size);
         Ok(frame)
@@ -2174,8 +2989,13 @@ impl Decoder for Vc1Decoder {
     /// The frame last returned; before the first, the next queued one.
     /// The coded size (`init_context`); display size only sets the aspect.
     fn output_video_dimensions(&self) -> Option<(u32, u32)> {
+        let queued = if let Some(pipe) = self.async_pipe.as_ref() {
+            pipe.ready_out.front().map(|(_, size)| *size)
+        } else {
+            self.pending.front().map(|(_, size)| *size)
+        };
         self.last_output
-            .or_else(|| self.pending.front().map(|(_, size)| *size))
+            .or(queued)
             .filter(|&(w, h)| w > 0 && h > 0)
     }
 
@@ -2184,18 +3004,23 @@ impl Decoder for Vc1Decoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        // End of stream: the last reference is still waiting (B-frame delay).
-        if !self.low_delay {
-            if let Some(next) = self.next.take() {
-                let size = (self.width as u32, self.height as u32);
-                self.pending
-                    .push_back((next.pic.to_frame(self.width as usize, self.height as usize, None), size));
-                self.spare.push(next);
+        if let Some(pipe) = self.async_pipe.as_mut() {
+            if let Some(tx) = pipe.cmd_tx.as_ref()
+                && tx.send(PipeCmd::Flush).is_ok()
+            {
+                while let Ok(msg) = pipe.msg_rx.recv() {
+                    let is_flushed = matches!(msg, PipeMsg::Flushed(_));
+                    pipe.apply_msg(msg);
+                    if is_flushed {
+                        break;
+                    }
+                }
             }
+            if let Some(e) = pipe.deferred_err.take() {
+                return Err(e);
+            }
+            return Ok(());
         }
-        if let Some(l) = self.last.take() {
-            self.spare.push(l);
-        }
-        Ok(())
+        self.flush_serial()
     }
 }

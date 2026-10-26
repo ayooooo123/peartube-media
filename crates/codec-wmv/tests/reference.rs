@@ -293,3 +293,239 @@ fn wmv2_vsynth_matches_ffmpeg() {
     let path = encoded_sample("wmv2_cif", "352x288", &["-c:v", "wmv2", "-qscale:v", "10"]);
     check_video_path(&path, &[codec_wmv::register, oxideav_avi::__oxideav_entry], &["-idct", "simple"]);
 }
+
+/// The first three packets are reference, reference, B in decode order and
+/// reference, B, reference in display order. Synthetic demux PTS equals DTS:
+/// the B is timed at slot 2, so the delayed reference must continue at slot 3,
+/// not return to its decode slot 1. Consumers infer that last slot from an
+/// untimed frame plus the packet duration (the player's `FrameClock` rule).
+#[test]
+fn vc1_flush_tail_preserves_presentation_pts_but_not_synthetic_decode_pts() {
+    use oxideav_core::{Error, ExecutionContext, Frame};
+
+    for (sample, format) in [("vc1/SMM0005.rcv", "vc1test"), ("vc1/SA10143.vc1", "vc1")] {
+        let path = fate(sample);
+        let mut ctx = RuntimeContext::new();
+        codec_wmv::register(&mut ctx);
+        let mut demux = ctx.containers.open_demuxer(format, Box::new(File::open(&path).unwrap()), &ctx.codecs).unwrap();
+        let stream = demux.streams()[0].clone();
+        let packets: Vec<_> = (0..3).map(|_| demux.next_packet().unwrap()).collect();
+        let step = packets[0].duration.expect("fixed-rate fixture duration");
+        assert!(step > 0);
+        for (i, packet) in packets.iter().enumerate() {
+            assert_eq!(packet.pts, Some(i as i64 * step), "{sample}: synthetic packet PTS");
+            assert_eq!(packet.dts, packet.pts, "{sample}: synthetic packet DTS");
+            assert_eq!(packet.duration, Some(step), "{sample}: fixed cadence");
+        }
+        // FFmpeg independently establishes both frame identity and display order.
+        let reference = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", &["-idct", "simple"]);
+        assert_eq!(
+            ffprobe(&["-read_intervals", "%+#3", "-show_entries", "frame=pict_type", "-of", "csv=p=0"], &path)
+                .lines()
+                .collect::<Vec<_>>(),
+            if format == "vc1test" { vec!["I", "B", "P"] } else { vec!["P", "B", "P"] },
+            "{sample}: fixture display order"
+        );
+
+        for threads in [1, 3] {
+            for presentation_pts in [false, true] {
+                let mut packets = packets.clone();
+                let offset = 100 * step;
+                if presentation_pts {
+                    // A container can supply actual reordered PTS, distinct from DTS.
+                    for (packet, slot) in packets.iter_mut().zip([0, 2, 1]) {
+                        packet.pts = Some(offset + slot * step);
+                    }
+                }
+                let mut decoder = ctx.codecs.first_decoder(&stream.params).unwrap();
+                decoder.set_execution_context(&ExecutionContext::with_threads(threads));
+                let mut pts = Vec::new();
+                let mut md5 = Vec::new();
+                for packet in packets.iter().map(Some).chain(std::iter::once(None)) {
+                    if let Some(packet) = packet {
+                        decoder.send_packet(packet).unwrap();
+                    } else {
+                        decoder.flush().unwrap();
+                    }
+                    loop {
+                        match decoder.receive_frame() {
+                            Ok(Frame::Video(frame)) => {
+                                let (w, h) = decoder.output_video_dimensions().expect("frame dimensions");
+                                let (w, h) = (w as usize, h as usize);
+                                let dims = [(w, h), (w.div_ceil(2), h.div_ceil(2)), (w.div_ceil(2), h.div_ceil(2))];
+                                md5.push(refcheck::md5_hex(&refcheck::pack(&frame, &dims)));
+                                pts.push(frame.pts);
+                            }
+                            Ok(_) => panic!("{sample}: non-video frame"),
+                            Err(Error::NeedMore | Error::Eof) => break,
+                            Err(e) => panic!("{sample} (threads={threads}, presentation_pts={presentation_pts}): {e}"),
+                        }
+                    }
+                }
+                assert_eq!(md5, reference[..3], "{sample}: truncated GOP display frames, threads={threads}");
+                let expected_pts = if presentation_pts {
+                    vec![Some(offset), Some(offset + step), Some(offset + 2 * step)]
+                } else {
+                    vec![Some(0), Some(2 * step), None]
+                };
+                assert_eq!(pts, expected_pts, "{sample}: decoder PTS, threads={threads}, presentation_pts={presentation_pts}");
+                let mut next = 0;
+                let display_pts: Vec<_> = pts
+                    .into_iter()
+                    .map(|pts| {
+                        let display = pts.unwrap_or(next);
+                        next = display + step;
+                        display
+                    })
+                    .collect();
+                let expected_display = if presentation_pts {
+                    vec![offset, offset + step, offset + 2 * step]
+                } else {
+                    vec![0, 2 * step, 3 * step]
+                };
+                assert_eq!(display_pts, expected_display, "{sample}: inferred display timeline, threads={threads}");
+            }
+        }
+    }
+}
+
+/// Exercises `Vc1Decoder` with `ExecutionContext::with_threads(3)` across every VC-1 / WMV3
+/// FATE sample (progressive, B-frames, sliced, interlaced, fragmented MP4), proving bit-exact
+/// frame MD5s, display order, output dimensions, PTS, flush tail, mid-stream drop/reopen, and
+/// corrupt-packet error propagation against serial decode and FFmpeg.
+#[test]
+fn vc1_and_wmv3_threaded_pipeline_matches_serial_and_ffmpeg() {
+    use oxideav_core::{Error, ExecutionContext, Frame, MediaType, Packet, TimeBase};
+
+    let cases: &[(&str, &[refcheck::Registrar], &[&str])] = &[
+        ("vc1/SMM0005.rcv", &[codec_wmv::register], &["-idct", "simple"]),
+        ("vc1/SMM0015.rcv", &[codec_wmv::register], &["-idct", "simple"]),
+        ("vc1/SA00040.vc1", &[codec_wmv::register], &["-idct", "simple"]),
+        ("vc1/SA00050.vc1", &[codec_wmv::register], &["-idct", "simple"]),
+        ("vc1/SA10091.vc1", &[codec_wmv::register], &["-idct", "simple"]),
+        ("vc1/SA10143.vc1", &[codec_wmv::register], &["-idct", "simple"]),
+        ("vc1/SA20021.vc1", &[codec_wmv::register], &["-idct", "simple"]),
+        ("vc1/ilaced_twomv.vc1", &[codec_wmv::register], &["-idct", "simple", "-flags", "+bitexact"]),
+        (
+            "isom/vc1-wmapro.ism",
+            &[codec_wmv::register, oxideav_mp4::__oxideav_entry, oxideav_mov::registry::register],
+            &["-idct", "simple"],
+        ),
+    ];
+
+    let decode_with = |sample: &str, registrars: &[refcheck::Registrar], threads: usize, abort_at: Option<usize>| {
+        let path = fate(sample);
+        let mut ctx = RuntimeContext::new();
+        for r in registrars {
+            r(&mut ctx);
+        }
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let container = ctx
+            .containers
+            .container_for_extension(ext)
+            .unwrap_or_else(|| if ext == "ism" { "mp4" } else { panic!("no container for {ext}") });
+        let mut demux = ctx
+            .containers
+            .open_demuxer(container, Box::new(File::open(&path).unwrap()), &ctx.codecs)
+            .unwrap();
+        let vstream = demux
+            .streams()
+            .iter()
+            .find(|s| s.params.media_type == MediaType::Video)
+            .unwrap()
+            .clone();
+        let mut dec = ctx.codecs.first_decoder(&vstream.params).unwrap();
+        dec.set_execution_context(&ExecutionContext::with_threads(threads));
+
+        let mut out_md5 = Vec::new();
+        let mut out_pts = Vec::new();
+        let mut out_dims = Vec::new();
+        let mut pkt_count = 0usize;
+        while let Ok(pkt) = demux.next_packet() {
+            if pkt.stream_index != vstream.index {
+                continue;
+            }
+            pkt_count += 1;
+            if abort_at.is_some_and(|lim| pkt_count > lim) {
+                // Drop `dec` mid-flight with workers queued to prove clean teardown without hang.
+                drop(dec);
+                return (out_md5, out_pts, out_dims);
+            }
+            dec.send_packet(&pkt).unwrap();
+            loop {
+                match dec.receive_frame() {
+                    Ok(Frame::Video(vf)) => {
+                        let (dw, dh) = dec.output_video_dimensions().expect("dims");
+                        let (w, h) = (dw as usize, dh as usize);
+                        let dims = [(w, h), (w.div_ceil(2), h.div_ceil(2)), (w.div_ceil(2), h.div_ceil(2))];
+                        out_md5.push(refcheck::md5_hex(&refcheck::pack(&vf, &dims)));
+                        out_pts.push(vf.pts);
+                        out_dims.push((dw, dh));
+                    }
+                    Ok(_) => {}
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
+                    Err(e) => panic!("{sample} (threads={threads}): {e}"),
+                }
+            }
+        }
+        dec.flush().unwrap();
+        loop {
+            match dec.receive_frame() {
+                Ok(Frame::Video(vf)) => {
+                    let (dw, dh) = dec.output_video_dimensions().expect("dims");
+                    let (w, h) = (dw as usize, dh as usize);
+                    let dims = [(w, h), (w.div_ceil(2), h.div_ceil(2)), (w.div_ceil(2), h.div_ceil(2))];
+                    out_md5.push(refcheck::md5_hex(&refcheck::pack(&vf, &dims)));
+                    out_pts.push(vf.pts);
+                    out_dims.push((dw, dh));
+                }
+                Ok(_) => {}
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("{sample} flush (threads={threads}): {e}"),
+            }
+        }
+        (out_md5, out_pts, out_dims)
+    };
+
+    for &(sample, registrars, ff_args) in cases {
+        let path = fate(sample);
+        let expected_ff = refcheck::ffmpeg_video_md5s_with(&path, 0, "yuv420p", ff_args);
+        let (ser_md5, ser_pts, ser_dims) = decode_with(sample, registrars, 1, None);
+        // Mid-stream abort/reopen check (simulating seek replacement while B-workers are active)
+        let _ = decode_with(sample, registrars, 3, Some(5));
+        let (mt_md5, mt_pts, mt_dims) = decode_with(sample, registrars, 3, None);
+        assert_eq!(mt_md5, expected_ff, "{sample}: threaded MD5s differ from FFmpeg");
+        assert_eq!(mt_md5, ser_md5, "{sample}: threaded MD5s differ from serial");
+        assert_eq!(mt_dims, ser_dims, "{sample}: threaded dimensions differ from serial");
+        assert_eq!(mt_pts, ser_pts, "{sample}: threaded PTS differ from serial");
+    }
+
+    // Corrupt packet error propagation under threaded mode (`uninitialized seq/ep` error)
+    let mut ctx = RuntimeContext::new();
+    codec_wmv::register(&mut ctx);
+    let mut params = oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("vc1"));
+    params.width = Some(320);
+    params.height = Some(240);
+    let mut dec = ctx.codecs.first_decoder(&params).unwrap();
+    dec.set_execution_context(&ExecutionContext::with_threads(3));
+    let bad = Packet {
+        stream_index: 0,
+        time_base: TimeBase::new(1, 1000),
+        pts: Some(0),
+        dts: Some(0),
+        duration: Some(41),
+        flags: Default::default(),
+        data: vec![0x00, 0x00, 0x01, 0x0D, 0xFF, 0xFF],
+    };
+    let mut saw_err = false;
+    for _ in 0..8 {
+        if dec.send_packet(&bad).is_err() || matches!(dec.receive_frame(), Err(e) if !matches!(e, Error::NeedMore | Error::Eof)) {
+            saw_err = true;
+            break;
+        }
+    }
+    if !saw_err && dec.flush().is_err() {
+        saw_err = true;
+    }
+    assert!(saw_err, "threaded Vc1Decoder must surface decode errors");
+}
