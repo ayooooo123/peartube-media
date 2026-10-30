@@ -14,6 +14,7 @@ use oxideav_core::{
     SampleFormat, StreamInfo, TimeBase, VideoFrame, PROBE_SCORE_EXTENSION,
 };
 
+mod aspect;
 mod captions;
 mod entry;
 mod decode_order;
@@ -95,6 +96,10 @@ pub struct State {
     pub video: Option<u32>,
     pub subtitle: Option<u32>,
     pub video_size: Option<(u32, u32)>,
+    /// One pixel's width over its height, `(h, v)`, when not square: the
+    /// picture shows `video_size.0 * h / v` wide. From the codec's headers,
+    /// which may arrive with the first packets, after `video_size`.
+    pub video_pixel_aspect: Option<(u32, u32)>,
     pub video_fps: Option<f64>,
     pub video_decoder: Option<String>,
     pub dropped_frames: u64,
@@ -947,6 +952,10 @@ fn run_player_pipeline(
                 (w > 0 && h > 0).then_some((w, h))
             })
         });
+        st.video_pixel_aspect = current_video
+            .and_then(|idx| streams.iter().find(|s| s.index == idx))
+            .and_then(|s| aspect::pixel_aspect(&s.params, &[]))
+            .flatten();
         st.video_fps = current_video.and_then(|idx| {
             streams.iter().find(|s| s.index == idx).and_then(|s| {
                 s.params
@@ -1404,6 +1413,10 @@ fn read_packet(demuxer: &mut dyn Demuxer) -> Read {
     }))
 }
 
+/// Video packets searched for the pixel's shape before giving up: headers
+/// lead a stream, so a stream without one in its first packets has none.
+const SHAPE_PACKETS: u32 = 64;
+
 fn run_demux_loop(run: &mut Run<'_>) {
     let shared = run.shared;
     let mut active: Vec<u32> = [run.current_video, run.current_audio, run.current_subtitle]
@@ -1414,6 +1427,12 @@ fn run_demux_loop(run: &mut Run<'_>) {
     let mut eof = false;
     let mut full = false;
     let mut captions = captions::Captions::new(run);
+    // The pixel's shape, when the setup bytes did not carry it: streams that
+    // send their headers inline have it in the first video packets.
+    let mut shape = find_stream(run.streams, run.current_video)
+        .map(|s| s.params)
+        .filter(|p| aspect::readable(p) && aspect::pixel_aspect(p, &[]).is_none());
+    let mut shape_packets = 0;
 
     // Resolve a start inside an intra-refresh cycle before any packet
     // reaches a decoder. B-pyramid decode order can put a
@@ -1519,6 +1538,17 @@ fn run_demux_loop(run: &mut Run<'_>) {
                 let end = pipe.and_then(|_| packet_end_secs(&packet.packet));
                 if pipe == Some(Pipe::Video) {
                     captions.video_packet(run, &packet.packet);
+                    if let Some(params) = &shape {
+                        shape_packets += 1;
+                        let found = aspect::pixel_aspect(params, &packet.packet.data);
+                        if found.is_some() || shape_packets >= SHAPE_PACKETS {
+                            shape = None;
+                        }
+                        if let Some(Some(pixel)) = found {
+                            shared.state.lock().video_pixel_aspect = Some(pixel);
+                            notify_changed(shared);
+                        }
+                    }
                 }
                 match pipe {
                     Some(Pipe::Video) => run.video_lane.push(packet),
@@ -1913,6 +1943,7 @@ fn retire_video(shared: &SharedState, message: String) {
     state.error.get_or_insert(message);
     state.video = None;
     state.video_size = None;
+    state.video_pixel_aspect = None;
     state.video_fps = None;
     drop(state);
     notify_changed_now(shared);
