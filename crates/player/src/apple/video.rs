@@ -713,8 +713,6 @@ struct Vp9SessionConfig {
 
 struct Vp9State {
     config: Vp9SessionConfig,
-    /// True once a real keyframe header has matched (or rebuilt) the session.
-    keyframe_aligned: bool,
     color_signal: oxideav_core::ColorSignal,
     frame_rate: Option<oxideav_core::Rational>,
 }
@@ -864,19 +862,12 @@ unsafe extern "C" {
     ) -> i32;
     fn VTDecompressionSessionWaitForAsynchronousFrames(session: *const CFType) -> i32;
     fn VTDecompressionSessionInvalidate(session: *const CFType);
-    fn VTSessionSetProperty(
-        session: *const CFType,
-        property_key: *const CFString,
-        property_value: *const CFType,
-    ) -> i32;
     fn VTSessionCopyProperty(
         session: *const CFType,
         property_key: *const CFString,
         allocator: *const std::ffi::c_void,
         property_value_out: *mut *const CFType,
     ) -> i32;
-    static kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata: &'static CFString;
-    static kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder: &'static CFString;
 }
 
 struct NativeDecoder {
@@ -934,14 +925,6 @@ impl NativeDecoder {
             )));
         }
         let session = unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw)) };
-        // Older OSes lack this key and return a non-zero status; ignore.
-        unsafe {
-            let _ = VTSessionSetProperty(
-                &*session,
-                kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
-                CFBoolean::new(true) as *const CFBoolean as *const CFType,
-            );
-        }
         Ok(Self {
             session,
             output,
@@ -978,14 +961,12 @@ impl NativeDecoder {
     }
 
     fn using_hardware(&self) -> bool {
+        // The literal key, not the framework constant: the constant is iOS 17+,
+        // and a strong reference to it would stop the app loading on older iOS.
+        let key = CFString::from_str("UsingHardwareAcceleratedVideoDecoder");
         let mut raw: *const CFType = ptr::null();
         let status = unsafe {
-            VTSessionCopyProperty(
-                &*self.session,
-                kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
-                ptr::null(),
-                &mut raw,
-            )
+            VTSessionCopyProperty(&*self.session, &*key, ptr::null(), &mut raw)
         };
         if status != 0 || raw.is_null() {
             return false;
@@ -2067,7 +2048,6 @@ impl AppleDevice {
                     })?;
                 let vp9 = Vp9State {
                     config,
-                    keyframe_aligned: false,
                     color_signal: params.color_signal,
                     frame_rate: params.frame_rate,
                 };
@@ -3590,9 +3570,6 @@ fn ensure_vp9_session(
         vp9.config != new_cfg
     };
     if !needs_rebuild {
-        if let Some(vp9) = compressed.vp9.as_mut() {
-            vp9.keyframe_aligned = true;
-        }
         return Ok(());
     }
 
@@ -3614,10 +3591,9 @@ fn ensure_vp9_session(
             held_output,
             true,
         )?;
-        // Drop any undeliverable remainder so the rebuild can proceed.
-        if held_output.is_some() {
-            dec.output.pictures.lock().clear();
-        }
+        // Pictures still queued after a blocked enqueue stay in the shared
+        // output (`recreate` keeps it), sorted by time, so they are shown
+        // before the new session's pictures.
     }
 
     let (color_signal, frame_rate) = {
@@ -3636,7 +3612,6 @@ fn ensure_vp9_session(
     compressed.format = format;
     if let Some(vp9) = compressed.vp9.as_mut() {
         vp9.config = new_cfg;
-        vp9.keyframe_aligned = true;
     }
     Ok(())
 }
