@@ -1703,7 +1703,7 @@ dependencies = [
 [[package]]
 name = "oxideav-vp9"
 version = "0.0.13"
-source = "git+https://github.com/ayooooo123/oxideav-vp9?rev=35a7c43234e04c2d8d12e1cd6a2fda41be5e411e#35a7c43234e04c2d8d12e1cd6a2fda41be5e411e"
+source = "git+https://github.com/ayooooo123/oxideav-vp9?rev=2737c8be4b56381075861f746968a08d05902ee9#2737c8be4b56381075861f746968a08d05902ee9"
 dependencies = [
  "oxideav-core",
 ]

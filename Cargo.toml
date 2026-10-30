@@ -256,6 +256,6 @@ oxideav-vc2 = { git = "https://github.com/ayooooo123/oxideav-vc2", rev = "364ebd
 oxideav-vorbis = { git = "https://github.com/ayooooo123/oxideav-vorbis", rev = "01fa38348842cb32613558ae71d39aa3fa2b4525" }
 oxideav-vp6 = { git = "https://github.com/ayooooo123/oxideav-vp6", rev = "4a2ff51bc5e139b1833f3bf08dd1f167e6225c29" }
 oxideav-vp8 = { git = "https://github.com/ayooooo123/oxideav-vp8", rev = "5aad171851320a741981f3d331c1e3cfdb48c044" }
-oxideav-vp9 = { git = "https://github.com/ayooooo123/oxideav-vp9", rev = "35a7c43234e04c2d8d12e1cd6a2fda41be5e411e" }
+oxideav-vp9 = { git = "https://github.com/ayooooo123/oxideav-vp9", rev = "2737c8be4b56381075861f746968a08d05902ee9" }
 oxideav-wma = { git = "https://github.com/OxideAV/oxideav-wma", rev = "ab1eeb2acb51388d5da21e735723ac05bd7226fe" }
 # END pin-oxideav
