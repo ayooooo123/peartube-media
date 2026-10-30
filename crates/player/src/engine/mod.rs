@@ -18,8 +18,6 @@ mod aspect;
 mod captions;
 mod entry;
 mod decode_order;
-mod bridge;
-mod native;
 
 pub use captions::{CAPTIONS_608, CAPTIONS_708};
 
@@ -462,9 +460,6 @@ struct SharedState {
     last_changed: Mutex<Instant>,
     /// The demuxer's source, for suspend/resume.
     source: Mutex<Option<SourceMonitor>>,
-    /// Sources the native route opened besides `source` (its segment
-    /// producer's): stopped with it.
-    native_sources: Mutex<Vec<SourceMonitor>>,
     /// Monotonic counter bumped by every `seek`. The demux loop applies the
     /// newest request; decoder threads compare their local copy against it to
     /// detect a seek they have not yet honoured.
@@ -597,7 +592,6 @@ impl Player {
             on_event: on_event_arc,
             last_changed: Mutex::new(Instant::now() - Duration::from_secs(1)),
             source: Mutex::new(None),
-            native_sources: Mutex::new(Vec::new()),
             seek_gen: AtomicU64::new(0),
             seek_target: Mutex::new(None),
             active_seek: Mutex::new(None),
@@ -671,18 +665,12 @@ impl Player {
         if let Some(src) = &*self.shared.source.lock() {
             src.suspend();
         }
-        for src in self.shared.native_sources.lock().iter() {
-            src.suspend();
-        }
         self.shared.backend.suspend();
         notify_changed(&self.shared);
     }
 
     pub fn resume(&self) {
         if let Some(src) = &*self.shared.source.lock() {
-            src.resume();
-        }
-        for src in self.shared.native_sources.lock().iter() {
             src.resume();
         }
         self.shared.backend.resume();
@@ -723,9 +711,6 @@ impl Drop for Player {
             }
             None => false,
         };
-        for source in self.shared.native_sources.lock().iter() {
-            source.stop();
-        }
         self.shared.condvar.notify_all();
         if let Some(pipeline) = self.pipeline.take() {
             // Until the source exists the pipeline thread may sit in the
@@ -814,7 +799,6 @@ fn run_player_pipeline(
         return;
     }
 
-    let mut container = String::new();
     let demuxer = if vobsub.is_some() {
         // 2-3. VobSub: the index, read whole as it opens, beside the
         //    program stream (FFmpeg's vobsub demuxer pairs them the same
@@ -833,7 +817,7 @@ fn run_player_pipeline(
         }
     } else {
         // 2. Probe (rule from engine-api.md, same as refcheck), then rewind.
-        container = match probe_container(&url, &mut source, &shared) {
+        let container = match probe_container(&url, &mut source, &shared) {
             Ok(c) => c,
             Err(e) => {
                 if !shared.stopped.load(Ordering::SeqCst) {
@@ -962,7 +946,7 @@ fn run_player_pipeline(
                     .frame_rate
                     .filter(|r| r.num > 0 && r.den > 0)
                     .map(|r| r.num as f64 / r.den as f64)
-                    .or_else(|| crate::native::codec::video_config(&s.params, &[]).and_then(|c| c.frame_rate))
+                    .or_else(|| crate::headers::codec::video_config(&s.params, &[]).and_then(|c| c.frame_rate))
                     .or_else(|| vc1_extradata_fps(&s.params))
                     .filter(|fps| (1.0..=240.0).contains(fps))
             })
@@ -994,28 +978,6 @@ fn run_player_pipeline(
             options.realtime,
         );
         headless.set_clock(shared.sink_clock());
-    }
-
-    // 5b. A platform player that plays H.264/HEVC itself gets the playback
-    // as HLS (see `crate::native`); what it cannot start comes back here.
-    if options.realtime && vobsub.is_none() {
-        if let Some(presenter) = shared.backend.native() {
-            let selection = native::Selection {
-                video: current_video,
-                audio: current_audio,
-                subtitle: current_subtitle,
-                select_gen,
-            };
-            match native::play(&shared, presenter, &url, &container, demuxer, &streams, selection, duration, &options) {
-                native::Outcome::Finished => return,
-                native::Outcome::Declined { demuxer: back, at } => {
-                    demuxer = back;
-                    if let Some(at) = at {
-                        shared.request_seek(at);
-                    }
-                }
-            }
-        }
     }
 
     // 6. Lanes + sinks.
@@ -1985,6 +1947,17 @@ fn run_audio_thread(
             decoder_params.options.insert("soundfont", path);
         }
     }
+    // E-AC-3 goes to an output that takes it compressed: the platform's own
+    // decoder keeps the Dolby Atmos objects PCM loses. When the output plays
+    // PCM only, or stops taking packets, decoding takes over from the packet
+    // it has not played.
+    let mut pending = None;
+    if stream.params.codec_id.as_str() == "eac3" {
+        match play_compressed(&stream, sink, &lane, &demux_cv, &shared, realtime, &retired) {
+            Passthrough::Played => return,
+            Passthrough::Declined(packet) => pending = packet,
+        }
+    }
     let decoder_delay = audio_trim::take_decoder_delay(&mut decoder_params);
     let mut decoder = match make_decoder(&shared.ctx, &decoder_params) {
         Ok(d) => d,
@@ -2056,7 +2029,11 @@ fn run_audio_thread(
         let applied = out.written.running;
         let woken = || quit() || Some(shared.running()) != applied;
         let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
-        let QueuedPacket { packet, metadata } = match lane.pop(seen_seek, &demux_cv, woken, &mut starved, report) {
+        let popped = match pending.take() {
+            Some(packet) => Pop::Packet(packet),
+            None => lane.pop(seen_seek, &demux_cv, woken, &mut starved, report),
+        };
+        let QueuedPacket { packet, metadata } = match popped {
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
@@ -2178,6 +2155,144 @@ fn run_audio_thread(
             }
         }
     }
+}
+
+enum Passthrough {
+    /// The stream played through to its end, a stop, or a retirement.
+    Played,
+    /// The output plays PCM: decode, starting with this packet if any.
+    Declined(Option<QueuedPacket>),
+}
+
+/// Plays `stream` compressed through `sink`, packet by packet, with the
+/// bookkeeping `write_pcm` keeps for PCM: the clock's run state, seeks, the
+/// pre-target drop (whole packets: the one holding the target plays), the
+/// realtime preroll, and where the written audio ends.
+fn play_compressed(
+    stream: &StreamInfo,
+    sink: &mut dyn AudioSink,
+    lane: &Lane,
+    demux_cv: &Condvar,
+    shared: &SharedState,
+    realtime: bool,
+    retired: &AtomicBool,
+) -> Passthrough {
+    let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
+    let rate = f64::from(stream.params.sample_rate.unwrap_or(48000).max(1));
+    let mut written = Written::default();
+    let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
+    let mut seen_seek_target = 0;
+    let mut starved = false;
+    let mut opened = false;
+    sink.flush();
+    'packets: while !quit() {
+        if !realtime {
+            shared.wait_while_paused(retired);
+            if quit() {
+                break;
+            }
+        }
+        sync_audio_sink(sink, shared, &mut written.running);
+        let gen_now = shared.seek_gen.load(Ordering::SeqCst);
+        if gen_now != seen_seek {
+            seen_seek = gen_now;
+            sink.flush();
+            written.running = None;
+            written.end = None;
+        }
+        let applied = written.running;
+        let woken = || quit() || Some(shared.running()) != applied;
+        let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
+        let queued = match lane.pop(seen_seek, demux_cv, woken, &mut starved, report) {
+            Pop::Packet(p) => p,
+            Pop::Wake => continue,
+            Pop::Eof => {
+                // The output plays what it holds before the pipeline ends.
+                if let (true, Some(end), Some(leads)) = (realtime, written.end, written.leads) {
+                    if leads == seen_seek {
+                        shared.wait_heard(end, seen_seek, retired, |running| {
+                            if written.running != Some(running) {
+                                if running { sink.play(); } else { sink.pause(); }
+                                written.running = Some(running);
+                            }
+                        });
+                    }
+                }
+                if shared.seek_gen.load(Ordering::SeqCst) != seen_seek {
+                    continue;
+                }
+                break;
+            }
+        };
+        if !opened {
+            match sink.open_compressed(&stream.params, &queued.packet.data) {
+                Ok(true) => opened = true,
+                _ => return Passthrough::Declined(Some(queued)),
+            }
+        }
+        let packet = &queued.packet;
+        let frames = crate::headers::codec::eac3_frame_samples(&packet.data).unwrap_or(1536);
+        let span = f64::from(frames) / rate;
+        let start = match packet.pts {
+            Some(pts) => packet.time_base.seconds_of(pts),
+            None => written.end.map_or(0.0, |end| end.as_secs_f64()),
+        };
+        if start + span <= 0.0 {
+            continue;
+        }
+        if let Some(seek) = *shared.active_seek.lock() {
+            if seek.generation > seen_seek_target {
+                if start + span <= seek.target {
+                    continue;
+                }
+                seen_seek_target = seek.generation;
+            }
+        }
+        let at = Duration::from_secs_f64(start.max(0.0));
+        loop {
+            if quit() {
+                break 'packets;
+            }
+            sync_audio_sink(sink, shared, &mut written.running);
+            if realtime {
+                match shared.preroll(at, written.running, None, seen_seek, retired) {
+                    Preroll::Go => {}
+                    Preroll::Resync => continue,
+                    Preroll::Abort => continue 'packets,
+                }
+            }
+            match sink.write_packet(&packet.data, at, frames) {
+                Ok(true) => {
+                    written.end = Some(at + Duration::from_secs_f64(span));
+                    if written.leads != Some(seen_seek) {
+                        written.leads = Some(seen_seek);
+                        shared.master.follow_audio(sink.clock(), seen_seek);
+                        shared.pipe_primed(Pipe::Audio, seen_seek);
+                    }
+                    break;
+                }
+                Ok(false) => {
+                    if !shared.wait_output(seen_seek, retired) {
+                        continue 'packets;
+                    }
+                }
+                Err(SinkError::Unavailable) => {
+                    if written.leads.is_some() {
+                        written.reopen(shared);
+                    }
+                    if !shared.wait_resumed(seen_seek, retired) {
+                        continue 'packets;
+                    }
+                }
+                Err(_) => {
+                    // The output stopped taking packets: decode from the next one.
+                    written.reopen(shared);
+                    return Passthrough::Declined(None);
+                }
+            }
+        }
+    }
+    Passthrough::Played
 }
 
 /// Decoded audio on its way to the sink: interleaved f32 in its own layout

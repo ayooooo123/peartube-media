@@ -213,20 +213,6 @@ impl MasterClock {
         }
     }
 
-    /// While held: holds where the leading clock stands now. A platform
-    /// player that presents on its own (the native route) stops a moment
-    /// after the transport does; its stop is where the picture stays.
-    pub(crate) fn rehold(&self) {
-        let mut lead = self.lead.lock();
-        if lead.held.is_none() {
-            return;
-        }
-        if let Some(now) = lead.audio.as_ref().and_then(|audio| audio.now()) {
-            lead.held = Some(now);
-            self.free.set_position(now);
-        }
-    }
-
     /// The audio stopped leading (its pipeline ended, failed or was
     /// replaced): the free clock carries on from where the audio was.
     pub(crate) fn release_audio(&self) {

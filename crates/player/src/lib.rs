@@ -19,7 +19,7 @@ pub mod engine;
 #[forbid(unsafe_code)]
 pub mod headless;
 #[forbid(unsafe_code)]
-mod native;
+mod headers;
 #[forbid(unsafe_code)]
 pub mod source;
 #[forbid(unsafe_code)]

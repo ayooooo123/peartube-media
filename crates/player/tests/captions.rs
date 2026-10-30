@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use oxideav_core::{Error, MediaType};
 use parking_lot::Mutex;
-use player::backend::{AudioSink, Backend, Clock, NativePresenter, NativeStatus, SubtitleImage, SubtitleSink, VideoSink};
+use player::backend::{AudioSink, Backend, Clock, SubtitleImage, SubtitleSink, VideoSink};
 use player::{Headless, Player, PlayerOptions, State, TrackKind};
 use subs_cc::cea708::Cea708;
 use subs_cc::eia608::ticks_to_us;
@@ -183,196 +183,9 @@ struct Observation {
     shows: Vec<(Duration, bool)>,
 }
 
-struct MockPresenterState {
-    playing: bool,
-    start_time: Option<Instant>,
-    start_pos: Duration,
-    item_origin: Option<Duration>,
-    closed: bool,
-}
-
-struct MockPresenter {
-    end: Duration,
-    seek_serial: AtomicU64,
-    state: Arc<Mutex<MockPresenterState>>,
-    on_change: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
-}
-
-struct MockPresenterClock {
-    end: Duration,
-    state: Arc<Mutex<MockPresenterState>>,
-    source_axis: bool,
-}
-
-impl Clock for MockPresenterClock {
-    fn now(&self) -> Option<Duration> {
-        let state = self.state.lock();
-        if state.closed {
-            return None;
-        }
-        let origin = state.item_origin.unwrap_or(Duration::ZERO);
-        let item_end = self.end + origin;
-        let item_pos = if state.playing {
-            let elapsed = state.start_time.map_or(Duration::ZERO, |t| t.elapsed());
-            (state.start_pos + elapsed).min(item_end)
-        } else {
-            state.start_pos.min(item_end)
-        };
-        if self.source_axis {
-            Some(item_pos.saturating_sub(origin))
-        } else {
-            Some(item_pos)
-        }
-    }
-
-    fn monotonic_ns_at(&self, at: Duration) -> Option<i64> {
-        let state = self.state.lock();
-        if !state.playing {
-            return None;
-        }
-        let start_time = state.start_time?;
-        let start_pos = state.start_pos;
-        let origin = state.item_origin.unwrap_or(Duration::ZERO);
-        drop(state);
-        let now = start_pos + start_time.elapsed();
-        let now_axis = if self.source_axis { now.saturating_sub(origin) } else { now };
-        let ahead_secs = at.as_secs_f64() - now_axis.as_secs_f64();
-        Some(player::clock::current_monotonic_ns() + (ahead_secs * 1e9) as i64)
-    }
-}
-
-impl MockPresenter {
-    fn new(end: Duration) -> Self {
-        Self {
-            end,
-            seek_serial: AtomicU64::new(0),
-            state: Arc::new(Mutex::new(MockPresenterState {
-                playing: false,
-                start_time: None,
-                start_pos: Duration::ZERO,
-                item_origin: None,
-                closed: false,
-            })),
-            on_change: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    fn source_clock(&self) -> Arc<dyn Clock> {
-        Arc::new(MockPresenterClock {
-            end: self.end,
-            state: Arc::clone(&self.state),
-            source_axis: true,
-        })
-    }
-
-    fn notify(&self) {
-        if let Some(cb) = self.on_change.lock().as_ref() {
-            cb();
-        }
-    }
-}
-
-impl NativePresenter for MockPresenter {
-    fn open(&self, _url: &str, start: Duration) {
-        let mut state = self.state.lock();
-        state.playing = false;
-        state.start_time = None;
-        state.start_pos = start;
-        state.item_origin.get_or_insert(start);
-        state.closed = false;
-        drop(state);
-        self.notify();
-    }
-
-    fn play(&self) {
-        let mut state = self.state.lock();
-        if !state.playing {
-            state.playing = true;
-            state.start_time = Some(Instant::now());
-        }
-        drop(state);
-        self.notify();
-    }
-
-    fn pause(&self) {
-        let mut state = self.state.lock();
-        if state.playing {
-            if let Some(t) = state.start_time {
-                let item_end = self.end + state.item_origin.unwrap_or(Duration::ZERO);
-                state.start_pos = (state.start_pos + t.elapsed()).min(item_end);
-            }
-            state.playing = false;
-            state.start_time = None;
-        }
-        drop(state);
-        self.notify();
-    }
-
-    fn seek(&self, to: Duration) -> u64 {
-        let serial = self.seek_serial.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut state = self.state.lock();
-        state.start_pos = to;
-        if state.playing {
-            state.start_time = Some(Instant::now());
-        } else {
-            state.start_time = None;
-        }
-        drop(state);
-        self.notify();
-        serial
-    }
-
-    fn clock(&self) -> Arc<dyn Clock> {
-        Arc::new(MockPresenterClock {
-            end: self.end,
-            state: Arc::clone(&self.state),
-            source_axis: false,
-        })
-    }
-
-    fn status(&self) -> NativeStatus {
-        let state = self.state.lock();
-        let item_end = self.end + state.item_origin.unwrap_or(Duration::ZERO);
-        let pos = if state.closed {
-            None
-        } else if state.playing {
-            let elapsed = state.start_time.map_or(Duration::ZERO, |t| t.elapsed());
-            Some((state.start_pos + elapsed).min(item_end))
-        } else {
-            Some(state.start_pos.min(item_end))
-        };
-        let ended = pos.is_some_and(|p| p >= item_end);
-        let seek_done = self.seek_serial.load(Ordering::SeqCst);
-        NativeStatus {
-            ready: true,
-            picture: true,
-            playing: state.playing,
-            waiting: false,
-            ended,
-            seek_done,
-            position: pos,
-            failed: None,
-        }
-    }
-
-    fn set_on_change(&self, on_change: Option<Arc<dyn Fn() + Send + Sync>>) {
-        *self.on_change.lock() = on_change;
-    }
-
-    fn close(&self) {
-        let mut state = self.state.lock();
-        state.closed = true;
-        state.playing = false;
-        state.start_time = None;
-        drop(state);
-        self.notify();
-    }
-}
-
 struct Recorder {
     headless: Arc<Headless>,
     observation: Arc<Mutex<Observation>>,
-    native_presenter: Option<Arc<MockPresenter>>,
 }
 
 impl Backend for Recorder {
@@ -387,10 +200,6 @@ impl Backend for Recorder {
 
     fn subtitles(&self) -> Box<dyn SubtitleSink> {
         Box::new(Stamped(self.observation.clone()))
-    }
-
-    fn native(&self) -> Option<Arc<dyn NativePresenter>> {
-        self.native_presenter.as_ref().map(|p| p.clone() as Arc<dyn NativePresenter>)
     }
 }
 
@@ -409,7 +218,6 @@ fn play(path: &Path, subtitle: u32) -> (Player, Arc<Mutex<Observation>>) {
     let backend = Arc::new(Recorder {
         headless: Headless::new(),
         observation: observation.clone(),
-        native_presenter: None,
     });
     let player = Player::open(
         path.to_str().unwrap(),
@@ -420,25 +228,6 @@ fn play(path: &Path, subtitle: u32) -> (Player, Arc<Mutex<Observation>>) {
     );
     (player, observation)
 }
-fn play_native(path: &Path, subtitle: u32, end: f64) -> (Player, Arc<Mutex<Observation>>) {
-    let observation = Arc::new(Mutex::new(Observation::default()));
-    let presenter = Arc::new(MockPresenter::new(Duration::from_secs_f64(end)));
-    observation.lock().clock = Some(presenter.source_clock());
-    let backend = Arc::new(Recorder {
-        headless: Headless::new(),
-        observation: observation.clone(),
-        native_presenter: Some(presenter),
-    });
-    let player = Player::open(
-        path.to_str().unwrap(),
-        backend,
-        Arc::new(codecs::context()),
-        PlayerOptions { subtitle: Some(subtitle), realtime: true, ..PlayerOptions::default() },
-        |_| {},
-    );
-    (player, observation)
-}
-
 
 fn wait_end(player: &Player, what: &str) -> State {
     let begun = Instant::now();
@@ -528,102 +317,4 @@ fn cea708_captions_come_up_at_the_decoders_times() {
     wait_end(&player, "mkv");
     assert_shows("CEA-708 in mkv", &observation.lock().shows, &screens, 0.0, video_end(&path));
     drop(player);
-}
-#[test]
-fn eia608_and_cea708_captions_work_on_native_route() {
-    let scratch = Scratch::new();
-    let _realtime = REALTIME.lock();
-    let path = captioned(&scratch, "mkv");
-    let end = video_end(&path);
-
-    // Discovery when subtitle is None
-    {
-        let observation = Arc::new(Mutex::new(Observation::default()));
-        let presenter = Arc::new(MockPresenter::new(Duration::from_secs_f64(end)));
-        let backend = Arc::new(Recorder {
-            headless: Headless::new(),
-            observation,
-            native_presenter: Some(presenter),
-        });
-        let player = Player::open(
-            path.to_str().unwrap(),
-            backend,
-            Arc::new(codecs::context()),
-            PlayerOptions { subtitle: None, realtime: true, ..PlayerOptions::default() },
-            |_| {},
-        );
-        let state = wait_end(&player, "native mkv discovery with subtitle None");
-        assert!(
-            state.video_decoder.as_deref().unwrap_or("").starts_with("native "),
-            "expected native video decoder, got: {:?}",
-            state.video_decoder
-        );
-        let mut caption_tracks: Vec<(u32, String)> = state
-            .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Subtitle && t.stream >= CAPTIONS_608)
-            .map(|t| (t.stream, t.codec.clone()))
-            .collect();
-        caption_tracks.sort();
-        assert_eq!(
-            caption_tracks,
-            [(CAPTIONS_608, "eia_608".to_string()), (CAPTIONS_708, "cea_708".to_string())],
-            "native route: tracks discovered when subtitle was None"
-        );
-        drop(player);
-    }
-
-    // 1. EIA-608
-    {
-        let screens: Vec<(i64, bool)> = ffmpeg_events(&path).into_iter().map(|(cs, up)| (cs * 10_000, up)).collect();
-        let (player, observation) = play_native(&path, CAPTIONS_608, end);
-        let state = wait_end(&player, "native mkv 608");
-        assert!(
-            state.video_decoder.as_deref().unwrap_or("").starts_with("native "),
-            "expected native video decoder, got: {:?}",
-            state.video_decoder
-        );
-        let mut caption_tracks: Vec<(u32, String)> = state
-            .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Subtitle && t.stream >= CAPTIONS_608)
-            .map(|t| (t.stream, t.codec.clone()))
-            .collect();
-        caption_tracks.sort();
-        assert_eq!(
-            caption_tracks,
-            [(CAPTIONS_608, "eia_608".to_string()), (CAPTIONS_708, "cea_708".to_string())],
-            "native route: the caption tracks listed"
-        );
-        assert_eq!(state.subtitle, Some(CAPTIONS_608), "native route: selected caption track");
-        assert_shows("EIA-608 on native route", &observation.lock().shows, &screens, 0.005, end);
-        drop(player);
-    }
-
-    // 2. CEA-708
-    {
-        let screens = cea708_screens(&path);
-        let (player, observation) = play_native(&path, CAPTIONS_708, end);
-        let state = wait_end(&player, "native mkv 708");
-        assert!(
-            state.video_decoder.as_deref().unwrap_or("").starts_with("native "),
-            "expected native video decoder, got: {:?}",
-            state.video_decoder
-        );
-        let mut caption_tracks: Vec<(u32, String)> = state
-            .tracks
-            .iter()
-            .filter(|t| t.kind == TrackKind::Subtitle && t.stream >= CAPTIONS_608)
-            .map(|t| (t.stream, t.codec.clone()))
-            .collect();
-        caption_tracks.sort();
-        assert_eq!(
-            caption_tracks,
-            [(CAPTIONS_608, "eia_608".to_string()), (CAPTIONS_708, "cea_708".to_string())],
-            "native route: the caption tracks listed"
-        );
-        assert_eq!(state.subtitle, Some(CAPTIONS_708), "native route: selected caption track");
-        assert_shows("CEA-708 on native route", &observation.lock().shows, &screens, 0.0, end);
-        drop(player);
-    }
 }

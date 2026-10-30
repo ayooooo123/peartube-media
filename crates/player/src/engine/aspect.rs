@@ -18,7 +18,7 @@ pub(crate) fn readable(params: &CodecParameters) -> bool {
 /// has been seen.
 pub(crate) fn pixel_aspect(params: &CodecParameters, data: &[u8]) -> Option<Option<(u32, u32)>> {
     let found = match params.codec_id.as_str() {
-        "h264" | "h265" | "hevc" => crate::native::codec::video_config(params, data).map(|c| c.pixel_aspect),
+        "h264" | "h265" | "hevc" => crate::headers::codec::video_config(params, data).map(|c| c.pixel_aspect),
         "mpeg2video" | "mpeg2" => mpeg2(&params.extradata).or_else(|| mpeg2(data)),
         "mpeg4video" | "mpeg4" | "mp4v-es" => mpeg4(&params.extradata).or_else(|| mpeg4(data)),
         _ => None,

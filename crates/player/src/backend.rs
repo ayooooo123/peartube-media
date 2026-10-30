@@ -1,8 +1,9 @@
 //! What a platform gives the engine: somewhere to send audio, video and
 //! subtitles, and the clock that ties them together.
 //!
-//! The engine decodes audio itself and hands PCM to an [`AudioSink`], whose
-//! [`Clock`] is the playback's master clock while audio plays. Video goes to
+//! The engine decodes audio itself and hands PCM to an [`AudioSink`], unless
+//! the sink takes the stream compressed (E-AC-3, to keep Dolby Atmos); the
+//! sink's [`Clock`] is the playback's master clock while audio plays. Video goes to
 //! a [`VideoSink`], which first gets a chance to take the stream compressed
 //! (a platform decoder); if it declines, or fails later, the engine decodes
 //! in software and hands it frames. Either way the video is presented on
@@ -30,62 +31,6 @@ pub trait Backend: Send + Sync {
     fn suspend(&self) {}
     /// The app is back in front.
     fn resume(&self) {}
-    /// A platform player that plays H.264/HEVC itself from an HLS playlist
-    /// the engine serves on 127.0.0.1 (AVPlayer on Apple). `None`: the
-    /// engine decodes everything.
-    fn native(&self) -> Option<Arc<dyn NativePresenter>> {
-        None
-    }
-}
-
-/// A platform player the engine hands an HLS playlist to. Every time is
-/// item time: the timeline of the media in the playlist. Every method
-/// returns at once, from any thread; what happens shows in `status`.
-pub trait NativePresenter: Send + Sync {
-    /// Replaces any current item with the playlist at `url`, seeks it to
-    /// `start` with zero tolerance and leaves it paused.
-    fn open(&self, url: &str, start: Duration);
-    fn play(&self);
-    fn pause(&self);
-    /// Seeks the current item to `to` with zero tolerance. Returns the
-    /// seek's serial; `NativeStatus::seek_done` reaches it once the seek
-    /// completed or was superseded.
-    fn seek(&self, to: Duration) -> u64;
-    /// The current item's time. `now` is `None` while there is no item or
-    /// it has no time yet; `monotonic_ns_at` is `None` while it stands still.
-    fn clock(&self) -> Arc<dyn Clock>;
-    fn status(&self) -> NativeStatus;
-    /// `on_change` runs, on any thread, whenever `status` may have changed.
-    /// Replaces the previous one; `None` removes it.
-    fn set_on_change(&self, on_change: Option<Arc<dyn Fn() + Send + Sync>>);
-    /// Removes the current item: nothing plays or shows until the next
-    /// `open`. Never waits for the main thread.
-    fn close(&self);
-}
-
-/// What a [`NativePresenter`]'s current item is doing.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct NativeStatus {
-    /// The item is ready to play (AVPlayerItem status readyToPlay).
-    pub ready: bool,
-    /// The item failed: domain, code and description.
-    pub failed: Option<String>,
-    /// The layer has a picture to show (AVPlayerLayer readyForDisplay):
-    /// the video decodes. A player can play the audio of a video it cannot
-    /// decode.
-    pub picture: bool,
-    /// Media is moving (AVPlayer timeControlStatus playing).
-    pub playing: bool,
-    /// Asked to play, waiting for media (timeControlStatus
-    /// waitingToPlayAtSpecifiedRate).
-    pub waiting: bool,
-    /// The item played to its end.
-    pub ended: bool,
-    /// Serial of the last seek that completed or was superseded; 0 before
-    /// any.
-    pub seek_done: u64,
-    /// Item time when the status was taken.
-    pub position: Option<Duration>,
 }
 
 /// Media time, shared by every sink of one playback.
@@ -143,6 +88,20 @@ pub trait AudioSink: Send {
     /// paused output still holds room back so the caller should retry.
     fn drain(&mut self) -> Result<bool, SinkError> {
         Ok(true)
+    }
+    /// Offers the stream compressed (`params`, and its first packet for the
+    /// headers the setup bytes lack), to play with the platform's own decoder,
+    /// which keeps what PCM loses (Dolby Atmos in E-AC-3). `Ok(true)`: packets
+    /// follow through `write_packet` until the next `open`. `Ok(false)`: the
+    /// engine decodes, as for every sink that plays PCM only.
+    fn open_compressed(&mut self, _params: &CodecParameters, _first_packet: &[u8]) -> Result<bool, SinkError> {
+        Ok(false)
+    }
+    /// Queues one compressed packet of `frames` samples per channel whose first
+    /// sample plays at media time `pts`. `Ok(false)`: full or paused, nothing
+    /// taken; the caller retries.
+    fn write_packet(&mut self, _packet: &[u8], _pts: Duration, _frames: u32) -> Result<bool, SinkError> {
+        Err(SinkError::Fatal("this output plays PCM only".into()))
     }
     /// The output's clock: the media time of the sample being heard. The
     /// playback's master clock while audio plays.

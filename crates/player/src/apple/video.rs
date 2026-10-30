@@ -20,11 +20,15 @@ use objc2_av_foundation::{
     AVLayerVideoGravityResizeAspect, AVQueuedSampleBufferRenderingStatus, AVSampleBufferDisplayLayer,
     AVSampleBufferRenderSynchronizer, AVSampleBufferVideoRenderer,
 };
-use objc2_core_foundation::{CFNumber, CFRetained, CFType};
+use objc2_core_foundation::{CFData, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_media::{
     CMClock, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
     CMTimebase, CMVideoFormatDescription,
-    CMVideoFormatDescriptionCreateForImageBuffer,
+    CMVideoFormatDescriptionCreate, CMVideoFormatDescriptionCreateForImageBuffer,
+    kCMFormatDescriptionExtension_ContentLightLevelInfo,
+    kCMFormatDescriptionExtension_MasteringDisplayColorVolume,
+    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
+    kCMVideoCodecType_DolbyVisionHEVC, kCMVideoCodecType_HEVC,
     CMVideoFormatDescriptionCreateFromH264ParameterSets,
     CMVideoFormatDescriptionCreateFromHEVCParameterSets,
     CMVideoFormatDescriptionMatchesImageBuffer,
@@ -684,9 +688,77 @@ struct Compressed {
     first_irap: bool,
     discard_rasl: bool,
     present_from: Duration,
+    params: CodecParameters,
+    /// What the current format was built from.
+    headers: StreamHeaders,
+}
+
+/// What a video stream's headers say beyond its parameter sets. HDR10's mastering display
+/// and content light (SEI 137/144) reach VideoToolbox's pictures only from the format
+/// description, never from the bitstream, and Dolby Vision decodes only from a format that
+/// carries the DV record. From the setup bytes, or the first keyframe once it arrives.
+#[derive(Clone, Default, PartialEq)]
+struct StreamHeaders {
+    mastering: Option<[u8; 24]>,
+    content_light: Option<[u8; 4]>,
+    dovi: Option<DolbyVision>,
+}
+
+#[derive(Clone, PartialEq)]
+struct DolbyVision {
+    /// The `hvcC` payload the DV format carries beside the DV record.
+    hvcc: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// `dvcC` up to profile 7, `dvvC` above.
+    atom: &'static str,
+    record: [u8; 24],
+    /// Profile 5 has no backward-compatible base layer: `dvh1`, not `hvc1`.
+    dvh1: bool,
+}
+
+fn stream_headers(params: &CodecParameters, keyframe: &[u8]) -> StreamHeaders {
+    use crate::headers::codec;
+    let Some(mut config) = codec::video_config(params, keyframe) else {
+        return StreamHeaders::default();
+    };
+    codec::apply_dovi(&mut config, codec::find_dovi_box(&params.extradata), keyframe, codec::video_framing(params));
+    let (hvcc, width, height) = (config.record, config.width, config.height);
+    // Profile 7 needs every RPU rewritten: its HDR10 base layer plays as it is.
+    let dovi = config.dovi.filter(|d| !d.convert_p7_to_81).map(|d| DolbyVision {
+        hvcc,
+        width,
+        height,
+        atom: if d.profile > 7 { "dvvC" } else { "dvcC" },
+        record: d.record,
+        dvh1: d.use_dvh1,
+    });
+    StreamHeaders { mastering: config.mastering_display, content_light: config.content_light, dovi }
 }
 
 impl Compressed {
+    /// The first keyframe can say what the setup bytes did not (a Dolby Vision RPU, HDR10's
+    /// SEI). Before anything is decoded, a format and decoder that know it replace `old`;
+    /// when they cannot be made, `old` stays and the stream plays as plain HEVC/H.264.
+    fn reformat(&mut self, keyframe: &[u8], old: NativeDecoder) -> NativeDecoder {
+        let headers = stream_headers(&self.params, keyframe);
+        if headers == self.headers {
+            return old;
+        }
+        let Ok((format, length_size, annex_b, reorder_depth)) =
+            create_h264_or_hevc_format(self.kind, &self.params, &headers)
+        else {
+            return old;
+        };
+        let Ok(replacement) = old.rebuilt(&format, reorder_depth) else {
+            return old;
+        };
+        let _ = old.retire();
+        (self.format, self.length_size, self.annex_b, self.reorder_depth) = (format, length_size, annex_b, reorder_depth);
+        self.headers = headers;
+        replacement
+    }
+
     fn filter_leading(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         if self.kind != CompressedKind::Hevc {
             return None;
@@ -806,6 +878,26 @@ impl NativeDecoder {
             output,
             retired: false,
         })
+    }
+
+    /// A session for `format` that reports exactly as this one does; nothing decoded yet.
+    fn rebuilt(&self, format: &CMVideoFormatDescription, reorder_depth: usize) -> Result<Self, SinkError> {
+        let o = &self.output;
+        Self::new(
+            format,
+            DecodedOutput {
+                reports: Arc::clone(&o.reports),
+                generation: o.generation,
+                present_from: AtomicU64::new(o.present_from.load(Ordering::Acquire)),
+                producer: AtomicU64::new(o.producer.load(Ordering::Acquire)),
+                mailbox: Arc::clone(&o.mailbox),
+                control: Arc::clone(&o.control),
+                failed: Arc::clone(&o.failed),
+                format: Mutex::new(None),
+                reorder_depth,
+                pictures: Mutex::new(Vec::new()),
+            },
+        )
     }
 
     fn set_producer_control(&self, producer: ProducerId, control: Arc<dyn VideoControl>) {
@@ -1863,8 +1955,9 @@ impl AppleDevice {
         if params.extradata.is_empty() {
             return Err(VideoError::Unsupported);
         }
+        let headers = stream_headers(params, &[]);
         let (format, length_size, annex_b, reorder_depth) =
-            create_h264_or_hevc_format(kind, params).map_err(|e| match e {
+            create_h264_or_hevc_format(kind, params, &headers).map_err(|e| match e {
                 SinkError::Fallback(_) => VideoError::Unsupported,
                 other => VideoError::Sink(other),
             })?;
@@ -1879,6 +1972,8 @@ impl AppleDevice {
             first_irap: true,
             discard_rasl: false,
             present_from,
+            params: params.clone(),
+            headers,
         };
 
         // Create VT during compressed configuration, BEFORE publishing Compressed.
@@ -2004,7 +2099,7 @@ impl AppleDevice {
             ))));
         }
         let pool = unsafe { CFRetained::from_raw(NonNull::new_unchecked(pool_raw)) };
-        let sample_aspect_ratio = crate::native::codec::video_config(params, &[])
+        let sample_aspect_ratio = crate::headers::codec::video_config(params, &[])
             .and_then(|vc| vc.pixel_aspect)
             .map(|(w, h)| oxideav_core::Rational::new(i64::from(w), i64::from(h)));
 
@@ -2760,6 +2855,9 @@ fn owner_loop(
                             }
                             if !compressed.primed && random_access {
                                 compressed.primed = true;
+                                if let Some(old) = decoder.take() {
+                                    *decoder = Some(compressed.reformat(&packet.data, old));
+                                }
                             }
                             if compressed.primed {
                                 if let Some(dec) = decoder.as_ref() {
@@ -3477,6 +3575,7 @@ impl Drop for AppleVideoSink {
 fn create_h264_or_hevc_format(
     kind: CompressedKind,
     params: &CodecParameters,
+    headers: &StreamHeaders,
 ) -> Result<(CFRetained<CMVideoFormatDescription>, usize, bool, usize), SinkError> {
     let record: &[u8] = if let Some(body) = find_atom(&params.extradata, b"avcC") {
         body
@@ -3514,9 +3613,56 @@ fn create_h264_or_hevc_format(
         ptrs.push(NonNull::from(&nal[0]));
         sizes.push(nal.len());
     }
+    // HDR10's static metadata (HEVC: the H.264 constructor takes no extensions) and, for
+    // Dolby Vision, the HEVC and DV records as the sample entry's atoms.
+    let mastering = headers.mastering.map(|m| CFData::from_bytes(&m));
+    let light = headers.content_light.map(|c| CFData::from_bytes(&c));
+    let dovi = headers.dovi.as_ref().map(|d| {
+        (
+            CFString::from_static_str("hvcC"),
+            CFString::from_static_str(d.atom),
+            CFData::from_bytes(&d.hvcc),
+            CFData::from_bytes(&d.record),
+        )
+    });
+    let atoms = match &dovi {
+        Some((hvcc_key, dovi_key, hvcc, record)) => Some(
+            unsafe { cf_dictionary(&[(hvcc_key, hvcc as &CFType), (dovi_key, record as &CFType)]) }
+                .ok_or_else(|| SinkError::Fallback("could not build Dolby Vision atoms".into()))?,
+        ),
+        None => None,
+    };
+    let mut entries: Vec<(&CFString, &CFType)> = Vec::new();
+    if let Some(m) = &mastering {
+        entries.push((unsafe { kCMFormatDescriptionExtension_MasteringDisplayColorVolume }, m as &CFType));
+    }
+    if let Some(c) = &light {
+        entries.push((unsafe { kCMFormatDescriptionExtension_ContentLightLevelInfo }, c as &CFType));
+    }
+    if let Some(a) = &atoms {
+        entries.push((unsafe { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms }, a as &CFType));
+    }
+    let extensions = if entries.is_empty() {
+        None
+    } else {
+        Some(
+            unsafe { cf_dictionary(&entries) }
+                .ok_or_else(|| SinkError::Fallback("could not build format extensions".into()))?,
+        )
+    };
     let mut raw: *const CMFormatDescription = ptr::null();
-    let status = match kind {
-        CompressedKind::H264 => unsafe {
+    let status = match (kind, &headers.dovi) {
+        (CompressedKind::Hevc, Some(dv)) => unsafe {
+            CMVideoFormatDescriptionCreate(
+                None,
+                if dv.dvh1 { kCMVideoCodecType_DolbyVisionHEVC } else { kCMVideoCodecType_HEVC },
+                dv.width as i32,
+                dv.height as i32,
+                extensions.as_deref(),
+                NonNull::from(&mut raw).cast(),
+            )
+        },
+        (CompressedKind::H264, _) => unsafe {
             CMVideoFormatDescriptionCreateFromH264ParameterSets(
                 None,
                 nals.len(),
@@ -3526,14 +3672,14 @@ fn create_h264_or_hevc_format(
                 NonNull::from(&mut raw),
             )
         },
-        CompressedKind::Hevc => unsafe {
+        (CompressedKind::Hevc, None) => unsafe {
             CMVideoFormatDescriptionCreateFromHEVCParameterSets(
                 None,
                 nals.len(),
                 NonNull::from(ptrs.as_mut_slice()).cast(),
                 NonNull::from(sizes.as_mut_slice()).cast(),
                 length_size as i32,
-                None,
+                extensions.as_deref(),
                 NonNull::from(&mut raw),
             )
         },
@@ -3607,7 +3753,7 @@ fn cm_time_from_duration(d: Duration, timescale: i32) -> CMTime {
 }
 
 unsafe fn cf_dictionary(
-    entries: &[(&'static objc2_core_foundation::CFString, &objc2_core_foundation::CFType)],
+    entries: &[(&objc2_core_foundation::CFString, &objc2_core_foundation::CFType)],
 ) -> Option<CFRetained<objc2_core_foundation::CFDictionary>> {
     let mut keys: Vec<*const std::ffi::c_void> = Vec::with_capacity(entries.len());
     let mut vals: Vec<*const std::ffi::c_void> = Vec::with_capacity(entries.len());

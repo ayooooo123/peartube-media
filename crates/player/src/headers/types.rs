@@ -1,8 +1,6 @@
-//! What the native route knows about the streams it serves: filled from
-//! the codec configuration (`codec.rs`), written into the init segment
-//! (`fmp4.rs`) and the playlists (`hls.rs`).
+//! Parsed codec headers and stream metadata for direct playback.
 
-/// The video codecs AVPlayer decodes from fMP4.
+/// Supported video codecs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VideoCodec {
     /// Sample entry `avc1`, record `avcC`.
@@ -11,7 +9,7 @@ pub(crate) enum VideoCodec {
     Hevc,
 }
 
-/// HLS `VIDEO-RANGE`.
+/// Video transfer-function range.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum VideoRange {
     #[default]
@@ -22,7 +20,7 @@ pub(crate) enum VideoRange {
     Hlg,
 }
 
-/// The `colr` box, colour type `nclx` (ISO/IEC 23001-8 code points).
+/// Colour characteristics using ISO/IEC 23001-8 code points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Colour {
     pub primaries: u16,
@@ -41,9 +39,9 @@ pub(crate) struct DoviConfig {
     pub record: [u8; 24],
     /// Sample entry FourCC is `dvh1` (Profile 5) instead of `hvc1`.
     pub use_dvh1: bool,
-    /// HLS `SUPPLEMENTAL-CODECS` entry, e.g. `dvh1.08.06/db1p` or `dvh1.08.06/db4h`.
+    /// Supplemental Dolby Vision codec identifier.
     pub supplemental_codecs: Option<String>,
-    /// Convert per-packet `UNSPEC62` RPU NALs from Profile 7 to Profile 8.1 (mode 2).
+    /// The source is Profile 7 and would require RPU conversion for Profile 8.1.
     pub convert_p7_to_81: bool,
 }
 
@@ -74,50 +72,35 @@ pub(crate) struct VideoConfig {
     /// Pictures a decoder may hold back before output (H.264
     /// max_num_reorder_frames, HEVC sps_max_num_reorder_pics).
     pub reorder_depth: u32,
-    /// Field-coded or interlaced: AVPlayer does not deinterlace.
+    /// Whether the source is field-coded or interlaced.
     pub interlaced: bool,
     pub dovi: Option<DoviConfig>,
 }
 
-/// The audio codecs in the native route's fMP4, copied from the source, or
-/// FLAC made by the bridge.
+/// Supported compressed-audio codec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AudioCodec {
-    /// Sample entry `mp4a`, config box `esds`.
-    Aac,
-    /// Sample entry `ac-3`, config box `dac3`.
-    Ac3,
     /// Sample entry `ec-3`, config box `dec3`.
     Eac3,
-    /// Sample entry `fLaC`, config box `dfLa`.
-    Flac,
-    /// Sample entry `alac`, config box `alac`.
-    Alac,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AudioConfig {
     pub codec: AudioCodec,
-    /// The track's timescale: the AAC core rate from the
-    /// AudioSpecificConfig (not the SBR output rate), the AC-3/E-AC-3 rate.
+    /// Audio sample rate in Hz.
     pub sample_rate: u32,
     pub channels: u16,
-    /// The sample entry's `samplesize`: 16 for AAC/AC-3/E-AC-3, STREAMINFO bits
-    /// per sample for FLAC, the cookie's bitDepth for ALAC.
+    /// Decoded bits per sample.
     pub bits: u16,
-    /// The config box payload: `esds` (FullBox: version and flags, then the
-    /// ES_Descriptor), `dac3`, `dec3`, `dfLa` (FullBox version/flags 0, then
-    /// the STREAMINFO metadata block with its last-block flag set) or `alac`
-    /// (FullBox version/flags 0, then the ALAC magic cookie).
+    /// E-AC-3 dec3 configuration payload.
     pub config: Vec<u8>,
-    /// RFC 6381 `CODECS` entry: `mp4a.40.2`, `mp4a.40.5`, `ac-3`, `ec-3`, `fLaC`, `alac`.
+    /// RFC 6381 codec identifier (`ec-3`).
     pub codec_string: String,
-    /// Samples per access unit at `sample_rate` (AAC 1024 or 960, AC-3
-    /// 1536, ALAC the cookie's frameLength); 0 for E-AC-3 and FLAC (per packet).
+    /// Samples per access unit; 0 when determined per packet.
     pub frame_samples: u32,
-    /// The packets start with ADTS headers to strip.
+    /// Whether packet headers need stripping.
     pub adts: bool,
-    /// ISO 639-2/T language for `mdhd`, e.g. `eng`.
+    /// ISO 639-2/T language, e.g. `eng`.
     pub language: Option<String>,
     /// E-AC-3 Dolby Atmos (JOC) object count / complexity index.
     pub atmos_joc: Option<u8>,

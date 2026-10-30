@@ -23,8 +23,8 @@ use objc2_av_foundation::{
     AVSampleBufferRenderSynchronizer,
 };
 use objc2_core_audio_types::{
-    AudioStreamBasicDescription, kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked,
-    kAudioFormatLinearPCM,
+    AudioStreamBasicDescription, AudioStreamPacketDescription, kAudioFormatEnhancedAC3,
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
 };
 use objc2_core_foundation::CFRetained;
 use objc2_core_media::{
@@ -112,6 +112,8 @@ pub struct AppleAudioSink {
     /// Format reopens preserve it; unanchored `play`/`pause` record intent.
     anchored: bool,
     playing: bool,
+    /// `format_desc` is E-AC-3 and packets arrive through `write_packet`.
+    compressed: bool,
     playback: super::PlaybackSlot,
 }
 
@@ -178,6 +180,7 @@ impl AppleAudioSink {
             requesting: std::cell::Cell::new(false),
             anchored: false,
             playing: false,
+            compressed: false,
             playback,
         }
     }
@@ -302,16 +305,20 @@ impl AppleAudioSink {
             let _: () = objc2::msg_send![renderer, enqueueSampleBuffer: &*sample];
         }
         self.clock_anchor.commit(out_ticks, reanchor, frames);
+        self.anchor_synchronizer(pts_cm);
+        Ok(())
+    }
 
+    /// The first buffer after an explicit flush starts the synchronizer there.
+    fn anchor_synchronizer(&mut self, at: CMTime) {
         if !self.anchored {
             self.anchored = true;
             let rate = if self.playing { 1.0 } else { 0.0 };
             unsafe {
                 let sync: &AVSampleBufferRenderSynchronizer = &self.synchronizer;
-                let _: () = objc2::msg_send![sync, setRate: rate as f32, time: pts_cm];
+                let _: () = objc2::msg_send![sync, setRate: rate as f32, time: at];
             }
         }
-        Ok(())
     }
 }
 
@@ -334,6 +341,7 @@ impl AudioSink for AppleAudioSink {
         }
         self.sample_rate = sample_rate;
         self.channels = channels;
+        self.compressed = false;
         // CoreAudio gets unlabeled channels from a count alone and placed 5.1
         // dialogue on one side of 2-speaker hardware; mix surround ourselves as Android does.
         let (output_channels, mix) = if channels > 2 {
@@ -380,8 +388,8 @@ impl AudioSink for AppleAudioSink {
     }
 
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
-        if self.format_desc.is_none() {
-            return Err(SinkError::Fatal("audio sink not open".into()));
+        if self.format_desc.is_none() || self.compressed {
+            return Err(SinkError::Fatal("audio sink not open for PCM".into()));
         }
         let channels = self.channels as usize;
         if channels == 0 {
@@ -439,6 +447,107 @@ impl AudioSink for AppleAudioSink {
             self.emit_pending()?;
         }
         Ok(frames)
+    }
+
+    fn open_compressed(&mut self, params: &oxideav_core::CodecParameters, first_packet: &[u8]) -> Result<bool, SinkError> {
+        if params.codec_id.as_str() != "eac3" {
+            return Ok(false);
+        }
+        let Some(config) = crate::headers::codec::audio_config(params, first_packet) else {
+            return Ok(false);
+        };
+        if self.pending_frames > 0 && self.format_desc.is_some() && !self.compressed {
+            let _ = self.emit_pending();
+        }
+        if self.sample_rate != config.sample_rate {
+            self.clock_anchor.reset();
+        }
+        // The magic cookie is the whole `dec3` box, as an MP4 sample entry
+        // carries it: CoreAudio's E-AC-3 decoder reads the substreams and the
+        // Atmos (JOC) flag from it. The payload alone stalled the first
+        // enqueue for about 3 s.
+        let mut cookie = Vec::with_capacity(8 + config.config.len());
+        cookie.extend_from_slice(&((8 + config.config.len()) as u32).to_be_bytes());
+        cookie.extend_from_slice(b"dec3");
+        cookie.extend_from_slice(&config.config);
+        let mut asbd = AudioStreamBasicDescription {
+            mSampleRate: f64::from(config.sample_rate),
+            mFormatID: kAudioFormatEnhancedAC3,
+            mFormatFlags: 0,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: 1536,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: u32::from(config.channels),
+            mBitsPerChannel: 0,
+            mReserved: 0,
+        };
+        let mut raw: *const CMAudioFormatDescription = ptr::null();
+        let status = unsafe {
+            objc2_core_media::CMAudioFormatDescriptionCreate(
+                None,
+                NonNull::from(&mut asbd),
+                0,
+                ptr::null(),
+                cookie.len(),
+                cookie.as_ptr().cast(),
+                None,
+                NonNull::from(&mut raw),
+            )
+        };
+        if status != 0 || raw.is_null() {
+            return Ok(false);
+        }
+        // SAFETY: Create-rule function returned +1.
+        self.format_desc = Some(unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw as *mut _)) });
+        self.sample_rate = config.sample_rate;
+        self.channels = config.channels;
+        self.mix = None;
+        self.compressed = true;
+        Ok(true)
+    }
+
+    fn write_packet(&mut self, packet: &[u8], pts: Duration, frames: u32) -> Result<bool, SinkError> {
+        if !self.compressed || packet.is_empty() {
+            return Err(SinkError::Fatal("audio sink not open for E-AC-3".into()));
+        }
+        if !self.wait_ready() {
+            return Ok(false);
+        }
+        let format_desc = self.format_desc.as_ref().expect("compressed format");
+        let sample_rate = self.sample_rate;
+        let ticks = (pts.as_secs_f64() * f64::from(sample_rate)).round() as i64;
+        let (out_ticks, reanchor) = self.clock_anchor.resolve(ticks, sample_rate);
+        let pts_cm = CMTime { value: out_ticks, timescale: sample_rate as i32, flags: CMTimeFlags::Valid, epoch: 0 };
+        let block = unsafe { create_block_buffer_from_bytes(packet)? };
+        let description = AudioStreamPacketDescription {
+            mStartOffset: 0,
+            mVariableFramesInPacket: if frames == 1536 { 0 } else { frames },
+            mDataByteSize: packet.len() as u32,
+        };
+        let mut raw: *mut CMSampleBuffer = ptr::null_mut();
+        let status = unsafe {
+            objc2_core_media::CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+                None,
+                &block,
+                format_desc,
+                1,
+                pts_cm,
+                &description,
+                NonNull::from(&mut raw),
+            )
+        };
+        if status != 0 || raw.is_null() {
+            return Err(SinkError::Fatal(format!("CMAudioSampleBufferCreateReadyWithPacketDescriptions: {status}")));
+        }
+        // SAFETY: Create-rule function returned +1.
+        let sample = unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw)) };
+        unsafe {
+            let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
+            let _: () = objc2::msg_send![renderer, enqueueSampleBuffer: &*sample];
+        }
+        self.clock_anchor.commit(out_ticks, reanchor, frames as usize);
+        self.anchor_synchronizer(pts_cm);
+        Ok(true)
     }
 
     fn drain(&mut self) -> Result<bool, SinkError> {

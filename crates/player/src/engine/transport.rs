@@ -406,17 +406,6 @@ impl SharedState {
         published
     }
 
-    /// The native route: the platform player's buffering is the hold
-    /// (`pipelines_started` never runs, so `rebuffer` leaves it alone).
-    pub(super) fn native_hold(&self, hold: bool) {
-        self.update(|t| t.buffering = hold);
-    }
-
-    /// The user's intent: paused.
-    pub(super) fn paused(&self) -> bool {
-        self.transport.lock().paused
-    }
-
     /// The pipelines are running: from now on the hold follows their data.
     pub(super) fn pipelines_started(&self) {
         self.update(|t| t.started = true);
@@ -465,7 +454,7 @@ impl SharedState {
     }
 
     /// The pipeline has output ready (decoded and past the seek target) for
-    /// seek generation `generation`. Wakes `wait_primed` even when the hold
+    /// seek generation `generation`; clock waiters wake even when the hold
     /// stays.
     pub(super) fn pipe_primed(&self, pipe: Pipe, generation: u64) {
         self.update(|t| {
@@ -518,30 +507,6 @@ impl SharedState {
             }
         });
     }
-    /// Waits until `pipe` has output ready for seek generation `generation`
-    /// (`pipe_primed`) or `until` on `active_now` passes. False when the
-    /// player stopped, the pipeline retired or a newer seek superseded it.
-    pub(super) fn wait_primed(&self, pipe: Pipe, generation: u64, until: Instant, retired: &AtomicBool) -> bool {
-        let mut t = self.transport.lock();
-        loop {
-            if t.done || self.superseded(generation, retired) {
-                return false;
-            }
-            if pipe == Pipe::Video && self.video_wake.load(Ordering::SeqCst) {
-                return true;
-            }
-            let now = t.active_now();
-            if t.pipe(pipe).primed == Some(generation) || now >= until {
-                return true;
-            }
-            if t.paused {
-                self.transport_cv.wait(&mut t);
-            } else {
-                self.transport_cv.wait_for(&mut t, until - now);
-            }
-        }
-    }
-
     pub(super) fn source_starved(&self, starved: bool) {
         self.update(|t| t.source_starved = starved);
     }
@@ -811,14 +776,6 @@ impl SharedState {
             self.transport_cv.wait(&mut t);
         }
         !self.superseded(seen_seek, retired)
-    }
-
-    /// A platform decoder's input was full. It can still drain while the
-    /// clock stands still (decoding ahead of presentation), so retry after a
-    /// short wait that pause/seek/drop also interrupt.
-    pub(super) fn wait_retry(&self) {
-        let mut t = self.transport.lock();
-        self.transport_cv.wait_for(&mut t, Duration::from_millis(5));
     }
 
     pub(super) fn video_wait_retry(&self) {

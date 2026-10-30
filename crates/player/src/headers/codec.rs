@@ -1,6 +1,5 @@
-//! Codec configuration for the native route: sample-entry records, RFC 6381
-//! codec strings and per-packet framing for H.264, HEVC, AAC, AC-3 and
-//! E-AC-3.
+//! Codec-header parsing for direct playback: H.264/HEVC parameter sets and VUI,
+//! HDR10 SEI metadata, Dolby Vision detection, and E-AC-3 dec3 configuration.
 
 use oxideav_core::CodecParameters;
 
@@ -41,42 +40,6 @@ pub(crate) fn video_framing(params: &CodecParameters) -> Framing {
     }
 }
 
-/// One video packet as a sample in the record's framing. LengthPrefixed input is returned unchanged.
-/// AnnexB input becomes 4-byte length prefixes (the record built from Annex B parameter sets declares 4),
-/// dropping empty NAL units and trailing zero bytes.
-pub(crate) fn video_sample(data: Vec<u8>, framing: Framing) -> Vec<u8> {
-    match framing {
-        Framing::LengthPrefixed(_) => data,
-        Framing::AnnexB => {
-            let mut out = Vec::with_capacity(data.len() + 16);
-            let mut i = 0;
-            let mut starts = Vec::new();
-            while i + 2 < data.len() {
-                if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
-                    starts.push(i);
-                    i += 3;
-                } else {
-                    i += 1;
-                }
-            }
-            for (idx, &start) in starts.iter().enumerate() {
-                let nalu_start = start + 3;
-                let next_start = starts.get(idx + 1).copied().unwrap_or(data.len());
-                let mut nalu_end = next_start;
-                while nalu_end > nalu_start && data[nalu_end - 1] == 0 {
-                    nalu_end -= 1;
-                }
-                if nalu_end > nalu_start {
-                    let len = (nalu_end - nalu_start) as u32;
-                    out.extend_from_slice(&len.to_be_bytes());
-                    out.extend_from_slice(&data[nalu_start..nalu_end]);
-                }
-            }
-            out
-        }
-    }
-}
-
 /// None unless codec_id is "h264" or "h265"/"hevc" and an SPS (and PPS) is found in the extradata
 /// (avcC/hvcC record or Annex B) or, failing that, in `first_keyframe` (framed per `video_framing`).
 pub(crate) fn video_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoConfig> {
@@ -87,67 +50,11 @@ pub(crate) fn video_config(params: &CodecParameters, first_keyframe: &[u8]) -> O
     }
 }
 
-/// None unless codec_id is "aac", "ac3", "eac3", "flac" or "alac" and the headers parse.
+/// None unless codec_id is "eac3" and the headers parse.
 pub(crate) fn audio_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConfig> {
     match params.codec_id.as_str() {
-        "aac" => aac_config(params, first_packet),
-        "ac3" => ac3_config(params, first_packet),
         "eac3" => eac3_config(params, first_packet),
-        "flac" => flac_config(&params.extradata, params.language.clone()),
-        "alac" => alac_config(params),
         _ => None,
-    }
-}
-
-/// The packet as a sample: ADTS header (7 bytes, 9 with CRC) stripped when `config.adts`, else unchanged.
-pub(crate) fn audio_sample(config: &AudioConfig, mut data: Vec<u8>) -> Vec<u8> {
-    if config.adts && data.len() >= 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0 {
-        let protection_absent = data[1] & 1;
-        let header_len = if protection_absent == 1 { 7 } else { 9 };
-        if data.len() >= header_len {
-            data.drain(..header_len);
-            data
-        } else {
-            Vec::new()
-        }
-    } else {
-        data
-    }
-}
-
-/// Samples (at config.sample_rate) this packet carries: AAC frame_samples; AC-3 1536 x syncframes in the packet; E-AC-3 via eac3_frame_samples; FLAC via frame header block size; ALAC via frame header hasSize sample count or frame_samples. 0 if unparseable.
-pub(crate) fn audio_packet_samples(config: &AudioConfig, data: &[u8]) -> u32 {
-    match config.codec {
-        AudioCodec::Aac => {
-            if data.is_empty() {
-                0
-            } else {
-                config.frame_samples
-            }
-        }
-        AudioCodec::Ac3 => {
-            let mut count = 0u32;
-            let mut pos = 0;
-            while pos + 7 <= data.len() {
-                if data[pos] == 0x0B && data[pos + 1] == 0x77 {
-                    let fscod = (data[pos + 4] >> 6) & 3;
-                    let frmsizecod = (data[pos + 4] & 0x3F) as usize;
-                    if fscod < 3 && frmsizecod <= 37 {
-                        let frame_size = FRAME_SIZE_TAB[frmsizecod][fscod as usize] as usize * 2;
-                        if frame_size > 0 && pos + frame_size <= data.len() {
-                            count += 1;
-                            pos += frame_size;
-                            continue;
-                        }
-                    }
-                }
-                break;
-            }
-            1536 * count
-        }
-        AudioCodec::Eac3 => eac3_frame_samples(data).unwrap_or(0),
-        AudioCodec::Flac => flac_frame_samples(data),
-        AudioCodec::Alac => alac_frame_samples(config, data),
     }
 }
 
@@ -884,272 +791,8 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
     Some(config)
 }
 
-// ---------------------------------------------------------------------------
-// AAC
-// ---------------------------------------------------------------------------
-
-const AAC_SAMPLE_RATES: [u32; 13] = [
-    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
-];
-
-fn encode_expandable_len(mut len: usize) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.push((len & 0x7F) as u8);
-    len >>= 7;
-    while len > 0 {
-        bytes.push(((len & 0x7F) | 0x80) as u8);
-        len >>= 7;
-    }
-    bytes.reverse();
-    let n = bytes.len();
-    for i in 0..n - 1 {
-        bytes[i] |= 0x80;
-    }
-    bytes[n - 1] &= 0x7F;
-    bytes
-}
-
-fn encode_descriptor(tag: u8, payload: &[u8]) -> Vec<u8> {
-    let len_bytes = encode_expandable_len(payload.len());
-    let mut out = Vec::with_capacity(1 + len_bytes.len() + payload.len());
-    out.push(tag);
-    out.extend_from_slice(&len_bytes);
-    out.extend_from_slice(payload);
-    out
-}
-
-fn aac_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConfig> {
-    let (asc, adts) = if !params.extradata.is_empty() {
-        (params.extradata.clone(), false)
-    } else if first_packet.len() >= 7 && first_packet[0] == 0xFF && (first_packet[1] & 0xF0) == 0xF0 {
-        let profile = (first_packet[2] >> 6) & 3;
-        let aot = profile + 1;
-        let sfi = (first_packet[2] >> 2) & 0x0F;
-        let channel_config = ((first_packet[2] & 1) << 2) | ((first_packet[3] >> 6) & 3);
-        let byte0 = (aot << 3) | (sfi >> 1);
-        let byte1 = ((sfi & 1) << 7) | (channel_config << 3);
-        (vec![byte0, byte1], true)
-    } else {
-        return None;
-    };
-
-    let mut br = BitReader::new(&asc);
-    let mut aot = br.read(5)?;
-    if aot == 31 {
-        aot = 32 + br.read(6)?;
-    }
-    let signalled_aot = aot;
-
-    let sfi = br.read(4)?;
-    let sampling_freq = if sfi == 15 {
-        br.read(24)?
-    } else {
-        *AAC_SAMPLE_RATES.get(sfi as usize)?
-    };
-
-    let channel_config = br.read(4)?;
-
-    let core_sample_rate = sampling_freq;
-    if aot == 5 || aot == 29 {
-        let ext_sfi = br.read(4)?;
-        let _ext_freq = if ext_sfi == 15 {
-            br.read(24)?
-        } else {
-            *AAC_SAMPLE_RATES.get(ext_sfi as usize)?
-        };
-        let mut core_aot = br.read(5)?;
-        if core_aot == 31 {
-            core_aot = 32 + br.read(6)?;
-        }
-        if core_aot == 22 {
-            let _ = br.read(4);
-        }
-    }
-
-    let frame_length_flag = br.read(1)? != 0;
-    let frame_samples = if frame_length_flag { 960 } else { 1024 };
-
-    let channels = match channel_config {
-        1..=6 => channel_config as u16,
-        7 => 8,
-        _ => params.channels.unwrap_or(2),
-    };
-
-    let codec_string = format!("mp4a.40.{}", signalled_aot);
-
-    // Build esds FullBox
-    let sl_desc = encode_descriptor(6, &[0x02]);
-    let dec_spec_info = encode_descriptor(5, &asc);
-
-    let mut tag4_payload = Vec::with_capacity(13 + dec_spec_info.len());
-    tag4_payload.push(0x40); // objectTypeIndication
-    tag4_payload.push(0x15); // streamType = AudioStream
-    tag4_payload.extend_from_slice(&[0, 0, 0]); // bufferSizeDB = 0
-    tag4_payload.extend_from_slice(&[0, 0, 0, 0]); // maxBitrate = 0
-    tag4_payload.extend_from_slice(&[0, 0, 0, 0]); // avgBitrate = 0
-    tag4_payload.extend_from_slice(&dec_spec_info);
-    let dec_config_desc = encode_descriptor(4, &tag4_payload);
-
-    let mut tag3_payload = Vec::with_capacity(3 + dec_config_desc.len() + sl_desc.len());
-    tag3_payload.extend_from_slice(&[0x00, 0x00]); // ES_ID = 0
-    tag3_payload.push(0x00); // flags = 0
-    tag3_payload.extend_from_slice(&dec_config_desc);
-    tag3_payload.extend_from_slice(&sl_desc);
-    let es_desc = encode_descriptor(3, &tag3_payload);
-
-    let mut esds = Vec::with_capacity(4 + es_desc.len());
-    esds.extend_from_slice(&[0, 0, 0, 0]); // version = 0, flags = 0
-    esds.extend_from_slice(&es_desc);
-
-    Some(AudioConfig {
-        codec: AudioCodec::Aac,
-        sample_rate: core_sample_rate,
-        channels,
-        bits: 16,
-        config: esds,
-        codec_string,
-        frame_samples,
-        adts,
-        language: None,
-        atmos_joc: None,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// AC-3
-// ---------------------------------------------------------------------------
-
 const AC3_SAMPLE_RATES: [u32; 4] = [48000, 44100, 32000, 0];
 const ACMOD_CHANNELS: [u16; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
-const FRAME_SIZE_TAB: [[u16; 3]; 38] = [
-    [64, 69, 96],
-    [64, 70, 96],
-    [80, 87, 120],
-    [80, 88, 120],
-    [96, 104, 144],
-    [96, 105, 144],
-    [112, 121, 168],
-    [112, 122, 168],
-    [128, 139, 192],
-    [128, 140, 192],
-    [160, 174, 240],
-    [160, 175, 240],
-    [192, 208, 288],
-    [192, 209, 288],
-    [224, 243, 336],
-    [224, 244, 336],
-    [256, 278, 384],
-    [256, 279, 384],
-    [320, 348, 480],
-    [320, 349, 480],
-    [384, 417, 576],
-    [384, 418, 576],
-    [448, 487, 672],
-    [448, 488, 672],
-    [512, 557, 768],
-    [512, 558, 768],
-    [640, 696, 960],
-    [640, 697, 960],
-    [768, 835, 1152],
-    [768, 836, 1152],
-    [896, 975, 1344],
-    [896, 976, 1344],
-    [1024, 1114, 1536],
-    [1024, 1115, 1536],
-    [1152, 1253, 1728],
-    [1152, 1254, 1728],
-    [1280, 1393, 1920],
-    [1280, 1394, 1920],
-];
-
-fn ac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConfig> {
-    let syncframe = if first_packet.len() >= 7 && first_packet[0] == 0x0B && first_packet[1] == 0x77 {
-        Some(first_packet)
-    } else if params.extradata.len() >= 7
-        && params.extradata[0] == 0x0B
-        && params.extradata[1] == 0x77
-    {
-        Some(params.extradata.as_slice())
-    } else {
-        None
-    };
-
-    if let Some(buf) = syncframe {
-        let fscod = (buf[4] >> 6) & 3;
-        if fscod == 3 {
-            return None;
-        }
-        let sample_rate = AC3_SAMPLE_RATES[fscod as usize];
-        let frmsizecod = (buf[4] & 0x3F) as usize;
-        let bit_rate_code = (frmsizecod >> 1) as u32;
-
-        let bsid = (buf[5] >> 3) & 0x1F;
-        let bsmod = (buf[5] & 0x07) as u32;
-
-        let acmod = (buf[6] >> 5) & 7;
-        let mut skip = 0;
-        if acmod & 1 != 0 && acmod != 1 {
-            skip += 2;
-        }
-        if acmod & 4 != 0 {
-            skip += 2;
-        }
-        if acmod == 2 {
-            skip += 2;
-        }
-        let lfeon = ((buf[6] >> (4 - skip)) & 1) as u32;
-        let channels = ACMOD_CHANNELS[acmod as usize] + lfeon as u16;
-
-        let val: u32 = ((fscod as u32 & 0x03) << 22)
-            | ((bsid as u32 & 0x1F) << 17)
-            | ((bsmod & 0x07) << 14)
-            | ((acmod as u32 & 0x07) << 11)
-            | ((lfeon & 0x01) << 10)
-            | ((bit_rate_code & 0x1F) << 5);
-        let dac3 = vec![(val >> 16) as u8, (val >> 8) as u8, val as u8];
-
-        return Some(AudioConfig {
-            codec: AudioCodec::Ac3,
-            sample_rate,
-            channels,
-            bits: 16,
-            config: dac3,
-            codec_string: "ac-3".into(),
-            frame_samples: 1536,
-            adts: false,
-            language: None,
-            atmos_joc: None,
-        });
-    }
-
-    if params.extradata.len() == 3 {
-        let b0 = params.extradata[0];
-        let b1 = params.extradata[1];
-        let fscod = (b0 >> 6) & 3;
-        if fscod == 3 {
-            return None;
-        }
-        let sample_rate = AC3_SAMPLE_RATES[fscod as usize];
-        let acmod = (b1 >> 3) & 7;
-        let lfeon = (b1 >> 2) & 1;
-        let channels = ACMOD_CHANNELS[acmod as usize] + lfeon as u16;
-        return Some(AudioConfig {
-            codec: AudioCodec::Ac3,
-            sample_rate,
-            channels,
-            bits: 16,
-            config: params.extradata.clone(),
-            codec_string: "ac-3".into(),
-            frame_samples: 1536,
-            adts: false,
-            language: None,
-            atmos_joc: None,
-        });
-    }
-
-    None
-}
-
 // ---------------------------------------------------------------------------
 // E-AC-3
 // ---------------------------------------------------------------------------
@@ -1546,215 +1189,6 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
 }
 
 // ---------------------------------------------------------------------------
-// FLAC
-// ---------------------------------------------------------------------------
-
-/// The `fLaC` configuration for a STREAMINFO block (bare, after `fLaC`, or
-/// in a `dfLa` payload). `None` for what CoreMedia drops: a minimum block
-/// size under 192 (AetherEngine's finding) or more than 24 bits per sample
-/// (`-11855 Cannot Decode`); the bridge re-encodes those.
-pub(crate) fn flac_config(streaminfo: &[u8], language: Option<String>) -> Option<AudioConfig> {
-    let raw = extract_streaminfo(streaminfo)?;
-    if raw.len() != 34 {
-        return None;
-    }
-    let mut si = raw.to_vec();
-    let mut min_blocksize = u16::from_be_bytes([si[0], si[1]]);
-    let max_blocksize = u16::from_be_bytes([si[2], si[3]]);
-
-    if min_blocksize < 16 {
-        min_blocksize = max_blocksize;
-        si[0..2].copy_from_slice(&min_blocksize.to_be_bytes());
-    }
-    if min_blocksize < 192 {
-        return None;
-    }
-
-    let b = u64::from_be_bytes(si[10..18].try_into().ok()?);
-    let sample_rate = ((b >> 44) & 0xF_FFFF) as u32;
-    let channels = (((b >> 41) & 0x07) + 1) as u16;
-    let bits = (((b >> 36) & 0x1F) + 1) as u16;
-
-    if sample_rate == 0 || bits > 24 {
-        return None;
-    }
-
-    let mut config = Vec::with_capacity(4 + 4 + 34);
-    config.extend_from_slice(&[0, 0, 0, 0]); // FullBox version 0, flags 0
-    config.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]); // Last metadata block, STREAMINFO (0), len 34
-    config.extend_from_slice(&si);
-
-    Some(AudioConfig {
-        codec: AudioCodec::Flac,
-        sample_rate,
-        channels,
-        bits,
-        config,
-        codec_string: "fLaC".to_string(),
-        frame_samples: 0,
-        adts: false,
-        language,
-        atmos_joc: None,
-    })
-}
-
-fn extract_streaminfo(data: &[u8]) -> Option<&[u8]> {
-    if data.len() == 34 {
-        return Some(data);
-    }
-    let mut cursor = data;
-    if cursor.starts_with(b"fLaC") {
-        cursor = &cursor[4..];
-    } else if cursor.len() >= 4 && cursor[0] == 0 && cursor[1] == 0 && cursor[2] == 0 && cursor[3] == 0 {
-        cursor = &cursor[4..];
-    }
-    while cursor.len() >= 4 {
-        let is_last = (cursor[0] & 0x80) != 0;
-        let block_type = cursor[0] & 0x7F;
-        let block_len = u32::from_be_bytes([0, cursor[1], cursor[2], cursor[3]]) as usize;
-        cursor = &cursor[4..];
-        if cursor.len() < block_len {
-            return None;
-        }
-        if block_type == 0 && block_len == 34 {
-            return Some(&cursor[..34]);
-        }
-        cursor = &cursor[block_len..];
-        if is_last {
-            break;
-        }
-    }
-    None
-}
-
-fn flac_frame_samples(data: &[u8]) -> u32 {
-    if data.len() < 4 {
-        return 0;
-    }
-    if data[0] != 0xFF || (data[1] != 0xF8 && data[1] != 0xF9) {
-        return 0;
-    }
-    let bs_code = data[2] >> 4;
-    match bs_code {
-        0 => 0,
-        1 => 192,
-        2..=5 => 576 << (bs_code - 2),
-        8..=15 => 256 << (bs_code - 8),
-        6 => {
-            let offset = match flac_uncommon_offset(data) {
-                Some(off) => off,
-                None => return 0,
-            };
-            if data.len() <= offset {
-                return 0;
-            }
-            (data[offset] as u32) + 1
-        }
-        7 => {
-            let offset = match flac_uncommon_offset(data) {
-                Some(off) => off,
-                None => return 0,
-            };
-            if data.len() < offset + 2 {
-                return 0;
-            }
-            (u16::from_be_bytes([data[offset], data[offset + 1]]) as u32) + 1
-        }
-        _ => 0,
-    }
-}
-
-fn flac_uncommon_offset(data: &[u8]) -> Option<usize> {
-    if data.len() <= 4 {
-        return None;
-    }
-    let lead = data[4];
-    let utf8_len = if (lead & 0x80) == 0 {
-        1
-    } else if (lead & 0xE0) == 0xC0 {
-        2
-    } else if (lead & 0xF0) == 0xE0 {
-        3
-    } else if (lead & 0xF8) == 0xF0 {
-        4
-    } else if (lead & 0xFC) == 0xF8 {
-        5
-    } else if (lead & 0xFE) == 0xFC {
-        6
-    } else if lead == 0xFE {
-        7
-    } else {
-        return None;
-    };
-    if data.len() < 4 + utf8_len {
-        return None;
-    }
-    Some(4 + utf8_len)
-}
-
-// ---------------------------------------------------------------------------
-// ALAC
-// ---------------------------------------------------------------------------
-
-fn alac_config(params: &CodecParameters) -> Option<AudioConfig> {
-    let cookie = if params.extradata.len() >= 12 && &params.extradata[4..8] == b"alac" {
-        &params.extradata[12..]
-    } else {
-        &params.extradata[..]
-    };
-    if cookie.len() < 24 {
-        return None;
-    }
-    let frame_length = u32::from_be_bytes(cookie[0..4].try_into().ok()?);
-    let bit_depth = cookie[5];
-    let num_channels = cookie[9];
-    let sample_rate = u32::from_be_bytes(cookie[20..24].try_into().ok()?);
-
-    if sample_rate == 0 || num_channels == 0 || bit_depth == 0 {
-        return None;
-    }
-
-    let mut config = Vec::with_capacity(4 + cookie.len());
-    config.extend_from_slice(&[0, 0, 0, 0]); // FullBox version 0, flags 0
-    config.extend_from_slice(cookie);
-
-    Some(AudioConfig {
-        codec: AudioCodec::Alac,
-        sample_rate,
-        channels: u16::from(num_channels),
-        bits: u16::from(bit_depth),
-        config,
-        codec_string: "alac".to_string(),
-        frame_samples: frame_length,
-        adts: false,
-        language: params.language.clone(),
-        atmos_joc: None,
-    })
-}
-
-fn alac_frame_samples(config: &AudioConfig, data: &[u8]) -> u32 {
-    if data.is_empty() {
-        return 0;
-    }
-    if data.len() < 3 {
-        return config.frame_samples;
-    }
-    let has_size = (data[2] & 0x10) != 0;
-    if has_size {
-        if data.len() < 7 {
-            return 0;
-        }
-        ((data[2] as u32 & 1) << 31)
-            | ((data[3] as u32) << 23)
-            | ((data[4] as u32) << 15)
-            | ((data[5] as u32) << 7)
-            | ((data[6] as u32) >> 1)
-    } else {
-        config.frame_samples
-    }
-}
-
-// ---------------------------------------------------------------------------
 // BitWriter / BitReader
 // ---------------------------------------------------------------------------
 
@@ -1785,6 +1219,7 @@ impl BitWriter {
         }
     }
 
+    #[cfg(test)]
     fn write_ue(&mut self, val: u32) {
         let v = val + 1;
         let total_bits = 32 - v.leading_zeros() as usize;
@@ -1977,12 +1412,16 @@ pub(crate) fn apply_dovi(
 
     let resolved = match parsed {
         None => {
+            // Profile 5 leaves its colour unspecified or names its own matrix, IPT-C2 (15).
             let unspecified_colour = config.colour.is_none()
-                || config.colour.is_some_and(|c| c.primaries == 2 && c.transfer == 2 && c.matrix == 2);
-            if unspecified_colour && rpu_profile == Some(5) {
-                Some((5u8, 6u8, 0u8, build_dovi_record(5, 6, true, false, true, 0)))
-            } else {
-                None
+                || config.colour.is_some_and(|c| (c.primaries == 2 && c.transfer == 2 && c.matrix == 2) || c.matrix == 15);
+            match rpu_profile {
+                Some(5) if unspecified_colour => Some((5u8, 6u8, 0u8, build_dovi_record(5, 6, true, false, true, 0))),
+                // A profile 8 RPU with no container record: the base layer's own transfer says
+                // which compatibility it keeps (8.1 over HDR10, 8.4 over HLG).
+                Some(8) if config.range == VideoRange::Pq => Some((8, 6, 1, build_dovi_record(8, 6, true, false, true, 1))),
+                Some(8) if config.range == VideoRange::Hlg => Some((8, 6, 4, build_dovi_record(8, 6, true, false, true, 4))),
+                _ => None,
             }
         }
         Some((mut profile, level, mut compat_id, mut record)) => {
@@ -2078,374 +1517,6 @@ pub(crate) fn apply_dovi(
     }
 }
 
-/// Converts one HEVC `UNSPEC62` RPU NAL unit (with its 2-byte NAL header) to
-/// Profile 8.1 (mode 2: luma/chroma mapping curves set to no-op, EL/NLQ
-/// removed, L1/L2/L5/L8/L9/L11 display metadata kept). Returns `None` when
-/// the RPU fails CRC32 validation, hits a hostile Exp-Golomb/pivot count, or
-/// fails conversion in `dolby_vision`.
-pub(crate) fn convert_rpu_nal_to_p81(nal: &[u8]) -> Option<Vec<u8>> {
-    use dolby_vision::rpu::{ConversionMode, dovi_rpu::DoviRpu};
-
-    if nal.len() < 25 || ((nal[0] >> 1) & 0x3F) != 62 {
-        return None;
-    }
-    let mut rbsp = unescape_rbsp(&nal[2..]);
-    while rbsp.last() == Some(&0) {
-        rbsp.pop();
-    }
-    if rbsp.len() < 8 || rbsp[0] != 0x19 || *rbsp.last()? != 0x80 {
-        return None;
-    }
-    let crc_at = rbsp.len() - 5;
-    let expected_crc = u32::from_be_bytes([rbsp[crc_at], rbsp[crc_at + 1], rbsp[crc_at + 2], rbsp[crc_at + 3]]);
-    if rpu_crc32(&rbsp[1..crc_at]) != expected_crc || rpu_is_hostile(&rbsp[1..]) {
-        return None;
-    }
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut rpu = DoviRpu::parse_unspec62_nalu(nal).ok()?;
-        rpu.convert_with_mode(ConversionMode::To81).ok()?;
-        rpu.write_hevc_unspec62_nalu().ok()
-    }))
-    .ok()
-    .flatten()
-}
-
-fn rpu_crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= u32::from(byte) << 24;
-        for _ in 0..8 {
-            crc = if (crc & 0x8000_0000) != 0 {
-                (crc << 1) ^ 0x04C1_1DB7
-            } else {
-                crc << 1
-            };
-        }
-    }
-    crc
-}
-
-/// Pre-parse allocation and panic guard against CRC-valid crafted RPUs:
-/// - Exp-Golomb codes with >= 32 leading zeros,
-/// - `num_pivots_minus2` or DM `num_ext_blocks` exceeding the remaining bits
-///   (which `dolby_vision` passes straight to `Vec::with_capacity`),
-/// - mixed `mapping_idc` on one curve or `poly_order_minus1 == 0` with linear
-///   interpolation,
-/// - undefined CM v4.0 block lengths for levels 8, 9, and 10.
-fn rpu_is_hostile(rbsp_after_prefix: &[u8]) -> bool {
-    struct GuardBits<'a> {
-        data: &'a [u8],
-        pos: usize,
-        hostile: bool,
-    }
-    impl<'a> GuardBits<'a> {
-        fn rem(&self) -> usize {
-            (self.data.len() * 8).saturating_sub(self.pos)
-        }
-        fn bit(&mut self) -> Option<u64> {
-            if self.pos >= self.data.len() * 8 {
-                return None;
-            }
-            let b = (self.data[self.pos >> 3] >> (7 - (self.pos & 7))) & 1;
-            self.pos += 1;
-            Some(u64::from(b))
-        }
-        fn bits(&mut self, n: usize) -> Option<u64> {
-            if n > 64 || self.pos + n > self.data.len() * 8 {
-                return None;
-            }
-            let mut v = 0u64;
-            for _ in 0..n {
-                v = (v << 1) | self.bit()?;
-            }
-            Some(v)
-        }
-        fn ue(&mut self) -> Option<u64> {
-            let mut zeros = 0usize;
-            while self.bit()? == 0 {
-                zeros += 1;
-                if zeros >= 32 {
-                    self.hostile = true;
-                    return None;
-                }
-            }
-            let rest = self.bits(zeros)?;
-            Some(((1u64 << zeros) - 1) + rest)
-        }
-        fn skip_se(&mut self) -> Option<()> {
-            self.ue().map(|_| ())
-        }
-    }
-    fn check_dm_blocks(r: &mut GuardBits<'_>, compressed: bool) -> Option<bool> {
-        r.ue()?;
-        r.ue()?;
-        r.ue()?;
-        if !compressed {
-            if r.rem() < 509 {
-                return Some(false);
-            }
-            r.pos += 509;
-        }
-        for section in 0..2 {
-            if section == 1 && r.rem() < 56 {
-                return Some(false);
-            }
-            let count = r.ue()?;
-            if count > (r.rem() / 9) as u64 {
-                return Some(true);
-            }
-            while (r.pos & 7) != 0 {
-                r.bit()?;
-            }
-            for _ in 0..count {
-                let length = r.ue()?;
-                let level = r.bits(8)?;
-                if section == 1 {
-                    match level {
-                        8 if !matches!(length, 10 | 12 | 13 | 19 | 25) => return Some(true),
-                        9 if !matches!(length, 1 | 17) => return Some(true),
-                        10 if !matches!(length, 5 | 21) => return Some(true),
-                        8 | 9 | 10 | 3 | 11 | 254 => {}
-                        _ => return Some(false),
-                    }
-                } else if !matches!(level, 1 | 2 | 4 | 5 | 6 | 255) {
-                    return Some(false);
-                }
-                if length >= (1 << 20) || (length as usize) * 8 > r.rem() {
-                    return Some(false);
-                }
-                r.pos += (length as usize) * 8;
-            }
-        }
-        Some(false)
-    }
-
-    let mut r = GuardBits { data: rbsp_after_prefix, pos: 0, hostile: false };
-    let check = (|| -> Option<bool> {
-        if r.bits(6)? != 2 {
-            return Some(false);
-        }
-        let format = r.bits(11)?;
-        r.bits(8)?;
-        if r.bit()? != 1 {
-            return Some(false);
-        }
-        r.bit()?;
-        let data_type = r.bits(2)?;
-        let mut denom = 0u64;
-        if data_type == 0 {
-            denom = r.ue()?;
-        }
-        r.bits(3)?;
-        let mut bl_depth = 0u64;
-        let mut el_depth = 0u64;
-        let mut reserved3 = 0u64;
-        let mut disable_residual = false;
-        if (format & 0x700) == 0 {
-            bl_depth = r.ue()?;
-            el_depth = r.ue()? & 0xFF;
-            r.ue()?;
-            r.bit()?;
-            reserved3 = r.bits(3)?;
-            r.bit()?;
-            disable_residual = r.bit()? == 1;
-        }
-        let coef_len = if data_type == 0 {
-            if denom > 32 {
-                return Some(false);
-            }
-            denom as usize
-        } else if data_type == 1 {
-            32
-        } else {
-            return Some(false);
-        };
-        if bl_depth != 2 || denom > 23 {
-            return Some(false);
-        }
-        let dm_present = r.bit()? == 1;
-        let use_prev = r.bit()? == 1;
-        if use_prev {
-            r.ue()?;
-            if !dm_present {
-                return Some(false);
-            }
-            return check_dm_blocks(&mut r, reserved3 == 1);
-        }
-        r.ue()?;
-        r.ue()?;
-        r.ue()?;
-        let depth = (bl_depth as usize) + 8;
-        let mut pieces = [0usize; 3];
-        for c in 0..3 {
-            let n = r.ue()?;
-            if n > (r.rem() / depth) as u64 {
-                return Some(true);
-            }
-            pieces[c] = (n as usize) + 1;
-            for _ in 0..(n as usize + 2) {
-                r.bits(depth)?;
-            }
-        }
-        if (format & 0x700) == 0 && !disable_residual {
-            if r.bits(3)? != 0 {
-                return Some(false);
-            }
-            r.bits(depth)?;
-            r.bits(depth)?;
-        }
-        r.ue()?;
-        r.ue()?;
-        for &piece_count in &pieces {
-            let mut curve_idc: Option<u64> = None;
-            for _ in 0..piece_count {
-                let idc = r.ue()?;
-                if let Some(prev) = curve_idc {
-                    if idc <= 1 && idc != prev {
-                        return Some(true);
-                    }
-                }
-                curve_idc = Some(idc);
-                if idc == 0 {
-                    let order = r.ue()?;
-                    if order > 1 {
-                        return Some(false);
-                    }
-                    if order == 0 && r.bit()? == 1 {
-                        return Some(true);
-                    }
-                    for _ in 0..(order as usize + 2) {
-                        if data_type == 0 {
-                            r.skip_se()?;
-                        }
-                        r.bits(coef_len)?;
-                    }
-                } else if idc == 1 {
-                    let order = r.bits(2)?;
-                    if order > 2 {
-                        return Some(false);
-                    }
-                    if data_type == 0 {
-                        r.skip_se()?;
-                    }
-                    r.bits(coef_len)?;
-                    for _ in 0..=(order as usize) {
-                        for _ in 0..7 {
-                            if data_type == 0 {
-                                r.skip_se()?;
-                            }
-                            r.bits(coef_len)?;
-                        }
-                    }
-                } else {
-                    return Some(false);
-                }
-            }
-        }
-        if (format & 0x700) == 0 && !disable_residual {
-            if el_depth != 2 {
-                return Some(false);
-            }
-            for _ in 0..3 {
-                r.bits((el_depth as usize) + 8)?;
-                for _ in 0..3 {
-                    if data_type == 0 {
-                        r.skip_se()?;
-                    }
-                    r.bits(coef_len)?;
-                }
-            }
-        }
-        if !dm_present {
-            return Some(false);
-        }
-        check_dm_blocks(&mut r, reserved3 == 1)
-    })();
-    r.hostile || check == Some(true)
-}
-
-/// Strips any HEVC `UNSPEC63` (enhancement layer) NAL units from length-prefixed
-/// packet data, and when `convert_p7_to_81` is true, rewrites `UNSPEC62` RPU NAL
-/// units from Profile 7 to Profile 8.1 (mode 2), dropping any corrupt RPU so a
-/// stale P7 RPU never rides inside an 8.1 container.
-pub(crate) fn strip_hevc_el_nals(data: Vec<u8>, length_size: u8, convert_p7_to_81: bool) -> Vec<u8> {
-    let size = length_size as usize;
-    if size == 0 || data.len() < size {
-        return data;
-    }
-    let max_nal_len: usize = match size {
-        1 => u8::MAX as usize,
-        2 => u16::MAX as usize,
-        4 => u32::MAX as usize,
-        _ => return data,
-    };
-    let mut pos = 0;
-    let mut needs_rewrite = false;
-    while pos + size <= data.len() {
-        let nal_len = match size {
-            1 => data[pos] as usize,
-            2 => u16::from_be_bytes([data[pos], data[pos + 1]]) as usize,
-            4 => u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize,
-            _ => break,
-        };
-        pos += size;
-        if pos + nal_len > data.len() {
-            break;
-        }
-        if nal_len > 0 {
-            let nal_type = (data[pos] >> 1) & 0x3F;
-            if nal_type == 63 || (convert_p7_to_81 && nal_type == 62) {
-                needs_rewrite = true;
-                break;
-            }
-        }
-        pos += nal_len;
-    }
-    if !needs_rewrite {
-        return data;
-    }
-    let mut out = Vec::with_capacity(data.len());
-    let mut pos = 0;
-    while pos + size <= data.len() {
-        let nal_len = match size {
-            1 => data[pos] as usize,
-            2 => u16::from_be_bytes([data[pos], data[pos + 1]]) as usize,
-            4 => u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize,
-            _ => break,
-        };
-        let header = &data[pos..pos + size];
-        pos += size;
-        if pos + nal_len > data.len() {
-            break;
-        }
-        let nal = &data[pos..pos + nal_len];
-        pos += nal_len;
-        if nal_len > 0 {
-            let nal_type = (nal[0] >> 1) & 0x3F;
-            if nal_type == 63 {
-                continue;
-            }
-            if convert_p7_to_81 && nal_type == 62 {
-                if let Some(converted) = convert_rpu_nal_to_p81(nal) {
-                    if converted.len() <= max_nal_len {
-                        let len_bytes = (converted.len() as u32).to_be_bytes();
-                        out.extend_from_slice(&len_bytes[4 - size..]);
-                        out.extend_from_slice(&converted);
-                    }
-                }
-                continue;
-            }
-        }
-        out.extend_from_slice(header);
-        out.extend_from_slice(nal);
-    }
-    if out.is_empty() {
-        data
-    } else {
-        out
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2467,8 +1538,6 @@ mod tests {
         0x0b, 0x77, 0xb7, 0x3c, 0x1c, 0x40, 0xeb, 0xf8, 0x40, 0x3e, 0xff, 0x74, 0x84, 0x04,
         0x10, 0x80,
     ];
-
-    const AAC_EXTRA_MP4: &[u8] = &[0x11, 0x90, 0x56, 0xe5, 0x00];
 
     const EAC3_SYNCFRAME_MKV: &[u8] = &[
         0x0b, 0x77, 0x02, 0xff, 0x3f, 0x87, 0xc0, 0x00, 0x20, 0x00, 0x00, 0x00, 0x02, 0x00,
@@ -2517,27 +1586,6 @@ mod tests {
         let mut p_empty = CodecParameters::video(CodecId::new("h264"));
         p_empty.extradata = vec![];
         assert_eq!(video_framing(&p_empty), Framing::AnnexB);
-    }
-
-    #[test]
-    fn test_video_sample_annexb_to_length_prefixed() {
-        // Test with 3-byte and 4-byte start codes, empty NAL unit, and trailing zeros
-        let input = vec![
-            0, 0, 0, 1, 0x65, 0x88, 0x84, // 4-byte start code, NAL len 3
-            0, 0, 1, // empty NAL unit before next start code
-            0, 0, 1, 0x68, 0x01, // 3-byte start code, NAL len 2
-            0, 0, // trailing zeros
-        ];
-        let sample = video_sample(input, Framing::AnnexB);
-        let expected = vec![
-            0, 0, 0, 3, 0x65, 0x88, 0x84, // length prefix 3
-            0, 0, 0, 2, 0x68, 0x01,       // length prefix 2
-        ];
-        assert_eq!(sample, expected);
-
-        // LengthPrefixed is returned unchanged
-        let lp_input = vec![0, 0, 0, 2, 0x65, 0x88];
-        assert_eq!(video_sample(lp_input.clone(), Framing::LengthPrefixed(4)), lp_input);
     }
 
     #[test]
@@ -2621,29 +1669,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ac3_audio_config_and_samples() {
-        let p = CodecParameters::audio(CodecId::new("ac3"));
-        let mut pkt = AC3_SYNCFRAME_MKV.to_vec();
-        pkt.resize(1536, 0); // 1536 bytes AC-3 syncframe
-
-        let cfg = audio_config(&p, &pkt).expect("ac3 config");
-        assert_eq!(cfg.codec, AudioCodec::Ac3);
-        assert_eq!(cfg.sample_rate, 48000);
-        assert_eq!(cfg.channels, 6);
-        assert_eq!(cfg.frame_samples, 1536);
-        assert_eq!(cfg.codec_string, "ac-3");
-        assert_eq!(cfg.config, vec![0x10, 0x3d, 0xc0]); // matches FFmpeg dac3 exactly!
-        assert!(!cfg.adts);
-
-        assert_eq!(audio_packet_samples(&cfg, &pkt), 1536);
-
-        // Multi-syncframe test: 2 syncframes
-        let mut multi = pkt.clone();
-        multi.extend_from_slice(&pkt);
-        assert_eq!(audio_packet_samples(&cfg, &multi), 3072);
-    }
-
-    #[test]
     fn test_eac3_audio_config_and_samples() {
         let p = CodecParameters::audio(CodecId::new("eac3"));
         let mut pkt = EAC3_SYNCFRAME_MKV.to_vec();
@@ -2659,78 +1684,10 @@ mod tests {
         assert!(!cfg.adts);
 
         assert_eq!(eac3_frame_samples(&pkt), Some(1536));
-        assert_eq!(audio_packet_samples(&cfg, &pkt), 1536);
 
         // None if not starting with E-AC-3 syncframe
         let legacy_ac3 = AC3_SYNCFRAME_MKV.to_vec();
         assert_eq!(eac3_frame_samples(&legacy_ac3), None);
-    }
-
-    #[test]
-    fn test_aac_audio_config_and_adts_stripping() {
-        let mut p = CodecParameters::audio(CodecId::new("aac"));
-        p.extradata = AAC_EXTRA_MP4.to_vec();
-
-        let cfg = audio_config(&p, &[]).expect("aac config");
-        assert_eq!(cfg.codec, AudioCodec::Aac);
-        assert_eq!(cfg.sample_rate, 48000);
-        assert_eq!(cfg.channels, 2);
-        assert_eq!(cfg.frame_samples, 1024);
-        assert_eq!(cfg.codec_string, "mp4a.40.2");
-        assert!(!cfg.adts);
-
-        // ADTS test without extradata
-        let p_adts = CodecParameters::audio(CodecId::new("aac"));
-        // 7-byte ADTS header without CRC: 48 kHz, stereo, LC
-        let adts_header_7 = vec![0xFF, 0xF1, 0x4C, 0x80, 0x03, 0x1F, 0xFC];
-        let mut adts_pkt = adts_header_7.clone();
-        adts_pkt.extend_from_slice(&[0x12, 0x34, 0x56]); // 3-byte payload
-
-        let cfg_adts = audio_config(&p_adts, &adts_pkt).expect("aac adts config");
-        assert!(cfg_adts.adts);
-        assert_eq!(cfg_adts.sample_rate, 48000);
-        assert_eq!(cfg_adts.channels, 2);
-        assert_eq!(cfg_adts.frame_samples, 1024);
-        assert_eq!(cfg_adts.codec_string, "mp4a.40.2");
-
-        let stripped = audio_sample(&cfg_adts, adts_pkt);
-        assert_eq!(stripped, vec![0x12, 0x34, 0x56]);
-
-        // 9-byte ADTS header with CRC (protection_absent == 0)
-        let adts_header_9 = vec![0xFF, 0xF0, 0x4C, 0x80, 0x03, 0x1F, 0xFC, 0xAB, 0xCD];
-        let mut adts_pkt_9 = adts_header_9.clone();
-        adts_pkt_9.extend_from_slice(&[0x78, 0x9A]);
-        let stripped_9 = audio_sample(&cfg_adts, adts_pkt_9);
-        assert_eq!(stripped_9, vec![0x78, 0x9A]);
-    }
-
-    #[test]
-    fn test_explicit_he_aac() {
-        // Explicit HE-AAC (AOT 5, extension rate 48000, core AOT 2, core rate 24000)
-        // Bitstream:
-        // AOT 5 (5 bits: 00101)
-        // ext_sfi 3 (4 bits: 0011 -> 48000)
-        // core_aot 2 (5 bits: 00010)
-        // core_sfi 6 (4 bits: 0110 -> 24000)
-        // channel_config 2 (4 bits: 0010)
-        // frame_length_flag 0 (1 bit: 0 -> 1024)
-        // depends 0 (1 bit: 0)
-        // ext 0 (1 bit: 0)
-        // Total 26 bits.
-        // 00101 0011 00010 0110 0010 0 0 0 000000
-        // Group into bytes:
-        // Byte 0: 00101001 = 0x29
-        // Byte 1: 10001001 = 0x89
-        // Byte 2: 10001000 = 0x88
-        // Byte 3: 00000000 = 0x00
-        let mut p = CodecParameters::audio(CodecId::new("aac"));
-        p.extradata = vec![0x2B, 0x11, 0x88, 0x00];
-
-        let cfg = audio_config(&p, &[]).expect("explicit he-aac config");
-        assert_eq!(cfg.codec_string, "mp4a.40.5");
-        assert_eq!(cfg.sample_rate, 24000); // Core rate, not extension rate
-        assert_eq!(cfg.channels, 2);
-        assert_eq!(cfg.frame_samples, 1024);
     }
 
     #[test]
@@ -2781,11 +1738,6 @@ mod tests {
         // 2 frames with 6 blocks each -> 2 * 6 * 256 = 3072 samples
         assert_eq!(eac3_frame_samples(&multi), Some(3072));
 
-        let p = CodecParameters::audio(CodecId::new("eac3"));
-        let cfg = audio_config(&p, &pkt1).expect("eac3 config");
-        assert_eq!(audio_packet_samples(&cfg, &multi), 3072);
-        assert_eq!(audio_packet_samples(&cfg, &[]), 0);
-        assert_eq!(audio_packet_samples(&cfg, &[0xFF, 0xFF]), 0);
     }
 
     #[test]
@@ -2795,226 +1747,6 @@ mod tests {
 
         let p_vp9 = CodecParameters::video(CodecId::new("vp9"));
         assert_eq!(video_config(&p_vp9, &[]), None);
-    }
-
-    /// FFmpeg's `dfLa` payload for the multi_audio fixture's 7.1 FLAC, with
-    /// bits per sample set to 24 (byte 21: the fixture's is 32, which
-    /// CoreMedia cannot decode).
-    const FFMPEG_DFLA_PAYLOAD: &[u8] = &[
-        0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x22, 0x04, 0x00, 0x04, 0x00, 0x00, 0x12,
-        0x6e, 0x00, 0x41, 0x27, 0x0b, 0xb8, 0x0f, 0x70, 0x00, 0x15, 0xf9, 0x00, 0x8f, 0x43,
-        0x3f, 0x80, 0xfb, 0xab, 0x19, 0xf0, 0xdd, 0x3a, 0x0a, 0x24, 0x5c, 0x01, 0xab, 0xec,
-    ];
-
-    const FFMPEG_ALAC_PAYLOAD: &[u8] = &[
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x18, 0x28, 0x0a, 0x0e, 0x06,
-        0x00, 0x00, 0x00, 0x01, 0x20, 0x04, 0x00, 0x69, 0x78, 0x00, 0x00, 0x00, 0xbb, 0x80,
-    ];
-
-    #[test]
-    fn test_flac_dfla_matches_ffmpeg() {
-        // 1. Matroska CodecPrivate: "fLaC" + metadata block (38 bytes)
-        let mut mkv_extradata = b"fLaC".to_vec();
-        mkv_extradata.extend_from_slice(&FFMPEG_DFLA_PAYLOAD[4..]); // 0x80, 0, 0, 0x22 + 34 bytes
-
-        let mut p = CodecParameters::audio(CodecId::new("flac"));
-        p.extradata = mkv_extradata;
-        let cfg = audio_config(&p, &[]).expect("flac config from mkv extradata");
-        assert_eq!(cfg.codec, AudioCodec::Flac);
-        assert_eq!(cfg.sample_rate, 48000);
-        assert_eq!(cfg.channels, 8);
-        assert_eq!(cfg.bits, 24);
-        assert_eq!(cfg.codec_string, "fLaC");
-        assert_eq!(cfg.frame_samples, 0);
-        assert!(!cfg.adts);
-        assert_eq!(cfg.config, FFMPEG_DFLA_PAYLOAD);
-
-        // 2. Bare 34-byte STREAMINFO via flac_config
-        let bare_streaminfo = &FFMPEG_DFLA_PAYLOAD[8..];
-        let cfg_bare = flac_config(bare_streaminfo, None).expect("flac config from bare streaminfo");
-        assert_eq!(cfg_bare.config, FFMPEG_DFLA_PAYLOAD);
-
-        // 3. MP4 dfLa payload (FullBox header + blocks)
-        let cfg_dfla = flac_config(FFMPEG_DFLA_PAYLOAD, None).expect("flac config from dfLa payload");
-        assert_eq!(cfg_dfla.config, FFMPEG_DFLA_PAYLOAD);
-
-        // 4. 32 bits per sample (the fixture's own): the bridge's, not a copy.
-        let mut si32 = FFMPEG_DFLA_PAYLOAD[8..].to_vec();
-        si32[13] = 0xf0;
-        assert_eq!(flac_config(&si32, None), None);
-    }
-
-    #[test]
-    fn test_alac_cookie_matches_ffmpeg() {
-        let cookie = &FFMPEG_ALAC_PAYLOAD[4..]; // 24 bytes ALACSpecificConfig
-
-        // 1. Bare ALACSpecificConfig
-        let mut p = CodecParameters::audio(CodecId::new("alac"));
-        p.extradata = cookie.to_vec();
-        let cfg = audio_config(&p, &[]).expect("alac config from bare cookie");
-        assert_eq!(cfg.codec, AudioCodec::Alac);
-        assert_eq!(cfg.sample_rate, 48000);
-        assert_eq!(cfg.channels, 6);
-        assert_eq!(cfg.bits, 24);
-        assert_eq!(cfg.codec_string, "alac");
-        assert_eq!(cfg.frame_samples, 4096);
-        assert!(!cfg.adts);
-        assert_eq!(cfg.config, FFMPEG_ALAC_PAYLOAD);
-
-        // 2. Wrapped in an alac atom (12 bytes atom header + 24 bytes cookie)
-        let mut atom_wrapped = vec![0, 0, 0, 36];
-        atom_wrapped.extend_from_slice(b"alac");
-        atom_wrapped.extend_from_slice(&[0, 0, 0, 0]);
-        atom_wrapped.extend_from_slice(cookie);
-        p.extradata = atom_wrapped;
-        let cfg_wrapped = audio_config(&p, &[]).expect("alac config from atom wrapped");
-        assert_eq!(cfg_wrapped.config, FFMPEG_ALAC_PAYLOAD);
-
-        // 3. Cookie followed by a chan box
-        let mut with_chan = cookie.to_vec();
-        with_chan.extend_from_slice(&[0, 0, 0, 12, b'c', b'h', b'a', b'n', 0, 0, 0, 0]);
-        p.extradata = with_chan.clone();
-        let cfg_chan = audio_config(&p, &[]).expect("alac config with chan box");
-        assert_eq!(&cfg_chan.config[..4], &[0, 0, 0, 0]);
-        assert_eq!(&cfg_chan.config[4..], with_chan.as_slice());
-    }
-
-    #[test]
-    fn test_flac_min_blocksize_rules() {
-        let mut si = FFMPEG_DFLA_PAYLOAD[8..].to_vec();
-
-        // min_blocksize < 16 -> clamped to max_blocksize (4096), accepted
-        si[0..2].copy_from_slice(&0u16.to_be_bytes());
-        si[2..4].copy_from_slice(&4096u16.to_be_bytes());
-        let cfg = flac_config(&si, None).expect("min_blocksize < 16 clamped to 4096");
-        assert_eq!(&cfg.config[8..10], &4096u16.to_be_bytes());
-
-        // min_blocksize < 16, but max_blocksize < 192 (e.g. 100) -> returns None
-        si[0..2].copy_from_slice(&0u16.to_be_bytes());
-        si[2..4].copy_from_slice(&100u16.to_be_bytes());
-        assert_eq!(flac_config(&si, None), None);
-
-        // 16 <= min_blocksize < 192 -> returns None
-        si[2..4].copy_from_slice(&4096u16.to_be_bytes());
-        for bs in [16u16, 64, 128, 191] {
-            si[0..2].copy_from_slice(&bs.to_be_bytes());
-            assert_eq!(flac_config(&si, None), None, "min_blocksize {bs} must be None");
-        }
-
-        // min_blocksize >= 192 -> accepted
-        si[0..2].copy_from_slice(&192u16.to_be_bytes());
-        assert!(flac_config(&si, None).is_some());
-    }
-
-    #[test]
-    fn test_flac_frame_header_block_sizes() {
-        let cfg = AudioConfig {
-            codec: AudioCodec::Flac,
-            sample_rate: 48000,
-            channels: 2,
-            bits: 16,
-            config: Vec::new(),
-            codec_string: "fLaC".to_string(),
-            frame_samples: 0,
-            adts: false,
-            language: None,
-            atmos_joc: None,
-        };
-
-        let fixed_cases = [
-            (1, 192),
-            (2, 576),
-            (3, 1152),
-            (4, 2304),
-            (5, 4608),
-            (8, 256),
-            (9, 512),
-            (10, 1024),
-            (11, 2048),
-            (12, 4096),
-            (13, 8192),
-            (14, 16384),
-            (15, 32768),
-        ];
-
-        for (code, expected) in fixed_cases {
-            let hdr = [0xFF, 0xF8, (code << 4) | 0x0A, 0x70, 0x00, 0x00];
-            assert_eq!(
-                audio_packet_samples(&cfg, &hdr),
-                expected,
-                "block size code {code} must be {expected}"
-            );
-        }
-
-        // Variable blocking sync 0xFFF9
-        let var_hdr = [0xFF, 0xF9, 0xC0, 0x70, 0x00, 0x00];
-        assert_eq!(audio_packet_samples(&cfg, &var_hdr), 4096);
-
-        // Non-sync
-        let non_sync = [0xFF, 0x00, 0xC0, 0x70, 0x00, 0x00];
-        assert_eq!(audio_packet_samples(&cfg, &non_sync), 0);
-
-        // Code 0 (reserved)
-        let reserved_hdr = [0xFF, 0xF8, 0x00, 0x70, 0x00, 0x00];
-        assert_eq!(audio_packet_samples(&cfg, &reserved_hdr), 0);
-
-        // Uncommon size 8-bit (code 6): 1-byte UTF-8 coded number, size-1 = 199 -> 200
-        let code6_1byte = [0xFF, 0xF8, 0x60, 0x70, 0x00, 0xC7];
-        assert_eq!(audio_packet_samples(&cfg, &code6_1byte), 200);
-
-        // Uncommon size 8-bit (code 6): 2-byte UTF-8 coded number [0xC2, 0x80], size-1 = 42 -> 43
-        let code6_2byte = [0xFF, 0xF8, 0x60, 0x70, 0xC2, 0x80, 0x2A];
-        assert_eq!(audio_packet_samples(&cfg, &code6_2byte), 43);
-
-        // Uncommon size 16-bit (code 7): 1-byte UTF-8 coded number, size-1 = 2999 (0x0BB7) -> 3000
-        let code7_1byte = [0xFF, 0xF8, 0x70, 0x70, 0x00, 0x0B, 0xB7];
-        assert_eq!(audio_packet_samples(&cfg, &code7_1byte), 3000);
-
-        // Uncommon size 16-bit (code 7): 3-byte UTF-8 coded number [0xE0, 0xA0, 0x80], size-1 = 4096 -> 4097
-        let code7_3byte = [0xFF, 0xF8, 0x70, 0x70, 0xE0, 0xA0, 0x80, 0x10, 0x00];
-        assert_eq!(audio_packet_samples(&cfg, &code7_3byte), 4097);
-    }
-
-    #[test]
-    fn test_alac_packet_samples_and_partial_frame() {
-        let cfg = AudioConfig {
-            codec: AudioCodec::Alac,
-            sample_rate: 48000,
-            channels: 6,
-            bits: 24,
-            config: Vec::new(),
-            codec_string: "alac".to_string(),
-            frame_samples: 4096,
-            adts: false,
-            language: None,
-            atmos_joc: None,
-        };
-
-        // Frame without hasSize (data[2] & 0x10 == 0) -> frame_samples (4096)
-        let normal_pkt = [0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert_eq!(audio_packet_samples(&cfg, &normal_pkt), 4096);
-
-        // Actual partial frame from fixture (multi_audio.mkv last ALAC packet): 2304 samples
-        let fixture_last_pkt = [0x00, 0x00, 0x14, 0x00, 0x00, 0x12, 0x00, 0x00];
-        assert_eq!(audio_packet_samples(&cfg, &fixture_last_pkt), 2304);
-
-        // Synthetic partial frame with hasSize for arbitrary count (e.g. 1234)
-        let s: u32 = 1234;
-        let synth_pkt = [
-            0x00,
-            0x00,
-            0x10 | ((s >> 31) as u8 & 1),
-            (s >> 23) as u8,
-            (s >> 15) as u8,
-            (s >> 7) as u8,
-            ((s & 0x7F) << 1) as u8,
-        ];
-        assert_eq!(audio_packet_samples(&cfg, &synth_pkt), 1234);
-
-        // Truncated / empty
-        assert_eq!(audio_packet_samples(&cfg, &[]), 0);
-        assert_eq!(audio_packet_samples(&cfg, &[0x00, 0x00]), 4096);
-        assert_eq!(audio_packet_samples(&cfg, &[0x00, 0x00, 0x10]), 0); // hasSize but truncated
     }
 
     #[test]
@@ -3183,6 +1915,47 @@ mod tests {
     }
 
     #[test]
+    fn test_eac3_atmos_joc_detection_and_dec3() {
+        // Construct E-AC-3 syncframe with Atmos JOC:
+        // 0x0B, 0x77
+        // strmtyp=0, substreamid=0, frmsiz=383 (frame_size = 768)
+        // fscod=0 (48kHz), numblkscod=3 (6 blks), acmod=7 (3/2), lfeon=1
+        // bsid=16, dialnorm=31, compre=0, mixmdate=0, infomdate=0
+        // addbsie=1, addbsil=1 (2 bytes), b0=0x01 (extension type A), b1=16 (complexity 16)
+        let mut frame = vec![0x0B, 0x77];
+        let frmsiz: u16 = 383; // 768 bytes total
+        frame.push(((frmsiz >> 8) & 0x07) as u8); // strmtyp=0, substreamid=0
+        frame.push((frmsiz & 0xFF) as u8);
+        frame.push((0 << 6) | (3 << 4) | (7 << 1) | 1); // fscod=0, numblkscod=3, acmod=7, lfeon=1
+
+        let mut bw = BitWriter::new();
+        bw.write_bits(16, 5); // bsid = 16
+        bw.write_bits(31, 5); // dialnorm = 31
+        bw.write_bits(0, 1); // compre = 0
+        bw.write_bits(0, 1); // mixmdate = 0
+        bw.write_bits(0, 1); // infomdate = 0
+        // parse_eac3_joc fields:
+        bw.write_bits(1, 1); // addbsie = 1
+        bw.write_bits(1, 6); // addbsil = 1 (2 bytes)
+        bw.write_bits(0x01, 8); // b0 = 0x01 (flag_ec3_extension_type_a = 1)
+        bw.write_bits(16, 8); // b1 = 16 (complexity_index_type_a = 16)
+        let bsi_bytes = bw.finish();
+        frame.extend_from_slice(&bsi_bytes);
+        frame.resize(768, 0);
+
+        let info = parse_eac3_syncframe(&frame).expect("parse eac3 syncframe with joc");
+        assert_eq!(info.joc_complexity, Some(16));
+
+        let p = CodecParameters::audio(CodecId::new("eac3"));
+        let cfg = audio_config(&p, &frame).expect("eac3 audio config");
+        assert_eq!(cfg.atmos_joc, Some(16));
+        // Verify dec3 box ends with the 2-byte extension: 0x01, 0x10
+        let dec3 = &cfg.config;
+        assert!(dec3.len() >= 2);
+        assert_eq!(&dec3[dec3.len() - 2..], &[0x01, 0x10]);
+    }
+
+    #[test]
     fn test_apply_dovi_recordless_profile5_from_rpu() {
         // Build synthetic RPU NAL for Profile 5
         let mut bw = BitWriter::new();
@@ -3309,224 +2082,5 @@ mod tests {
         assert_eq!(dovi.compat_id, 1);
         assert!(!dovi.use_dvh1);
         assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
-    }
-
-    #[test]
-    fn test_eac3_atmos_joc_detection_and_dec3() {
-        // Construct E-AC-3 syncframe with Atmos JOC:
-        // 0x0B, 0x77
-        // strmtyp=0, substreamid=0, frmsiz=383 (frame_size = 768)
-        // fscod=0 (48kHz), numblkscod=3 (6 blks), acmod=7 (3/2), lfeon=1
-        // bsid=16, dialnorm=31, compre=0, mixmdate=0, infomdate=0
-        // addbsie=1, addbsil=1 (2 bytes), b0=0x01 (extension type A), b1=16 (complexity 16)
-        let mut frame = vec![0x0B, 0x77];
-        let frmsiz: u16 = 383; // 768 bytes total
-        frame.push(((frmsiz >> 8) & 0x07) as u8); // strmtyp=0, substreamid=0
-        frame.push((frmsiz & 0xFF) as u8);
-        frame.push((0 << 6) | (3 << 4) | (7 << 1) | 1); // fscod=0, numblkscod=3, acmod=7, lfeon=1
-
-        let mut bw = BitWriter::new();
-        bw.write_bits(16, 5); // bsid = 16
-        bw.write_bits(31, 5); // dialnorm = 31
-        bw.write_bits(0, 1); // compre = 0
-        bw.write_bits(0, 1); // mixmdate = 0
-        bw.write_bits(0, 1); // infomdate = 0
-        // parse_eac3_joc fields:
-        bw.write_bits(1, 1); // addbsie = 1
-        bw.write_bits(1, 6); // addbsil = 1 (2 bytes)
-        bw.write_bits(0x01, 8); // b0 = 0x01 (flag_ec3_extension_type_a = 1)
-        bw.write_bits(16, 8); // b1 = 16 (complexity_index_type_a = 16)
-        let bsi_bytes = bw.finish();
-        frame.extend_from_slice(&bsi_bytes);
-        frame.resize(768, 0);
-
-        let info = parse_eac3_syncframe(&frame).expect("parse eac3 syncframe with joc");
-        assert_eq!(info.joc_complexity, Some(16));
-
-        let p = CodecParameters::audio(CodecId::new("eac3"));
-        let cfg = audio_config(&p, &frame).expect("eac3 audio config");
-        assert_eq!(cfg.atmos_joc, Some(16));
-        // Verify dec3 box ends with the 2-byte extension: 0x01, 0x10
-        let dec3 = &cfg.config;
-        assert!(dec3.len() >= 2);
-        assert_eq!(&dec3[dec3.len() - 2..], &[0x01, 0x10]);
-    }
-
-    #[test]
-    fn test_strip_hevc_el_nals_and_convert_real_p7_rpu_to_81() {
-        use dolby_vision::rpu::dovi_rpu::DoviRpu;
-
-        let nalu1 = vec![0x42, 0x01]; // SPS (nal_type 33)
-        let nalu2 = vec![63 << 1, 0x01, 0xAA, 0xBB]; // UNSPEC63 (nal_type 63)
-        let nalu3 = vec![19 << 1, 0x01, 0xCC]; // IDR slice (nal_type 19)
-
-        let mut data = Vec::new();
-        for n in [&nalu1, &nalu2, &nalu3] {
-            data.extend_from_slice(&(n.len() as u32).to_be_bytes());
-            data.extend_from_slice(n);
-        }
-
-        let stripped = strip_hevc_el_nals(data, 4, false);
-        let mut expected = Vec::new();
-        for n in [&nalu1, &nalu3] {
-            expected.extend_from_slice(&(n.len() as u32).to_be_bytes());
-            expected.extend_from_slice(n);
-        }
-        assert_eq!(stripped, expected);
-
-        // Real 376-byte Profile 7 FEL UNSPEC62 RPU NAL (from fel-clip-a.mkv):
-        let p7_hex = "7c011908090840613650ae20002008020080200802007f801ffc00ffc001fffa0000030100000300d0000008000006800000400000340000030200000301a000001000000d0000030080000068000004000003034000002000000a800000800000e18618800000800000800000800000800000800000b0c30c800000800000800000800000800000800000986186800000800000800000800000800000540000040000040000070c30c4000004000004000004000004000004000005861864000004000004000004000004000004000004c30c34000004000004000004000004012000010010010000030100480000400400400000401200001001001000001c95980000d7a8959be7f3ac7095991328000004000003002000000300200000030070d8890c06182978c238145000000698f96bfffc00000300000300000300018081f73805463008015faa4900c0282183180081872b94210002020000030008050000030002261140120c1f4000641f2e1276ffb6cfda80";
-        let p7_rpu: Vec<u8> = (0..p7_hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&p7_hex[i..i + 2], 16).unwrap())
-            .collect();
-        let parsed_before = DoviRpu::parse_unspec62_nalu(&p7_rpu).expect("parse P7 FEL RPU");
-        assert_eq!(parsed_before.dovi_profile, 7);
-        assert!(!parsed_before.header.disable_residual_flag);
-
-        let mut p7_pkt = Vec::new();
-        for n in [&nalu3, &p7_rpu, &nalu2] {
-            p7_pkt.extend_from_slice(&(n.len() as u32).to_be_bytes());
-            p7_pkt.extend_from_slice(n);
-        }
-        let rewritten = strip_hevc_el_nals(p7_pkt, 4, true);
-        let out_nals = extract_nals(&rewritten, Framing::LengthPrefixed(4));
-        assert_eq!(out_nals.len(), 2, "BL and converted RPU survive; EL (63) is stripped");
-        assert_eq!(out_nals[0], nalu3.as_slice());
-        let parsed_after = DoviRpu::parse_unspec62_nalu(out_nals[1]).expect("parse converted P8.1 RPU");
-        assert_eq!(parsed_after.dovi_profile, 8);
-        assert!(parsed_after.header.disable_residual_flag);
-        assert!(!parsed_after.header.el_spatial_resampling_filter_flag);
-        assert!(parsed_after.el_type.is_none());
-
-        // Corrupt RPU is dropped (degrades cleanly to HDR10 BL without stale P7 RPU):
-        let mut bad_rpu = p7_rpu.clone();
-        let bad_idx = bad_rpu.len() - 6;
-        bad_rpu[bad_idx] ^= 0xFF;
-        let mut bad_pkt = Vec::new();
-        for n in [&nalu3, &bad_rpu, &nalu2] {
-            bad_pkt.extend_from_slice(&(n.len() as u32).to_be_bytes());
-            bad_pkt.extend_from_slice(n);
-        }
-        let degraded = strip_hevc_el_nals(bad_pkt, 4, true);
-        let deg_nals = extract_nals(&degraded, Framing::LengthPrefixed(4));
-        assert_eq!(deg_nals, vec![nalu3.as_slice()]);
-    }
-
-    #[test]
-    fn test_hostile_crc_valid_rpu_counts_are_refused_without_allocation() {
-        fn seal_rpu(payload: &[u8]) -> Vec<u8> {
-            let crc = rpu_crc32(payload);
-            let mut body = Vec::with_capacity(1 + payload.len() + 5);
-            body.push(0x19);
-            body.extend_from_slice(payload);
-            body.extend_from_slice(&crc.to_be_bytes());
-            body.push(0x80);
-            let mut nal = vec![0x7C, 0x01];
-            let mut zeros = 0;
-            for &b in &body {
-                if zeros >= 2 && b <= 3 {
-                    nal.push(3);
-                    zeros = 0;
-                }
-                nal.push(b);
-                zeros = if b == 0 { zeros + 1 } else { 0 };
-            }
-            while nal.len() < 26 {
-                nal.push(0);
-            }
-            nal
-        }
-
-        // 1. CRC-valid use_prev RPU with compressed DM metadata and huge cmv29 num_ext_blocks (0x7FFF_FFFE):
-        let mut bw1 = BitWriter::new();
-        bw1.write_bits(2, 6); // rpu_type = 2
-        bw1.write_bits(18, 11); // rpu_format = 18
-        bw1.write_bits(1, 4); // vdr_rpu_profile = 1
-        bw1.write_bits(0, 4); // vdr_rpu_level = 0
-        bw1.write_bits(1, 1); // vdr_seq_info_present = 1
-        bw1.write_bits(0, 1); // chroma_resampling = 0
-        bw1.write_bits(0, 2); // coef_data_type = 0
-        bw1.write_ue(23); // log2_denom = 23
-        bw1.write_bits(0, 2); // norm = 0
-        bw1.write_bits(0, 1); // bl_video_full_range = 0
-        bw1.write_ue(2); // bl_bit_depth_minus8 = 2
-        bw1.write_ue(2); // el_bit_depth_minus8 = 2
-        bw1.write_ue(4); // vdr_bit_depth_minus8 = 4
-        bw1.write_bits(0, 1); // spatial_resampling = 0
-        bw1.write_bits(1, 3); // reserved_zero_3bits = 1 (compressed DM)
-        bw1.write_bits(1, 1); // el_spatial_resampling = 1
-        bw1.write_bits(0, 1); // disable_residual = 0
-        bw1.write_bits(1, 1); // vdr_dm_metadata_present = 1
-        bw1.write_bits(1, 1); // use_prev_vdr_rpu = 1
-        bw1.write_ue(0); // prev_vdr_rpu_id = 0
-        bw1.write_ue(0); // affected_dm_metadata_id = 0
-        bw1.write_ue(0); // current_dm_metadata_id = 0
-        bw1.write_ue(0); // scene_refresh_flag = 0
-        bw1.write_ue(0x7FFF_FFFE); // hostile cmv29 num_ext_blocks (~2.1B blocks)
-        let hostile_dm_use_prev = seal_rpu(&bw1.finish());
-        assert!(convert_rpu_nal_to_p81(&hostile_dm_use_prev).is_none());
-
-        // 2. CRC-valid use_prev RPU with cmv29 count=0 and huge cmv40 num_ext_blocks (0x7FFF_FFFE):
-        let mut bw2 = BitWriter::new();
-        bw2.write_bits(2, 6);
-        bw2.write_bits(18, 11);
-        bw2.write_bits(1, 4);
-        bw2.write_bits(0, 4);
-        bw2.write_bits(1, 1);
-        bw2.write_bits(0, 1);
-        bw2.write_bits(0, 2);
-        bw2.write_ue(23);
-        bw2.write_bits(0, 2);
-        bw2.write_bits(0, 1);
-        bw2.write_ue(2);
-        bw2.write_ue(2);
-        bw2.write_ue(4);
-        bw2.write_bits(0, 1);
-        bw2.write_bits(1, 3);
-        bw2.write_bits(1, 1);
-        bw2.write_bits(0, 1);
-        bw2.write_bits(1, 1);
-        bw2.write_bits(1, 1);
-        bw2.write_ue(0);
-        bw2.write_ue(0);
-        bw2.write_ue(0);
-        bw2.write_ue(0);
-        bw2.write_ue(0); // cmv29 num_ext_blocks = 0
-        while bw2.bit_pos != 0 {
-            bw2.write_bits(0, 1);
-        }
-        bw2.write_ue(0x7FFF_FFFE); // hostile cmv40 num_ext_blocks
-        bw2.write_bits(0, 32); // ensure >= 56 bits available for cmv40 check
-        let hostile_cmv40 = seal_rpu(&bw2.finish());
-        assert!(convert_rpu_nal_to_p81(&hostile_cmv40).is_none());
-
-        // 3. CRC-valid non-use_prev RPU with huge num_pivots_minus2 (0x7FFF_FFFE):
-        let mut bw3 = BitWriter::new();
-        bw3.write_bits(2, 6);
-        bw3.write_bits(18, 11);
-        bw3.write_bits(1, 4);
-        bw3.write_bits(0, 4);
-        bw3.write_bits(1, 1);
-        bw3.write_bits(0, 1);
-        bw3.write_bits(0, 2);
-        bw3.write_ue(23);
-        bw3.write_bits(0, 2);
-        bw3.write_bits(0, 1);
-        bw3.write_ue(2);
-        bw3.write_ue(2);
-        bw3.write_ue(4);
-        bw3.write_bits(0, 1);
-        bw3.write_bits(1, 3);
-        bw3.write_bits(1, 1);
-        bw3.write_bits(0, 1);
-        bw3.write_bits(0, 1); // dm_present = 0
-        bw3.write_bits(0, 1); // use_prev = 0
-        bw3.write_ue(0);
-        bw3.write_ue(0);
-        bw3.write_ue(0);
-        bw3.write_ue(0x7FFF_FFFE); // hostile num_pivots_minus2
-        let hostile_pivots = seal_rpu(&bw3.finish());
-        assert!(convert_rpu_nal_to_p81(&hostile_pivots).is_none());
     }
 }
