@@ -845,6 +845,10 @@ impl VideoSink for AndroidVideoSink {
         self.backend.video_output()
     }
 
+    fn platform_decoder(&self) -> &'static str {
+        "MediaCodec"
+    }
+
     fn poll_transition(
         &mut self,
         request: &VideoRequest,

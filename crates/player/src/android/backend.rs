@@ -252,6 +252,10 @@ impl VideoSink for VideoSinkWrapper {
         self.inner.lock().output()
     }
 
+    fn platform_decoder(&self) -> &'static str {
+        self.inner.lock().platform_decoder()
+    }
+
     fn poll_transition(
         &mut self,
         request: &VideoRequest,

@@ -318,3 +318,4 @@ fn cea708_captions_come_up_at_the_decoders_times() {
     assert_shows("CEA-708 in mkv", &observation.lock().shows, &screens, 0.0, video_end(&path));
     drop(player);
 }
+

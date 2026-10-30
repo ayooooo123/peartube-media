@@ -3762,6 +3762,10 @@ impl VideoSink for AppleVideoSink {
         self.cached_output
     }
 
+    fn platform_decoder(&self) -> &'static str {
+        "VideoToolbox"
+    }
+
     fn poll_transition(
         &mut self,
         request: &VideoRequest,

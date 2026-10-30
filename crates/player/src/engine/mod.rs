@@ -3510,6 +3510,18 @@ fn run_video_thread(
                 // Cached playing state reapplies only to a newly configured producer.
                 if first_config {
                     session.sink_running = None;
+                    let decoder = match mode {
+                        VideoMode::Compressed => Some(sink.platform_decoder()),
+                        VideoMode::Frames => Some("software"),
+                        VideoMode::Retired => None,
+                    };
+                    if let Some(decoder) = decoder {
+                        let label = format!("{} · {decoder}", session.params.codec_id.as_str());
+                        let changed = shared.state.lock().video_decoder.replace(label.clone()) != Some(label);
+                        if changed {
+                            notify_changed(&shared);
+                        }
+                    }
                 }
                 true
             }

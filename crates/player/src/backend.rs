@@ -208,6 +208,12 @@ pub enum VideoError {
 /// Native backends use bounded owners; synchronous capture can stay inline.
 pub trait VideoSink: Send {
     fn output(&self) -> VideoOutput;
+    /// The decoder behind compressed input, as `State::video_decoder` names
+    /// it (`MediaCodec`, `VideoToolbox`); software decoding is named by the
+    /// engine.
+    fn platform_decoder(&self) -> &'static str {
+        "platform decoder"
+    }
     /// Continues to expose producer-tagged failures after configuration, even
     /// after the last input. Pending is not unsupported or a fallback request.
     /// A retired result requires cleanup and owner exit/reaping, not a stop flag.
