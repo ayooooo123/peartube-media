@@ -20,14 +20,34 @@ use objc2_av_foundation::{
     AVLayerVideoGravityResizeAspect, AVQueuedSampleBufferRenderingStatus, AVSampleBufferDisplayLayer,
     AVSampleBufferRenderSynchronizer, AVSampleBufferVideoRenderer,
 };
-use objc2_core_foundation::{CFData, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_foundation::{CFBoolean, CFData, CFNumber, CFRetained, CFString, CFType};
 use objc2_core_media::{
+    kCMFormatDescriptionExtension_ColorPrimaries,
+    kCMFormatDescriptionExtension_FullRangeVideo,
+    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
+    kCMFormatDescriptionExtension_TransferFunction,
+    kCMFormatDescriptionExtension_YCbCrMatrix,
+    kCMFormatDescriptionColorPrimaries_DCI_P3,
+    kCMFormatDescriptionColorPrimaries_EBU_3213,
+    kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+    kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
+    kCMFormatDescriptionColorPrimaries_P3_D65,
+    kCMFormatDescriptionColorPrimaries_SMPTE_C,
+    kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG,
+    kCMFormatDescriptionTransferFunction_ITU_R_709_2,
+    kCMFormatDescriptionTransferFunction_Linear,
+    kCMFormatDescriptionTransferFunction_SMPTE_240M_1995,
+    kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ,
+    kCMFormatDescriptionTransferFunction_sRGB,
+    kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+    kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4,
+    kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2,
+    kCMFormatDescriptionYCbCrMatrix_SMPTE_240M_1995,
     CMClock, CMFormatDescription, CMSampleBuffer, CMSampleTimingInfo, CMTime, CMTimeFlags,
     CMTimebase, CMVideoFormatDescription,
     CMVideoFormatDescriptionCreate, CMVideoFormatDescriptionCreateForImageBuffer,
     kCMFormatDescriptionExtension_ContentLightLevelInfo,
     kCMFormatDescriptionExtension_MasteringDisplayColorVolume,
-    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms,
     kCMVideoCodecType_DolbyVisionHEVC, kCMVideoCodecType_HEVC,
     CMVideoFormatDescriptionCreateFromH264ParameterSets,
     CMVideoFormatDescriptionCreateFromHEVCParameterSets,
@@ -676,6 +696,27 @@ impl Mailbox {
 enum CompressedKind {
     H264,
     Hevc,
+    Vp9,
+}
+
+/// Session-defining VP9 parameters. A change forces a format/session rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Vp9SessionConfig {
+    profile: u8,
+    bit_depth: u8,
+    /// ISOBMFF vpcC chroma_subsampling: 1=4:2:0, 2=4:2:2, 3=4:4:4.
+    chroma_subsampling: u8,
+    full_range: bool,
+    width: u32,
+    height: u32,
+}
+
+struct Vp9State {
+    config: Vp9SessionConfig,
+    /// True once a real keyframe header has matched (or rebuilt) the session.
+    keyframe_aligned: bool,
+    color_signal: oxideav_core::ColorSignal,
+    frame_rate: Option<oxideav_core::Rational>,
 }
 
 struct Compressed {
@@ -691,6 +732,7 @@ struct Compressed {
     params: CodecParameters,
     /// What the current format was built from.
     headers: StreamHeaders,
+    vp9: Option<Vp9State>,
 }
 
 /// What a video stream's headers say beyond its parameter sets. HDR10's mastering display
@@ -822,6 +864,19 @@ unsafe extern "C" {
     ) -> i32;
     fn VTDecompressionSessionWaitForAsynchronousFrames(session: *const CFType) -> i32;
     fn VTDecompressionSessionInvalidate(session: *const CFType);
+    fn VTSessionSetProperty(
+        session: *const CFType,
+        property_key: *const CFString,
+        property_value: *const CFType,
+    ) -> i32;
+    fn VTSessionCopyProperty(
+        session: *const CFType,
+        property_key: *const CFString,
+        allocator: *const std::ffi::c_void,
+        property_value_out: *mut *const CFType,
+    ) -> i32;
+    static kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata: &'static CFString;
+    static kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder: &'static CFString;
 }
 
 struct NativeDecoder {
@@ -846,7 +901,13 @@ struct DecodedOutput {
 
 impl NativeDecoder {
     fn new(format: &CMVideoFormatDescription, output: DecodedOutput) -> Result<Self, SinkError> {
-        let output = Arc::new(output);
+        Self::with_output(format, Arc::new(output))
+    }
+
+    fn with_output(
+        format: &CMVideoFormatDescription,
+        output: Arc<DecodedOutput>,
+    ) -> Result<Self, SinkError> {
         let callback = DecompressionCallback {
             callback: decoded_picture,
             context: Arc::as_ptr(&output).cast_mut().cast(),
@@ -873,6 +934,14 @@ impl NativeDecoder {
             )));
         }
         let session = unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw)) };
+        // Older OSes lack this key and return a non-zero status; ignore.
+        unsafe {
+            let _ = VTSessionSetProperty(
+                &*session,
+                kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+                CFBoolean::new(true) as *const CFBoolean as *const CFType,
+            );
+        }
         Ok(Self {
             session,
             output,
@@ -898,6 +967,34 @@ impl NativeDecoder {
                 pictures: Mutex::new(Vec::new()),
             },
         )
+    }
+
+    /// Finish the old session and open a new one sharing the same decoded-output Arc.
+    fn recreate(self, format: &CMVideoFormatDescription) -> Result<Self, SinkError> {
+        let output = Arc::clone(&self.output);
+        self.retire().map_err(SinkError::Fallback)?;
+        *output.format.lock() = None;
+        Self::with_output(format, output)
+    }
+
+    fn using_hardware(&self) -> bool {
+        let mut raw: *const CFType = ptr::null();
+        let status = unsafe {
+            VTSessionCopyProperty(
+                &*self.session,
+                kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
+                ptr::null(),
+                &mut raw,
+            )
+        };
+        if status != 0 || raw.is_null() {
+            return false;
+        }
+        let value = unsafe { CFRetained::<CFType>::from_raw(NonNull::new_unchecked(raw.cast_mut())) };
+        value
+            .downcast_ref::<CFBoolean>()
+            .map(|b| b.value())
+            .unwrap_or(false)
     }
 
     fn set_producer_control(&self, producer: ProducerId, control: Arc<dyn VideoControl>) {
@@ -1950,19 +2047,46 @@ impl AppleDevice {
         let kind = match params.codec_id.as_str() {
             "h264" => CompressedKind::H264,
             "hevc" | "h265" => CompressedKind::Hevc,
+            "vp9" => CompressedKind::Vp9,
             _ => return Err(VideoError::Unsupported),
         };
-        if params.extradata.is_empty() {
-            return Err(VideoError::Unsupported);
-        }
+        // VP9 has no H.264/HEVC headers to read: its headers stay the empty default.
         let headers = stream_headers(params, &[]);
-        let (format, length_size, annex_b, reorder_depth) =
-            create_h264_or_hevc_format(kind, params, &headers).map_err(|e| match e {
-                SinkError::Fallback(_) => VideoError::Unsupported,
-                other => VideoError::Sink(other),
-            })?;
 
-        let mut compressed = Compressed {
+        let (format, length_size, annex_b, reorder_depth, vp9) = match kind {
+            CompressedKind::Vp9 => {
+                super::vt_caps::register_supplemental(super::vt_caps::CODEC_VP9);
+                let config = provisional_vp9_config(params).map_err(|e| match e {
+                    SinkError::Fallback(_) => VideoError::Unsupported,
+                    other => VideoError::Sink(other),
+                })?;
+                let format = create_vp9_format(&config, params.color_signal, params.frame_rate)
+                    .map_err(|e| match e {
+                        SinkError::Fallback(_) => VideoError::Unsupported,
+                        other => VideoError::Sink(other),
+                    })?;
+                let vp9 = Vp9State {
+                    config,
+                    keyframe_aligned: false,
+                    color_signal: params.color_signal,
+                    frame_rate: params.frame_rate,
+                };
+                (format, 0usize, false, 0usize, Some(vp9))
+            }
+            CompressedKind::H264 | CompressedKind::Hevc => {
+                if params.extradata.is_empty() {
+                    return Err(VideoError::Unsupported);
+                }
+                let (format, length_size, annex_b, reorder_depth) =
+                    create_h264_or_hevc_format(kind, params, &headers).map_err(|e| match e {
+                        SinkError::Fallback(_) => VideoError::Unsupported,
+                        other => VideoError::Sink(other),
+                    })?;
+                (format, length_size, annex_b, reorder_depth, None)
+            }
+        };
+
+        let compressed = Compressed {
             kind,
             length_size,
             annex_b,
@@ -1974,6 +2098,7 @@ impl AppleDevice {
             present_from,
             params: params.clone(),
             headers,
+            vp9,
         };
 
         // Create VT during compressed configuration, BEFORE publishing Compressed.
@@ -1994,9 +2119,17 @@ impl AppleDevice {
                 pictures: Mutex::new(Vec::new()),
             },
         )
-        .map_err(VideoError::Sink)?;
+        .map_err(|e| match e {
+            // Configure-time session failure → Unsupported so the engine falls back immediately.
+            SinkError::Fallback(_) if kind == CompressedKind::Vp9 => VideoError::Unsupported,
+            other => VideoError::Sink(other),
+        })?;
 
-        let _ = &mut compressed; // keep mut for later primed flags
+        if kind == CompressedKind::Vp9 {
+            let hw = decoder.using_hardware();
+            eprintln!("[peartube-apple] VP9 on VideoToolbox, hardware: {hw}");
+        }
+
         Ok(Self::Compressed {
             compressed,
             decoder: Some(decoder),
@@ -2860,12 +2993,17 @@ fn owner_loop(
                                 }
                             }
                             if compressed.primed {
-                                if let Some(dec) = decoder.as_ref() {
-                                    dec.set_producer_control(inp_producer, Arc::clone(&control));
-                                    dec.present_from(compressed.present_from);
+                                if decoder.is_some() {
+                                    if let Some(dec) = decoder.as_ref() {
+                                        dec.set_producer_control(
+                                            inp_producer,
+                                            Arc::clone(&control),
+                                        );
+                                        dec.present_from(compressed.present_from);
+                                    }
                                     match process_compressed_packet(
                                         compressed,
-                                        dec,
+                                        decoder,
                                         &packet,
                                         pts,
                                         ready,
@@ -2878,7 +3016,9 @@ fn owner_loop(
                                         &mut held_output,
                                     ) {
                                         Ok(()) => {}
-                                        Err(e) => mailbox.report_error(inp_producer, e, &control),
+                                        Err(e) => {
+                                            mailbox.report_error(inp_producer, e, &control)
+                                        }
                                     }
                                 }
                             }
@@ -3250,7 +3390,7 @@ fn owner_loop(
 
 fn process_compressed_packet(
     compressed: &mut Compressed,
-    dec: &NativeDecoder,
+    decoder: &mut Option<NativeDecoder>,
     packet: &Packet,
     pts: Duration,
     ready: &PictureReady,
@@ -3265,7 +3405,30 @@ fn process_compressed_packet(
     if !mailbox.wait_for_published_request(control, inp_producer, seek_gen) {
         return Err(VideoError::Superseded);
     }
-    let mut data = if compressed.annex_b {
+
+    if compressed.kind == CompressedKind::Vp9 {
+        ensure_vp9_session(
+            compressed,
+            decoder,
+            &packet.data,
+            ready,
+            inp_producer,
+            main_bridge,
+            mailbox,
+            control,
+            seek_gen,
+            held_output,
+        )?;
+    }
+
+    let dec = decoder
+        .as_ref()
+        .ok_or_else(|| VideoError::Sink(SinkError::Fallback("VP9 decoder missing".into())))?;
+
+    let mut data = if compressed.kind == CompressedKind::Vp9 {
+        // VP9 packets go to VT unchanged: no length-prefix or Annex-B rewrite.
+        std::borrow::Cow::Borrowed(packet.data.as_slice())
+    } else if compressed.annex_b {
         std::borrow::Cow::Owned(annex_b_to_length_prefixed(
             &packet.data,
             compressed.length_size,
@@ -3273,8 +3436,10 @@ fn process_compressed_packet(
     } else {
         std::borrow::Cow::Borrowed(packet.data.as_slice())
     };
-    if let Some(filtered) = compressed.filter_leading(&data) {
-        data = std::borrow::Cow::Owned(filtered);
+    if compressed.kind != CompressedKind::Vp9 {
+        if let Some(filtered) = compressed.filter_leading(&data) {
+            data = std::borrow::Cow::Owned(filtered);
+        }
     }
     if data.is_empty() {
         return Ok(());
@@ -3312,11 +3477,46 @@ fn process_compressed_packet(
     if let Some(msg) = dec.take_failed() {
         return Err(VideoError::Sink(SinkError::Fallback(msg)));
     }
-    // Drain past reorder depth.
+    drain_decoded_pictures(
+        compressed,
+        dec,
+        ready,
+        inp_producer,
+        main_bridge,
+        mailbox,
+        control,
+        seek_gen,
+        held_output,
+        false,
+    )
+}
+
+/// Drain pictures past reorder depth (or all remaining when `all` is true).
+fn drain_decoded_pictures(
+    compressed: &Compressed,
+    dec: &NativeDecoder,
+    ready: &PictureReady,
+    inp_producer: ProducerId,
+    main_bridge: &Arc<AppleMain>,
+    mailbox: &Arc<Mailbox>,
+    control: &Arc<dyn VideoControl>,
+    seek_gen: u64,
+    held_output: &mut Option<HeldSample>,
+    all: bool,
+) -> Result<(), VideoError> {
     loop {
+        if held_output.is_some() {
+            break;
+        }
         let maybe = {
             let mut pictures = dec.output.pictures.lock();
-            if pictures.len() > dec.output.reorder_depth {
+            if all {
+                if pictures.is_empty() {
+                    None
+                } else {
+                    Some(pictures.remove(0))
+                }
+            } else if pictures.len() > dec.output.reorder_depth {
                 Some(pictures.remove(0))
             } else {
                 None
@@ -3347,7 +3547,15 @@ fn process_compressed_packet(
             Ok(()) => {}
             Err(VideoError::Sink(SinkError::WouldBlock) | VideoError::Superseded) => {
                 if let Some(s) = returned.lock().take() {
-                    *held_output = Some(HeldSample { sample: s, pts: out_pts, producer: inp_producer, is_ready_candidate: is_cand, ready: ready.clone(), seek_gen: seek_gen, input_credit: true });
+                    *held_output = Some(HeldSample {
+                        sample: s,
+                        pts: out_pts,
+                        producer: inp_producer,
+                        is_ready_candidate: is_cand,
+                        ready: ready.clone(),
+                        seek_gen,
+                        input_credit: true,
+                    });
                 }
                 break;
             }
@@ -3356,6 +3564,83 @@ fn process_compressed_packet(
     }
     Ok(())
 }
+
+/// Align or rebuild the VP9 session from a keyframe header when the config changes.
+fn ensure_vp9_session(
+    compressed: &mut Compressed,
+    decoder: &mut Option<NativeDecoder>,
+    packet_data: &[u8],
+    ready: &PictureReady,
+    inp_producer: ProducerId,
+    main_bridge: &Arc<AppleMain>,
+    mailbox: &Arc<Mailbox>,
+    control: &Arc<dyn VideoControl>,
+    seek_gen: u64,
+    held_output: &mut Option<HeldSample>,
+) -> Result<(), VideoError> {
+    let Some(info) = parse_vp9_keyframe_header(packet_data) else {
+        return Ok(());
+    };
+    let new_cfg = Vp9SessionConfig::from_keyframe(&info);
+    let needs_rebuild = {
+        let vp9 = compressed
+            .vp9
+            .as_ref()
+            .ok_or_else(|| VideoError::Sink(SinkError::Fallback("VP9 state missing".into())))?;
+        vp9.config != new_cfg
+    };
+    if !needs_rebuild {
+        if let Some(vp9) = compressed.vp9.as_mut() {
+            vp9.keyframe_aligned = true;
+        }
+        return Ok(());
+    }
+
+    // Finish the old session and drain its pictures before replacing it.
+    if let Some(dec) = decoder.as_ref() {
+        dec.finish().map_err(VideoError::Sink)?;
+        if let Some(msg) = dec.take_failed() {
+            return Err(VideoError::Sink(SinkError::Fallback(msg)));
+        }
+        drain_decoded_pictures(
+            compressed,
+            dec,
+            ready,
+            inp_producer,
+            main_bridge,
+            mailbox,
+            control,
+            seek_gen,
+            held_output,
+            true,
+        )?;
+        // Drop any undeliverable remainder so the rebuild can proceed.
+        if held_output.is_some() {
+            dec.output.pictures.lock().clear();
+        }
+    }
+
+    let (color_signal, frame_rate) = {
+        let vp9 = compressed.vp9.as_ref().expect("VP9 state");
+        (vp9.color_signal, vp9.frame_rate)
+    };
+    let format = create_vp9_format(&new_cfg, color_signal, frame_rate).map_err(VideoError::Sink)?;
+
+    let old = decoder
+        .take()
+        .ok_or_else(|| VideoError::Sink(SinkError::Fallback("VP9 decoder missing".into())))?;
+    let new_dec = old.recreate(&format).map_err(VideoError::Sink)?;
+    let hw = new_dec.using_hardware();
+    eprintln!("[peartube-apple] VP9 on VideoToolbox, hardware: {hw}");
+    *decoder = Some(new_dec);
+    compressed.format = format;
+    if let Some(vp9) = compressed.vp9.as_mut() {
+        vp9.config = new_cfg;
+        vp9.keyframe_aligned = true;
+    }
+    Ok(())
+}
+
 
 fn process_software_frame(
     software: &SoftwarePath,
@@ -3373,29 +3658,49 @@ fn process_software_frame(
     if !mailbox.wait_for_published_request(control, inp_producer, seek_gen) {
         return Err(VideoError::Superseded);
     }
-    let conv_format = match software.dst_ostype {
-        t if t == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            || t == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange => PixelFormat::Yuv420P10Le,
-        _ => PixelFormat::Nv12,
-    };
-    let converted = convert::convert(
-        frame,
-        PixFrameInfo::new(software.src_format, software.width, software.height),
-        conv_format,
-        &ConvertOptions::default(),
-    )
-    .map_err(|e| {
-        VideoError::Sink(SinkError::Fatal(format!("pixel conversion failed: {e}")))
-    })?;
+    let is_nv12_dst = software.dst_ostype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        || software.dst_ostype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    let direct_yuv420p = software.src_format == PixelFormat::Yuv420P
+        && is_nv12_dst
+        && frame.planes.len() >= 3;
+
     let sample = unsafe {
         let pixel = pool_pixel_buffer(&software.pool.0)?;
-        copy_planes_into_pixel_buffer(
-            &pixel,
-            &converted,
-            conv_format,
-            software.width,
-            software.height,
-        )?;
+        if direct_yuv420p {
+            copy_yuv420p_into_nv12_pixel_buffer(
+                &pixel,
+                &frame.planes[0],
+                &frame.planes[1],
+                &frame.planes[2],
+                software.width as usize,
+                software.height as usize,
+            )?;
+        } else {
+            let conv_format = match software.dst_ostype {
+                t if t == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                    || t == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange =>
+                {
+                    PixelFormat::Yuv420P10Le
+                }
+                _ => PixelFormat::Nv12,
+            };
+            let converted = convert::convert(
+                frame,
+                PixFrameInfo::new(software.src_format, software.width, software.height),
+                conv_format,
+                &ConvertOptions::default(),
+            )
+            .map_err(|e| {
+                VideoError::Sink(SinkError::Fatal(format!("pixel conversion failed: {e}")))
+            })?;
+            copy_planes_into_pixel_buffer(
+                &pixel,
+                &converted,
+                conv_format,
+                software.width,
+                software.height,
+            )?;
+        }
         attach_frame_metadata(
             &pixel,
             frame,
@@ -3572,6 +3877,522 @@ impl Drop for AppleVideoSink {
     }
 }
 
+/// Parsed VP9 uncompressed header fields from a keyframe (superframe first frame).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Vp9KeyframeInfo {
+    profile: u8,
+    bit_depth: u8,
+    color_space: u8,
+    full_range: bool,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    width: u32,
+    height: u32,
+}
+
+impl Vp9SessionConfig {
+    fn from_keyframe(info: &Vp9KeyframeInfo) -> Self {
+        Self {
+            profile: info.profile,
+            bit_depth: info.bit_depth,
+            chroma_subsampling: vp9_chroma_subsampling(info.subsampling_x, info.subsampling_y),
+            full_range: info.full_range,
+            width: info.width,
+            height: info.height,
+        }
+    }
+}
+
+fn vp9_chroma_subsampling(ss_x: u8, ss_y: u8) -> u8 {
+    match (ss_x, ss_y) {
+        (0, 0) => 3, // 4:4:4
+        (1, 0) => 2, // 4:2:2
+        _ => 1,      // 4:2:0 (colocated), including (1,1)
+    }
+}
+
+/// MSB-first bit reader for the VP9 uncompressed header.
+struct Vp9Bits<'a> {
+    data: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> Vp9Bits<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit: 0 }
+    }
+
+    fn get(&mut self, n: usize) -> Option<u32> {
+        if n == 0 {
+            return Some(0);
+        }
+        let mut v = 0u32;
+        for _ in 0..n {
+            let byte_i = self.bit / 8;
+            let b = *self.data.get(byte_i)?;
+            let shift = 7 - (self.bit % 8);
+            v = (v << 1) | u32::from((b >> shift) & 1);
+            self.bit += 1;
+        }
+        Some(v)
+    }
+}
+
+/// Parse the VP9 uncompressed header of a keyframe starting at packet byte 0.
+/// Returns `None` for non-keyframes, show_existing_frame, truncated input, or bad sync.
+fn parse_vp9_keyframe_header(data: &[u8]) -> Option<Vp9KeyframeInfo> {
+    let mut br = Vp9Bits::new(data);
+    if br.get(2)? != 2 {
+        return None; // frame_marker
+    }
+    let profile_low = br.get(1)? as u8;
+    let profile_high = br.get(1)? as u8;
+    let profile = (profile_high << 1) | profile_low;
+    if profile == 3 {
+        if br.get(1)? != 0 {
+            return None; // reserved zero
+        }
+    }
+    if br.get(1)? != 0 {
+        return None; // show_existing_frame
+    }
+    if br.get(1)? != 0 {
+        return None; // frame_type: 0 = KEY_FRAME
+    }
+    let _show_frame = br.get(1)?;
+    let _error_resilient = br.get(1)?;
+    // sync code 0x49 0x83 0x42
+    if br.get(8)? != 0x49 || br.get(8)? != 0x83 || br.get(8)? != 0x42 {
+        return None;
+    }
+
+    let bit_depth = if profile >= 2 {
+        if br.get(1)? != 0 {
+            12
+        } else {
+            10
+        }
+    } else {
+        8
+    };
+    let color_space = br.get(3)? as u8;
+    let (full_range, ss_x, ss_y) = if color_space != 7 {
+        let full_range = br.get(1)? != 0;
+        let (ss_x, ss_y) = if profile == 1 || profile == 3 {
+            let x = br.get(1)? as u8;
+            let y = br.get(1)? as u8;
+            if br.get(1)? != 0 {
+                return None; // reserved zero
+            }
+            (x, y)
+        } else {
+            (1, 1)
+        };
+        (full_range, ss_x, ss_y)
+    } else {
+        // RGB: full range, and profile 1/3 have ss=0,0 + reserved
+        if profile == 1 || profile == 3 {
+            if br.get(1)? != 0 {
+                return None;
+            }
+        }
+        (true, 0, 0)
+    };
+
+    let width = br.get(16)? as u32 + 1;
+    let height = br.get(16)? as u32 + 1;
+    Some(Vp9KeyframeInfo {
+        profile,
+        bit_depth,
+        color_space,
+        full_range,
+        subsampling_x: ss_x,
+        subsampling_y: ss_y,
+        width,
+        height,
+    })
+}
+
+fn provisional_vp9_config(params: &CodecParameters) -> Result<Vp9SessionConfig, SinkError> {
+    let width = params.width.unwrap_or(0);
+    let height = params.height.unwrap_or(0);
+    if width == 0 || height == 0 {
+        return Err(SinkError::Fallback("VP9 stream without dimensions".into()));
+    }
+    let (profile, bit_depth, chroma) = match params.pixel_format {
+        Some(PixelFormat::Yuv420P) | None => (0, 8, 1),
+        Some(PixelFormat::Yuv420P10Le) => (2, 10, 1),
+        Some(PixelFormat::Yuv420P12Le) => (2, 12, 1),
+        Some(PixelFormat::Yuv422P) => (1, 8, 2),
+        Some(PixelFormat::Yuv422P10Le) => (3, 10, 2),
+        Some(PixelFormat::Yuv444P) => (1, 8, 3),
+        Some(PixelFormat::Yuv444P10Le) => (3, 10, 3),
+        // Unknown high-bit or unusual layouts: still try 8-bit 4:2:0 profile 0.
+        _ => (0, 8, 1),
+    };
+    let full_range = matches!(
+        params.resolved_color_range(),
+        oxideav_core::ColorRange::Full
+    );
+    Ok(Vp9SessionConfig {
+        profile,
+        bit_depth,
+        chroma_subsampling: chroma,
+        full_range,
+        width,
+        height,
+    })
+}
+
+/// VP9 level idc from the coded picture size and optional frame rate.
+///
+/// Level is taken from the VP9 level table (MaxLumaPs / MaxLumaSampleRate).
+/// When `frame_rate` is unknown the sample-rate check is skipped and only
+/// MaxLumaPs applies — that still selects level 4.0 for 1080p and 3.1 for
+/// 720p, matching the vpcC ffmpeg writes for the test files. Level 0 was
+/// not used: VT accepts a computed level and the bitstream-accurate value
+/// avoids under-declaring high-rate content.
+fn vp9_level_idc(width: u32, height: u32, frame_rate: Option<oxideav_core::Rational>) -> u8 {
+    let luma_ps = (width as u64).saturating_mul(height as u64);
+    let sample_rate = frame_rate.and_then(|r| {
+        if r.den == 0 {
+            None
+        } else {
+            let fps = r.as_f64();
+            if fps.is_finite() && fps > 0.0 {
+                Some((luma_ps as f64 * fps).ceil() as u64)
+            } else {
+                None
+            }
+        }
+    });
+    // (level_idc, max_luma_ps, max_luma_sample_rate)
+    const LEVELS: &[(u8, u64, u64)] = &[
+        (10, 36864, 829440),
+        (11, 73728, 2764800),
+        (20, 122880, 4608000),
+        (21, 245760, 9216000),
+        (30, 552960, 20736000),
+        (31, 983040, 36864000),
+        (40, 2228224, 83558400),
+        (41, 2228224, 160432128),
+        (50, 8912896, 311951360),
+        (51, 8912896, 588251136),
+        (52, 8912896, 1176502272),
+        (60, 35651584, 1176502272),
+        (61, 35651584, 2353004544),
+        (62, 35651584, 4706009088),
+    ];
+    for &(idc, max_ps, max_sr) in LEVELS {
+        if luma_ps <= max_ps && sample_rate.map(|sr| sr <= max_sr).unwrap_or(true) {
+            return idc;
+        }
+    }
+    62
+}
+
+fn build_vpcc(
+    config: &Vp9SessionConfig,
+    color_signal: oxideav_core::ColorSignal,
+    frame_rate: Option<oxideav_core::Rational>,
+) -> [u8; 12] {
+    let level = vp9_level_idc(config.width, config.height, frame_rate);
+    let bit_depth = config.bit_depth.min(15);
+    let chroma = config.chroma_subsampling.min(3);
+    let full = u8::from(config.full_range);
+    let colour_byte = (bit_depth << 4) | (chroma << 1) | full;
+
+    // Prefer stream colour when known; otherwise leave H.273 "unspecified" (2).
+    let (prim, xfer, mtrx) = vpcc_colour_bytes(color_signal);
+
+    [
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        config.profile,
+        level,
+        colour_byte,
+        prim,
+        xfer,
+        mtrx,
+        0x00,
+        0x00,
+    ]
+}
+
+fn vpcc_colour_bytes(sig: oxideav_core::ColorSignal) -> (u8, u8, u8) {
+    let prim = if sig.primaries.is_unspecified() {
+        2
+    } else {
+        sig.primaries.code_point()
+    };
+    let xfer = if sig.transfer.is_unspecified() {
+        2
+    } else {
+        sig.transfer.code_point()
+    };
+    let mtrx = if sig.matrix.is_unspecified() {
+        2
+    } else {
+        sig.matrix.code_point()
+    };
+    (prim, xfer, mtrx)
+}
+
+fn create_vp9_format(
+    config: &Vp9SessionConfig,
+    color_signal: oxideav_core::ColorSignal,
+    frame_rate: Option<oxideav_core::Rational>,
+) -> Result<CFRetained<CMVideoFormatDescription>, SinkError> {
+    let vpcc = build_vpcc(config, color_signal, frame_rate);
+    let vpcc_data = CFData::from_bytes(&vpcc);
+    let vpcc_key = CFString::from_static_str("vpcC");
+    let atoms = unsafe {
+        cf_dictionary_owned(&[(
+            &*vpcc_key as *const CFString as *const std::ffi::c_void,
+            &*vpcc_data as *const CFData as *const std::ffi::c_void,
+        )])
+    }
+    .ok_or_else(|| SinkError::Fallback("could not build vpcC atoms dictionary".into()))?;
+
+    // Extensions always carry SampleDescriptionExtensionAtoms; colour keys when known.
+    let atoms_key = unsafe { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms };
+    let mut entries: Vec<(*const std::ffi::c_void, *const std::ffi::c_void)> = vec![(
+        atoms_key as *const CFString as *const std::ffi::c_void,
+        &*atoms as *const _ as *const std::ffi::c_void,
+    )];
+
+    // Hold colour CFString values for the duration of Create.
+    let color_refs;
+    let full_range_bool;
+    if color_is_known(color_signal) {
+        color_refs = Some(cm_color_extension_values(color_signal));
+        let (prim, xfer, mtrx) = color_refs.as_ref().unwrap();
+        entries.push((
+            unsafe { kCMFormatDescriptionExtension_ColorPrimaries } as *const CFString
+                as *const std::ffi::c_void,
+            *prim as *const CFString as *const std::ffi::c_void,
+        ));
+        entries.push((
+            unsafe { kCMFormatDescriptionExtension_TransferFunction } as *const CFString
+                as *const std::ffi::c_void,
+            *xfer as *const CFString as *const std::ffi::c_void,
+        ));
+        entries.push((
+            unsafe { kCMFormatDescriptionExtension_YCbCrMatrix } as *const CFString
+                as *const std::ffi::c_void,
+            *mtrx as *const CFString as *const std::ffi::c_void,
+        ));
+        if let Some(full) = color_signal.range.full_range_flag() {
+            full_range_bool = Some(CFBoolean::new(full));
+            entries.push((
+                unsafe { kCMFormatDescriptionExtension_FullRangeVideo } as *const CFString
+                    as *const std::ffi::c_void,
+                full_range_bool.unwrap() as *const CFBoolean as *const std::ffi::c_void,
+            ));
+        } else {
+            full_range_bool = None;
+        }
+    } else {
+        color_refs = None;
+        full_range_bool = None;
+    }
+    let _keep = (&color_refs, full_range_bool, &atoms, &vpcc_data, &vpcc_key);
+
+    let extensions = unsafe { cf_dictionary_owned(&entries) }
+        .ok_or_else(|| SinkError::Fallback("could not build VP9 format extensions".into()))?;
+
+    let mut raw: *const CMVideoFormatDescription = ptr::null();
+    let status = unsafe {
+        CMVideoFormatDescriptionCreate(
+            None,
+            super::vt_caps::CODEC_VP9,
+            config.width as i32,
+            config.height as i32,
+            Some(&extensions),
+            NonNull::from(&mut raw),
+        )
+    };
+    if status != 0 || raw.is_null() {
+        return Err(SinkError::Fallback(format!(
+            "CMVideoFormatDescriptionCreate(vp09): {status}"
+        )));
+    }
+    Ok(unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw.cast_mut())) })
+}
+
+fn color_is_known(sig: oxideav_core::ColorSignal) -> bool {
+    !sig.primaries.is_unspecified()
+        || !sig.transfer.is_unspecified()
+        || !sig.matrix.is_unspecified()
+        || sig.range.full_range_flag().is_some()
+}
+
+fn cm_color_extension_values(
+    sig: oxideav_core::ColorSignal,
+) -> (&'static CFString, &'static CFString, &'static CFString) {
+    // Map through the same code points resolve_colorimetry uses, but to the
+    // CMFormatDescription colour constants (same CFString values as CV's).
+    let prim_cp = sig.primaries.code_point();
+    let xfer_cp = sig.transfer.code_point();
+    let mtrx_cp = sig.matrix.code_point();
+    unsafe {
+        let prim = match prim_cp {
+            1 => kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
+            5 => kCMFormatDescriptionColorPrimaries_EBU_3213,
+            6 | 7 => kCMFormatDescriptionColorPrimaries_SMPTE_C,
+            9 => kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+            11 => kCMFormatDescriptionColorPrimaries_DCI_P3,
+            12 => kCMFormatDescriptionColorPrimaries_P3_D65,
+            _ => match mtrx_cp {
+                5 | 6 => kCMFormatDescriptionColorPrimaries_SMPTE_C,
+                9 | 10 => kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+                _ => kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
+            },
+        };
+        let xfer = match xfer_cp {
+            1 | 6 | 14 | 15 => kCMFormatDescriptionTransferFunction_ITU_R_709_2,
+            7 => kCMFormatDescriptionTransferFunction_SMPTE_240M_1995,
+            8 => kCMFormatDescriptionTransferFunction_Linear,
+            13 => kCMFormatDescriptionTransferFunction_sRGB,
+            16 => kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ,
+            18 => kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG,
+            _ => kCMFormatDescriptionTransferFunction_ITU_R_709_2,
+        };
+        let mtrx = match mtrx_cp {
+            1 => kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2,
+            5 | 6 => kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4,
+            7 => kCMFormatDescriptionYCbCrMatrix_SMPTE_240M_1995,
+            9 | 10 => kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+            _ => match prim_cp {
+                5 | 6 | 7 => kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4,
+                9 => kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+                _ => kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2,
+            },
+        };
+        (prim, xfer, mtrx)
+    }
+}
+
+unsafe fn cf_dictionary_owned(
+    entries: &[(*const std::ffi::c_void, *const std::ffi::c_void)],
+) -> Option<CFRetained<objc2_core_foundation::CFDictionary>> {
+    let mut keys: Vec<*const std::ffi::c_void> = Vec::with_capacity(entries.len());
+    let mut vals: Vec<*const std::ffi::c_void> = Vec::with_capacity(entries.len());
+    for &(k, v) in entries {
+        keys.push(k);
+        vals.push(v);
+    }
+    unsafe {
+        objc2_core_foundation::CFDictionary::new(
+            None,
+            keys.as_mut_ptr(),
+            vals.as_mut_ptr(),
+            entries.len() as isize,
+            &objc2_core_foundation::kCFTypeDictionaryKeyCallBacks,
+            &objc2_core_foundation::kCFTypeDictionaryValueCallBacks,
+        )
+    }
+}
+
+/// Pack planar 8-bit YUV420P into biplanar NV12 (Y + interleaved UV).
+pub(crate) fn pack_yuv420p_to_nv12(
+    y_src: &[u8],
+    y_src_stride: usize,
+    u_src: &[u8],
+    u_src_stride: usize,
+    v_src: &[u8],
+    v_src_stride: usize,
+    y_dst: &mut [u8],
+    y_dst_stride: usize,
+    uv_dst: &mut [u8],
+    uv_dst_stride: usize,
+    width: usize,
+    height: usize,
+) {
+    for r in 0..height {
+        let src_start = r * y_src_stride;
+        let dst_start = r * y_dst_stride;
+        if src_start + width > y_src.len() || dst_start + width > y_dst.len() {
+            continue;
+        }
+        y_dst[dst_start..dst_start + width].copy_from_slice(&y_src[src_start..src_start + width]);
+    }
+
+    let chroma_h = height.div_ceil(2);
+    let chroma_w = width.div_ceil(2);
+    for r in 0..chroma_h {
+        let u_start = r * u_src_stride;
+        let v_start = r * v_src_stride;
+        let uv_start = r * uv_dst_stride;
+        if u_start + chroma_w > u_src.len()
+            || v_start + chroma_w > v_src.len()
+            || uv_start + chroma_w * 2 > uv_dst.len()
+        {
+            continue;
+        }
+        let u_row = &u_src[u_start..u_start + chroma_w];
+        let v_row = &v_src[v_start..v_start + chroma_w];
+        let uv_row = &mut uv_dst[uv_start..uv_start + chroma_w * 2];
+        for c in 0..chroma_w {
+            uv_row[c * 2] = u_row[c];
+            uv_row[c * 2 + 1] = v_row[c];
+        }
+    }
+}
+
+unsafe fn copy_yuv420p_into_nv12_pixel_buffer(
+    pixel: &CFRetained<CVPixelBuffer>,
+    y_plane: &oxideav_core::VideoPlane,
+    u_plane: &oxideav_core::VideoPlane,
+    v_plane: &oxideav_core::VideoPlane,
+    width: usize,
+    height: usize,
+) -> Result<(), SinkError> {
+    let lock = unsafe { CVPixelBufferLockBaseAddress(pixel, CVPixelBufferLockFlags(0)) };
+    if lock != 0 {
+        return Err(SinkError::Fatal(format!(
+            "CVPixelBufferLockBaseAddress: {lock}"
+        )));
+    }
+    let result = (|| {
+        if CVPixelBufferGetPlaneCount(pixel) != 2 {
+            return Err(SinkError::Fatal(
+                "NV12 pixel buffer does not have 2 planes".into(),
+            ));
+        }
+        let y_base = CVPixelBufferGetBaseAddressOfPlane(pixel, 0);
+        let uv_base = CVPixelBufferGetBaseAddressOfPlane(pixel, 1);
+        if y_base.is_null() || uv_base.is_null() {
+            return Err(SinkError::Fatal("pixel buffer plane base null".into()));
+        }
+        let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0);
+        let y_h = CVPixelBufferGetHeightOfPlane(pixel, 0);
+        let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, 1);
+        let uv_h = CVPixelBufferGetHeightOfPlane(pixel, 1);
+        let y_dst = unsafe { std::slice::from_raw_parts_mut(y_base as *mut u8, y_stride * y_h) };
+        let uv_dst = unsafe { std::slice::from_raw_parts_mut(uv_base as *mut u8, uv_stride * uv_h) };
+        pack_yuv420p_to_nv12(
+            &y_plane.data,
+            y_plane.stride,
+            &u_plane.data,
+            u_plane.stride,
+            &v_plane.data,
+            v_plane.stride,
+            y_dst,
+            y_stride,
+            uv_dst,
+            uv_stride,
+            width,
+            height,
+        );
+        Ok(())
+    })();
+    unsafe { CVPixelBufferUnlockBaseAddress(pixel, CVPixelBufferLockFlags(0)) };
+    result
+}
+
 fn create_h264_or_hevc_format(
     kind: CompressedKind,
     params: &CodecParameters,
@@ -3595,6 +4416,11 @@ fn create_h264_or_hevc_format(
                 .ok_or_else(|| SinkError::Fallback("malformed avcC extradata".into()))?,
             CompressedKind::Hevc => parse_hvcc(record)
                 .ok_or_else(|| SinkError::Fallback("malformed hvcC extradata".into()))?,
+            CompressedKind::Vp9 => {
+                return Err(SinkError::Fallback(
+                    "create_h264_or_hevc_format called for VP9".into(),
+                ));
+            }
         };
         (kind_nals, len)
     };
@@ -3683,6 +4509,11 @@ fn create_h264_or_hevc_format(
                 NonNull::from(&mut raw),
             )
         },
+        (CompressedKind::Vp9, _) => {
+            return Err(SinkError::Fallback(
+                "create_h264_or_hevc_format called for VP9".into(),
+            ));
+        }
     };
     if status != 0 || raw.is_null() {
         return Err(SinkError::Fallback(format!(
@@ -3718,6 +4549,7 @@ fn reorder_depth(kind: CompressedKind, nals: &[&[u8]]) -> usize {
                             .max_num_reorder_pics,
                     )
                 }
+                CompressedKind::Vp9 => None,
                 _ => None,
             }
         })
@@ -4342,4 +5174,275 @@ mod tests {
         // Remove SAR attachment when square (1:1)
         attach_frame_metadata(&pixel, &frame, stream_color, Some(Rational::new(1, 1)));
     }
+
+    /// Build a minimal VP9 keyframe uncompressed header for tests.
+    fn make_vp9_keyframe_header(
+        profile: u8,
+        bit_depth: u8,
+        color_space: u8,
+        full_range: bool,
+        ss_x: u8,
+        ss_y: u8,
+        width: u32,
+        height: u32,
+        show_existing: bool,
+        is_key: bool,
+    ) -> Vec<u8> {
+        let mut bits: Vec<bool> = Vec::new();
+        let push = |bits: &mut Vec<bool>, n: usize, v: u32| {
+            for i in (0..n).rev() {
+                bits.push(((v >> i) & 1) != 0);
+            }
+        };
+        push(&mut bits, 2, 2); // frame_marker
+        push(&mut bits, 1, u32::from(profile & 1));
+        push(&mut bits, 1, u32::from((profile >> 1) & 1));
+        if profile == 3 {
+            push(&mut bits, 1, 0);
+        }
+        push(&mut bits, 1, u32::from(show_existing));
+        if show_existing {
+            // rest unused for our parser
+            while bits.len() % 8 != 0 {
+                bits.push(false);
+            }
+            let mut out = Vec::new();
+            for chunk in bits.chunks(8) {
+                let mut b = 0u8;
+                for (i, &bit) in chunk.iter().enumerate() {
+                    if bit {
+                        b |= 1 << (7 - i);
+                    }
+                }
+                out.push(b);
+            }
+            return out;
+        }
+        push(&mut bits, 1, u32::from(!is_key)); // frame_type 0=key
+        push(&mut bits, 1, 1); // show_frame
+        push(&mut bits, 1, 0); // error_resilient
+        push(&mut bits, 8, 0x49);
+        push(&mut bits, 8, 0x83);
+        push(&mut bits, 8, 0x42);
+        if profile >= 2 {
+            push(&mut bits, 1, u32::from(bit_depth == 12));
+        }
+        push(&mut bits, 3, u32::from(color_space));
+        if color_space != 7 {
+            push(&mut bits, 1, u32::from(full_range));
+            if profile == 1 || profile == 3 {
+                push(&mut bits, 1, u32::from(ss_x));
+                push(&mut bits, 1, u32::from(ss_y));
+                push(&mut bits, 1, 0);
+            }
+        } else if profile == 1 || profile == 3 {
+            push(&mut bits, 1, 0);
+        }
+        push(&mut bits, 16, width.saturating_sub(1));
+        push(&mut bits, 16, height.saturating_sub(1));
+        while bits.len() % 8 != 0 {
+            bits.push(false);
+        }
+        let mut out = Vec::new();
+        for chunk in bits.chunks(8) {
+            let mut b = 0u8;
+            for (i, &bit) in chunk.iter().enumerate() {
+                if bit {
+                    b |= 1 << (7 - i);
+                }
+            }
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn test_parse_vp9_keyframe_header_profile0_8bit() {
+        let h = make_vp9_keyframe_header(0, 8, 0, false, 1, 1, 1920, 1080, false, true);
+        let info = parse_vp9_keyframe_header(&h).expect("p0 keyframe");
+        assert_eq!(info.profile, 0);
+        assert_eq!(info.bit_depth, 8);
+        assert!(!info.full_range);
+        assert_eq!(info.subsampling_x, 1);
+        assert_eq!(info.subsampling_y, 1);
+        assert_eq!(info.width, 1920);
+        assert_eq!(info.height, 1080);
+        // Matches the real 1080p test file head.
+        let real = hex_bytes("824983420077f04376");
+        let real_info = parse_vp9_keyframe_header(&real).expect("real p0");
+        assert_eq!(real_info.width, 1920);
+        assert_eq!(real_info.height, 1080);
+        assert_eq!(real_info.profile, 0);
+        assert_eq!(real_info.bit_depth, 8);
+    }
+
+    #[test]
+    fn test_parse_vp9_keyframe_header_profile2_10bit() {
+        let h = make_vp9_keyframe_header(2, 10, 0, false, 1, 1, 1280, 720, false, true);
+        let info = parse_vp9_keyframe_header(&h).expect("p2 keyframe");
+        assert_eq!(info.profile, 2);
+        assert_eq!(info.bit_depth, 10);
+        assert_eq!(info.width, 1280);
+        assert_eq!(info.height, 720);
+        let real = hex_bytes("924983420027f8167b");
+        let real_info = parse_vp9_keyframe_header(&real).expect("real p2");
+        assert_eq!(real_info.profile, 2);
+        assert_eq!(real_info.bit_depth, 10);
+        assert_eq!(real_info.width, 1280);
+        assert_eq!(real_info.height, 720);
+    }
+
+    #[test]
+    fn test_parse_vp9_keyframe_header_profile1_444() {
+        let h = make_vp9_keyframe_header(1, 8, 0, false, 0, 0, 64, 48, false, true);
+        let info = parse_vp9_keyframe_header(&h).expect("p1 4:4:4");
+        assert_eq!(info.profile, 1);
+        assert_eq!(info.bit_depth, 8);
+        assert_eq!(info.subsampling_x, 0);
+        assert_eq!(info.subsampling_y, 0);
+        assert_eq!(info.width, 64);
+        assert_eq!(info.height, 48);
+    }
+
+    #[test]
+    fn test_parse_vp9_keyframe_header_rejects_non_key_and_truncated() {
+        let show_existing =
+            make_vp9_keyframe_header(0, 8, 0, false, 1, 1, 64, 64, true, true);
+        assert!(parse_vp9_keyframe_header(&show_existing).is_none());
+        let inter = make_vp9_keyframe_header(0, 8, 0, false, 1, 1, 64, 64, false, false);
+        assert!(parse_vp9_keyframe_header(&inter).is_none());
+        assert!(parse_vp9_keyframe_header(&[0x82, 0x49]).is_none());
+        assert!(parse_vp9_keyframe_header(&[]).is_none());
+    }
+
+    #[test]
+    fn test_vpcc_matches_ffmpeg_layout() {
+        let cfg0 = Vp9SessionConfig {
+            profile: 0,
+            bit_depth: 8,
+            chroma_subsampling: 1,
+            full_range: false,
+            width: 1920,
+            height: 1080,
+        };
+        let bytes0 = build_vpcc(
+            &cfg0,
+            ColorSignal::unspecified(),
+            Some(Rational::new(30, 1)),
+        );
+        assert_eq!(
+            bytes0,
+            [0x01, 0x00, 0x00, 0x00, 0x00, 0x28, 0x82, 0x02, 0x02, 0x02, 0x00, 0x00]
+        );
+        let cfg2 = Vp9SessionConfig {
+            profile: 2,
+            bit_depth: 10,
+            chroma_subsampling: 1,
+            full_range: false,
+            width: 1280,
+            height: 720,
+        };
+        let bytes2 = build_vpcc(
+            &cfg2,
+            ColorSignal::unspecified(),
+            Some(Rational::new(30, 1)),
+        );
+        assert_eq!(
+            bytes2,
+            [0x01, 0x00, 0x00, 0x00, 0x02, 0x1f, 0xa2, 0x02, 0x02, 0x02, 0x00, 0x00]
+        );
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn test_pack_yuv420p_to_nv12_matches_convert_path() {
+        // Odd sizes + padded strides; compare one-pass pack vs convert→copy.
+        for &(width, height, y_ss, u_ss, v_ss, y_ds, uv_ds) in &[
+            (4usize, 4usize, 8usize, 4usize, 4usize, 16usize, 16usize),
+            (5, 3, 8, 4, 4, 16, 16),
+            (7, 5, 16, 8, 8, 24, 24),
+            (1, 1, 4, 2, 2, 8, 8),
+        ] {
+            let chroma_h = height.div_ceil(2);
+            let chroma_w = width.div_ceil(2);
+            let mut y_src = vec![0u8; y_ss * height];
+            let mut u_src = vec![0u8; u_ss * chroma_h];
+            let mut v_src = vec![0u8; v_ss * chroma_h];
+            for r in 0..height {
+                for c in 0..width {
+                    y_src[r * y_ss + c] = ((r * 17 + c * 3) % 251) as u8;
+                }
+            }
+            for r in 0..chroma_h {
+                for c in 0..chroma_w {
+                    u_src[r * u_ss + c] = ((r * 13 + c * 7 + 11) % 251) as u8;
+                    v_src[r * v_ss + c] = ((r * 19 + c * 5 + 29) % 251) as u8;
+                }
+            }
+
+            let mut y_direct = vec![0xAAu8; y_ds * height];
+            let mut uv_direct = vec![0xBBu8; uv_ds * chroma_h];
+            pack_yuv420p_to_nv12(
+                &y_src, y_ss, &u_src, u_ss, &v_src, v_ss, &mut y_direct, y_ds, &mut uv_direct,
+                uv_ds, width, height,
+            );
+
+            let frame = VideoFrame {
+                pts: None,
+                planes: vec![
+                    VideoPlane {
+                        stride: y_ss,
+                        data: y_src.clone(),
+                    },
+                    VideoPlane {
+                        stride: u_ss,
+                        data: u_src.clone(),
+                    },
+                    VideoPlane {
+                        stride: v_ss,
+                        data: v_src.clone(),
+                    },
+                ],
+            };
+            let converted = convert::convert(
+                &frame,
+                PixFrameInfo::new(PixelFormat::Yuv420P, width as u32, height as u32),
+                PixelFormat::Nv12,
+                &ConvertOptions::default(),
+            )
+            .expect("convert yuv420p->nv12");
+            assert!(converted.planes.len() >= 2);
+            let mut y_conv = vec![0xAAu8; y_ds * height];
+            let mut uv_conv = vec![0xBBu8; uv_ds * chroma_h];
+            // Mirror copy_planes_into_pixel_buffer NV12 plane copy.
+            let y_plane = &converted.planes[0];
+            let uv_plane = &converted.planes[1];
+            for r in 0..height {
+                let src_off = r * y_plane.stride;
+                let n = width.min(y_plane.stride).min(y_ds);
+                if src_off + n <= y_plane.data.len() {
+                    y_conv[r * y_ds..r * y_ds + n]
+                        .copy_from_slice(&y_plane.data[src_off..src_off + n]);
+                }
+            }
+            for r in 0..chroma_h {
+                let src_off = r * uv_plane.stride;
+                let row_bytes = (chroma_w * 2).min(uv_plane.stride).min(uv_ds);
+                if src_off + row_bytes <= uv_plane.data.len() {
+                    uv_conv[r * uv_ds..r * uv_ds + row_bytes]
+                        .copy_from_slice(&uv_plane.data[src_off..src_off + row_bytes]);
+                }
+            }
+
+            assert_eq!(y_direct, y_conv, "Y mismatch {width}x{height}");
+            assert_eq!(uv_direct, uv_conv, "UV mismatch {width}x{height}");
+        }
+    }
+
 }
