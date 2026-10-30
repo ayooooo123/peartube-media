@@ -9,6 +9,7 @@ pub mod clock;
 pub mod subtitles;
 pub mod util;
 pub mod video;
+pub(crate) mod vt_caps;
 
 #[cfg(test)]
 mod video_tests;
