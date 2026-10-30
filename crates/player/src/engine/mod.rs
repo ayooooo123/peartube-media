@@ -618,6 +618,8 @@ impl Player {
         let init_thread = std::thread::Builder::new()
             .name("peartube-player-pipeline".into())
             .spawn(move || {
+                #[cfg(target_os = "ios")]
+                crate::clock::request_qos(false);
                 run_player_pipeline(url_owned, options, shared_clone);
             })
             .expect("failed to spawn player pipeline thread");
@@ -1107,8 +1109,11 @@ fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> oxideav_core:
             })?;
             d
         };
+        // Decoders that split a picture across threads, with output identical
+        // to the serial decode: VC-1 (B-picture coordinator), HEVC (wavefront,
+        // tiles, row-parallel in-loop filters) and VP9 (tile columns).
         #[cfg(not(target_arch = "wasm32"))]
-        if params.codec_id.as_str() == "vc1" {
+        if matches!(params.codec_id.as_str(), "vc1" | "h265" | "hevc" | "vp9") {
             decoder.set_execution_context(&oxideav_core::ExecutionContext::auto());
         }
         Ok(decoder)
@@ -1141,6 +1146,8 @@ fn spawn_video(
                 eprintln!("macOS video worker scheduling setup failed: {error}");
             }
         }
+        #[cfg(target_os = "ios")]
+        crate::clock::request_qos(false);
         run_video_thread(stream, sink, lane, demux_cv, shared, realtime, retired);
     })
 }
@@ -1165,6 +1172,8 @@ fn spawn_audio(
                 eprintln!("macOS audio worker scheduling setup failed: {error}");
             }
         }
+        #[cfg(target_os = "ios")]
+        crate::clock::request_qos(true);
         let mut output = AudioOutput {
             shared: Arc::clone(&shared),
             sink: Some(sink),

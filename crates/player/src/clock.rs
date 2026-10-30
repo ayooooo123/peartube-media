@@ -460,6 +460,24 @@ pub(crate) mod timing {
     }
 }
 
+/// iOS schedules a thread by its QoS class, and an engine thread that never
+/// sets one runs at the default class, which the scheduler may move to the
+/// efficiency cores under load. Decode and demux ask for user-initiated; the
+/// audio writer, which feeds the renderer on time, for user-interactive.
+#[cfg(target_os = "ios")]
+pub(crate) fn request_qos(interactive: bool) {
+    let class = if interactive {
+        libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE
+    } else {
+        libc::qos_class_t::QOS_CLASS_USER_INITIATED
+    };
+    // SAFETY: changes only the calling thread's QoS class.
+    let result = unsafe { libc::pthread_set_qos_class_self_np(class, 0) };
+    if result != 0 {
+        eprintln!("iOS thread QoS request failed: {result}");
+    }
+}
+
 #[cfg(test)]
 mod master_tests {
     use super::*;
