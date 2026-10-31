@@ -5,8 +5,9 @@
 //! `corpus/perf-inputs.sh` makes, through the player's registry
 //! (`codecs::context()`; the decoder `first_decoder` picks, built the way the
 //! engine builds it). The file is read into memory first; a run times demux +
-//! decode of that one stream, no sink, single-threaded
-//! (`ExecutionContext::serial`). ×real-time = media seconds decoded ÷ seconds
+//! decode of that one stream, no sink. Decoders are single-threaded by
+//! default; `--threads auto|N` grants a shared thread budget. ×real-time =
+//! media seconds decoded ÷ seconds
 //! spent, both as wall time and as the process's CPU time (user + system);
 //! verdicts use CPU time, which other load on the machine disturbs less. On
 //! macOS each run also records retired instructions and cycles. The table
@@ -27,7 +28,7 @@
 //!
 //! ```text
 //! cargo run --release -p perf -- --out target/perf/perf.json
-//!     [--runs 3] [--max-secs 0] [--filter <substring>] [--no-check] [--no-ffmpeg]
+//!     [--runs 3] [--threads auto|N] [--max-secs 0] [--filter <substring>] [--no-check] [--no-ffmpeg]
 //! cargo run --release -p perf -- --list                   # every manifest stream
 //! cargo run --release -p perf -- --filter <s> --loop 30   # decode in a loop, for a profiler
 //! ```
@@ -444,8 +445,8 @@ fn standard_inputs(ctx: &RuntimeContext, cache: &mut HashMap<PathBuf, Result<Pro
 
 /// The stream's decoder, built as `player::engine`'s `make_decoder` builds
 /// it: H.264 whose extradata is Annex B gets its parameter sets as a packet
-/// of their own ahead of the stream. Serial, as the player runs it.
-fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> Result<Box<dyn Decoder>, String> {
+/// of their own ahead of the stream, with the requested execution budget.
+fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters, exec: &ExecutionContext) -> Result<Box<dyn Decoder>, String> {
     let annex_b = params.extradata.starts_with(&[0, 0, 1]) || params.extradata.starts_with(&[0, 0, 0, 1]);
     let mut decoder = if params.codec_id.as_str() != "h264" || !annex_b {
         ctx.codecs.first_decoder(params).map_err(|e| e.to_string())?
@@ -466,7 +467,7 @@ fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> Result<Box<dy
             .map_err(|e| e.to_string())?;
         decoder
     };
-    decoder.set_execution_context(&ExecutionContext::serial());
+    decoder.set_execution_context(exec);
     Ok(decoder)
 }
 
@@ -518,6 +519,7 @@ impl Tally {
 /// returns.
 fn decode_stream(
     ctx: &RuntimeContext,
+    exec: &ExecutionContext,
     container: &str,
     bytes: &Arc<[u8]>,
     index: u32,
@@ -531,7 +533,7 @@ fn decode_stream(
         .map_err(|e| format!("{container} demuxer: {e}"))?;
     let stream = demuxer.streams().iter().find(|s| s.index == index).cloned().ok_or("stream vanished")?;
     let _ = demuxer.set_active_streams(&[index]);
-    let mut decoder = make_decoder(ctx, &stream.params)?;
+    let mut decoder = make_decoder(ctx, &stream.params, exec)?;
     let mut tally = Tally::default();
     let mut drain = |decoder: &mut Box<dyn Decoder>, tally: &mut Tally| loop {
         match decoder.receive_frame() {
@@ -654,14 +656,14 @@ fn media_secs(kind: Kind, tally: &Tally, rate: Option<f64>) -> Option<f64> {
     }
 }
 
-fn timed_run(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>, fps: Option<f64>, max: Duration) -> Result<Run, String> {
+fn timed_run(ctx: &RuntimeContext, exec: &ExecutionContext, input: &Input, bytes: &Arc<[u8]>, fps: Option<f64>, max: Duration) -> Result<Run, String> {
     let (container, stream) = (input.container.as_deref().unwrap(), input.stream.as_ref().unwrap());
     let mut demux = Duration::ZERO;
     let mut output = None;
     let start = Instant::now();
     let before = Counters::now();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        decode_stream(ctx, container, bytes, stream.index, (!max.is_zero()).then(|| start + max), &mut demux, &mut |frame, decoder, params| {
+        decode_stream(ctx, exec, container, bytes, stream.index, (!max.is_zero()).then(|| start + max), &mut demux, &mut |frame, decoder, params| {
             if let Frame::Audio(audio) = &frame {
                 output = Some(pcm::layout(decoder, params, audio));
             }
@@ -789,9 +791,9 @@ fn plane_dims(format: PixelFormat, width: u32, height: u32) -> Option<Vec<(usize
         .collect()
 }
 
-fn check(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Check {
+fn check(ctx: &RuntimeContext, exec: &ExecutionContext, input: &Input, bytes: &Arc<[u8]>) -> Check {
     let outcome = catch_unwind(AssertUnwindSafe(|| match input.kind {
-        Kind::Video => check_video(ctx, input, bytes),
+        Kind::Video => check_video(ctx, exec, input, bytes),
         Kind::Audio => check_audio(input),
     }));
     match outcome {
@@ -801,13 +803,13 @@ fn check(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Check {
     }
 }
 
-fn check_video(ctx: &RuntimeContext, input: &Input, bytes: &Arc<[u8]>) -> Result<Check, String> {
+fn check_video(ctx: &RuntimeContext, exec: &ExecutionContext, input: &Input, bytes: &Arc<[u8]>) -> Result<Check, String> {
     let (container, stream) = (input.container.as_deref().unwrap(), input.stream.as_ref().unwrap());
     let mut layout: Option<(PixelFormat, u32, u32, Vec<(usize, usize)>)> = None;
     let mut ours: Vec<String> = Vec::new();
     let mut failure: Option<String> = None;
     let mut demux = Duration::ZERO;
-    let (tally, _, _, _) = decode_stream(ctx, container, bytes, stream.index, None, &mut demux, &mut |frame, decoder, p| {
+    let (tally, _, _, _) = decode_stream(ctx, exec, container, bytes, stream.index, None, &mut demux, &mut |frame, decoder, p| {
         let Frame::Video(v) = frame else { return };
         if layout.is_none() && failure.is_none() {
             let reference_format = stream.reference.as_ref().and_then(|r| r.pixel_format.as_deref()).and_then(|name| {
@@ -932,6 +934,8 @@ struct Measured {
     input: String,
     path: String,
     kind: Kind,
+    #[serde(default)]
+    thread_budget: Option<usize>,
     container: Option<String>,
     codec: Option<String>,
     decoder: Option<String>,
@@ -1028,6 +1032,7 @@ fn sysctl(name: &str) -> String {
 struct Options {
     out: PathBuf,
     runs: usize,
+    threads: String,
     max_secs: f64,
     filters: Vec<String>,
     check: bool,
@@ -1041,6 +1046,7 @@ fn parse_args() -> Options {
     let mut o = Options {
         out: PathBuf::from("target/perf/perf.json"),
         runs: 3,
+        threads: "1".into(),
         max_secs: 0.0,
         filters: Vec::new(),
         check: true,
@@ -1055,6 +1061,12 @@ fn parse_args() -> Options {
         match arg.as_str() {
             "--out" => o.out = PathBuf::from(value("--out")),
             "--runs" => o.runs = value("--runs").parse().expect("--runs <n>"),
+            "--threads" => {
+                o.threads = value("--threads");
+                if o.threads != "auto" {
+                    assert!(o.threads.parse::<usize>().is_ok_and(|n| n > 0), "--threads <auto|positive integer>");
+                }
+            }
             "--max-secs" => o.max_secs = value("--max-secs").parse().expect("--max-secs <seconds>"),
             "--filter" => o.filters.push(value("--filter").to_ascii_lowercase()),
             "--loop" => o.loop_secs = Some(value("--loop").parse().expect("--loop <seconds>")),
@@ -1064,7 +1076,7 @@ fn parse_args() -> Options {
             "--resume" => o.resume = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "perf [--out target/perf/perf.json] [--runs 3] [--max-secs 0 (unlimited)] [--filter <s> (repeatable, any match)] [--no-check] [--no-ffmpeg] [--list] [--loop <secs>] [--resume]"
+                    "perf [--out target/perf/perf.json] [--runs 3] [--threads auto|N (default 1)] [--max-secs 0 (unlimited)] [--filter <s> (repeatable, any match)] [--no-check] [--no-ffmpeg] [--list] [--loop <secs>] [--resume]"
                 );
                 std::process::exit(0);
             }
@@ -1085,13 +1097,14 @@ fn matches(input: &Input, filters: &[String]) -> bool {
         })
 }
 
-fn measure(ctx: &RuntimeContext, input: &Input, opts: &Options) -> Measured {
+fn measure(ctx: &RuntimeContext, exec: &ExecutionContext, input: &Input, opts: &Options) -> Measured {
     let stream = input.stream.as_ref();
     let mut m = Measured {
         rows: input.rows.clone(),
         input: input.source.clone(),
         path: input.path.display().to_string(),
         kind: input.kind,
+        thread_budget: Some(exec.threads),
         container: input.container.clone(),
         codec: stream.map(|s| s.codec.clone()),
         decoder: stream.and_then(|s| s.decoder.clone()),
@@ -1142,7 +1155,7 @@ fn measure(ctx: &RuntimeContext, input: &Input, opts: &Options) -> Measured {
     m.load_avg = load_average();
     let max = Duration::from_secs_f64(opts.max_secs);
     for _ in 0..opts.runs {
-        match timed_run(ctx, input, &bytes, fps, max) {
+        match timed_run(ctx, exec, input, &bytes, fps, max) {
             Ok(run) => m.runs.push(run),
             Err(e) => {
                 m.error = Some(e);
@@ -1164,7 +1177,7 @@ fn measure(ctx: &RuntimeContext, input: &Input, opts: &Options) -> Measured {
     m.sample_rate = mid.sample_rate.filter(|r| *r > 0).or(m.sample_rate);
     m.verdict = if speed < m.floor { "SLOW" } else { "ok" }.into();
     if opts.check {
-        m.check = Some(check(ctx, input, &bytes));
+        m.check = Some(check(ctx, exec, input, &bytes));
         if !m.check.as_ref().unwrap().complete {
             m.verdict = if speed < m.floor { "SLOW!" } else { "FAIL" }.into();
         }
@@ -1296,6 +1309,8 @@ struct RegistryCoverage {
 struct Report<'a> {
     machine: String,
     runs: usize,
+    threads: &'a str,
+    thread_budget: usize,
     max_secs: f64,
     floors: HashMap<&'static str, f64>,
     results: Vec<&'a Measured>,
@@ -1309,6 +1324,11 @@ struct Report<'a> {
 
 fn main() {
     let opts = parse_args();
+    let exec = if opts.threads == "auto" {
+        ExecutionContext::auto()
+    } else {
+        ExecutionContext::with_threads(opts.threads.parse().unwrap())
+    };
     prefer_performance_cores();
     let ctx = codecs::context();
     let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/manifest.toml");
@@ -1330,7 +1350,7 @@ fn main() {
             let bytes: Arc<[u8]> = std::fs::read(&input.path).expect("read input").into();
             let fps = ffprobe_stream(&input.path, input.kind, input.stream.as_ref().unwrap().nth).and_then(|p| p.fps);
             while Instant::now() < until {
-                match timed_run(&ctx, input, &bytes, fps, Duration::from_secs_f64(opts.max_secs)) {
+                match timed_run(&ctx, &exec, input, &bytes, fps, Duration::from_secs_f64(opts.max_secs)) {
                     Ok(r) => eprintln!("{}: {:.2}×RT cpu, {:.2}×RT wall ({:.2} s in {:.3} s, {:.2} G instr)", input.source, r.cpu_xrt, r.xrt, r.media_secs, r.wall_secs, r.instructions as f64 / 1e9),
                     Err(e) => {
                         eprintln!("{}: {e}", input.source);
@@ -1343,12 +1363,14 @@ fn main() {
     }
 
     let (mut results, mut journal) = journal::Journal::open(&opts, &inputs);
+    assert!(results.iter().all(|row| row.thread_budget.unwrap_or(1) == exec.threads),
+        "--resume thread budget differs from the saved measurements");
     for (i, input) in inputs.iter().enumerate() {
         if results.iter().any(|done| done.rows == input.rows && done.input == input.source && done.path == input.path.to_string_lossy()) {
             continue;
         }
         eprint!("[{}/{}] {} {} … ", i + 1, inputs.len(), input.rows.join(" "), input.source);
-        let m = measure(&ctx, input, &opts);
+        let m = measure(&ctx, &exec, input, &opts);
         journal.append(&m);
         eprintln!(
             "{} {}",
@@ -1387,6 +1409,8 @@ fn main() {
         release: !cfg!(debug_assertions),
         registry,
         runs: opts.runs,
+        threads: &opts.threads,
+        thread_budget: exec.threads,
         max_secs: opts.max_secs,
         floors: HashMap::from([("audio", AUDIO_FLOOR), ("video_above_576", HD_FLOOR), ("video_sd", SD_FLOOR)]),
         results: ranked,
