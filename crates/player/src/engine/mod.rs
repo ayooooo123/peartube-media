@@ -1111,9 +1111,10 @@ fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> oxideav_core:
         };
         // Decoders that split a picture across threads, with output identical
         // to the serial decode: VC-1 (B-picture coordinator), HEVC (wavefront,
-        // tiles, row-parallel in-loop filters) and VP9 (tile columns).
+        // tiles, row-parallel in-loop filters), VP9 (tile columns) and AV1
+        // (row-parallel deblocking, CDEF and loop restoration).
         #[cfg(not(target_arch = "wasm32"))]
-        if matches!(params.codec_id.as_str(), "vc1" | "h265" | "hevc" | "vp9") {
+        if matches!(params.codec_id.as_str(), "vc1" | "h265" | "hevc" | "vp9" | "av1") {
             decoder.set_execution_context(&oxideav_core::ExecutionContext::auto());
         }
         Ok(decoder)

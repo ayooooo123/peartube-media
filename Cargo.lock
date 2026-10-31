@@ -1285,7 +1285,7 @@ dependencies = [
 [[package]]
 name = "oxideav-av1"
 version = "0.1.20"
-source = "git+https://github.com/ayooooo123/oxideav-av1?rev=a9dd1b194ec61dd05997f57de0bfb2188008d218#a9dd1b194ec61dd05997f57de0bfb2188008d218"
+source = "git+https://github.com/ayooooo123/oxideav-av1?rev=588800ab43ab36da18e25c2e83f44ef2988fd41a#588800ab43ab36da18e25c2e83f44ef2988fd41a"
 dependencies = [
  "oxideav-core",
 ]
