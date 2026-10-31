@@ -34,8 +34,8 @@ unicode-bidi = "0.3.18"
 oxideav-h264.workspace = true
 oxideav-h265.workspace = true
 oxideav-mkv.workspace = true
-# The native route's audio bridge encodes FLAC.
-oxideav-flac.workspace = true
+# Apple's AV1 decoder needs the sequence header and av1C record.
+oxideav-av1.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 ndk = { version = "0.9", features = ["media", "audio", "nativewindow", "api-level-29"] }

@@ -697,6 +697,7 @@ enum CompressedKind {
     H264,
     Hevc,
     Vp9,
+    Av1,
 }
 
 /// Session-defining VP9 parameters. A change forces a format/session rebuild.
@@ -734,14 +735,24 @@ struct Compressed {
 }
 
 /// What a video stream's headers say beyond its parameter sets. HDR10's mastering display
-/// and content light (SEI 137/144) reach VideoToolbox's pictures only from the format
-/// description, never from the bitstream, and Dolby Vision decodes only from a format that
-/// carries the DV record. From the setup bytes, or the first keyframe once it arrives.
+/// and content light (HEVC SEI 137/144, AV1 metadata OBUs) reach VideoToolbox's pictures only
+/// from the format description, never from the bitstream, and Dolby Vision decodes only from
+/// a format that carries the DV record. From the setup bytes, or the first keyframe once it
+/// arrives.
 #[derive(Clone, Default, PartialEq)]
 struct StreamHeaders {
     mastering: Option<[u8; 24]>,
     content_light: Option<[u8; 4]>,
     dovi: Option<DolbyVision>,
+    av1: Option<Av1Record>,
+}
+
+/// What an AV1 format is built from: the `av1C` record and the sequence header's size.
+#[derive(Clone, PartialEq)]
+struct Av1Record {
+    av1c: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Clone, PartialEq)]
@@ -763,30 +774,34 @@ fn stream_headers(params: &CodecParameters, keyframe: &[u8]) -> StreamHeaders {
         return StreamHeaders::default();
     };
     codec::apply_dovi(&mut config, codec::find_dovi_box(&params.extradata), keyframe, codec::video_framing(params));
-    let (hvcc, width, height) = (config.record, config.width, config.height);
-    // Profile 7 needs every RPU rewritten: its HDR10 base layer plays as it is.
-    let dovi = config.dovi.filter(|d| !d.convert_p7_to_81).map(|d| DolbyVision {
-        hvcc,
-        width,
-        height,
-        atom: if d.profile > 7 { "dvvC" } else { "dvcC" },
-        record: d.record,
-        dvh1: d.use_dvh1,
-    });
-    StreamHeaders { mastering: config.mastering_display, content_light: config.content_light, dovi }
+    let (record, width, height) = (config.record, config.width, config.height);
+    let (av1, dovi) = if config.codec == crate::headers::types::VideoCodec::Av1 {
+        (Some(Av1Record { av1c: record, width, height }), None)
+    } else {
+        // Profile 7 needs every RPU rewritten: its HDR10 base layer plays as it is.
+        let dovi = config.dovi.filter(|d| !d.convert_p7_to_81).map(|d| DolbyVision {
+            hvcc: record,
+            width,
+            height,
+            atom: if d.profile > 7 { "dvvC" } else { "dvcC" },
+            record: d.record,
+            dvh1: d.use_dvh1,
+        });
+        (None, dovi)
+    };
+    StreamHeaders { mastering: config.mastering_display, content_light: config.content_light, dovi, av1 }
 }
 
 impl Compressed {
     /// The first keyframe can say what the setup bytes did not (a Dolby Vision RPU, HDR10's
-    /// SEI). Before anything is decoded, a format and decoder that know it replace `old`;
-    /// when they cannot be made, `old` stays and the stream plays as plain HEVC/H.264.
+    /// SEI or AV1 metadata OBUs). Before anything is decoded, a format and decoder that know it
+    /// replace `old`; when they cannot be made, `old` stays and the stream plays without it.
     fn reformat(&mut self, keyframe: &[u8], old: NativeDecoder) -> NativeDecoder {
         let headers = stream_headers(&self.params, keyframe);
         if headers == self.headers {
             return old;
         }
-        let Ok((format, length_size, annex_b, reorder_depth)) =
-            create_h264_or_hevc_format(self.kind, &self.params, &headers)
+        let Ok((format, length_size, annex_b, reorder_depth)) = create_format(self.kind, &self.params, &headers)
         else {
             return old;
         };
@@ -2029,9 +2044,10 @@ impl AppleDevice {
             "h264" => CompressedKind::H264,
             "hevc" | "h265" => CompressedKind::Hevc,
             "vp9" => CompressedKind::Vp9,
+            "av1" => CompressedKind::Av1,
             _ => return Err(VideoError::Unsupported),
         };
-        // VP9 has no H.264/HEVC headers to read: its headers stay the empty default.
+        // VP9's headers stay the empty default; AV1's carry its av1C record.
         let headers = stream_headers(params, &[]);
 
         let (format, length_size, annex_b, reorder_depth, vp9) = match kind {
@@ -2052,6 +2068,18 @@ impl AppleDevice {
                     frame_rate: params.frame_rate,
                 };
                 (format, 0usize, false, 0usize, Some(vp9))
+            }
+            CompressedKind::Av1 => {
+                // Only a hardware decoder beats the engine's own; without one AV1 stays in
+                // software (Apple's AV1 decoder is hardware: A17 Pro, M3 and later).
+                if !super::vt_caps::hardware_decode_supported(super::vt_caps::CODEC_AV1) {
+                    return Err(VideoError::Unsupported);
+                }
+                let format = create_av1_format(&headers, params.color_signal).map_err(|e| match e {
+                    SinkError::Fallback(_) => VideoError::Unsupported,
+                    other => VideoError::Sink(other),
+                })?;
+                (format, 0usize, false, 0usize, None)
             }
             CompressedKind::H264 | CompressedKind::Hevc => {
                 if params.extradata.is_empty() {
@@ -2101,13 +2129,15 @@ impl AppleDevice {
         )
         .map_err(|e| match e {
             // Configure-time session failure → Unsupported so the engine falls back immediately.
-            SinkError::Fallback(_) if kind == CompressedKind::Vp9 => VideoError::Unsupported,
+            SinkError::Fallback(_) if matches!(kind, CompressedKind::Vp9 | CompressedKind::Av1) => {
+                VideoError::Unsupported
+            }
             other => VideoError::Sink(other),
         })?;
 
-        if kind == CompressedKind::Vp9 {
+        if matches!(kind, CompressedKind::Vp9 | CompressedKind::Av1) {
             let hw = decoder.using_hardware();
-            eprintln!("[peartube-apple] VP9 on VideoToolbox, hardware: {hw}");
+            eprintln!("[peartube-apple] {kind:?} on VideoToolbox, hardware: {hw}");
         }
 
         Ok(Self::Compressed {
@@ -3403,18 +3433,18 @@ fn process_compressed_packet(
 
     let dec = decoder
         .as_ref()
-        .ok_or_else(|| VideoError::Sink(SinkError::Fallback("VP9 decoder missing".into())))?;
+        .ok_or_else(|| VideoError::Sink(SinkError::Fallback("video decoder missing".into())))?;
 
-    let mut data = if compressed.kind == CompressedKind::Vp9 {
-        // VP9 packets go to VT unchanged: no length-prefix or Annex-B rewrite.
-        std::borrow::Cow::Borrowed(packet.data.as_slice())
-    } else if compressed.annex_b {
-        std::borrow::Cow::Owned(annex_b_to_length_prefixed(
-            &packet.data,
-            compressed.length_size,
-        ))
-    } else {
-        std::borrow::Cow::Borrowed(packet.data.as_slice())
+    let mut data = match compressed.kind {
+        // VP9 and AV1 packets go to VT as they are: no length-prefix or Annex-B rewrite.
+        CompressedKind::Vp9 => std::borrow::Cow::Borrowed(packet.data.as_slice()),
+        CompressedKind::Av1 => {
+            std::borrow::Cow::Borrowed(crate::headers::codec::without_temporal_delimiter(&packet.data))
+        }
+        _ if compressed.annex_b => {
+            std::borrow::Cow::Owned(annex_b_to_length_prefixed(&packet.data, compressed.length_size))
+        }
+        _ => std::borrow::Cow::Borrowed(packet.data.as_slice()),
     };
     if compressed.kind != CompressedKind::Vp9 {
         if let Some(filtered) = compressed.filter_leading(&data) {
@@ -4372,6 +4402,71 @@ unsafe fn copy_yuv420p_into_nv12_pixel_buffer(
     result
 }
 
+/// The format description for `kind` from its parameter sets and `headers`, with the NAL
+/// length size, Annex-B flag and reorder depth the samples need.
+fn create_format(
+    kind: CompressedKind,
+    params: &CodecParameters,
+    headers: &StreamHeaders,
+) -> Result<(CFRetained<CMVideoFormatDescription>, usize, bool, usize), SinkError> {
+    match kind {
+        CompressedKind::Av1 => Ok((create_av1_format(headers, params.color_signal)?, 0, false, 0)),
+        _ => create_h264_or_hevc_format(kind, params, headers),
+    }
+}
+
+/// An `av01` format: the `av1C` record as the sample entry's atom, the stream's colour, and
+/// HDR10's mastering display and content light when the stream carries them.
+fn create_av1_format(
+    headers: &StreamHeaders,
+    color_signal: oxideav_core::ColorSignal,
+) -> Result<CFRetained<CMVideoFormatDescription>, SinkError> {
+    let av1 = headers
+        .av1
+        .as_ref()
+        .ok_or_else(|| SinkError::Fallback("no AV1 sequence header in the setup bytes".into()))?;
+    let av1c_key = CFString::from_static_str("av1C");
+    let av1c = CFData::from_bytes(&av1.av1c);
+    let atoms = unsafe { cf_dictionary(&[(&av1c_key, &av1c as &CFType)]) }
+        .ok_or_else(|| SinkError::Fallback("could not build av1C atoms".into()))?;
+    let mastering = headers.mastering.map(|m| CFData::from_bytes(&m));
+    let light = headers.content_light.map(|c| CFData::from_bytes(&c));
+    let mut entries: Vec<(&CFString, &CFType)> =
+        vec![(unsafe { kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms }, &atoms as &CFType)];
+    if color_is_known(color_signal) {
+        let (primaries, transfer, matrix) = cm_color_extension_values(color_signal);
+        entries.push((unsafe { kCMFormatDescriptionExtension_ColorPrimaries }, primaries as &CFType));
+        entries.push((unsafe { kCMFormatDescriptionExtension_TransferFunction }, transfer as &CFType));
+        entries.push((unsafe { kCMFormatDescriptionExtension_YCbCrMatrix }, matrix as &CFType));
+        if let Some(full) = color_signal.range.full_range_flag() {
+            entries.push((unsafe { kCMFormatDescriptionExtension_FullRangeVideo }, CFBoolean::new(full) as &CFType));
+        }
+    }
+    if let Some(m) = &mastering {
+        entries.push((unsafe { kCMFormatDescriptionExtension_MasteringDisplayColorVolume }, m as &CFType));
+    }
+    if let Some(c) = &light {
+        entries.push((unsafe { kCMFormatDescriptionExtension_ContentLightLevelInfo }, c as &CFType));
+    }
+    let extensions = unsafe { cf_dictionary(&entries) }
+        .ok_or_else(|| SinkError::Fallback("could not build AV1 format extensions".into()))?;
+    let mut raw: *const CMVideoFormatDescription = ptr::null();
+    let status = unsafe {
+        CMVideoFormatDescriptionCreate(
+            None,
+            super::vt_caps::CODEC_AV1,
+            av1.width as i32,
+            av1.height as i32,
+            Some(&extensions),
+            NonNull::from(&mut raw),
+        )
+    };
+    if status != 0 || raw.is_null() {
+        return Err(SinkError::Fallback(format!("CMVideoFormatDescriptionCreate(av01): {status}")));
+    }
+    Ok(unsafe { CFRetained::from_raw(NonNull::new_unchecked(raw.cast_mut())) })
+}
+
 fn create_h264_or_hevc_format(
     kind: CompressedKind,
     params: &CodecParameters,
@@ -4395,10 +4490,8 @@ fn create_h264_or_hevc_format(
                 .ok_or_else(|| SinkError::Fallback("malformed avcC extradata".into()))?,
             CompressedKind::Hevc => parse_hvcc(record)
                 .ok_or_else(|| SinkError::Fallback("malformed hvcC extradata".into()))?,
-            CompressedKind::Vp9 => {
-                return Err(SinkError::Fallback(
-                    "create_h264_or_hevc_format called for VP9".into(),
-                ));
+            CompressedKind::Vp9 | CompressedKind::Av1 => {
+                return Err(SinkError::Fallback(format!("create_h264_or_hevc_format called for {kind:?}")));
             }
         };
         (kind_nals, len)
@@ -4488,10 +4581,8 @@ fn create_h264_or_hevc_format(
                 NonNull::from(&mut raw),
             )
         },
-        (CompressedKind::Vp9, _) => {
-            return Err(SinkError::Fallback(
-                "create_h264_or_hevc_format called for VP9".into(),
-            ));
+        (CompressedKind::Vp9 | CompressedKind::Av1, _) => {
+            return Err(SinkError::Fallback(format!("create_h264_or_hevc_format called for {kind:?}")));
         }
     };
     if status != 0 || raw.is_null() {

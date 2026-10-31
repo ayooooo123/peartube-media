@@ -1,6 +1,8 @@
 //! Codec-header parsing for direct playback: H.264/HEVC parameter sets and VUI,
-//! HDR10 SEI metadata, Dolby Vision detection, and E-AC-3 dec3 configuration.
+//! AV1 sequence headers and av1C records, HDR10 metadata (SEI and AV1 metadata
+//! OBUs), Dolby Vision detection, and E-AC-3 dec3 configuration.
 
+use oxideav_av1::{parse_leb128, parse_sequence_header, Av1CodecConfig, SequenceHeader};
 use oxideav_core::CodecParameters;
 
 use super::types::*;
@@ -40,12 +42,14 @@ pub(crate) fn video_framing(params: &CodecParameters) -> Framing {
     }
 }
 
-/// None unless codec_id is "h264" or "h265"/"hevc" and an SPS (and PPS) is found in the extradata
-/// (avcC/hvcC record or Annex B) or, failing that, in `first_keyframe` (framed per `video_framing`).
+/// None unless codec_id is "h264", "h265"/"hevc" or "av1" and its parameter sets (an SPS and PPS,
+/// or an AV1 sequence header) are found in the extradata (avcC/hvcC/av1C record or Annex B) or,
+/// failing that, in `first_keyframe` (framed per `video_framing`; AV1 as low-overhead OBUs).
 pub(crate) fn video_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoConfig> {
     match params.codec_id.as_str() {
         "h264" => h264_config(params, first_keyframe),
         "h265" | "hevc" => hevc_config(params, first_keyframe),
+        "av1" => av1_config(params, first_keyframe),
         _ => None,
     }
 }
@@ -789,6 +793,219 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         dovi: None,
     };
     Some(config)
+}
+
+/// None unless a sequence header OBU is found in the av1C record's configOBUs or, failing that,
+/// in `first_keyframe`. Without a record in the extradata, one is built from that header.
+fn av1_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoConfig> {
+    let record = av1_record(params.extradata.as_slice());
+    let record_config = record.and_then(Av1CodecConfig::parse);
+    let config_obus = record.map_or(&[][..], |body| &body[4..]);
+    // The sequence header may live in configOBUs or only in the samples.
+    let (seq, seq_obu) = first_sequence_header(config_obus).or_else(|| first_sequence_header(first_keyframe))?;
+    let record = match record_config {
+        Some(_) => record?.to_vec(),
+        None => {
+            let mut config = Av1CodecConfig::from_sequence_header(&seq);
+            config.config_obus = seq_obu;
+            config.to_bytes()
+        }
+    };
+    let config = Av1CodecConfig::parse(&record)?;
+
+    let width = match seq.max_frame_width_minus_1.saturating_add(1) {
+        0 => params.width?,
+        width => width,
+    };
+    let height = match seq.max_frame_height_minus_1.saturating_add(1) {
+        0 => params.height?,
+        height => height,
+    };
+
+    let cc = seq.color_config;
+    let colour = cc.color_description_present_flag.then_some(Colour {
+        primaries: u16::from(cc.color_primaries),
+        transfer: u16::from(cc.transfer_characteristics),
+        matrix: u16::from(cc.matrix_coefficients),
+        full_range: cc.color_range,
+    });
+    let range = match colour.map(|c| c.transfer) {
+        Some(16) => VideoRange::Pq,
+        Some(18) => VideoRange::Hlg,
+        _ => VideoRange::Sdr,
+    };
+    let tier = if config.seq_tier == 0 { 'M' } else { 'H' };
+    let codec_string =
+        format!("av01.{}.{:02}{tier}.{:02}", config.seq_profile, config.seq_level_idx, config.bit_depth());
+
+    let (config_mdcv, config_clli) = hdr_metadata(config_obus);
+    let (key_mdcv, key_clli) = hdr_metadata(first_keyframe);
+
+    let frame_rate = seq
+        .timing_info
+        .and_then(|timing| {
+            if !timing.equal_picture_interval || timing.num_units_in_display_tick == 0 || timing.time_scale == 0 {
+                return None;
+            }
+            let ticks = timing.num_ticks_per_picture_minus_1.map_or(1, |n| n.saturating_add(1));
+            Some(f64::from(timing.time_scale) / (f64::from(timing.num_units_in_display_tick) * f64::from(ticks)))
+        })
+        .filter(|fps| fps.is_finite() && (1.0..=500.0).contains(fps))
+        .or_else(|| params.frame_rate.filter(|rate| rate.den > 0).map(|rate| rate.num as f64 / rate.den as f64));
+
+    Some(VideoConfig {
+        codec: VideoCodec::Av1,
+        width,
+        height,
+        record,
+        nal_length_size: 0,
+        codec_string,
+        range,
+        colour,
+        mastering_display: config_mdcv.or(key_mdcv),
+        content_light: config_clli.or(key_clli),
+        pixel_aspect: None,
+        frame_rate,
+        // AV1 shows pictures in decode order: no reordering.
+        reorder_depth: 0,
+        interlaced: false,
+        dovi: None,
+    })
+}
+
+/// The `av1C` record body in the extradata: Matroska `V_AV1` CodecPrivate is the body; some MP4
+/// paths hand over the whole `av1C` box.
+fn av1_record(extra: &[u8]) -> Option<&[u8]> {
+    if extra.len() >= 4 && extra[0] == 0x81 {
+        return Some(extra);
+    }
+    if extra.len() >= 8 && &extra[4..8] == b"av1C" {
+        let size = u32::from_be_bytes([extra[0], extra[1], extra[2], extra[3]]) as usize;
+        // The body carries at least the record's four fixed bytes.
+        if size >= 12 && size <= extra.len() {
+            return Some(&extra[8..size]);
+        }
+    }
+    None
+}
+
+/// An OBU in a low-overhead AV1 bytestream.
+struct ObuUnit<'a> {
+    kind: u8,
+    payload: &'a [u8],
+    /// The whole unit, header and size field included.
+    bytes: &'a [u8],
+}
+
+/// Walks the OBUs of `data`. The last unit may omit its size field (allowed in a sample, though
+/// not in configOBUs).
+fn obu_units(data: &[u8]) -> impl Iterator<Item = ObuUnit<'_>> {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        if pos >= data.len() {
+            return None;
+        }
+        let start = pos;
+        let header = data[pos];
+        pos += 1;
+        if header & 0x80 != 0 {
+            return None;
+        }
+        let kind = (header >> 3) & 0x0F;
+        if (header >> 2) & 1 == 1 {
+            if pos >= data.len() {
+                return None;
+            }
+            pos += 1;
+        }
+        let payload_end = if (header >> 1) & 1 == 1 {
+            let (size, len) = parse_leb128(data.get(pos..)?).ok()?;
+            pos += len;
+            match usize::try_from(size).ok().and_then(|size| pos.checked_add(size)) {
+                Some(end) if end <= data.len() => end,
+                _ => return None,
+            }
+        } else {
+            data.len()
+        };
+        let unit = ObuUnit { kind, payload: &data[pos..payload_end], bytes: &data[start..payload_end] };
+        pos = payload_end;
+        Some(unit)
+    })
+}
+
+/// The first sequence header OBU: parsed fields and its exact bytes.
+fn first_sequence_header(data: &[u8]) -> Option<(SequenceHeader, Vec<u8>)> {
+    let unit = obu_units(data).find(|unit| unit.kind == 1)?;
+    let seq = parse_sequence_header(unit.payload).ok()?;
+    Some((seq, unit.bytes.to_vec()))
+}
+
+/// HDR10 static metadata from the metadata OBUs (types 1 and 2). HDR_CLL is the `clli` body as it
+/// stands; HDR_MDCV is converted to the `mdcv` layout (`av1_mdcv_to_mp4`).
+fn hdr_metadata(data: &[u8]) -> (Option<[u8; 24]>, Option<[u8; 4]>) {
+    let mut mastering_display = None;
+    let mut content_light = None;
+    for unit in obu_units(data).filter(|unit| unit.kind == 5) {
+        let Ok((meta_type, len)) = parse_leb128(unit.payload) else { continue };
+        let payload = &unit.payload[len..];
+        match meta_type {
+            // Metadata OBUs end in trailing bits (a 0x80 byte after these byte-aligned
+            // payloads), so the payload runs past the fields.
+            1 if payload.len() >= 4 && content_light.is_none() => content_light = payload[..4].try_into().ok(),
+            2 if payload.len() >= 24 && mastering_display.is_none() => {
+                mastering_display = payload[..24].try_into().ok().map(av1_mdcv_to_mp4)
+            }
+            _ => {}
+        }
+    }
+    (mastering_display, content_light)
+}
+
+/// AV1's HDR_MDCV and the ISOBMFF `mdcv` box (SMPTE ST 2086, as in HEVC's SEI) carry the same
+/// fields in different orders and units (AV1-ISOBMFF §2.3.5): AV1 lists the primaries red, green,
+/// blue with chromaticities in 0.16 fixed point and luminance max in 24.8 and min in 18.14 fixed
+/// point (cd/m²); `mdcv` lists green, blue, red with chromaticities in units of 0.00002 and both
+/// luminances in 0.0001 cd/m².
+fn av1_mdcv_to_mp4(av1: [u8; 24]) -> [u8; 24] {
+    let u16_at = |i: usize| u64::from(u16::from_be_bytes([av1[i], av1[i + 1]]));
+    let u32_at = |i: usize| u64::from(u32::from_be_bytes([av1[i], av1[i + 1], av1[i + 2], av1[i + 3]]));
+    let chroma = |v: u64| u16::try_from((v * 50_000 + 32_768) / 65_536).unwrap_or(u16::MAX);
+    let luminance = |v: u64, scale: u64| u32::try_from((v * 10_000 + scale / 2) / scale).unwrap_or(u32::MAX);
+    let mut out = [0u8; 24];
+    // AV1 primary i sits at 4·i (x) and 4·i + 2 (y): 0 red, 1 green, 2 blue.
+    for (slot, primary) in [1, 2, 0].into_iter().enumerate() {
+        out[4 * slot..4 * slot + 2].copy_from_slice(&chroma(u16_at(4 * primary)).to_be_bytes());
+        out[4 * slot + 2..4 * slot + 4].copy_from_slice(&chroma(u16_at(4 * primary + 2)).to_be_bytes());
+    }
+    out[12..14].copy_from_slice(&chroma(u16_at(12)).to_be_bytes());
+    out[14..16].copy_from_slice(&chroma(u16_at(14)).to_be_bytes());
+    out[16..20].copy_from_slice(&luminance(u32_at(16), 256).to_be_bytes());
+    out[20..24].copy_from_slice(&luminance(u32_at(20), 16_384).to_be_bytes());
+    out
+}
+
+/// An AV1 sample without an opening temporal delimiter OBU (type 2): ISOBMFF samples carry none,
+/// and some muxers keep one in every temporal unit.
+pub(crate) fn without_temporal_delimiter(data: &[u8]) -> &[u8] {
+    let Some(&header) = data.first() else { return data };
+    if header & 0x80 != 0 || (header >> 3) & 0x0F != 2 {
+        return data;
+    }
+    // A temporal delimiter has no payload: its header and size field (when present) are all of
+    // it, even without a size field, where any other OBU would run to the end of the sample.
+    let header_len = 1 + usize::from((header >> 2) & 1 == 1);
+    let end = if (header >> 1) & 1 == 1 {
+        data.get(header_len..)
+            .and_then(|rest| parse_leb128(rest).ok())
+            .and_then(|(size, len)| header_len.checked_add(len)?.checked_add(usize::try_from(size).ok()?))
+    } else {
+        Some(header_len)
+    };
+    match end {
+        Some(end) if end <= data.len() => &data[end..],
+        _ => data,
+    }
 }
 
 const AC3_SAMPLE_RATES: [u32; 4] = [48000, 44100, 32000, 0];
@@ -2082,5 +2299,116 @@ mod tests {
         assert_eq!(dovi.compat_id, 1);
         assert!(!dovi.use_dvh1);
         assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
+    }
+}
+
+#[cfg(test)]
+mod av1_tests {
+    use super::*;
+    use oxideav_core::CodecId;
+
+    /// av1C record body from a 1080p30 AV1 test encode: Main, seq_level_idx 8, 8-bit 4:2:0,
+    /// with the 12-byte sequence header OBU in configOBUs.
+    const AV1C_MKV: &[u8] = &[
+        0x81, 0x08, 0x0c, 0x00, 0x0a, 0x0c, 0x02, 0x00, 0x00, 0x42, 0x95, 0x5d, 0xfe, 0x1b, 0x80,
+        0x5f, 0x00, 0x08,
+    ];
+
+    fn av1_params(extradata: &[u8]) -> CodecParameters {
+        let mut params = CodecParameters::video(CodecId::new("av1"));
+        params.extradata = extradata.to_vec();
+        params.width = Some(1920);
+        params.height = Some(1080);
+        params
+    }
+
+    #[test]
+    fn av1c_box_shorter_than_its_fixed_fields_is_no_configuration() {
+        for size in 8u8..12 {
+            let mut extradata = vec![0, 0, 0, size];
+            extradata.extend_from_slice(b"av1C");
+            extradata.resize(usize::from(size), 0x81);
+            assert_eq!(video_config(&av1_params(&extradata), &[]), None, "box size {size}");
+        }
+    }
+
+    #[test]
+    fn av1c_record_from_matroska_configures_main_8bit() {
+        let config = video_config(&av1_params(AV1C_MKV), &[]).expect("AV1 configuration");
+        assert_eq!(config.codec, VideoCodec::Av1);
+        assert_eq!((config.width, config.height), (1920, 1080));
+        assert_eq!(config.record, AV1C_MKV);
+        assert_eq!(config.reorder_depth, 0);
+        assert_eq!(config.range, VideoRange::Sdr);
+        assert_eq!(config.colour, None);
+        assert_eq!(config.codec_string, "av01.0.08M.08");
+        let record = Av1CodecConfig::parse(&config.record).expect("record parses");
+        assert_eq!((record.seq_profile, record.seq_level_idx, record.seq_tier, record.bit_depth()), (0, 8, 0, 8));
+        assert!(record.chroma_subsampling_x && record.chroma_subsampling_y && !record.monochrome);
+        assert_eq!(record.config_obus, &AV1C_MKV[4..]);
+    }
+
+    #[test]
+    fn av1c_is_built_from_the_first_keyframes_sequence_header() {
+        let config = video_config(&av1_params(&[]), &AV1C_MKV[4..]).expect("AV1 configuration");
+        assert_eq!((config.width, config.height), (1920, 1080));
+        assert_eq!(&config.record[..4], &[0x81, 0x08, 0x0c, 0x00]);
+        assert_eq!(&config.record[4..], &AV1C_MKV[4..]);
+    }
+
+    #[test]
+    fn a_full_av1c_box_in_the_extradata_is_unwrapped() {
+        let mut boxed = Vec::new();
+        boxed.extend_from_slice(&((AV1C_MKV.len() + 8) as u32).to_be_bytes());
+        boxed.extend_from_slice(b"av1C");
+        boxed.extend_from_slice(AV1C_MKV);
+        let config = video_config(&av1_params(&boxed), &[]).expect("AV1 configuration");
+        assert_eq!(config.record, AV1C_MKV);
+    }
+
+    #[test]
+    fn av1_without_any_sequence_header_has_no_configuration() {
+        assert!(video_config(&av1_params(&[0x81, 0x08, 0x0c, 0x00]), &[]).is_none());
+    }
+
+    #[test]
+    fn av1_samples_lose_a_leading_temporal_delimiter_only() {
+        let frame = [0x32, 0x02, 0xAA, 0xBB];
+        let mut with_td = vec![0x12, 0x00];
+        with_td.extend_from_slice(&frame);
+        assert_eq!(without_temporal_delimiter(&with_td), frame);
+        assert_eq!(without_temporal_delimiter(&frame), frame);
+        // Without a size field the delimiter is its header alone.
+        let mut no_size = vec![0x10];
+        no_size.extend_from_slice(&frame);
+        assert_eq!(without_temporal_delimiter(&no_size), frame);
+        // A truncated delimiter is left as it is.
+        assert_eq!(without_temporal_delimiter(&[0x12]), [0x12]);
+    }
+
+    #[test]
+    fn av1_metadata_obus_become_mdcv_and_clli() {
+        // BT.2020 primaries, D65 white, 1000 / 0.005 cd/m², in AV1's units.
+        let mut av1_mdcv = Vec::new();
+        for v in [46_400u16, 19_136, 11_141, 52_232, 8_585, 3_015, 20_493, 21_561] {
+            av1_mdcv.extend_from_slice(&v.to_be_bytes());
+        }
+        av1_mdcv.extend_from_slice(&(1000u32 << 8).to_be_bytes());
+        av1_mdcv.extend_from_slice(&82u32.to_be_bytes());
+        let mut data = vec![0x2A, 0x1A, 0x02];
+        data.extend_from_slice(&av1_mdcv);
+        data.push(0x80);
+        data.extend_from_slice(&[0x2A, 0x06, 0x01, 0x03, 0xE8, 0x01, 0x90, 0x80]);
+        let (mastering, light) = hdr_metadata(&data);
+        // The same display in `mdcv` units and order: G, B, R, white point, max 1000 cd/m² =
+        // 10,000,000, min 0.005 cd/m² = 50.
+        let mut mdcv = Vec::new();
+        for v in [8_500u16, 39_850, 6_550, 2_300, 35_400, 14_600, 15_635, 16_450] {
+            mdcv.extend_from_slice(&v.to_be_bytes());
+        }
+        mdcv.extend_from_slice(&10_000_000u32.to_be_bytes());
+        mdcv.extend_from_slice(&50u32.to_be_bytes());
+        assert_eq!(mastering, Some(<[u8; 24]>::try_from(&mdcv[..]).unwrap()));
+        assert_eq!(light, Some([0x03, 0xE8, 0x01, 0x90]));
     }
 }

@@ -7,6 +7,8 @@ pub(crate) enum VideoCodec {
     H264,
     /// Sample entry `hvc1` (parameter sets in the record only), record `hvcC`.
     Hevc,
+    /// Sample entry `av01`, record `av1C`.
+    Av1,
 }
 
 /// Video transfer-function range.
@@ -51,8 +53,8 @@ pub(crate) struct VideoConfig {
     /// Coded size from the SPS after cropping.
     pub width: u32,
     pub height: u32,
-    /// The `avcC` / `hvcC` box payload. hvcC keeps only its VPS, SPS and
-    /// PPS arrays (iOS rejects records carrying SEI arrays).
+    /// The `avcC` / `hvcC` / `av1C` box payload. hvcC keeps only its VPS, SPS
+    /// and PPS arrays (iOS rejects records carrying SEI arrays).
     pub record: Vec<u8>,
     /// Byte width of the NAL length prefixes in the samples (1, 2 or 4),
     /// as the record declares.

@@ -12,6 +12,13 @@ use parking_lot::Mutex;
 
 /// `kCMVideoCodecType_VP9`.
 pub(crate) const CODEC_VP9: u32 = u32::from_be_bytes(*b"vp09");
+/// `kCMVideoCodecType_AV1`.
+pub(crate) const CODEC_AV1: u32 = u32::from_be_bytes(*b"av01");
+
+#[link(name = "VideoToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn VTIsHardwareDecodeSupported(codec: u32) -> u8;
+}
 
 /// Codec types already passed to the registration function (or found to
 /// have none to pass to). Registration is idempotent; this only avoids
@@ -40,4 +47,12 @@ pub(crate) fn register_supplemental(codec: u32) {
     // `void VTRegisterSupplementalVideoDecoderIfAvailable(CMVideoCodecType)`.
     let register: unsafe extern "C" fn(u32) = unsafe { std::mem::transmute::<*mut c_void, _>(symbol) };
     unsafe { register(codec) };
+}
+
+/// Whether this device has a hardware decoder for `codec`. Registers a supplemental decoder
+/// first, since VP9 and AV1 report false until then.
+pub(crate) fn hardware_decode_supported(codec: u32) -> bool {
+    register_supplemental(codec);
+    // SAFETY: plain query of a codec type; no pointers involved.
+    unsafe { VTIsHardwareDecodeSupported(codec) != 0 }
 }
