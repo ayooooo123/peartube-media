@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 # The H.264 and VP9 decoders (upstream OxideAV's, since 0.3.0) need 1.95.
 rust-version = "1.95"
