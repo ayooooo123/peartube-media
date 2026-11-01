@@ -535,16 +535,22 @@ fn decode_stream(
     let _ = demuxer.set_active_streams(&[index]);
     let mut decoder = make_decoder(ctx, &stream.params, exec)?;
     let mut tally = Tally::default();
+    let mut params = stream.params.clone();
+    let mut output_watch = oxideav_core::OutputParamsWatch::new();
     let mut drain = |decoder: &mut Box<dyn Decoder>, tally: &mut Tally| loop {
         match decoder.receive_frame() {
-            // Phase B: merge output parameters; do not count or hash this event.
-            Ok(Frame::StreamParams(_)) => continue,
+            Ok(Frame::StreamParams(event)) => {
+                output_watch.observe(decoder.as_ref(), &mut params);
+                params.merge_output_params(&event);
+                continue;
+            }
             Ok(frame) => {
+                output_watch.observe(decoder.as_ref(), &mut params);
                 tally.frames += 1;
                 if let Frame::Audio(a) = &frame {
                     tally.samples += a.samples as u64;
                 }
-                sink(frame, decoder.as_ref(), &stream.params);
+                sink(frame, decoder.as_ref(), &params);
             }
             Err(Error::NeedMore) | Err(Error::Eof) => break,
             Err(e) => {
@@ -584,7 +590,7 @@ fn decode_stream(
         }
         drain(&mut decoder, &mut tally);
     }
-    Ok((tally, decoder, stream.params, capped))
+    Ok((tally, decoder, params, capped))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -813,7 +819,7 @@ fn check_video(ctx: &RuntimeContext, exec: &ExecutionContext, input: &Input, byt
     let mut demux = Duration::ZERO;
     let (tally, _, _, _) = decode_stream(ctx, exec, container, bytes, stream.index, None, &mut demux, &mut |frame, decoder, p| {
         let Frame::Video(v) = frame else { return };
-        if layout.is_none() && failure.is_none() {
+        if failure.is_none() {
             let reference_format = stream.reference.as_ref().and_then(|r| r.pixel_format.as_deref()).and_then(|name| {
                 [PixelFormat::Yuv420P, PixelFormat::Yuv422P, PixelFormat::Yuv444P, PixelFormat::Yuv411P,
                  PixelFormat::Yuv420P10Le, PixelFormat::Yuv422P10Le, PixelFormat::Yuv444P10Le,
@@ -822,8 +828,9 @@ fn check_video(ctx: &RuntimeContext, exec: &ExecutionContext, input: &Input, byt
             });
             let format = decoder.output_pixel_format().or(p.pixel_format).or(reference_format).unwrap_or(PixelFormat::Yuv420P);
             let dimensions = decoder.output_video_dimensions()
-                .or_else(|| stream.width.or(p.width).zip(stream.height.or(p.height)));
+                .or_else(|| p.width.or(stream.width).zip(p.height.or(stream.height)));
             match dimensions {
+                Some((w, h)) if layout.as_ref().is_some_and(|(f, lw, lh, _)| (*f, *lw, *lh) == (format, w, h)) => {}
                 Some((w, h)) => match plane_dims(format, w, h) {
                     Some(dims) => layout = Some((format, w, h, dims)),
                     None => failure = Some(format!("no plane layout for {format:?}")),

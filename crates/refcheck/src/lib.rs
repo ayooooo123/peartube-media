@@ -132,6 +132,8 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
         frame_video_layouts: Vec::new(),
         trimmer,
         kept: Vec::new(),
+        params: stream.params.clone(),
+        output_watch: oxideav_core::OutputParamsWatch::new(),
     };
     loop {
         match demuxer.next_packet() {
@@ -159,9 +161,9 @@ pub fn decode(path: &Path, registrars: &[Registrar], kind: MediaType, nth: usize
     if !trim_fallbacks.is_empty() {
         eprintln!("{}: audio trim mismatch: {trim_fallbacks:?}", path.display());
     }
-    let Output { frames, frame_formats, frame_video_layouts, .. } = out;
+    let Output { frames, frame_formats, frame_video_layouts, params, .. } = out;
     Decoded {
-        params: stream.params,
+        params,
         audio_format: decoder.output_audio_format(),
         frame_formats,
         frame_video_layouts,
@@ -210,6 +212,8 @@ struct Output {
     frame_video_layouts: Vec<VideoLayout>,
     trimmer: Trimmer<Piece>,
     kept: Vec<Piece>,
+    params: CodecParameters,
+    output_watch: oxideav_core::OutputParamsWatch,
 }
 
 impl Output {
@@ -217,16 +221,24 @@ impl Output {
     fn drain(&mut self, decoder: &mut Box<dyn oxideav_core::Decoder>, stream: &StreamInfo) {
         loop {
             let frame = match decoder.receive_frame() {
-                // Phase B: merge output parameters, without recording a frame.
-                Ok(Frame::StreamParams(_)) => continue,
+                Ok(Frame::StreamParams(event)) => {
+                    self.output_watch.observe(decoder.as_ref(), &mut self.params);
+                    self.params.merge_output_params(&event);
+                    continue;
+                }
                 Ok(frame) => frame,
                 Err(Error::NeedMore) | Err(Error::Eof) => break,
                 Err(e) => panic!("decode: {e}"),
             };
-            let reported = decoder.output_audio_format();
+            self.output_watch.observe(decoder.as_ref(), &mut self.params);
+            let reported = decoder.output_audio_format().or_else(|| Some(AudioFormat {
+                sample_format: self.params.sample_format?,
+                sample_rate: self.params.sample_rate?,
+                channels: self.params.resolved_channels()?,
+            }));
             match frame {
                 Frame::Audio(frame) => {
-                    let layout = read_layout(reported, &stream.params, &frame);
+                    let layout = read_layout(reported, &self.params, &frame);
                     let pts = frame.pts;
                     let piece = Piece {
                         frame,
@@ -242,7 +254,10 @@ impl Output {
                 frame => {
                     self.frames.push(frame);
                     self.frame_formats.push(reported);
-                    self.frame_video_layouts.push((decoder.output_video_dimensions(), decoder.output_pixel_format()));
+                    self.frame_video_layouts.push((
+                        decoder.output_video_dimensions().or(self.params.width.zip(self.params.height)),
+                        decoder.output_pixel_format().or(self.params.pixel_format),
+                    ));
                 }
             }
         }

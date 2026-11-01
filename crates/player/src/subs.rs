@@ -217,7 +217,8 @@ fn decoded_cue(
     vtt: Option<(&WebVttTrack, Option<&CueInfo>)>,
 ) -> Option<Cue> {
     match frame {
-        // Phase B: apply subtitle parameters; a control event is not a cue.
+        // Text cues carry their styles; bitmap frames carry canvas size, pixel
+        // layout and palette. Stream shape cannot add rendering information here.
         Frame::StreamParams(_) => None,
         Frame::Subtitle(cue) => {
             let start = Duration::from_micros(cue.start_us.max(0) as u64);
@@ -677,7 +678,8 @@ impl SubtitlePipeline {
         loop {
             let decoder = &mut self.decoder;
             let frame = match std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame())) {
-                // Phase B: apply subtitle parameters without advancing cue metadata.
+                // No cue or WebVTT metadata slot: text styles are on each cue,
+                // bitmap geometry/palette on each frame; ASS uses its raw track.
                 Ok(Ok(Frame::StreamParams(_))) => continue,
                 Ok(Ok(frame)) => frame,
                 _ => break,

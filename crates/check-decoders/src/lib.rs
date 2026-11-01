@@ -98,14 +98,26 @@ pub fn decode_packets(
         trim_fallbacks: Default::default(),
     };
     let mut errors = Vec::new();
-    let drain = |decoder: &mut Box<dyn Decoder>, out: &mut Decoded, errors: &mut Vec<(usize, String)>, index: usize| loop {
+    let mut output_watch = oxideav_core::OutputParamsWatch::new();
+    let mut drain = |decoder: &mut Box<dyn Decoder>, out: &mut Decoded, errors: &mut Vec<(usize, String)>, index: usize| loop {
         match decoder.receive_frame() {
-            // Phase B: merge output parameters; control events are not frames.
-            Ok(oxideav_core::Frame::StreamParams(_)) => continue,
+            Ok(oxideav_core::Frame::StreamParams(event)) => {
+                output_watch.observe(decoder.as_ref(), &mut out.params);
+                out.params.merge_output_params(&event);
+                continue;
+            }
             Ok(frame) => {
+                output_watch.observe(decoder.as_ref(), &mut out.params);
                 out.frames.push(frame);
-                out.frame_formats.push(decoder.output_audio_format());
-                out.frame_video_layouts.push((decoder.output_video_dimensions(), decoder.output_pixel_format()));
+                out.frame_formats.push(decoder.output_audio_format().or_else(|| Some(oxideav_core::AudioFormat {
+                    sample_format: out.params.sample_format?,
+                    sample_rate: out.params.sample_rate?,
+                    channels: out.params.resolved_channels()?,
+                })));
+                out.frame_video_layouts.push((
+                    decoder.output_video_dimensions().or(out.params.width.zip(out.params.height)),
+                    decoder.output_pixel_format().or(out.params.pixel_format),
+                ));
             }
             Err(Error::NeedMore) | Err(Error::Eof) => break,
             Err(e) => {

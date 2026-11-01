@@ -11,7 +11,7 @@ use parking_lot::{Condvar, Mutex, MutexGuard};
 
 use oxideav_core::{
     ChannelLayout, CodecParameters, Decoder, Demuxer, Frame, MediaType, Packet, PacketMetadata, ProbeData, RuntimeContext,
-    SampleFormat, StreamInfo, TimeBase, VideoFrame, PROBE_SCORE_EXTENSION,
+    OutputParamsWatch, SampleFormat, StreamInfo, TimeBase, VideoFrame, PROBE_SCORE_EXTENSION,
 };
 
 mod aspect;
@@ -2045,6 +2045,8 @@ fn run_audio_thread(
     // Where the decoder's output so far ends: where a frame without a pts
     // of its own starts.
     let mut decoded_end: Option<f64> = None;
+    let mut output_stream = stream.clone();
+    let mut output_watch = OutputParamsWatch::new();
     let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
 
     while !quit() {
@@ -2075,6 +2077,8 @@ fn run_audio_thread(
                 }
             };
             consecutive_errors = 0;
+            output_stream.params = stream.params.clone();
+            output_watch.reset();
         }
 
         // Pull a packet; the EOF marker ends this pipeline.
@@ -2100,8 +2104,11 @@ fn run_audio_thread(
                 while !quit() {
                     let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
                     let af = match recv {
-                        // Phase B: apply audio parameter events before PCM.
-                        Ok(Ok(Frame::StreamParams(_))) => continue,
+                        Ok(Ok(Frame::StreamParams(params))) => {
+                            output_watch.observe(decoder.as_ref(), &mut output_stream.params);
+                            output_stream.params.merge_output_params(&params);
+                            continue;
+                        }
                         Ok(Ok(Frame::Audio(af))) => af,
                         Ok(Ok(_)) => continue,
                         _ => break,
@@ -2111,7 +2118,8 @@ fn run_audio_thread(
                     if af.samples == 0 {
                         break;
                     }
-                    let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
+                    output_watch.observe(decoder.as_ref(), &mut output_stream.params);
+                    let chunk = decoded_chunk(decoder.as_ref(), &output_stream, &af, &mut packet_pts, &mut decoded_end);
                     trimmer.frame(chunk, af.pts, &mut kept);
                     record_trim_fallbacks(&shared, &mut trimmer);
                     if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
@@ -2184,8 +2192,11 @@ fn run_audio_thread(
             let recv_res =
                 std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
             let frame = match recv_res {
-                // Phase B: apply audio parameter events without consuming PTS.
-                Ok(Ok(Frame::StreamParams(_))) => continue,
+                Ok(Ok(Frame::StreamParams(params))) => {
+                    output_watch.observe(decoder.as_ref(), &mut output_stream.params);
+                    output_stream.params.merge_output_params(&params);
+                    continue;
+                }
                 Ok(Ok(f)) => {
                     consecutive_errors = 0;
                     f
@@ -2202,7 +2213,10 @@ fn run_audio_thread(
                 }
             };
             let Frame::Audio(af) = frame else { continue };
-            let chunk = decoded_chunk(decoder.as_ref(), &stream, &af, &mut packet_pts, &mut decoded_end);
+            output_watch.observe(decoder.as_ref(), &mut output_stream.params);
+            // Chunks retain their own rate/layout through trimming. The existing
+            // present_audio path reopens only when the first new-shape PCM plays.
+            let chunk = decoded_chunk(decoder.as_ref(), &output_stream, &af, &mut packet_pts, &mut decoded_end);
             trimmer.frame(chunk, af.pts, &mut kept);
             record_trim_fallbacks(&shared, &mut trimmer);
             if !present_kept(sink, &shared, &mut out, &mut kept, seen_seek, realtime, &retired) {
@@ -2803,6 +2817,8 @@ struct VideoSession {
     control: Arc<PipelineVideoControl>,
     sw_decoder: Option<Box<dyn Decoder>>,
     frame_format: Option<CodecParameters>,
+    decoded_params: CodecParameters,
+    output_watch: OutputParamsWatch,
     need_keyframe: bool,
     sink_running: Option<bool>,
     shown_seek: u64,
@@ -2886,6 +2902,8 @@ impl VideoSession {
             control,
             sw_decoder: None,
             frame_format: None,
+            decoded_params: stream.params.clone(),
+            output_watch: OutputParamsWatch::new(),
             need_keyframe: false,
             sink_running: None,
             shown_seek: 0,
@@ -3011,6 +3029,7 @@ impl VideoSession {
         self.retained_packet = None;
         self.retained_frame = None;
         self.pending_format_change = None;
+        self.output_watch.reset();
         self.presenting_for = None;
         self.entered = None;
         self.recovering = None;
@@ -3046,6 +3065,7 @@ impl VideoSession {
         self.producer = next_producer_id();
         self.control.set_active_producer(self.producer);
         self.target_compressed = false;
+        self.output_watch.reset();
         // Clear only after the software decoder actually accepts a restart keyframe.
         self.need_keyframe = true;
         self.mode = None;
@@ -3342,21 +3362,31 @@ impl VideoSession {
         let Some(decoder) = self.sw_decoder.as_mut() else { return Ok(false) };
         let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
         match recv {
-            // Phase B: apply the event before the next picture; do not consume
-            // packet PTS, seek-first-picture credit, or a playback frame count.
-            Ok(Ok(Frame::StreamParams(_))) => Ok(true),
+            Ok(Ok(Frame::StreamParams(params))) => {
+                let mut changed = self.output_watch.observe(decoder.as_ref(), &mut self.decoded_params);
+                changed |= self.decoded_params.merge_output_params(&params);
+                if changed {
+                    self.pending_format_change = Some(Arc::new(self.decoded_params.clone()));
+                }
+                // No picture: preserve packet PTS, seek credit and frame counts.
+                Ok(true)
+            }
             Ok(Ok(Frame::Video(vf))) => {
-                let dec_dims = decoder.output_video_dimensions();
-                let dec_pix_fmt = decoder.output_pixel_format();
-                let format_changed = match &self.frame_format {
-                    Some(curr) => {
-                        let (w, h) = (curr.width, curr.height);
-                        let pf = curr.pixel_format;
-                        dec_dims.is_some_and(|(dw, dh)| Some(dw) != w || Some(dh) != h)
-                            || dec_pix_fmt.is_some_and(|dpf| Some(dpf) != pf)
-                    }
-                    None => true,
-                };
+                let mut format_changed = self.output_watch.observe(decoder.as_ref(), &mut self.decoded_params);
+                // Older fork decoders still override only the narrow hooks and
+                // leave generation at zero. Their emitted-frame reports remain
+                // authoritative until those implementations migrate too.
+                if let Some((w, h)) = decoder.output_video_dimensions() {
+                    format_changed |= self.decoded_params.width != Some(w)
+                        || self.decoded_params.height != Some(h);
+                    self.decoded_params.width = Some(w);
+                    self.decoded_params.height = Some(h);
+                }
+                if let Some(format) = decoder.output_pixel_format() {
+                    format_changed |= self.decoded_params.pixel_format != Some(format);
+                    self.decoded_params.pixel_format = Some(format);
+                }
+                format_changed |= self.frame_format.is_none();
 
                 let seed = self.packet_pts_seed.take();
                 let ticks = self.frame_clock.time(vf.pts, seed);
@@ -3364,16 +3394,9 @@ impl VideoSession {
                 let pts = Duration::from_secs_f64(frame_pts_secs);
 
                 if format_changed {
-                    let mut want = (*self.params).clone();
-                    if let Some((w, h)) = dec_dims {
-                        want.width = Some(w);
-                        want.height = Some(h);
-                    }
-                    if let Some(format) = dec_pix_fmt {
-                        want.pixel_format = Some(format);
-                    }
-                    // Install format before transferring the frame.
-                    self.pending_format_change = Some(Arc::new(want));
+                    // One existing transition installs all output fields before
+                    // the retained picture, including rate, colour and layers.
+                    self.pending_format_change = Some(Arc::new(self.decoded_params.clone()));
                 }
 
                 if before_seek_target(shared, frame_pts_secs, self.seek_generation, &mut self.shown_seek) {
@@ -3550,6 +3573,12 @@ fn run_video_thread(
                         }
                     }
                     session.frame_format = Some((*session.params).clone());
+                    if let Some(rate) = session.params.frame_rate.filter(|r| r.num > 0 && r.den > 0) {
+                        let fps = rate.num as f64 / rate.den as f64;
+                        session.fps_resolved = true;
+                        let changed = shared.state.lock().video_fps.replace(fps) != Some(fps);
+                        if changed { notify_changed(&shared); }
+                    }
                 }
                 // Cached playing state reapplies only to a newly configured producer.
                 if first_config {

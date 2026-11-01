@@ -1699,6 +1699,7 @@ struct FormatChangeSink {
     inner: Box<dyn VideoSink>,
     initial_deadline: Option<Instant>,
     accepted_frames: usize,
+    sizes: Arc<Mutex<Vec<(u32, u32)>>>,
 }
 
 impl VideoSink for FormatChangeSink {
@@ -1742,6 +1743,9 @@ impl VideoSink for FormatChangeSink {
         }
         self.inner.push_frame(producer, frame, pts)?;
         self.accepted_frames += 1;
+        let transitions = self.transitions.lock();
+        let (_, _, w, h) = transitions.last().expect("configured before frame");
+        self.sizes.lock().push((*w, *h));
         Ok(())
     }
     fn present_from(&mut self, producer: ProducerId, start: Duration) -> Result<(), VideoError> {
@@ -1761,6 +1765,7 @@ impl VideoSink for FormatChangeSink {
 struct FormatChangeBackend {
     audio: Arc<Headless>,
     transitions: Arc<Mutex<Vec<(ProducerId, bool, u32, u32)>>>,
+    sizes: Arc<Mutex<Vec<(u32, u32)>>>,
 }
 
 impl Backend for FormatChangeBackend {
@@ -1776,51 +1781,30 @@ impl Backend for FormatChangeBackend {
             inner: self.audio.video(clock),
             initial_deadline: None,
             accepted_frames: 0,
+            sizes: self.sizes.clone(),
         })
     }
 }
 
 #[test]
 fn software_format_change_issues_fresh_producer_and_preserves_queued_frames() {
+    for codec in ["libx264", "libvpx-vp9"] {
     // Concatenated encoded sequences at two resolutions force a midstream
     // decoded format change through the real software path.
     let part_a = fixture::tmp("format_change_a.mkv");
     let part_b = fixture::tmp("format_change_b.mkv");
     let clip = fixture::tmp("format_change_concat.mkv");
-    fixture::encode(
-        &[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=64x48:rate=8:duration=1",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-bf",
-            "0",
-            "-f",
-            "matroska",
-        ],
-        &part_a,
-    );
-    fixture::encode(
-        &[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=96x64:rate=8:duration=1",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-bf",
-            "0",
-            "-f",
-            "matroska",
-        ],
-        &part_b,
-    );
+    for (part, size) in [(&part_a, "64x48"), (&part_b, "96x64")] {
+        let source = format!("testsrc2=size={size}:rate=8:duration=1");
+        let mut args = vec!["-f", "lavfi", "-i", &source, "-c:v", codec];
+        if codec == "libx264" {
+            args.extend(["-preset", "ultrafast", "-bf", "0"]);
+        } else {
+            args.extend(["-deadline", "realtime", "-cpu-used", "8"]);
+        }
+        args.extend(["-f", "matroska"]);
+        fixture::encode(&args, part);
+    }
     // Concat demuxer list.
     let list = fixture::tmp("format_change_list.txt");
     std::fs::write(
@@ -1850,9 +1834,11 @@ fn software_format_change_issues_fresh_producer_and_preserves_queued_frames() {
 
     let transitions = Arc::new(Mutex::new(Vec::new()));
     let headless = Headless::new();
+    let sizes = Arc::new(Mutex::new(Vec::new()));
     let backend = Arc::new(FormatChangeBackend {
         audio: headless.clone(),
         transitions: transitions.clone(),
+        sizes: sizes.clone(),
     });
     let (tx, rx) = std::sync::mpsc::channel();
     let player = Player::open(
@@ -1890,4 +1876,9 @@ fn software_format_change_issues_fresh_producer_and_preserves_queued_frames() {
     assert_eq!(expected.len(), 16, "both complete eight-frame sequences");
     assert_eq!(capture.video.len(), 1);
     assert_eq!(capture.video[0].frame_md5, expected, "format change must preserve every frame in order");
+    assert_eq!(*sizes.lock(), [(64, 48); 8].into_iter().chain([(96, 64); 8]).collect::<Vec<_>>(),
+        "{codec}: every presented frame has its FFmpeg sequence's dimensions");
+    eprintln!("{codec}: 16/16 frame MD5s and sizes match FFmpeg across 64x48 -> 96x64");
+    for path in [&part_a, &part_b, &clip, &list] { std::fs::remove_file(path).unwrap(); }
+    }
 }
