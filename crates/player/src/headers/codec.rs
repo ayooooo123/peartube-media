@@ -406,11 +406,6 @@ fn h264_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
     let width = if width > 0 { width } else { params.width.unwrap_or(0) };
     let height = if height > 0 { height } else { params.height.unwrap_or(0) };
 
-    let codec_string = format!(
-        "avc1.{:02x}{:02x}{:02x}",
-        sps.profile_idc, sps.constraint_set_flags, sps.level_idc
-    );
-
     let (range, colour) = if let Some(vui) = &sps.vui {
         let (range, colour) = if let Some(vst) = &vui.video_signal_type {
             let col = vst.colour_description.as_ref().map(|cd| Colour {
@@ -464,8 +459,6 @@ fn h264_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         (max_dpb_mbs / pic_size_mbs).min(16)
     };
 
-    let interlaced = !sps.frame_mbs_only_flag;
-
     // SEI extraction
     let mut mastering_display = None;
     let mut content_light = None;
@@ -488,7 +481,6 @@ fn h264_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         height,
         record,
         nal_length_size,
-        codec_string,
         range,
         colour,
         mastering_display,
@@ -496,7 +488,6 @@ fn h264_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         pixel_aspect,
         frame_rate,
         reorder_depth,
-        interlaced,
         dovi: None,
     })
 }
@@ -686,29 +677,6 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
     let width = if width > 0 { width } else { params.width.unwrap_or(0) };
     let height = if height > 0 { height } else { params.height.unwrap_or(0) };
 
-    // RFC 6381 codec string
-    let space_prefix = match sps.ptl.general_profile_space {
-        1 => "A",
-        2 => "B",
-        3 => "C",
-        _ => "",
-    };
-    let compat_hex = format!("{:x}", sps.ptl.general_profile_compatibility_flags.reverse_bits());
-    let tier = if sps.ptl.general_tier_flag { "H" } else { "L" };
-    let level = sps.ptl.general_level_idc;
-    let constraint_bytes = &sps.ptl.general_constraint_indicator_flags.to_be_bytes()[2..8];
-    let mut trimmed_constraints = constraint_bytes;
-    while let Some((&0, rest)) = trimmed_constraints.split_last() {
-        trimmed_constraints = rest;
-    }
-    let mut codec_string = format!(
-        "hvc1.{}{}.{}.{}{}",
-        space_prefix, sps.ptl.general_profile_idc, compat_hex, tier, level
-    );
-    for &b in trimmed_constraints {
-        codec_string.push_str(&format!(".{:X}", b));
-    }
-
     let (range, colour) = if let Some(vui) = &sps.vui_parameters {
         let (range, colour) = if let Some(vst) = &vui.video_signal_type {
             let col = vst.colour_description.as_ref().map(|cd| Colour {
@@ -754,11 +722,6 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         .get(highest_sub_layer)
         .map_or(0, |info| info.max_num_reorder_pics);
 
-    let field_seq_flag = sps.vui_parameters.as_ref().map_or(false, |v| v.field_seq_flag);
-    let progressive = (sps.ptl.general_constraint_indicator_flags & (1 << 47)) != 0;
-    let interlaced_flag = (sps.ptl.general_constraint_indicator_flags & (1 << 46)) != 0;
-    let interlaced = field_seq_flag || (interlaced_flag && !progressive);
-
     // SEI extraction
     let mut mastering_display = None;
     let mut content_light = None;
@@ -781,7 +744,6 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         height,
         record,
         nal_length_size,
-        codec_string,
         range,
         colour,
         mastering_display,
@@ -789,7 +751,6 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         pixel_aspect,
         frame_rate,
         reorder_depth,
-        interlaced,
         dovi: None,
     };
     Some(config)
@@ -811,7 +772,8 @@ fn av1_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoCo
             config.to_bytes()
         }
     };
-    let config = Av1CodecConfig::parse(&record)?;
+    // An av1C the parser rejects is no configuration at all.
+    Av1CodecConfig::parse(&record)?;
 
     let width = match seq.max_frame_width_minus_1.saturating_add(1) {
         0 => params.width?,
@@ -834,10 +796,6 @@ fn av1_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoCo
         Some(18) => VideoRange::Hlg,
         _ => VideoRange::Sdr,
     };
-    let tier = if config.seq_tier == 0 { 'M' } else { 'H' };
-    let codec_string =
-        format!("av01.{}.{:02}{tier}.{:02}", config.seq_profile, config.seq_level_idx, config.bit_depth());
-
     let (config_mdcv, config_clli) = hdr_metadata(config_obus);
     let (key_mdcv, key_clli) = hdr_metadata(first_keyframe);
 
@@ -859,7 +817,6 @@ fn av1_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoCo
         height,
         record,
         nal_length_size: 0,
-        codec_string,
         range,
         colour,
         mastering_display: config_mdcv.or(key_mdcv),
@@ -868,7 +825,6 @@ fn av1_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoCo
         frame_rate,
         // AV1 shows pictures in decode order: no reordering.
         reorder_depth: 0,
-        interlaced: false,
         dovi: None,
     })
 }
@@ -1394,10 +1350,6 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
             channels: total_channels,
             bits: 16,
             config: dec3,
-            codec_string: "ec-3".into(),
-            frame_samples: 0,
-            adts: false,
-            language: None,
             atmos_joc,
         });
     }
@@ -1656,7 +1608,6 @@ pub(crate) fn apply_dovi(
     match resolved {
         Some((5, level, _compat_id, _record)) => {
             let lvl = if level > 0 { level } else { 6 };
-            config.codec_string = format!("dvh1.05.{lvl:02}");
             config.range = VideoRange::Pq;
             if config.colour.is_none()
                 || config.colour.is_some_and(|c| c.primaries == 2 && c.transfer == 2 && c.matrix == 2)
@@ -1674,7 +1625,6 @@ pub(crate) fn apply_dovi(
                 compat_id: 0,
                 record: build_dovi_record(5, lvl, true, false, true, 0),
                 use_dvh1: true,
-                supplemental_codecs: None,
                 convert_p7_to_81: false,
             });
         }
@@ -1687,7 +1637,6 @@ pub(crate) fn apply_dovi(
                 compat_id: 1,
                 record: build_dovi_record(8, lvl, true, false, true, 1),
                 use_dvh1: false,
-                supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db1p")),
                 convert_p7_to_81: true,
             });
         }
@@ -1705,7 +1654,6 @@ pub(crate) fn apply_dovi(
                         compat_id: 4,
                         record,
                         use_dvh1: false,
-                        supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db4h")),
                         convert_p7_to_81: false,
                     });
                 }
@@ -1722,7 +1670,6 @@ pub(crate) fn apply_dovi(
                         compat_id: 1,
                         record: rec,
                         use_dvh1: false,
-                        supplemental_codecs: Some(format!("dvh1.08.{lvl:02}/db1p")),
                         convert_p7_to_81: false,
                     });
                 }
@@ -1813,11 +1760,9 @@ mod tests {
         assert_eq!(cfg.codec, VideoCodec::H264);
         assert_eq!(cfg.width, 1280);
         assert_eq!(cfg.height, 720);
-        assert_eq!(cfg.codec_string, "avc1.64001f");
         assert_eq!(cfg.nal_length_size, 4);
         assert_eq!(cfg.range, VideoRange::Sdr);
         assert_eq!(cfg.reorder_depth, 2);
-        assert!(!cfg.interlaced);
         assert_eq!(cfg.record, H264_AVCC_MKV);
     }
 
@@ -1831,7 +1776,6 @@ mod tests {
         assert_eq!(cfg.codec, VideoCodec::Hevc);
         assert_eq!(cfg.width, 1920);
         assert_eq!(cfg.height, 1080);
-        assert_eq!(cfg.codec_string, "hvc1.2.4.L120.90");
         assert_eq!(cfg.nal_length_size, 4);
         assert_eq!(cfg.range, VideoRange::Pq);
 
@@ -1864,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hevc_codec_string_variations() {
+    fn test_hevc_config_from_annex_b_parameter_sets() {
         let sps_bytes = vec![
             0x42, 0x01, 0x01, 0x02, 0x20, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00,
             0x00, 0x03, 0x00, 0x78, 0xa0, 0x03, 0xc0, 0x80, 0x11, 0x07, 0xca, 0xd9, 0x65, 0x65,
@@ -1882,7 +1826,9 @@ mod tests {
 
         let p = CodecParameters::video(CodecId::new("hevc"));
         let cfg = video_config(&p, &keyframe).expect("hevc config from annex b");
-        assert_eq!(cfg.codec_string, "hvc1.2.4.L120.90");
+        assert_eq!((cfg.width, cfg.height, cfg.nal_length_size), (1920, 1080, 4));
+        assert_eq!(cfg.range, VideoRange::Pq);
+        assert!(!cfg.record.is_empty());
     }
 
     #[test]
@@ -1895,10 +1841,7 @@ mod tests {
         assert_eq!(cfg.codec, AudioCodec::Eac3);
         assert_eq!(cfg.sample_rate, 48000);
         assert_eq!(cfg.channels, 6);
-        assert_eq!(cfg.frame_samples, 0);
-        assert_eq!(cfg.codec_string, "ec-3");
         assert_eq!(cfg.config, vec![0x0c, 0x00, 0x20, 0x0f, 0x00]); // matches FFmpeg dec3 exactly!
-        assert!(!cfg.adts);
 
         assert_eq!(eac3_frame_samples(&pkt), Some(1536));
 
@@ -1926,7 +1869,6 @@ mod tests {
         assert_eq!(cfg.codec, VideoCodec::H264);
         assert_eq!(cfg.width, 1280);
         assert_eq!(cfg.height, 720);
-        assert_eq!(cfg.codec_string, "avc1.64001f");
         assert_eq!(cfg.nal_length_size, 4);
 
         // Profile 100 has extension in avcC (chroma_format_idc, bit depths, numOfSequenceParameterSetExt)
@@ -1991,7 +1933,6 @@ mod tests {
             height: 2160,
             record: vec![1, 2, 3],
             nal_length_size: 4,
-            codec_string: "hvc1.2.4.L153.B0".into(),
             range: VideoRange::Sdr,
             colour: None,
             mastering_display: None,
@@ -1999,13 +1940,11 @@ mod tests {
             pixel_aspect: None,
             frame_rate: Some(24.0),
             reorder_depth: 2,
-            interlaced: false,
             dovi: None,
         };
         let rec = build_dovi_record(5, 6, true, false, true, 0);
         apply_dovi(&mut cfg, Some(&rec), &[], Framing::LengthPrefixed(4));
 
-        assert_eq!(cfg.codec_string, "dvh1.05.06");
         assert_eq!(cfg.range, VideoRange::Pq);
         assert_eq!(
             cfg.colour,
@@ -2021,7 +1960,6 @@ mod tests {
         assert_eq!(dovi.level, 6);
         assert_eq!(dovi.compat_id, 0);
         assert!(dovi.use_dvh1);
-        assert_eq!(dovi.supplemental_codecs, None);
     }
 
     #[test]
@@ -2032,7 +1970,6 @@ mod tests {
             height: 2160,
             record: vec![1, 2, 3],
             nal_length_size: 4,
-            codec_string: "hvc1.2.4.L153.B0".into(),
             range: VideoRange::Pq,
             colour: Some(Colour {
                 primaries: 9,
@@ -2045,20 +1982,17 @@ mod tests {
             pixel_aspect: None,
             frame_rate: Some(24.0),
             reorder_depth: 2,
-            interlaced: false,
             dovi: None,
         };
         let rec = build_dovi_record(8, 6, true, false, true, 1);
         apply_dovi(&mut cfg, Some(&rec), &[], Framing::LengthPrefixed(4));
 
-        assert_eq!(cfg.codec_string, "hvc1.2.4.L153.B0");
         assert_eq!(cfg.range, VideoRange::Pq);
         let dovi = cfg.dovi.expect("dovi config");
         assert_eq!(dovi.profile, 8);
         assert_eq!(dovi.level, 6);
         assert_eq!(dovi.compat_id, 1);
         assert!(!dovi.use_dvh1);
-        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
     }
 
     #[test]
@@ -2069,7 +2003,6 @@ mod tests {
             height: 2160,
             record: vec![1, 2, 3],
             nal_length_size: 4,
-            codec_string: "hvc1.2.4.L153.B0".into(),
             range: VideoRange::Sdr,
             colour: None,
             mastering_display: None,
@@ -2077,7 +2010,6 @@ mod tests {
             pixel_aspect: None,
             frame_rate: Some(24.0),
             reorder_depth: 2,
-            interlaced: false,
             dovi: None,
         };
         let rec = build_dovi_record(8, 6, true, false, true, 4);
@@ -2089,7 +2021,6 @@ mod tests {
         assert_eq!(dovi.level, 6);
         assert_eq!(dovi.compat_id, 4);
         assert!(!dovi.use_dvh1);
-        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db4h"));
     }
 
     #[test]
@@ -2100,7 +2031,6 @@ mod tests {
             height: 2160,
             record: vec![1, 2, 3],
             nal_length_size: 4,
-            codec_string: "hvc1.2.4.L153.B0".into(),
             range: VideoRange::Pq,
             colour: Some(Colour {
                 primaries: 9,
@@ -2113,7 +2043,6 @@ mod tests {
             pixel_aspect: None,
             frame_rate: Some(24.0),
             reorder_depth: 2,
-            interlaced: false,
             dovi: None,
         };
         let rec7 = build_dovi_record(7, 6, true, true, true, 0);
@@ -2125,7 +2054,6 @@ mod tests {
         assert_eq!(dovi.level, 6);
         assert_eq!(dovi.compat_id, 1);
         assert!(!dovi.use_dvh1);
-        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
         let parsed = parse_dovi_record(&dovi.record).expect("rewritten record parses");
         assert_eq!(parsed.0, 8);
         assert_eq!(parsed.2, 1);
@@ -2205,7 +2133,6 @@ mod tests {
             height: 2160,
             record: vec![1, 2, 3],
             nal_length_size: 4,
-            codec_string: "hvc1.2.4.L153.B0".into(),
             range: VideoRange::Sdr,
             colour: None,
             mastering_display: None,
@@ -2213,14 +2140,12 @@ mod tests {
             pixel_aspect: None,
             frame_rate: Some(24.0),
             reorder_depth: 2,
-            interlaced: false,
             dovi: None,
         };
 
         apply_dovi(&mut cfg, None, &keyframe, Framing::LengthPrefixed(4));
         // Idempotent when called a second time with None:
         apply_dovi(&mut cfg, None, &keyframe, Framing::LengthPrefixed(4));
-        assert_eq!(cfg.codec_string, "dvh1.05.06");
         assert_eq!(cfg.range, VideoRange::Pq);
         assert_eq!(
             cfg.colour,
@@ -2236,7 +2161,6 @@ mod tests {
         assert_eq!(dovi.level, 6);
         assert_eq!(dovi.compat_id, 0);
         assert!(dovi.use_dvh1);
-        assert_eq!(dovi.supplemental_codecs, None);
     }
 
     #[test]
@@ -2273,7 +2197,6 @@ mod tests {
             height: 2160,
             record: vec![1, 2, 3],
             nal_length_size: 4,
-            codec_string: "hvc1.2.4.L153.B0".into(),
             range: VideoRange::Pq,
             colour: Some(Colour {
                 primaries: 9,
@@ -2286,7 +2209,6 @@ mod tests {
             pixel_aspect: None,
             frame_rate: Some(24.0),
             reorder_depth: 2,
-            interlaced: false,
             dovi: None,
         };
 
@@ -2298,7 +2220,6 @@ mod tests {
         assert_eq!(dovi.profile, 8);
         assert_eq!(dovi.compat_id, 1);
         assert!(!dovi.use_dvh1);
-        assert_eq!(dovi.supplemental_codecs.as_deref(), Some("dvh1.08.06/db1p"));
     }
 }
 
@@ -2341,7 +2262,6 @@ mod av1_tests {
         assert_eq!(config.reorder_depth, 0);
         assert_eq!(config.range, VideoRange::Sdr);
         assert_eq!(config.colour, None);
-        assert_eq!(config.codec_string, "av01.0.08M.08");
         let record = Av1CodecConfig::parse(&config.record).expect("record parses");
         assert_eq!((record.seq_profile, record.seq_level_idx, record.seq_tier, record.bit_depth()), (0, 8, 0, 8));
         assert!(record.chroma_subsampling_x && record.chroma_subsampling_y && !record.monochrome);

@@ -41,8 +41,6 @@ pub(crate) struct DoviConfig {
     pub record: [u8; 24],
     /// Sample entry FourCC is `dvh1` (Profile 5) instead of `hvc1`.
     pub use_dvh1: bool,
-    /// Supplemental Dolby Vision codec identifier.
-    pub supplemental_codecs: Option<String>,
     /// The source is Profile 7 and would require RPU conversion for Profile 8.1.
     pub convert_p7_to_81: bool,
 }
@@ -59,8 +57,6 @@ pub(crate) struct VideoConfig {
     /// Byte width of the NAL length prefixes in the samples (1, 2 or 4),
     /// as the record declares.
     pub nal_length_size: u8,
-    /// RFC 6381 `CODECS` entry: `avc1.PPCCLL`, `hvc1.<profile>.<compat>.<tier><level>.<constraints>`.
-    pub codec_string: String,
     pub range: VideoRange,
     pub colour: Option<Colour>,
     /// `mdcv` payload (ST 2086 mastering display, 24 bytes).
@@ -74,8 +70,6 @@ pub(crate) struct VideoConfig {
     /// Pictures a decoder may hold back before output (H.264
     /// max_num_reorder_frames, HEVC sps_max_num_reorder_pics).
     pub reorder_depth: u32,
-    /// Whether the source is field-coded or interlaced.
-    pub interlaced: bool,
     pub dovi: Option<DoviConfig>,
 }
 
@@ -96,14 +90,6 @@ pub(crate) struct AudioConfig {
     pub bits: u16,
     /// E-AC-3 dec3 configuration payload.
     pub config: Vec<u8>,
-    /// RFC 6381 codec identifier (`ec-3`).
-    pub codec_string: String,
-    /// Samples per access unit; 0 when determined per packet.
-    pub frame_samples: u32,
-    /// Whether packet headers need stripping.
-    pub adts: bool,
-    /// ISO 639-2/T language, e.g. `eng`.
-    pub language: Option<String>,
     /// E-AC-3 Dolby Atmos (JOC) object count / complexity index.
     pub atmos_joc: Option<u8>,
 }
