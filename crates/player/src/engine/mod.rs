@@ -147,6 +147,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(5);
 const AUDIO_ALIGN_SECS: f64 = 0.040;
 
 /// Side data travels with its packet, including across equal-PTS laces.
+#[derive(Clone)]
 pub(crate) struct QueuedPacket {
     pub(crate) packet: Packet,
     pub(crate) metadata: PacketMetadata,
@@ -1031,6 +1032,8 @@ fn run_player_pipeline(
         audio_thread: None,
         sub_thread: None,
         replay: VecDeque::new(),
+        subtitle_read_ahead: streams.iter().filter(|s| s.params.media_type == MediaType::Subtitle)
+            .map(|s| (s.index, PacketQueue::default())).collect(),
     };
     let video_stream = find_stream(&streams, current_video);
     let audio_stream = find_stream(&streams, current_audio);
@@ -1373,6 +1376,8 @@ struct Run<'a> {
     /// What the demuxer read while a seek looked for its entry point
     /// (`enter_video`), handed on before anything newer.
     replay: VecDeque<Read>,
+    /// Future packets retained even while their subtitle track is inactive.
+    subtitle_read_ahead: Vec<(u32, PacketQueue)>,
 }
 
 /// One demuxer read: the packet and its metadata, the read's error, or the
@@ -1398,6 +1403,9 @@ fn run_demux_loop(run: &mut Run<'_>) {
         .into_iter()
         .flatten()
         .collect();
+    active.extend(run.subtitle_read_ahead.iter().map(|(index, _)| *index));
+    active.sort_unstable();
+    active.dedup();
     let _ = run.demuxer.set_active_streams(&active);
     let mut eof = false;
     let mut full = false;
@@ -1503,6 +1511,21 @@ fn run_demux_loop(run: &mut Run<'_>) {
         match packet_res {
             Ok(Ok(packet)) => {
                 let stream_id = packet.packet.stream_index;
+                if let Some((_, cache)) = run.subtitle_read_ahead.iter_mut().find(|(index, _)| *index == stream_id) {
+                    let now = shared.master.now().unwrap_or_default().as_secs_f64();
+                    while cache.front().is_some_and(|p| subtitle_start(&p.packet) <= now) {
+                        cache.pop_front();
+                    }
+                    if subtitle_start(&packet.packet) > now {
+                        cache.push_back(packet.clone());
+                    }
+                    while cache.bytes > SUB_MAX_BYTES
+                        || cache.front().zip(cache.back()).is_some_and(|(first, last)|
+                            subtitle_start(&last.packet) - subtitle_start(&first.packet) > QUEUE_MAX_SECS)
+                    {
+                        cache.pop_front();
+                    }
+                }
                 let pipe = if Some(stream_id) == run.current_video {
                     Some(Pipe::Video)
                 } else if Some(stream_id) == run.current_audio {
@@ -1597,6 +1620,7 @@ fn do_seek(run: &mut Run<'_>, pending: SeekTarget, generation: u64, eof: &mut bo
     run.audio_lane.clear_for_seek(generation);
     run.sub_lane.clear_for_seek(generation);
     run.replay.clear();
+    for (_, cache) in &mut run.subtitle_read_ahead { cache.clear(); }
     *eof = false;
     shared.demux_seeked(generation);
 
@@ -1884,6 +1908,14 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
             .filter(|s| s.params.media_type == MediaType::Subtitle);
         if let Some(stream) = stream {
             run.sub_thread = Some(spawn_subtitles(shared, stream, run.sub_lane, run.demux_cv, realtime, &run.options.fonts, run.demuxer.attachments(), false));
+            // Reuse only not-yet-started cues: switching does not resurrect
+            // the state that was already up, nor seek any media pipeline.
+            let now = shared.master.now().unwrap_or_default().as_secs_f64();
+            if let Some((_, cache)) = run.subtitle_read_ahead.iter().find(|(index, _)| Some(*index) == run.current_subtitle) {
+                for packet in cache.iter().filter(|p| subtitle_start(&p.packet) > now) {
+                    run.sub_lane.push(packet.clone());
+                }
+            }
         }
     }
 
@@ -1891,7 +1923,14 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
         .into_iter()
         .flatten()
         .collect();
+    active.extend(run.subtitle_read_ahead.iter().map(|(index, _)| *index));
+    active.sort_unstable();
+    active.dedup();
     let _ = run.demuxer.set_active_streams(active);
+}
+
+fn subtitle_start(packet: &Packet) -> f64 {
+    packet.time_base.seconds_of(packet.pts.or(packet.dts).unwrap_or(0))
 }
 
 fn audio_failed(shared: &SharedState, message: String) {

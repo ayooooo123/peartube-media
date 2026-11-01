@@ -34,10 +34,8 @@ const MAX_WAIT: Duration = Duration::from_millis(100);
 const MAX_CANVAS_SIDE: usize = 4096;
 const MAX_CANVAS_PIXELS: usize = 4096 * 4096;
 
-/// Decoded cues waiting for their start, at most: behind video or audio the
-/// lane drains into them, so only cues stamped beyond the demuxer's
-/// read-ahead, or a flood, pile up there.
-const MAX_PENDING_CUES: usize = 64;
+/// Decoded cues waiting for their start, bounded by owned bytes rather than
+/// cue count: a dense burst must not crowd out the cues following it.
 const MAX_PENDING_BYTES: usize = 64 << 20;
 
 /// Text cues up at once, at most: past either bound the earliest up go
@@ -180,9 +178,9 @@ struct Cue {
 }
 
 impl Cue {
-    /// Bytes of the bitmap it holds.
+    /// Owned bytes, including the cue itself even when its image is empty.
     fn bytes(&self) -> usize {
-        match &self.content {
+        std::mem::size_of::<Self>() + match &self.content {
             Content::Text(text) => text.image.rgba.len() + region_bytes(&text.layout),
             Content::Bitmap(state) => state.image.as_ref().map_or(0, |image| image.rgba.len()),
             Content::Ass(event) => event.text.len() + event.name.len() + event.effect.len(),
@@ -499,12 +497,10 @@ fn advance(on: &mut OnScreen, pending: &mut VecDeque<Cue>, now: Duration) -> boo
     }
 }
 
-/// Drops the cues due last while more wait than `MAX_PENDING_*` allow.
-/// Every image is within the canvas bounds, so a cue alone never outgrows
-/// the bytes.
+/// Drops the cues due last while their owned bytes exceed the budget.
 fn bound(pending: &mut VecDeque<Cue>) {
     let mut bytes: usize = pending.iter().map(Cue::bytes).sum();
-    while !pending.is_empty() && (pending.len() > MAX_PENDING_CUES || bytes > MAX_PENDING_BYTES) {
+    while !pending.is_empty() && bytes > MAX_PENDING_BYTES {
         if let Some(dropped) = pending.pop_back() {
             bytes -= dropped.bytes();
         }
