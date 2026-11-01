@@ -1092,13 +1092,23 @@ fn find_stream(streams: &[StreamInfo], index: Option<u32>) -> Option<StreamInfo>
 /// reads only avcC extradata, while FFmpeg's accepts both forms.
 fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> oxideav_core::Result<Box<dyn Decoder>> {
     let built = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut decoder = if params.codec_id.as_str() != "h264" || !is_annex_b(&params.extradata) {
-            ctx.codecs.first_decoder(params)?
-        } else {
-            let mut bare = params.clone();
-            let parameter_sets = std::mem::take(&mut bare.extradata);
-            let mut d = ctx.codecs.first_decoder(&bare)?;
-            d.send_packet(&Packet {
+        let annex_b_h264 = params.codec_id.as_str() == "h264" && is_annex_b(&params.extradata);
+        let mut bare = params.clone();
+        let parameter_sets = if annex_b_h264 { std::mem::take(&mut bare.extradata) } else { Vec::new() };
+        let mut decoder = ctx.codecs.first_decoder(&bare)?;
+        // Decoders that split work across threads, with output identical to the
+        // serial decode: H.264 (frame threads, wavefront deblocking), VC-1
+        // (B-picture coordinator), HEVC (wavefront, tiles, row-parallel in-loop
+        // filters), VP9 (tile columns, row pipeline, frame threads) and AV1
+        // (frame lookahead, row-parallel deblocking, CDEF and loop restoration).
+        // The budget is set before the first packet, so a decoder that sizes its
+        // workers on its first input sees it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(params.codec_id.as_str(), "h264" | "vc1" | "h265" | "hevc" | "vp9" | "av1") {
+            decoder.set_execution_context(&oxideav_core::ExecutionContext::auto());
+        }
+        if annex_b_h264 {
+            decoder.send_packet(&Packet {
                 stream_index: 0,
                 time_base: TimeBase::new(1, 1000),
                 pts: None,
@@ -1107,15 +1117,6 @@ fn make_decoder(ctx: &RuntimeContext, params: &CodecParameters) -> oxideav_core:
                 flags: Default::default(),
                 data: parameter_sets,
             })?;
-            d
-        };
-        // Decoders that split a picture across threads, with output identical
-        // to the serial decode: VC-1 (B-picture coordinator), HEVC (wavefront,
-        // tiles, row-parallel in-loop filters), VP9 (tile columns) and AV1
-        // (row-parallel deblocking, CDEF and loop restoration).
-        #[cfg(not(target_arch = "wasm32"))]
-        if matches!(params.codec_id.as_str(), "vc1" | "h265" | "hevc" | "vp9" | "av1") {
-            decoder.set_execution_context(&oxideav_core::ExecutionContext::auto());
         }
         Ok(decoder)
     }));
