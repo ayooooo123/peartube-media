@@ -168,10 +168,6 @@ impl LayerLeaseState {
         }
     }
 
-    pub(crate) fn try_acquire(&mut self, sink_id: u64) -> bool {
-        self.try_reserve(sink_id)
-    }
-
     pub(crate) fn start_unbind(&mut self, sink_id: u64) {
         if self.bound_sink_id == Some(sink_id) || self.reserved_sink_id == Some(sink_id) {
             self.unbind_pending = true;
@@ -337,20 +333,6 @@ impl Mailbox {
         drop(state);
         self.condvar.notify_all();
         Ok(())
-    }
-
-    /// Observe and clear the one-shot setup flag without dropping desired_request.
-    pub(crate) fn take_setup_request(&self) -> Option<VideoRequest> {
-        let mut state = self.state.lock();
-        if !state.setup_pending {
-            return None;
-        }
-        state.setup_pending = false;
-        state.desired_request.clone()
-    }
-
-    pub(crate) fn take_pending_request(&self) -> Option<VideoRequest> {
-        self.take_setup_request()
     }
 
     pub(crate) fn take_input(&self) -> Option<MailboxInput> {
@@ -2025,7 +2007,6 @@ enum AppleDevice {
     Frames {
         software: SoftwarePath,
         ready: PictureReady,
-        producer: ProducerId,
     },
 }
 
@@ -2151,7 +2132,6 @@ impl AppleDevice {
     fn frames(
         params: &CodecParameters,
         ready: PictureReady,
-        producer: ProducerId,
     ) -> Result<Self, VideoError> {
         let width = params.width.ok_or_else(|| {
             VideoError::Sink(SinkError::Fatal(
@@ -2257,15 +2237,7 @@ impl AppleDevice {
                 sample_aspect_ratio,
             },
             ready,
-            producer,
         })
-    }
-
-    fn producer(&self) -> ProducerId {
-        match self {
-            Self::Compressed { producer, .. } => *producer,
-            Self::Frames { producer, .. } => *producer,
-        }
     }
 
     fn retire(self) -> Result<(), String> {
@@ -2293,8 +2265,9 @@ impl AppleDevice {
 }
 
 pub struct AppleVideoSink {
-    sink_id: u64,
-    layer: SendSync<Retained<AVSampleBufferDisplayLayer>>,
+    /// A second reference to the display layer `AppleMain` drives, held for
+    /// the sink's whole life.
+    _layer: SendSync<Retained<AVSampleBufferDisplayLayer>>,
     synchronizer: Option<Retained<AVSampleBufferRenderSynchronizer>>,
     clock: Arc<dyn Clock>,
     mailbox: Arc<Mailbox>,
@@ -2318,8 +2291,7 @@ impl AppleVideoSink {
         let main_bridge = Arc::new(AppleMain::new(layer.clone(), layer_lease, sink_id));
 
         Self {
-            sink_id,
-            layer: SendSync(layer),
+            _layer: SendSync(layer),
             synchronizer,
             clock,
             mailbox,
@@ -2372,7 +2344,6 @@ fn owner_loop(
     let mut applied_playing: Option<bool> = None;
     let mut force_playing_reapply = false;
     let mut applied_present_from: Option<Duration> = None;
-    let mut reports_generation = 0u64;
     // Already-accepted predecessor authorized under a reset=false preserving request.
     let mut authorized_predecessor: Option<ProducerId> = None;
     // Deferred same-seek reset=false request; device install waits for predecessor completion.
@@ -2381,7 +2352,7 @@ fn owner_loop(
     let mut held_output: Option<HeldSample> = None;
     // Drain completed locally for producer (mailbox also records it).
     let mut local_drain_done: Option<ProducerId> = None;
-    /// VT finish() completed once per producer (separate from tail delivery).
+    // VT finish() completed once per producer (separate from tail delivery).
     let mut native_finish_done: Option<ProducerId> = None;
 
     loop {
@@ -2531,8 +2502,12 @@ fn owner_loop(
                     }
                     native_finish_done = None;
                     local_drain_done = None;
-                    *reports.lock() += 1;
-                    reports_generation = *reports.lock();
+                    // A new generation retires reports from devices already gone.
+                    let reports_generation = {
+                        let mut reports = reports.lock();
+                        *reports += 1;
+                        *reports
+                    };
 
                     if let Err(e) = main_bridge.bind(
                         synchronizer.0.clone(),
@@ -2641,7 +2616,6 @@ fn owner_loop(
                             dev.retire()?;
                         }
                         *reports.lock() += 1;
-                        reports_generation = *reports.lock();
 
                         if let Err(e) = main_bridge.bind(
                             synchronizer.0.clone(),
@@ -2684,7 +2658,7 @@ fn owner_loop(
                             continue;
                         }
 
-                        match AppleDevice::frames(params, ready.clone(), req.producer) {
+                        match AppleDevice::frames(params, ready.clone()) {
                             Ok(new_dev) => {
                                 // Final cancel/deadline after native frames config.
                                 if req.control.cancelled(req.producer, req.seek_generation) {
@@ -2758,7 +2732,7 @@ fn owner_loop(
                                 req.control.wake();
                                 continue;
                             }
-                            match AppleDevice::frames(params, ready.clone(), req.producer) {
+                            match AppleDevice::frames(params, ready.clone()) {
                                 Ok(new_dev) => {
                                     let error = if req.control.cancelled(req.producer, req.seek_generation) {
                                         Some(VideoError::Superseded)
@@ -2813,7 +2787,7 @@ fn owner_loop(
                             req.control.wake();
                             continue;
                         }
-                        match AppleDevice::frames(params, ready.clone(), req.producer) {
+                        match AppleDevice::frames(params, ready.clone()) {
                             Ok(new_dev) => {
                                 let error = if req.control.cancelled(req.producer, req.seek_generation) {
                                     Some(VideoError::Superseded)
@@ -3085,17 +3059,6 @@ fn owner_loop(
             let pred_held = held_output
                 .as_ref()
                 .is_some_and(|h| h.producer == pred);
-            let slot_is_pred = mailbox
-                .lock()
-                .input_slot
-                .as_ref()
-                .is_some_and(|inp| inp.producer() == pred);
-            let input_held_pred = mailbox.lock().input_held_by_owner
-                && !pred_held
-                && (slot_is_pred
-                    || held_output
-                        .as_ref()
-                        .is_some_and(|h| h.input_credit && h.producer == pred));
 
             // Service remaining compressed reorder under authorization before install.
             // At most one delivery while the output credit is free; no full drain/collect.
@@ -3223,7 +3186,7 @@ fn owner_loop(
                             if let Some(dev) = device.take() {
                                 dev.retire()?;
                             }
-                            match AppleDevice::frames(params, ready.clone(), req.producer) {
+                            match AppleDevice::frames(params, ready.clone()) {
                                 Ok(new_dev) => {
                                     if req.control.cancelled(req.producer, req.seek_generation)
                                     {

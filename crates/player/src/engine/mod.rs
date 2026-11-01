@@ -2761,7 +2761,6 @@ enum RetainedFramePayload {
 struct RetainedFrame {
     payload: RetainedFramePayload,
     pts: Duration,
-    seen_seek: u64,
 }
 
 enum PresentOutcome {
@@ -2907,10 +2906,6 @@ impl VideoSession {
 
     fn effective_deadline(&self) -> Instant {
         self.recovery_deadline.unwrap_or(self.deadline)
-    }
-
-    fn episode_pending(&self) -> bool {
-        !self.first_picture_reported || self.recovery_deadline.is_some()
     }
 
     /// Fresh outage/format after healthy playback: new five-active-second episode.
@@ -3412,7 +3407,6 @@ impl VideoSession {
                 self.retained_frame = Some(RetainedFrame {
                     payload: RetainedFramePayload::Frame(vf),
                     pts,
-                    seen_seek: self.seek_generation,
                 });
                 Ok(true)
             }

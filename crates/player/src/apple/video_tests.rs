@@ -7,7 +7,7 @@ use oxideav_core::{CodecId, CodecParameters, Packet, TimeBase, VideoFrame};
 use parking_lot::Mutex;
 
 use crate::apple::video::{
-    drop_held_input_credit, LayerLeaseState, Mailbox, MailboxInput, MainBridgeSlot,
+    drop_held_input_credit, LayerLeaseState, Mailbox, MainBridgeSlot,
 };
 use crate::backend::{
     PictureReady, ProducerId, SinkError, VideoControl, VideoError, VideoMode, VideoRequest,
@@ -149,9 +149,10 @@ fn test_same_request_polled_during_setup() {
     let deadline = control.active_now() + Duration::from_secs(5);
     let req = compressed_request(1, Arc::clone(&control), deadline, Duration::ZERO);
     assert!(mailbox.submit_request(&req).is_ok());
-    assert!(mailbox.take_setup_request().is_some());
+    // The owner takes the setup flag the way owner_loop does.
+    assert!(std::mem::take(&mut mailbox.lock().setup_pending));
     assert!(mailbox.submit_request(&req).is_ok());
-    assert!(mailbox.take_setup_request().is_none());
+    assert!(!mailbox.lock().setup_pending, "resubmitting the same request must not set it up again");
 }
 
 #[test]
