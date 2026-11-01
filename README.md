@@ -139,15 +139,11 @@ OxideAV crates are used at pinned git revisions; their crates.io releases lag th
 
 The player never encodes or muxes. `crates/codecs` turns on the core fork's `decode-only` feature: `CodecInfo::encoder` and `ContainerRegistry::register_muxer` drop their factories, so nothing references OxideAV's encoders and muxers and LTO removes them (Android `libmain.so`: 27.3 MB to 21.0 MB stripped, 13.2 MB to 9.9 MB deflated in the APK).
 
-Core migration Phase A retains today's narrow decoder format queries. The
-merged core adds `output_params` and `Frame::StreamParams`, but this phase
-explicitly discards those control events without counting, hashing, assigning
-picture PTS, or consuming subtitle packet-cue metadata. Phase B must apply
-the events and the decoder's output description before affected media.
-The handoff sites are `player/src/engine/mod.rs` (audio tail, audio packet
-drain, video drain), `player/src/subs.rs` (subtitle receive and cue conversion),
-`perf/src/main.rs` (`decode_stream`), `refcheck/src/lib.rs` (`Output::drain`),
-and `check-decoders/src/lib.rs` (decode drain).
+The core fork carries upstream OxideAV's `output_params` /
+`output_params_generation` and `Frame::StreamParams`. The engine applies them
+through its existing format transition (see the video and audio pipeline
+notes); `perf`, `refcheck` and `check-decoders` take each frame's format from
+them and still count and hash real frames only.
 The reviewed core merge is `979d7e3` (parents `9a314bf` and upstream `c1d9313`).
 It preserves the fork's numeric ABI: `Yuv410P = 70` and display duration at
 `usize::MAX - 3`; imported packed RGB formats use 71–82, palette alpha
@@ -158,10 +154,9 @@ Three pinned subtitle crates also need non-exhaustive-safe capabilities:
 `oxideav-subtitle` retains our `53df836` with the single compatibility
 commit `405630a`; upstream `0d8428b` compiles but also replaces fork code
 and changes probing, so it is not a behavior-preserving replacement.
-For review, a separate temporary commit selects these four clones under
-`/tmp/oxu-core/`. Replace the core/subtitle paths with reviewed published
-fork revisions and the ass/sub-image paths with the upstream revisions.
-No app repository or shipping pin is changed by this worktree.
+These are the pinned revisions in `[patch.crates-io]`. Against the pre-merge
+pins, `perf` decodes 24,063 frames across 55 video streams with identical
+MD5s and unchanged verdicts.
 
 Release builds compile dependencies and this workspace's cold crates at `opt-level = "s"`. The speed-critical set stays at 3: H.264, HEVC, AV1, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, VC-1/WMV (`codec-wmv`), DV (`codec-dv`), AAC, MP3, DTS (`codec-dca`), TrueHD (`codec-mlp`) and FLAC, plus `oxideav-core`, `oxideav-pixfmt`, the Ogg demuxer, the A/53 caption parser (`subs-cc`) and `player`. Opus and AC-3 retain ample measured audio headroom at `"s"`. Binaries stay at 3 because fat LTO optimises the whole program at the final crate's level; `"s"` there disables loop and SLP vectorization throughout.
 
@@ -181,7 +176,7 @@ added one initial dropped frame, then kept the drop counter flat for more than
 a minute. That forced-HTTP run does not prove zero-drop startup, every format,
 or autonomous P2P playback; final Pixel 9 playback checks remain pending.
 
-H.264 (`bb2e817`) and VP9 (`851739b`) are upstream OxideAV's decoders (`f8404d8`, `391278f`) with our fork's behaviour ported on top: on H.264 the open-GOP / non-IDR entry, recovery-point output suppression and recovery-record lifecycle fixes, on both the returned frames' size and pixel format through our core's API; upstream's `output_params` waits for the core migration. Against our previous forks on the 1080p30 perf inputs (M1 Pro, every frame matching FFmpeg 2da55bf, serial and threaded): H.264 410 G instructions on one thread instead of 789 G and about 5.5× real time with the player's threads instead of 0.57×; VP9 338 G instead of 527 G and 8.5× instead of 1.6×. On an Intel i7-10710U (x86_64, no NEON on either side) H.264 runs 0.48× on one thread and 1.42× threaded, where the old fork stayed at 0.30× at any thread count. Our HEVC (`4d3e6ec`) and AV1 (`55e39d6`) forks stay: upstream HEVC takes about 2.7× and upstream AV1 about 2× their instructions. HEVC's tile workers now derive deblocking at tile edges only once the neighbouring tiles' motion and slice maps exist, so `TILES_A_Cisco_2`, `TILES_B_Cisco_1` and `DSLICE_C_HHI_5` decode exactly at 2 and 4 threads (52 of the 53 usable conformance streams at every thread count). AV1: 0.76× → 1.51× on one thread (291 G instructions) and 3.40× with the player's thread budget (`perf --threads auto`: four frames at once, two row workers each); it reconstructs, filters and keeps its references in the stream's own sample size (`u8` planes for 8-bit, `u16` above), about 63 MiB of retained frames at 1080p, and on AArch64 its CDEF, motion filters and inverse transforms use NEON (`src/{cdef,inter_pred,transform}/neon.rs`, each checked against its scalar twin); every other target, wasm32 included, keeps the scalar code. The `SLOW` verdicts are CPU-time against the 2× HD floor on one thread. In a release `apple_play` on the same M1 Pro (load average 5–6 from other work), the AV1 file with an audio track plays to the end with 1–6 of 900 pictures dropped and no stalls beyond the harness's own once-a-second sampling pauses. On Apple, H.264, HEVC and VP9 normally play on VideoToolbox instead, and so does AV1 on A17 Pro, M3 and later.
+H.264 (`8df6e11`) and VP9 (`8be9d44`) are upstream OxideAV's decoders (`f8404d8`/`104a172`, `391278f`) with our fork's behaviour ported on top: on H.264 the open-GOP / non-IDR entry, recovery-point output suppression and recovery-record lifecycle fixes; on both, upstream's `output_params` and its generations, resolved against those ports (H.264 keeps the full-range `YuvJ*` labels; VP9 keeps the last emitted shape across a reset). Against our previous forks on the 1080p30 perf inputs (M1 Pro, every frame matching FFmpeg 2da55bf, serial and threaded): H.264 410 G instructions on one thread instead of 789 G and about 5.5× real time with the player's threads instead of 0.57×; VP9 338 G instead of 527 G and 8.5× instead of 1.6×. On an Intel i7-10710U (x86_64, no NEON on either side) H.264 runs 0.48× on one thread and 1.42× threaded, where the old fork stayed at 0.30× at any thread count. Our HEVC (`4d3e6ec`) and AV1 (`55e39d6`) forks stay: upstream HEVC takes about 2.7× and upstream AV1 about 2× their instructions. HEVC's tile workers now derive deblocking at tile edges only once the neighbouring tiles' motion and slice maps exist, so `TILES_A_Cisco_2`, `TILES_B_Cisco_1` and `DSLICE_C_HHI_5` decode exactly at 2 and 4 threads (52 of the 53 usable conformance streams at every thread count). AV1: 0.76× → 1.51× on one thread (291 G instructions) and 3.40× with the player's thread budget (`perf --threads auto`: four frames at once, two row workers each); it reconstructs, filters and keeps its references in the stream's own sample size (`u8` planes for 8-bit, `u16` above), about 63 MiB of retained frames at 1080p, and on AArch64 its CDEF, motion filters and inverse transforms use NEON (`src/{cdef,inter_pred,transform}/neon.rs`, each checked against its scalar twin); every other target, wasm32 included, keeps the scalar code. The `SLOW` verdicts are CPU-time against the 2× HD floor on one thread. In a release `apple_play` on the same M1 Pro (load average 5–6 from other work), the AV1 file with an audio track plays to the end with 1–6 of 900 pictures dropped and no stalls beyond the harness's own once-a-second sampling pauses. On Apple, H.264, HEVC and VP9 normally play on VideoToolbox instead, and so does AV1 on A17 Pro, M3 and later.
 
 Leaving TLS out (rustls, ring and the webpki roots, through `oxideav-http`'s `tls` feature) saves another 0.86 MB raw, 0.54 MB deflated, in the Android `libmain.so`.
 
