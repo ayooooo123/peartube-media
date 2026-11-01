@@ -54,29 +54,12 @@ impl Services {
     }
 }
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, MediaType, RuntimeContext};
+use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, RuntimeContext};
 
 /// A subtitle decoder's capabilities: decode-only, intra-only.
 fn caps(implementation: &str) -> CodecCapabilities {
-    CodecCapabilities {
-        decode: true,
-        encode: false,
-        media_type: MediaType::Subtitle,
-        intra_only: true,
-        lossy: false,
-        lossless: true,
-        hardware_accelerated: false,
-        implementation: implementation.into(),
-        // Capability metadata only: `first_decoder` takes registration order.
-        priority: 50,
-        max_width: None,
-        max_height: None,
-        max_bitrate: None,
-        max_sample_rate: None,
-        max_channels: None,
-        accepted_pixel_formats: Vec::new(),
-        ..CodecCapabilities::audio(String::new())
-    }
+    // Capability metadata only; first_decoder uses registration order.
+    CodecCapabilities::subtitle(implementation).with_decode().with_priority(50)
 }
 
 /// Registers the `eia_608` and `cea_708` decoders.

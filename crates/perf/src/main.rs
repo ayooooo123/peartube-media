@@ -537,6 +537,8 @@ fn decode_stream(
     let mut tally = Tally::default();
     let mut drain = |decoder: &mut Box<dyn Decoder>, tally: &mut Tally| loop {
         match decoder.receive_frame() {
+            // Phase B: merge output parameters; do not count or hash this event.
+            Ok(Frame::StreamParams(_)) => continue,
             Ok(frame) => {
                 tally.frames += 1;
                 if let Frame::Audio(a) = &frame {

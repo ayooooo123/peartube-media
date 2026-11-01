@@ -217,6 +217,8 @@ fn decoded_cue(
     vtt: Option<(&WebVttTrack, Option<&CueInfo>)>,
 ) -> Option<Cue> {
     match frame {
+        // Phase B: apply subtitle parameters; a control event is not a cue.
+        Frame::StreamParams(_) => None,
         Frame::Subtitle(cue) => {
             let start = Duration::from_micros(cue.start_us.max(0) as u64);
             let end = Duration::from_micros(cue.end_us.max(cue.start_us).max(0) as u64);
@@ -671,9 +673,12 @@ impl SubtitlePipeline {
             std::panic::catch_unwind(AssertUnwindSafe(|| track.packet_cues(packet, metadata))).unwrap_or_default()
         });
         let (w, h) = (self.video_width.max(320), self.video_height.max(240));
-        for index in 0.. {
+        let mut index = 0;
+        loop {
             let decoder = &mut self.decoder;
             let frame = match std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame())) {
+                // Phase B: apply subtitle parameters without advancing cue metadata.
+                Ok(Ok(Frame::StreamParams(_))) => continue,
                 Ok(Ok(frame)) => frame,
                 _ => break,
             };
@@ -681,6 +686,7 @@ impl SubtitlePipeline {
             // ASS drawing uses the raw event below, not this plain-text view.
             if self.ass.is_some() { continue; }
             let vtt = self.webvtt.as_ref().map(|track| (track, cues.get(index)));
+            index += 1;
             let cue = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 decoded_cue(frame, packet, self.time_base, w, h, vtt)
             }));

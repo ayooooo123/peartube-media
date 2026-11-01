@@ -138,6 +138,30 @@ OxideAV crates are used at pinned git revisions; their crates.io releases lag th
 
 The player never encodes or muxes. `crates/codecs` turns on the core fork's `decode-only` feature: `CodecInfo::encoder` and `ContainerRegistry::register_muxer` drop their factories, so nothing references OxideAV's encoders and muxers and LTO removes them (Android `libmain.so`: 27.3 MB to 21.0 MB stripped, 13.2 MB to 9.9 MB deflated in the APK).
 
+Core migration Phase A retains today's narrow decoder format queries. The
+merged core adds `output_params` and `Frame::StreamParams`, but this phase
+explicitly discards those control events without counting, hashing, assigning
+picture PTS, or consuming subtitle packet-cue metadata. Phase B must apply
+the events and the decoder's output description before affected media.
+The handoff sites are `player/src/engine/mod.rs` (audio tail, audio packet
+drain, video drain), `player/src/subs.rs` (subtitle receive and cue conversion),
+`perf/src/main.rs` (`decode_stream`), `refcheck/src/lib.rs` (`Output::drain`),
+and `check-decoders/src/lib.rs` (decode drain).
+The reviewed core merge is `979d7e3` (parents `9a314bf` and upstream `c1d9313`).
+It preserves the fork's numeric ABI: `Yuv410P = 70` and display duration at
+`usize::MAX - 3`; imported packed RGB formats use 71–82, palette alpha
+uses `MAX - 5`, and metadata blobs use `MAX - 4`.
+Three pinned subtitle crates also need non-exhaustive-safe capabilities:
+`oxideav-ass` uses upstream `368f4df`, and `oxideav-sub-image` uses upstream
+`a6b5c5c` (capability builders plus mechanical edition/MSRV/release changes).
+`oxideav-subtitle` retains our `53df836` with the single compatibility
+commit `405630a`; upstream `0d8428b` compiles but also replaces fork code
+and changes probing, so it is not a behavior-preserving replacement.
+For review, a separate temporary commit selects these four clones under
+`/tmp/oxu-core/`. Replace the core/subtitle paths with reviewed published
+fork revisions and the ass/sub-image paths with the upstream revisions.
+No app repository or shipping pin is changed by this worktree.
+
 Release builds compile dependencies and this workspace's cold crates at `opt-level = "s"`. The speed-critical set stays at 3: H.264, HEVC, AV1, VP8, VP9, MPEG-1/2, MPEG-4 Part 2, VC-1/WMV (`codec-wmv`), DV (`codec-dv`), AAC, MP3, DTS (`codec-dca`), TrueHD (`codec-mlp`) and FLAC, plus `oxideav-core`, `oxideav-pixfmt`, the Ogg demuxer, the A/53 caption parser (`subs-cc`) and `player`. Opus and AC-3 retain ample measured audio headroom at `"s"`. Binaries stay at 3 because fat LTO optimises the whole program at the final crate's level; `"s"` there disables loop and SLP vectorization throughout.
 
 The app's `mobile/Cargo.toml` and this manifest must keep the same effective profiles. App dependencies default to `"s"`, but workspace crates default to 3, so new cold workspace crates need explicit entries here. `codec-midi`, `codec-mp2`, `codec-tracker` and `subs-render` now match the app's `"s"` setting. The earlier profile split saved 1.5 MB raw and 1.1 MB deflated; that historical library measurement is not a new APK size claim.

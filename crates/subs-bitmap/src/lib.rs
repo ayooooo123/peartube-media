@@ -48,7 +48,7 @@
 
 #![forbid(unsafe_code)]
 
-use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, ContainerRegistry, MediaType, RuntimeContext};
+use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, ContainerRegistry, RuntimeContext};
 
 mod bytes;
 mod colorspace;
@@ -85,13 +85,7 @@ pub const OGT_CODEC_ID: &str = "ogt";
 pub const RESOLUTION_PRIORITY: i32 = 50;
 
 fn caps(implementation: &str) -> CodecCapabilities {
-    CodecCapabilities {
-        media_type: MediaType::Subtitle,
-        intra_only: true,
-        lossless: true,
-        ..CodecCapabilities::audio(implementation)
-    }
-    .with_priority(RESOLUTION_PRIORITY)
+    CodecCapabilities::subtitle(implementation).with_priority(RESOLUTION_PRIORITY)
 }
 
 /// Installs the decoders and demuxers of this crate.

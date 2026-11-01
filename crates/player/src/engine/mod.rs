@@ -2100,6 +2100,8 @@ fn run_audio_thread(
                 while !quit() {
                     let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
                     let af = match recv {
+                        // Phase B: apply audio parameter events before PCM.
+                        Ok(Ok(Frame::StreamParams(_))) => continue,
                         Ok(Ok(Frame::Audio(af))) => af,
                         Ok(Ok(_)) => continue,
                         _ => break,
@@ -2182,6 +2184,8 @@ fn run_audio_thread(
             let recv_res =
                 std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
             let frame = match recv_res {
+                // Phase B: apply audio parameter events without consuming PTS.
+                Ok(Ok(Frame::StreamParams(_))) => continue,
                 Ok(Ok(f)) => {
                     consecutive_errors = 0;
                     f
@@ -3338,6 +3342,9 @@ impl VideoSession {
         let Some(decoder) = self.sw_decoder.as_mut() else { return Ok(false) };
         let recv = std::panic::catch_unwind(AssertUnwindSafe(|| decoder.receive_frame()));
         match recv {
+            // Phase B: apply the event before the next picture; do not consume
+            // packet PTS, seek-first-picture credit, or a playback frame count.
+            Ok(Ok(Frame::StreamParams(_))) => Ok(true),
             Ok(Ok(Frame::Video(vf))) => {
                 let dec_dims = decoder.output_video_dimensions();
                 let dec_pix_fmt = decoder.output_pixel_format();

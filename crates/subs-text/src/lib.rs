@@ -49,7 +49,7 @@ pub mod webvtt_css;
 pub mod webvtt_cue;
 pub mod webvtt_settings;
 pub mod xml;
-use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry, MediaType};
+use oxideav_core::{CodecCapabilities, CodecId, CodecInfo, CodecRegistry};
 
 /// Codec id for 3GPP Timed Text / QuickTime text (MP4 `tx3g` / `text`).
 pub const MOV_TEXT_CODEC_ID: &str = "mov_text";
@@ -76,26 +76,8 @@ pub const CMML_OGG_MAGIC: &[u8] = b"CMML\x00\x00\x00\x00";
 
 /// A subtitle-flavoured capability set: decode-only, intra-only, lossless.
 fn subtitle_caps(impl_name: &str) -> CodecCapabilities {
-    CodecCapabilities {
-        decode: true,
-        encode: false,
-        media_type: MediaType::Subtitle,
-        intra_only: true,
-        lossy: false,
-        lossless: true,
-        hardware_accelerated: false,
-        implementation: impl_name.into(),
-        // Capability metadata only: `first_decoder` uses registration order.
-        // Production registers these factories before upstream subtitle codecs.
-        priority: 50,
-        max_width: None,
-        max_height: None,
-        max_bitrate: None,
-        max_sample_rate: None,
-        max_channels: None,
-        accepted_pixel_formats: Vec::new(),
-        ..CodecCapabilities::audio(String::new())
-    }
+    // Capability metadata only; production registers these factories first.
+    CodecCapabilities::subtitle(impl_name).with_decode().with_priority(50)
 }
 
 /// Register every subtitle decoder this crate provides.

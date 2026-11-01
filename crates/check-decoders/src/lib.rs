@@ -100,6 +100,8 @@ pub fn decode_packets(
     let mut errors = Vec::new();
     let drain = |decoder: &mut Box<dyn Decoder>, out: &mut Decoded, errors: &mut Vec<(usize, String)>, index: usize| loop {
         match decoder.receive_frame() {
+            // Phase B: merge output parameters; control events are not frames.
+            Ok(oxideav_core::Frame::StreamParams(_)) => continue,
             Ok(frame) => {
                 out.frames.push(frame);
                 out.frame_formats.push(decoder.output_audio_format());

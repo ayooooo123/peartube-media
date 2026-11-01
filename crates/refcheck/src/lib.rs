@@ -217,6 +217,8 @@ impl Output {
     fn drain(&mut self, decoder: &mut Box<dyn oxideav_core::Decoder>, stream: &StreamInfo) {
         loop {
             let frame = match decoder.receive_frame() {
+                // Phase B: merge output parameters, without recording a frame.
+                Ok(Frame::StreamParams(_)) => continue,
                 Ok(frame) => frame,
                 Err(Error::NeedMore) | Err(Error::Eof) => break,
                 Err(e) => panic!("decode: {e}"),
