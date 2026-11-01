@@ -1774,9 +1774,43 @@ fn far_future_final_timestamp_does_not_hold_the_end() {
     drop(player);
     std::fs::remove_file(path).unwrap();
     assert!(state.ended && state.error.is_none(), "{state:?}");
-    // Two seconds of media, then at most the queue horizon and a second.
-    assert!(elapsed < Duration::from_secs(8), "end held {elapsed:?} by a bogus timestamp");
-    assert!(state.position < Duration::from_secs(6), "position ran to {:?}", state.position);
+    // Two seconds of media, then at most the queue horizon (the engine's QUEUE_MAX_SECS,
+    // 5 s since it grew for slow P2P links and 4K bursts; it was 2 s when this test was
+    // written) and a second. Change both together.
+    const MEDIA: Duration = Duration::from_secs(2);
+    const HORIZON: Duration = Duration::from_secs(5);
+    let bound = MEDIA + HORIZON + Duration::from_secs(1);
+    assert!(elapsed < bound, "end held {elapsed:?} by a bogus timestamp");
+    assert!(state.position < bound, "position ran to {:?}", state.position);
+}
+
+#[test]
+fn video_only_position_follows_the_pictures() {
+    let _cpu = realtime_test();
+    // No audio track: the free-running clock must lead, so the position moves and ends
+    // at the media's end rather than standing at zero.
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "testsrc=size=160x96:rate=25:duration=3",
+        "-c:v", "libx264", "-bf", "0", "-g", "25", "-an",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, bytes).unwrap();
+    let backend = Headless::new();
+    let player = Player::open(path.to_str().unwrap(), backend.clone(), test_context(), PlayerOptions::default(), |_| {});
+    let (samples, state) = sample_until(&player, Duration::from_secs(20), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+    let peak = samples.iter().map(|s| s.position).max().unwrap_or_default();
+    assert!(
+        samples.iter().any(|s| s.playing && s.position > Duration::from_secs(1)),
+        "position never passed 1 s while playing (peak {peak:?})"
+    );
+    assert!(
+        state.position >= Duration::from_millis(2800) && state.position <= Duration::from_millis(3200),
+        "ended at {:?}, not at the 3 s media end",
+        state.position
+    );
 }
 
 /// Wraps the registry's MPEG-2 decoder and releases every picture only at

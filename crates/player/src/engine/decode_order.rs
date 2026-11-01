@@ -1398,9 +1398,10 @@ mod tests {
         let mut reorder = Reorder::new();
         let mut releases = Vec::new();
 
-        // 4 pictures with N = 4 (none released by bumping), each charging 10 MiB.
-        // Sum = 40 MiB > 32 MiB VIDEO_MAX_BYTES.
-        let large_bytes = 10 * 1024 * 1024;
+        // 4 pictures with N = 4 (none released by bumping), each charging just over a
+        // quarter of VIDEO_MAX_BYTES, so the fourth takes the held total past the budget
+        // whatever the budget is (it was 32 MiB when this was written and is 64 MiB now).
+        let large_bytes = super::super::VIDEO_MAX_BYTES / 4 + 1;
         for i in 0..4 {
             reorder.push(
                 i,

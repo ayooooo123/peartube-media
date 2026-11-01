@@ -125,6 +125,8 @@ pub enum TrackKind {
 
 /// Queue bounds: duration paces normal playback; bytes also bound priming,
 /// when nonvideo must wait for a reordered picture without blocking input.
+/// `tests/headless.rs` `far_future_final_timestamp_does_not_hold_the_end`
+/// bounds a held end by this horizon: change both together.
 const QUEUE_MAX_SECS: f64 = 5.0;
 pub(super) const VIDEO_MAX_BYTES: usize = 64 * 1024 * 1024;
 const AUDIO_MAX_BYTES: usize = 8 * 1024 * 1024;
