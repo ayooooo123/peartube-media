@@ -468,6 +468,10 @@ fn measure(path: String, backend: Arc<Measured>, transport: bool) {
             let held = player.state().position;
             std::thread::sleep(Duration::from_millis(250));
             assert_eq!(player.state().position, held);
+            // The next renderer sample (3.008 s) is already behind the 4.1 s
+            // target, so the probe pauses and resumes within the synchronizer's
+            // post-seek start window: that is what catches a resume which
+            // leaves the timebase stopped ("engine not on audio").
             player.seek(Duration::from_millis(4100));
             player.play();
             swapped = true;

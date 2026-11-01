@@ -631,6 +631,17 @@ Android freezes the last observed position, detaches the stream and requests
 stop directly, without an intervening asynchronous pause. Empty and suspended
 sinks do not open a stream during destruction.
 
+On Apple the video layer shares the audio output's synchronizer, and while
+that audio leads the master clock (`Clock::follows_audio`) it owns the
+synchronizer's position: video play/pause only sets the rate. Only a
+free-running lead (no audio, audio ended or failed, or a seek before the
+audio's first samples) is re-timed from the video side. After a seek the
+timebase takes more than 60 ms to start; a pause and play inside that window
+used to re-time it with `setRate:time:` as well, and the synchronizer then
+reported rate 1 while its timebase stayed at rate 0, freezing picture and
+clock until the audio ran out (~3.6 s). `apple_play --transport` failed on
+that in about one run in ten; with single ownership, 0 of 40.
+
 Native retirement probes retain the clock/output observers across sink drop.
 The macOS probe submitted 48,000 frames and observed the audio renderer leave
 the surviving video synchronizer without changing its requested rate. The

@@ -44,6 +44,12 @@ pub trait Clock: Send + Sync {
     /// `AMediaCodec_releaseOutputBufferAtTime`; the engine to wake for a
     /// frame's time.
     fn monotonic_ns_at(&self, at: Duration) -> Option<i64>;
+    /// True while an audio output's clock leads this one: that output then
+    /// owns the position of the timebase it drives, and others only start
+    /// or stop it.
+    fn follows_audio(&self) -> bool {
+        false
+    }
 }
 
 /// Why a sink refused a packet or frame.

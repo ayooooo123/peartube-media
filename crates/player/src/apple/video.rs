@@ -2440,7 +2440,11 @@ fn owner_loop(
                         if need_playing {
                             match main_bridge.set_playing(
                                 playing,
-                                clock.now(),
+                                // Audio that leads the clock owns its synchronizer's
+                                // position. Re-timing it while the timebase starts after a
+                                // seek left it stopped at rate 1 until the audio ran out:
+                                // only a free-running lead is re-timed.
+                                (!clock.follows_audio()).then(|| clock.now()).flatten(),
                                 &req.control,
                                 req.producer,
                                 req.seek_generation,

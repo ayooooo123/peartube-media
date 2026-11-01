@@ -239,6 +239,10 @@ impl Clock for MasterClock {
             None => self.free.monotonic_ns_at(at),
         }
     }
+
+    fn follows_audio(&self) -> bool {
+        self.lead.lock().audio.is_some()
+    }
 }
 
 /// macOS can coalesce ordinary timed waits well beyond an audio buffer.
