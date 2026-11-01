@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "audio-trim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-core",
 ]
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "check-decoders"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codec-mp2",
  "codecs",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "codec-als"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-core",
  "oxideav-mp4",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "codec-ape"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-core",
  "refcheck",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "codec-atrac"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "check-decoders",
  "oxideav-core",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "codec-dv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecs",
  "demux-mxf",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "codec-gsm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-basic",
  "oxideav-core",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "codec-lpcm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecs",
  "oxideav-core",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "codec-mp1"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mpegaudiodsp",
  "oxideav-core",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "codec-mp2"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mpegaudiodsp",
  "oxideav-core",
@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "codec-musepack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mpegaudiodsp",
  "oxideav-core",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "codec-rv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "demux-rm",
  "oxideav-core",
@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "codec-shorten"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-core",
  "refcheck",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "codec-speech"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "demux-misc",
  "oxideav-core",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "codec-speex"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-avi",
  "oxideav-core",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "codec-tak"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-core",
  "refcheck",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "codec-tracker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-core",
  "sha2",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "codec-tta"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-core",
  "refcheck",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "codec-vp3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-avi",
  "oxideav-core",
@@ -428,7 +428,7 @@ dependencies = [
 
 [[package]]
 name = "codec-vp56"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecs",
  "oxideav-avi",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "codec-wavpack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "demux-seek-core",
  "oxideav-core",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "codec-wma"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "demux-asf",
  "oxideav-core",
@@ -461,7 +461,7 @@ dependencies = [
 
 [[package]]
 name = "codec-wmv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "demux-asf",
  "demux-seek-core",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "codecs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codec-als",
  "codec-ape",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "demux-asf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "demux-seek-core",
  "oxideav-core",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "demux-misc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecs",
  "demux-seek-core",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "demux-mxf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecs",
  "oxideav-core",
@@ -652,7 +652,7 @@ dependencies = [
 
 [[package]]
 name = "demux-seek-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "oxideav-core",
 ]
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "e2e"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecs",
  "libc",
@@ -871,7 +871,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "mpegaudiodsp"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ndk"
@@ -1747,7 +1747,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "perf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecs",
  "libc",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "player"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "audio-trim",
  "block2",
@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "refcheck"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "audio-trim",
  "md5",
@@ -2025,7 +2025,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "subs-bitmap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "demux-misc",
  "oxideav-core",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "subs-cc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "demux-misc",
  "oxideav-core",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "subs-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph_rasterizer",
  "oxideav-subtitle",
@@ -2066,7 +2066,7 @@ dependencies = [
 
 [[package]]
 name = "subs-text"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecs",
  "oxideav-ass",
