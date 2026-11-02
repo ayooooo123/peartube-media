@@ -1,1 +1,29 @@
 /target
+
+# Private packet captures and local diagnostic bundles
+*.pcap*
+*.cap
+*.cap.*
+*.har*
+*-pcap/
+.evidence/
+**/.artifacts/
+
+# Local environment and private runtime state
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+receiver.json
+cast-receivers.json
+jobs.json
+settings.json
+
+# Private keys and signing credentials
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
