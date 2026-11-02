@@ -93,6 +93,7 @@ impl AppleBackend {
                 let _: () =
                     objc2::msg_send![&*video_layer, setPreventsDisplaySleepDuringVideoPlayback: true];
             }
+            let _ = video::prime_and_disable_pse_mitigation_on_layer(&video_layer);
         }
         let subtitle_layer = CALayer::new();
         subtitle_layer.setMasksToBounds(true);

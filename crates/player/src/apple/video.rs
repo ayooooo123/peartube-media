@@ -894,6 +894,22 @@ unsafe extern "C" {
         attachment_mode: *mut u32,
     ) -> *const CFType;
     fn CVBufferRemoveAttachment(buffer: *mut CVBuffer, key: *const CFString);
+    fn CVPixelBufferCreate(
+        allocator: *const std::ffi::c_void,
+        width: usize,
+        height: usize,
+        pixel_format_type: u32,
+        pixel_buffer_attributes: *const std::ffi::c_void,
+        pixel_buffer_out: *mut *mut CVPixelBuffer,
+    ) -> i32;
+}
+
+#[link(name = "CoreMedia", kind = "framework")]
+unsafe extern "C" {
+    fn CMSampleBufferGetSampleAttachmentsArray(
+        sbuf: *const CMSampleBuffer,
+        create_if_necessary: u8,
+    ) -> *const CFType;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -908,6 +924,13 @@ unsafe extern "C" {
         num_values: isize,
         callbacks: *const std::ffi::c_void,
     ) -> *const CFType;
+    fn CFArrayGetCount(the_array: *const CFType) -> isize;
+    fn CFArrayGetValueAtIndex(the_array: *const CFType, idx: isize) -> *mut std::ffi::c_void;
+    fn CFDictionarySetValue(
+        the_dict: *mut std::ffi::c_void,
+        key: *const std::ffi::c_void,
+        value: *const std::ffi::c_void,
+    );
     static kCFTypeArrayCallBacks: u8;
 }
 
@@ -1019,6 +1042,91 @@ unsafe fn disable_pse_mitigation_on_layer(layer: &AVSampleBufferDisplayLayer) ->
         done
     }))
     .unwrap_or(true)
+}
+
+/// Materializes `layer`'s `FigImageQueue` with a 16x16 non-`IOSurface` `DoNotDisplay` prime
+/// sample when needed and sets `EnablePSEMitigation = false` BEFORE any pooled video `IOSurface`
+/// is ever registered into `CAImageQueue` (otherwise Frame 0's recycled pool `IOSurface` keeps
+/// `CA::Render::Surface` bit `0x20` and `WindowServer` flashes grey once per pool cycle).
+pub(crate) unsafe fn prime_and_disable_pse_mitigation_on_layer(
+    layer: &AVSampleBufferDisplayLayer,
+) -> bool {
+    if unsafe { disable_pse_mitigation_on_layer(layer) } {
+        return true;
+    }
+    if renderer_path(layer) != RendererPath::Modern {
+        return true;
+    }
+    objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+        let mut pb: *mut CVPixelBuffer = ptr::null_mut();
+        let st = CVPixelBufferCreate(
+            ptr::null(),
+            16,
+            16,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            ptr::null(),
+            &mut pb,
+        );
+        if st != 0 || pb.is_null() {
+            return false;
+        }
+        let img: &CVImageBuffer = &*pb.cast::<CVImageBuffer>();
+        let mut raw_fmt: *const CMVideoFormatDescription = ptr::null();
+        let fst =
+            CMVideoFormatDescriptionCreateForImageBuffer(None, img, NonNull::from(&mut raw_fmt));
+        if fst != 0 || raw_fmt.is_null() {
+            CFRelease(pb.cast());
+            return false;
+        }
+        let fmt = CFRetained::from_raw(NonNull::new_unchecked(raw_fmt.cast_mut()));
+        let timing = CMSampleTimingInfo {
+            duration: CMTime {
+                value: 1,
+                timescale: 24,
+                flags: CMTimeFlags(1),
+                epoch: 0,
+            },
+            presentationTimeStamp: CMTime {
+                value: 0,
+                timescale: 24,
+                flags: CMTimeFlags(1),
+                epoch: 0,
+            },
+            decodeTimeStamp: objc2_core_media::kCMTimeInvalid,
+        };
+        let mut raw_sb: *mut CMSampleBuffer = ptr::null_mut();
+        let sst = CMSampleBuffer::create_ready_with_image_buffer(
+            None,
+            img,
+            &fmt,
+            NonNull::from(&timing),
+            NonNull::from(&mut raw_sb),
+        );
+        CFRelease(pb.cast());
+        if sst != 0 || raw_sb.is_null() {
+            return false;
+        }
+        let sb = CFRetained::from_raw(NonNull::new_unchecked(raw_sb));
+        let att_arr = CMSampleBufferGetSampleAttachmentsArray(&*sb, 1);
+        if !att_arr.is_null() && CFArrayGetCount(att_arr) > 0 {
+            let dict = CFArrayGetValueAtIndex(att_arr, 0);
+            if !dict.is_null() {
+                let dnd_key = CFString::from_static_str("DoNotDisplay");
+                let yes = CFBoolean::new(true);
+                CFDictionarySetValue(
+                    dict,
+                    ptr::from_ref(&*dnd_key).cast(),
+                    ptr::from_ref(yes).cast(),
+                );
+            }
+        }
+        let renderer: Retained<AVSampleBufferVideoRenderer> = layer.sampleBufferRenderer();
+        let _: () = objc2::msg_send![&*renderer, enqueueSampleBuffer: &*sb];
+        let disabled = disable_pse_mitigation_on_layer(layer);
+        let _: () = objc2::msg_send![&*renderer, flush];
+        disabled
+    }))
+    .unwrap_or(false)
 }
 
 pub(crate) fn is_hdr_transfer(transfer: oxideav_core::TransferCharacteristics) -> bool {
@@ -2044,6 +2152,20 @@ impl AppleMain {
                 this.stream_edr.load(Ordering::Acquire) || unsafe { sample_needs_edr(&sample) };
             if this.edr_applied.swap(want_edr, Ordering::AcqRel) != want_edr {
                 unsafe { super::set_layer_edr(&layer_for_enqueue.0, want_edr) };
+            }
+
+            if !this.pse_disabled.load(Ordering::Acquire) {
+                let already_enqueued = mailbox_cb.lock().frames_enqueued > 0;
+                let ok = unsafe {
+                    if already_enqueued {
+                        disable_pse_mitigation_on_layer(&layer_for_enqueue.0)
+                    } else {
+                        prime_and_disable_pse_mitigation_on_layer(&layer_for_enqueue.0)
+                    }
+                };
+                if ok {
+                    this.pse_disabled.store(true, Ordering::Release);
+                }
             }
 
             let enqueued = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
