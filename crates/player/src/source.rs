@@ -329,30 +329,23 @@ fn worker_loop(mut reader: Box<dyn ReadSeekSend>, shared: Arc<SharedRing>) {
             continue;
         }
 
-        let ahead = (state.head_pos - state.cur_pos) as usize;
-        let total_buffered = (state.head_pos - state.tail_pos) as usize;
         if state.eof {
             // EOF stands until a seek or a reset; nothing to read.
             shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
             continue;
         }
 
-        // Window full and the consumer has not advanced: park on the
-        // worker condvar (the consumer's read/seek notifies it) instead
-        // of spinning through this loop.
-        if ahead >= state.capacity {
-            shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
-            continue;
-        }
-
-        // Window full and the consumer has read into it: drop what it has
-        // read to make room. Without this the ring never takes another byte
-        // once 32 MiB have arrived since the last seek, and playback stops
-        // for good when the consumer reaches the end of the window.
-        if state.capacity - total_buffered == 0 && state.cur_pos > state.tail_pos {
-            let evict = (state.cur_pos - state.tail_pos) as usize;
+        // Keep 1/8 of the ring (~8 MiB) warm behind the consumer's tongue so
+        // Cluster CRC probes and MP4 chunk interleaves never fall off the tail.
+        let keep = (state.capacity / 8) as u64;
+        if (state.head_pos - state.tail_pos) as usize >= state.capacity && state.cur_pos > state.tail_pos + keep {
+            let evict = (state.cur_pos - state.tail_pos - keep) as usize;
             state.tail_pos += evict as u64;
             state.ring_start = (state.ring_start + evict) % state.capacity;
+        }
+        if (state.head_pos - state.tail_pos) as usize >= state.capacity {
+            shared.worker_cv.wait_for(&mut state, Duration::from_millis(100));
+            continue;
         }
 
         let write_room = state.capacity - ((state.head_pos - state.tail_pos) as usize);
