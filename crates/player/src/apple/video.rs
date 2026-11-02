@@ -796,6 +796,20 @@ impl Compressed {
         replacement
     }
 
+    /// True only when this compressed stream actually carries HDR/Dolby Vision curves, keeping
+    /// SDR streams out of WindowServer's XDR tone-mapper so black bars stay pitch-black.
+    fn is_hdr(&self) -> bool {
+        let xfer = self
+            .vp9
+            .as_ref()
+            .map(|v| v.color_signal.transfer)
+            .unwrap_or(self.params.color_signal.transfer);
+        self.headers.dovi.is_some()
+            || self.headers.mastering.is_some()
+            || self.headers.content_light.is_some()
+            || is_hdr_transfer(xfer)
+    }
+
     fn filter_leading(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         if self.kind != CompressedKind::Hevc {
             return None;
@@ -865,6 +879,66 @@ unsafe extern "C" {
         allocator: *const std::ffi::c_void,
         property_value_out: *mut *const CFType,
     ) -> i32;
+}
+
+#[link(name = "CoreMedia", kind = "framework")]
+unsafe extern "C" {
+    fn CMSampleBufferGetImageBuffer(sbuf: *const CMSampleBuffer) -> *mut CVImageBuffer;
+}
+
+#[link(name = "CoreVideo", kind = "framework")]
+unsafe extern "C" {
+    fn CVBufferCopyAttachment(
+        buffer: *const CVBuffer,
+        key: *const CFString,
+        attachment_mode: *mut u32,
+    ) -> *const CFType;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFEqual(cf1: *const CFType, cf2: *const CFType) -> u8;
+    fn CFRelease(cf: *const CFType);
+}
+
+pub(crate) fn is_hdr_transfer(transfer: oxideav_core::TransferCharacteristics) -> bool {
+    matches!(
+        transfer,
+        oxideav_core::TransferCharacteristics::SMPTE_ST2084
+            | oxideav_core::TransferCharacteristics::ARIB_STD_B67
+    )
+}
+
+/// Tastes a ready `CMSampleBuffer`'s image buffer attachments for PQ, HLG, or Dolby Vision RPU
+/// so VUI-only HDR bitstreams still open EDR while SDR stays strictly clamped at 1.0 headroom.
+unsafe fn sample_needs_edr(sample: &CMSampleBuffer) -> bool {
+    let img = unsafe { CMSampleBufferGetImageBuffer(ptr::from_ref(sample)) };
+    if img.is_null() {
+        return false;
+    }
+    let xfer = unsafe {
+        CVBufferCopyAttachment(
+            img.cast(),
+            kCVImageBufferTransferFunctionKey,
+            ptr::null_mut(),
+        )
+    };
+    if !xfer.is_null() {
+        let pq = unsafe { ptr::from_ref(kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ).cast() };
+        let hlg = unsafe { ptr::from_ref(kCVImageBufferTransferFunction_ITU_R_2100_HLG).cast() };
+        let hit = unsafe { CFEqual(xfer, pq) != 0 || CFEqual(xfer, hlg) != 0 };
+        unsafe { CFRelease(xfer) };
+        if hit {
+            return true;
+        }
+    }
+    let rpu_key = CFString::from_static_str("DolbyVisionRPUData");
+    let rpu = unsafe { CVBufferCopyAttachment(img.cast(), &*rpu_key, ptr::null_mut()) };
+    if !rpu.is_null() {
+        unsafe { CFRelease(rpu) };
+        return true;
+    }
+    false
 }
 
 struct NativeDecoder {
@@ -1301,6 +1375,10 @@ pub(crate) struct AppleMain {
     lease_reserved: AtomicBool,
     /// True once a native attach side-effect occurred (addRenderer/timebase).
     native_attached: AtomicBool,
+    /// Stream-level HDR intent from container/SEI/DV headers; checked right before sample enqueue.
+    stream_edr: AtomicBool,
+    /// Current `wantsExtendedDynamicRangeContent` state live on `self.layer` on the main thread.
+    edr_applied: AtomicBool,
 }
 
 impl AppleMain {
@@ -1324,7 +1402,13 @@ impl AppleMain {
             is_bound: AtomicBool::new(false),
             lease_reserved: AtomicBool::new(false),
             native_attached: AtomicBool::new(false),
+            stream_edr: AtomicBool::new(false),
+            edr_applied: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn set_stream_edr(&self, enabled: bool) {
+        self.stream_edr.store(enabled, Ordering::Release);
     }
 
     fn work_cancelled(
@@ -1809,6 +1893,12 @@ impl AppleMain {
                 return;
             }
 
+            let want_edr =
+                this.stream_edr.load(Ordering::Acquire) || unsafe { sample_needs_edr(&sample) };
+            if this.edr_applied.swap(want_edr, Ordering::AcqRel) != want_edr {
+                unsafe { super::set_layer_edr(&layer_for_enqueue.0, want_edr) };
+            }
+
             let enqueued = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
                 with_renderer(&layer_for_enqueue, |renderer| unsafe {
                     let _: () = objc2::msg_send![renderer, enqueueSampleBuffer: &**sample];
@@ -1922,13 +2012,16 @@ impl AppleMain {
         let timing_mode = std::mem::replace(&mut *self.timing_mode.lock(), TimingMode::None);
         let observer = self.observer.lock().take();
         let this = Arc::clone(self);
+        self.stream_edr.store(false, Ordering::Release);
 
         self.main.exec_async(move || {
             let res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+                if this.edr_applied.swap(false, Ordering::AcqRel) {
+                    super::set_layer_edr(&layer_for_unbind.0, false);
+                }
                 if let Some(obs) = observer {
                     NSNotificationCenter::defaultCenter().removeObserver(obs.0.as_ref());
                 }
-
                 match timing_mode {
                     TimingMode::Synchronized(sync) => {
                         let this_cb = Arc::clone(&this);
@@ -1995,6 +2088,15 @@ struct SoftwarePath {
     pool: SendSync<CFRetained<CVPixelBufferPool>>,
     color_signal: oxideav_core::ColorSignal,
     sample_aspect_ratio: Option<oxideav_core::Rational>,
+}
+
+impl SoftwarePath {
+    fn is_hdr(&self, frame_color: Option<oxideav_core::ColorSignal>) -> bool {
+        let sig = frame_color
+            .map(|s| s.or(self.color_signal))
+            .unwrap_or(self.color_signal);
+        is_hdr_transfer(sig.transfer)
+    }
 }
 
 enum AppleDevice {
@@ -2238,6 +2340,13 @@ impl AppleDevice {
             },
             ready,
         })
+    }
+
+    fn initial_hdr(&self) -> bool {
+        match self {
+            Self::Compressed { compressed, .. } => compressed.is_hdr(),
+            Self::Frames { software, .. } => software.is_hdr(None),
+        }
     }
 
     fn retire(self) -> Result<(), String> {
@@ -2584,6 +2693,7 @@ fn owner_loop(
                                     Err(VideoError::Sink(SinkError::WouldBlock)),
                                 ));
                             } else {
+                                main_bridge.set_stream_edr(new_dev.initial_hdr());
                                 device = Some(new_dev);
                                 active_request = Some(req.clone());
                                 // Seed present_from only from mailbox (set at submit);
@@ -2676,6 +2786,7 @@ fn owner_loop(
                                         Err(VideoError::Sink(SinkError::WouldBlock)),
                                     ));
                                 } else {
+                                    main_bridge.set_stream_edr(new_dev.initial_hdr());
                                     device = Some(new_dev);
                                     active_request = Some(req.clone());
                                     applied_playing = None;
@@ -2751,6 +2862,7 @@ fn owner_loop(
                                         req.control.wake();
                                         continue;
                                     }
+                                    main_bridge.set_stream_edr(new_dev.initial_hdr());
                                     device = Some(new_dev);
                                     active_request = Some(req.clone());
                                     applied_playing = None;
@@ -2806,6 +2918,7 @@ fn owner_loop(
                                     req.control.wake();
                                     continue;
                                 }
+                                main_bridge.set_stream_edr(new_dev.initial_hdr());
                                 device = Some(new_dev);
                                 active_request = Some(req.clone());
                                 applied_playing = None;
@@ -2978,6 +3091,7 @@ fn owner_loop(
                                 compressed.primed = true;
                                 if let Some(old) = decoder.take() {
                                     *decoder = Some(compressed.reformat(&packet.data, old));
+                                    main_bridge.set_stream_edr(compressed.is_hdr());
                                 }
                             }
                             if compressed.primed {
@@ -3206,6 +3320,7 @@ fn owner_loop(
                                             Err(VideoError::Sink(SinkError::WouldBlock)),
                                         ));
                                     } else {
+                                        main_bridge.set_stream_edr(new_dev.initial_hdr());
                                         device = Some(new_dev);
                                         active_request = Some(req.clone());
                                         pending_replacement = None;
@@ -3610,6 +3725,7 @@ fn ensure_vp9_session(
     if let Some(vp9) = compressed.vp9.as_mut() {
         vp9.config = new_cfg;
     }
+    main_bridge.set_stream_edr(compressed.is_hdr());
     Ok(())
 }
 
@@ -3706,6 +3822,7 @@ fn process_software_frame(
     if !mailbox.wait_for_published_request(control, inp_producer, seek_gen) {
         return Err(VideoError::Superseded);
     }
+    main_bridge.set_stream_edr(software.is_hdr(frame.color_signal()));
     let returned = Arc::new(Mutex::new(None));
     match main_bridge.enqueue_sample(
         sample,

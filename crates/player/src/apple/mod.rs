@@ -84,12 +84,10 @@ impl AppleBackend {
     pub fn new() -> std::sync::Arc<Self> {
         // SAFETY: plain allocation on the main thread.
         let video_layer = unsafe { objc2_av_foundation::AVSampleBufferDisplayLayer::new() };
-        unsafe {
-            let sel = objc2::sel!(setWantsExtendedDynamicRangeContent:);
-            if objc2::msg_send![&*video_layer, respondsToSelector: sel] {
-                let _: () = objc2::msg_send![&*video_layer, setWantsExtendedDynamicRangeContent: true];
-            }
-        }
+        // Keep the layer collared in SDR until an actual HDR/Dolby Vision stream spreads it open,
+        // so macOS WindowServer never ramps 6.7x XDR headroom onto an 8-bit SDR picture and crushes
+        // its black bars into washed-out grey when compositing beneath GPUI's SDR Metal surface.
+        unsafe { set_layer_edr(&video_layer, false) };
         let subtitle_layer = CALayer::new();
         subtitle_layer.setMasksToBounds(true);
         let main = main_queue();
@@ -207,17 +205,36 @@ impl AppleBackend {
     /// objects. Safe to call from any thread; layer work lands on main.
     pub fn detach(&self) {
         let container = self.container.lock().expect("container lock").take();
-        if let Some(container) = container {
-            let ptr = SendPtr(Retained::into_raw(container.0));
-            self.main.exec_async(move || {
+        let video_ptr = SendPtr(Retained::into_raw(self.video_layer.0.clone()));
+        let container_ptr = container.map(|c| SendPtr(Retained::into_raw(c.0)));
+        self.main.exec_async(move || unsafe {
+            let vlayer = Retained::from_raw(video_ptr.get()).expect("video layer null");
+            set_layer_edr(&vlayer, false);
+            if let Some(ptr) = container_ptr {
                 // SAFETY: non-null by construction; +1 held until here.
-                let layer = unsafe { Retained::from_raw(ptr.get()) }
-                    .expect("layer null");
+                let layer = Retained::from_raw(ptr.get()).expect("layer null");
                 layer.removeFromSuperlayer();
-            });
-        }
+            }
+        });
         *self.playback.lock().expect("playback lock") = None;
     }
+}
+
+/// Flips `wantsExtendedDynamicRangeContent` on `layer` without implicit Core Animation fade,
+/// only spreading XDR headroom open when genuine PQ, HLG, or Dolby Vision frames ride in.
+pub(crate) unsafe fn set_layer_edr(
+    layer: &objc2_av_foundation::AVSampleBufferDisplayLayer,
+    enabled: bool,
+) {
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    unsafe {
+        let sel = objc2::sel!(setWantsExtendedDynamicRangeContent:);
+        if objc2::msg_send![layer, respondsToSelector: sel] {
+            let _: () = objc2::msg_send![layer, setWantsExtendedDynamicRangeContent: enabled];
+        }
+    }
+    CATransaction::commit();
 }
 
 /// Snapshot of the native macOS `NSView` slot and its `CALayer` tree.
@@ -503,6 +520,23 @@ impl AppleBackend {
     /// The video layer, for examples that inspect playback state.
     pub fn video_layer(&self) -> &Retained<objc2_av_foundation::AVSampleBufferDisplayLayer> {
         &self.video_layer.0
+    }
+
+    /// Reads `wantsExtendedDynamicRangeContent` from `video_layer` on the main thread.
+    pub fn wants_edr(&self) -> bool {
+        let video_layer = std::sync::Arc::new(SendPtr(Retained::into_raw(
+            self.video_layer.0.clone(),
+        )));
+        run_on_main(move |_mtm| unsafe {
+            let layer = Retained::from_raw(video_layer.0).expect("video layer null");
+            let sel = objc2::sel!(wantsExtendedDynamicRangeContent);
+            if objc2::msg_send![&*layer, respondsToSelector: sel] {
+                let on: bool = objc2::msg_send![&*layer, wantsExtendedDynamicRangeContent];
+                on
+            } else {
+                false
+            }
+        })
     }
 
     /// Blocks until the video layer reports `isReadyForDisplay` or
