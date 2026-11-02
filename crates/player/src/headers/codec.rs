@@ -469,7 +469,7 @@ fn h264_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
                 if ptype == 137 && payload.len() == 24 && mastering_display.is_none() {
                     mastering_display = payload.try_into().ok();
                 } else if ptype == 144 && payload.len() == 4 && content_light.is_none() {
-                    content_light = payload.try_into().ok();
+                    content_light = nonzero_clli(payload);
                 }
             });
         }
@@ -732,7 +732,7 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
                 if ptype == 137 && payload.len() == 24 && mastering_display.is_none() {
                     mastering_display = payload.try_into().ok();
                 } else if ptype == 144 && payload.len() == 4 && content_light.is_none() {
-                    content_light = payload.try_into().ok();
+                    content_light = nonzero_clli(payload);
                 }
             });
         }
@@ -908,7 +908,7 @@ fn hdr_metadata(data: &[u8]) -> (Option<[u8; 24]>, Option<[u8; 4]>) {
         match meta_type {
             // Metadata OBUs end in trailing bits (a 0x80 byte after these byte-aligned
             // payloads), so the payload runs past the fields.
-            1 if payload.len() >= 4 && content_light.is_none() => content_light = payload[..4].try_into().ok(),
+            1 if payload.len() >= 4 && content_light.is_none() => content_light = nonzero_clli(&payload[..4]),
             2 if payload.len() >= 24 && mastering_display.is_none() => {
                 mastering_display = payload[..24].try_into().ok().map(av1_mdcv_to_mp4)
             }
@@ -916,6 +916,13 @@ fn hdr_metadata(data: &[u8]) -> (Option<[u8; 24]>, Option<[u8; 4]>) {
         }
     }
     (mastering_display, content_light)
+}
+
+/// ITU-T H.265 §D.2.35 / CTA-861.3 define `0` for MaxCLL and MaxFALL as unknown rather than 0 nits;
+/// drop all-zero `clli` payloads so CoreMedia honors `MasteringDisplayColorVolume` instead of hunting.
+fn nonzero_clli(bytes: &[u8]) -> Option<[u8; 4]> {
+    let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    (arr != [0, 0, 0, 0]).then_some(arr)
 }
 
 /// AV1's HDR_MDCV and the ISOBMFF `mdcv` box (SMPTE ST 2086, as in HEVC's SEI) carry the same

@@ -53,7 +53,6 @@ pub struct AppleBackend {
     main: DispatchRetained<DispatchQueue>,
     /// Container layer added to the parent view.
     container: Mutex<Option<SendSync<Retained<CALayer>>>>,
-    /// Video layer reused across playbacks.
     video_layer: SendSync<Retained<objc2_av_foundation::AVSampleBufferDisplayLayer>>,
     subtitle_layer: SendSync<Retained<CALayer>>,
     frame: Mutex<[f64; 4]>,
@@ -84,10 +83,17 @@ impl AppleBackend {
     pub fn new() -> std::sync::Arc<Self> {
         // SAFETY: plain allocation on the main thread.
         let video_layer = unsafe { objc2_av_foundation::AVSampleBufferDisplayLayer::new() };
-        // Keep the layer collared in SDR until an actual HDR/Dolby Vision stream spreads it open,
-        // so macOS WindowServer never ramps 6.7x XDR headroom onto an 8-bit SDR picture and crushes
-        // its black bars into washed-out grey when compositing beneath GPUI's SDR Metal surface.
-        unsafe { set_layer_edr(&video_layer, false) };
+        // Keep the layer collared in SDR (`preferredDynamicRange = "standard"`, `wantsEDR = false`)
+        // until an actual HDR/Dolby Vision stream spreads it open: on macOS 26+, `AVSampleBufferDisplayLayer`
+        // defaults `preferredDynamicRange` to `"high"`, which bypasses SDR clamping even when `wantsEDR` is false.
+        unsafe {
+            set_layer_edr_raw(&video_layer, false);
+            let sleep_sel = objc2::sel!(setPreventsDisplaySleepDuringVideoPlayback:);
+            if objc2::msg_send![&*video_layer, respondsToSelector: sleep_sel] {
+                let _: () =
+                    objc2::msg_send![&*video_layer, setPreventsDisplaySleepDuringVideoPlayback: true];
+            }
+        }
         let subtitle_layer = CALayer::new();
         subtitle_layer.setMasksToBounds(true);
         let main = main_queue();
@@ -208,35 +214,49 @@ impl AppleBackend {
         let video_ptr = SendPtr(Retained::into_raw(self.video_layer.0.clone()));
         let container_ptr = container.map(|c| SendPtr(Retained::into_raw(c.0)));
         self.main.exec_async(move || unsafe {
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
             let vlayer = Retained::from_raw(video_ptr.get()).expect("video layer null");
-            set_layer_edr(&vlayer, false);
+            set_layer_edr_raw(&vlayer, false);
             if let Some(ptr) = container_ptr {
                 // SAFETY: non-null by construction; +1 held until here.
                 let layer = Retained::from_raw(ptr.get()).expect("layer null");
                 layer.removeFromSuperlayer();
             }
+            CATransaction::commit();
         });
         *self.playback.lock().expect("playback lock") = None;
     }
 }
 
-/// Flips `wantsExtendedDynamicRangeContent` on `layer` without implicit Core Animation fade,
-/// only spreading XDR headroom open when genuine PQ, HLG, or Dolby Vision frames ride in.
+unsafe fn set_layer_edr_raw(
+    layer: &objc2_av_foundation::AVSampleBufferDisplayLayer,
+    enabled: bool,
+) {
+    unsafe {
+        let edr_sel = objc2::sel!(setWantsExtendedDynamicRangeContent:);
+        if objc2::msg_send![layer, respondsToSelector: edr_sel] {
+            let _: () = objc2::msg_send![layer, setWantsExtendedDynamicRangeContent: enabled];
+        }
+        let dr_sel = objc2::sel!(setPreferredDynamicRange:);
+        if objc2::msg_send![layer, respondsToSelector: dr_sel] {
+            let mode = objc2_foundation::NSString::from_str(if enabled { "high" } else { "standard" });
+            let _: () = objc2::msg_send![layer, setPreferredDynamicRange: &*mode];
+        }
+    }
+}
+
+/// Flips both `preferredDynamicRange` (`"high"` vs `"standard"`, macOS 26+) and
+/// `wantsExtendedDynamicRangeContent` on `layer` in one disabled-actions transaction.
 pub(crate) unsafe fn set_layer_edr(
     layer: &objc2_av_foundation::AVSampleBufferDisplayLayer,
     enabled: bool,
 ) {
     CATransaction::begin();
     CATransaction::setDisableActions(true);
-    unsafe {
-        let sel = objc2::sel!(setWantsExtendedDynamicRangeContent:);
-        if objc2::msg_send![layer, respondsToSelector: sel] {
-            let _: () = objc2::msg_send![layer, setWantsExtendedDynamicRangeContent: enabled];
-        }
-    }
+    unsafe { set_layer_edr_raw(layer, enabled) };
     CATransaction::commit();
 }
-
 /// Snapshot of the native macOS `NSView` slot and its `CALayer` tree.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Debug, PartialEq)]
@@ -247,15 +267,18 @@ pub struct WindowSlotMetrics {
     pub sublayer_frames: Vec<[f64; 4]>,
     pub active_animation_keys: usize,
     pub aligned_with_parent: bool,
+    pub host_above_video: bool,
 }
 
 /// Safe macOS window subview slot behind a GPUI/winit content view: encapsulates
 /// all `raw_window_handle` and AppKit `NSView` FFI so desktop UI crates stay
-/// `#![forbid(unsafe_code)]`.
+/// `#![forbid(unsafe_code)]` while keeping GPUI's controls strictly above the picture
+/// in both windowed and native macOS fullscreen modes.
 #[cfg(target_os = "macos")]
 pub struct AppleWindowSlot {
     backend: Arc<AppleBackend>,
     view: Retained<NSView>,
+    main_view: Retained<NSView>,
     last_rect: std::cell::Cell<[f64; 4]>,
 }
 
@@ -282,20 +305,22 @@ impl AppleWindowSlot {
             return Err("No AppKit window".into());
         };
         // SAFETY: `window` is borrowed for this call on the main thread; its `ns_view` is live.
-        let main_view: &NSView = unsafe { appkit.ns_view.cast::<NSView>().as_ref() };
+        let main_view = unsafe { Retained::retain(appkit.ns_view.cast::<NSView>().as_ptr()) }
+            .ok_or("Null AppKit NSView")?;
         // SAFETY: the window's content/theme view outlives this call.
         let parent = unsafe { main_view.superview() }.ok_or("Window view has no superview")?;
         let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
         view.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
-        parent.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, Some(main_view));
+        parent.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, Some(&main_view));
         let backend = AppleBackend::new();
         // SAFETY: `view` is a live NSView kept alive by `self` until `Drop` detaches.
         unsafe { backend.attach(Retained::as_ptr(&view) as *mut std::ffi::c_void) };
         Ok(Self {
             backend,
             view,
+            main_view,
             last_rect: std::cell::Cell::new([0.0; 4]),
         })
     }
@@ -304,10 +329,13 @@ impl AppleWindowSlot {
         self.backend.clone()
     }
 
-    /// Places the slot in points from the parent's top-left: `[left, top, width, height]`.
+    pub fn apple_backend(&self) -> &Arc<AppleBackend> {
+        &self.backend
+    }
+
+    /// Places the subview in points from the window content's top-left: `[left, top, width, height]`.
     pub fn set_frame(&self, [left, top, width, height]: [f64; 4]) {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
-
         let next = [left, top, width, height];
         if self.last_rect.get() == next {
             return;
@@ -327,7 +355,6 @@ impl AppleWindowSlot {
 
     /// Reads the live native view and `CALayer` bounds and active animation count.
     pub fn metrics(&self) -> Option<WindowSlotMetrics> {
-        // SAFETY: `self.view` is owned on the main thread.
         let parent = unsafe { self.view.superview() }?;
         let p_bounds = parent.bounds();
         let vf = self.view.frame();
@@ -361,6 +388,12 @@ impl AppleWindowSlot {
             && sublayer_frames
                 .iter()
                 .all(|f| (f[2] - pw).abs() < 1.0 && (f[3] - ph).abs() < 1.0);
+        let subviews = parent.subviews();
+        let vid_ptr = Retained::as_ptr(&self.view);
+        let main_ptr = Retained::as_ptr(&self.main_view);
+        let vid_idx = subviews.iter().position(|v| Retained::as_ptr(&v) == vid_ptr);
+        let main_idx = subviews.iter().position(|v| Retained::as_ptr(&v) == main_ptr);
+        let host_above_video = matches!((vid_idx, main_idx), (Some(vi), Some(mi)) if vi < mi);
         Some(WindowSlotMetrics {
             parent_size: [pw, ph],
             ns_view_frame,
@@ -368,6 +401,7 @@ impl AppleWindowSlot {
             sublayer_frames,
             active_animation_keys,
             aligned_with_parent,
+            host_above_video,
         })
     }
 }
@@ -535,6 +569,24 @@ impl AppleBackend {
                 on
             } else {
                 false
+            }
+        })
+    }
+
+    /// Reads `preferredDynamicRange` (macOS 26+) from `video_layer` on the main thread.
+    pub fn preferred_dynamic_range(&self) -> Option<String> {
+        let video_layer = std::sync::Arc::new(SendPtr(Retained::into_raw(
+            self.video_layer.0.clone(),
+        )));
+        run_on_main(move |_mtm| unsafe {
+            let layer = Retained::from_raw(video_layer.0).expect("video layer null");
+            let sel = objc2::sel!(preferredDynamicRange);
+            if objc2::msg_send![&*layer, respondsToSelector: sel] {
+                let s: Option<Retained<objc2_foundation::NSString>> =
+                    objc2::msg_send![&*layer, preferredDynamicRange];
+                s.map(|ns| ns.to_string())
+            } else {
+                None
             }
         })
     }

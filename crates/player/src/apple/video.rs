@@ -893,12 +893,132 @@ unsafe extern "C" {
         key: *const CFString,
         attachment_mode: *mut u32,
     ) -> *const CFType;
+    fn CVBufferRemoveAttachment(buffer: *mut CVBuffer, key: *const CFString);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFEqual(cf1: *const CFType, cf2: *const CFType) -> u8;
     fn CFRelease(cf: *const CFType);
+    fn CFCopyDescription(cf: *const CFType) -> *const CFString;
+    fn CFGetTypeID(cf: *const CFType) -> usize;
+    fn CFArrayCreate(
+        allocator: *const std::ffi::c_void,
+        values: *const *const std::ffi::c_void,
+        num_values: isize,
+        callbacks: *const std::ffi::c_void,
+    ) -> *const CFType;
+    static kCFTypeArrayCallBacks: u8;
+}
+
+unsafe extern "C" {
+    fn dlsym(
+        handle: *mut std::ffi::c_void,
+        symbol: *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_void;
+}
+
+struct PseMitigationSyms {
+    derived_storage: unsafe extern "C" fn(*const CFType) -> *const usize,
+    is_cm_base: unsafe extern "C" fn(*const CFType) -> u8,
+    iq_type_id: unsafe extern "C" fn() -> usize,
+    iq_array_set_prop: unsafe extern "C" fn(*const CFType, *const CFString, *const CFType) -> i32,
+}
+
+static PSE_SYMS: std::sync::LazyLock<Option<PseMitigationSyms>> = std::sync::LazyLock::new(|| unsafe {
+    let rtld_default = (-2isize) as *mut std::ffi::c_void;
+    let p1 = dlsym(rtld_default, c"CMBaseObjectGetDerivedStorage".as_ptr());
+    let p2 = dlsym(rtld_default, c"CFTypeIsCMBaseObject".as_ptr());
+    let p3 = dlsym(rtld_default, c"FigImageQueueGetTypeID".as_ptr());
+    let p4 = dlsym(rtld_default, c"FigImageQueueArraySetProperty".as_ptr());
+    if p1.is_null() || p2.is_null() || p3.is_null() || p4.is_null() {
+        return None;
+    }
+    Some(PseMitigationSyms {
+        derived_storage: std::mem::transmute::<*mut std::ffi::c_void, _>(p1),
+        is_cm_base: std::mem::transmute::<*mut std::ffi::c_void, _>(p2),
+        iq_type_id: std::mem::transmute::<*mut std::ffi::c_void, _>(p3),
+        iq_array_set_prop: std::mem::transmute::<*mut std::ffi::c_void, _>(p4),
+    })
+});
+
+#[repr(C)]
+struct OpaqueFigVideoQueue([u8; 0]);
+
+unsafe impl objc2::RefEncode for OpaqueFigVideoQueue {
+    const ENCODING_REF: objc2::Encoding =
+        objc2::Encoding::Pointer(&objc2::Encoding::Struct("OpaqueFigVideoQueue", &[]));
+}
+
+/// Turns off `FigImageQueue`'s `EnablePSEMitigation` on `layer`'s video queue so a stuck macOS
+/// `PhotosensitiveMitigation = 1` plist never washes lightning or HDR scenes into `#262626` grey.
+unsafe fn disable_pse_mitigation_on_layer(layer: &AVSampleBufferDisplayLayer) -> bool {
+    let Some(syms) = PSE_SYMS.as_ref() else {
+        return true;
+    };
+    if renderer_path(layer) != RendererPath::Modern {
+        return true;
+    }
+    objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+        let renderer: Retained<AVSampleBufferVideoRenderer> = layer.sampleBufferRenderer();
+        let sel = objc2::sel!(_copyVideoQueue);
+        let responds: bool = objc2::msg_send![&*renderer, respondsToSelector: sel];
+        if !responds {
+            return true;
+        }
+        let vq_raw: *const OpaqueFigVideoQueue = objc2::msg_send![&*renderer, _copyVideoQueue];
+        let vq = vq_raw.cast::<CFType>();
+        if vq.is_null() {
+            return false;
+        }
+        let mut done = false;
+        if (syms.is_cm_base)(vq) != 0 {
+            let desc_ptr = CFCopyDescription(vq);
+            if !desc_ptr.is_null() {
+                let desc = (&*desc_ptr).to_string();
+                CFRelease(desc_ptr.cast());
+                if let Some(rest) = desc.split("[FigImageQueue 0x").nth(1)
+                    && let Some(hex) = rest.split(']').next()
+                    && let Ok(addr) = usize::from_str_radix(hex.trim(), 16)
+                    && addr != 0
+                {
+                    let storage = (syms.derived_storage)(vq);
+                    if !storage.is_null() {
+                        let want_tid = (syms.iq_type_id)();
+                        for i in 0..32 {
+                            if *storage.add(i) == addr {
+                                let iq = addr as *const CFType;
+                                if CFGetTypeID(iq) == want_tid && (syms.is_cm_base)(iq) != 0 {
+                                    let val_ptr = iq.cast::<std::ffi::c_void>();
+                                    let arr = CFArrayCreate(
+                                        ptr::null(),
+                                        ptr::from_ref(&val_ptr),
+                                        1,
+                                        ptr::from_ref(&kCFTypeArrayCallBacks).cast(),
+                                    );
+                                    if !arr.is_null() {
+                                        let key = CFString::from_static_str("EnablePSEMitigation");
+                                        let no = CFBoolean::new(false);
+                                        let st = (syms.iq_array_set_prop)(
+                                            arr,
+                                            &*key,
+                                            ptr::from_ref(no).cast(),
+                                        );
+                                        CFRelease(arr);
+                                        done = st == 0;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        CFRelease(vq);
+        done
+    }))
+    .unwrap_or(true)
 }
 
 pub(crate) fn is_hdr_transfer(transfer: oxideav_core::TransferCharacteristics) -> bool {
@@ -975,8 +1095,13 @@ impl NativeDecoder {
             context: Arc::as_ptr(&output).cast_mut().cast(),
         };
         let surface = objc2_core_foundation::CFDictionary::<CFType, CFType>::empty();
+        let ca_compat_key = CFString::from_static_str("IOSurfaceCoreAnimationCompatibility");
+        let yes = CFBoolean::new(true);
         let attributes = unsafe {
-            cf_dictionary(&[(kCVPixelBufferIOSurfacePropertiesKey, &surface as &CFType)])
+            cf_dictionary(&[
+                (kCVPixelBufferIOSurfacePropertiesKey, &surface as &CFType),
+                (&ca_compat_key, yes as &CFType),
+            ])
         }
         .ok_or_else(|| SinkError::Fallback("could not create decoded pixel attributes".into()))?;
         let mut raw = ptr::null_mut();
@@ -1132,6 +1257,24 @@ impl DecodedOutput {
     ) -> Result<CFRetained<CMSampleBuffer>, SinkError> {
         let mut cached = self.format.lock();
         unsafe {
+            // Strip bogus all-zero `ContentLightLevelInfo` (`MaxCLL=0, MaxFALL=0`) attachments
+            // parsed by VideoToolbox from in-band SEI so CoreMedia honors `MasteringDisplayColorVolume`.
+            let clli_key = CFString::from_static_str("ContentLightLevelInfo");
+            let raw_clli = CVBufferCopyAttachment(
+                ptr::from_ref(image).cast(),
+                &*clli_key,
+                ptr::null_mut(),
+            );
+            if !raw_clli.is_null() {
+                let clli_ref = &*raw_clli;
+                let is_all_zero = clli_ref
+                    .downcast_ref::<CFData>()
+                    .is_some_and(|d| d.as_bytes_unchecked() == [0, 0, 0, 0]);
+                CFRelease(raw_clli);
+                if is_all_zero {
+                    CVBufferRemoveAttachment(ptr::from_ref(image).cast_mut().cast(), &*clli_key);
+                }
+            }
             if cached
                 .as_ref()
                 .is_none_or(|format| !CMVideoFormatDescriptionMatchesImageBuffer(format, image))
@@ -1379,6 +1522,8 @@ pub(crate) struct AppleMain {
     stream_edr: AtomicBool,
     /// Current `wantsExtendedDynamicRangeContent` state live on `self.layer` on the main thread.
     edr_applied: AtomicBool,
+    /// True once `EnablePSEMitigation = false` has been applied to the active `FigImageQueue`.
+    pse_disabled: AtomicBool,
 }
 
 impl AppleMain {
@@ -1404,6 +1549,7 @@ impl AppleMain {
             native_attached: AtomicBool::new(false),
             stream_edr: AtomicBool::new(false),
             edr_applied: AtomicBool::new(false),
+            pse_disabled: AtomicBool::new(false),
         }
     }
 
@@ -1765,6 +1911,7 @@ impl AppleMain {
                 this.complete_ticket(ticket, Err("deadline at flush execution".into()));
                 return;
             }
+            this.pse_disabled.store(false, Ordering::Release);
             let res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
                 match renderer_path(&layer_for_flush) {
                     RendererPath::Modern => {
@@ -1906,6 +2053,11 @@ impl AppleMain {
             }));
 
             if enqueued.is_ok() {
+                if !this.pse_disabled.load(Ordering::Acquire)
+                    && unsafe { disable_pse_mitigation_on_layer(&layer_for_enqueue.0) }
+                {
+                    this.pse_disabled.store(true, Ordering::Release);
+                }
                 {
                     let mut state = mailbox_cb.lock();
                     state.frames_enqueued += 1;
@@ -2016,6 +2168,7 @@ impl AppleMain {
 
         self.main.exec_async(move || {
             let res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+                this.pse_disabled.store(false, Ordering::Release);
                 if this.edr_applied.swap(false, Ordering::AcqRel) {
                     super::set_layer_edr(&layer_for_unbind.0, false);
                 }
@@ -2398,7 +2551,6 @@ impl AppleVideoSink {
         let sink_id = SINK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mailbox = Arc::new(Mailbox::new());
         let main_bridge = Arc::new(AppleMain::new(layer.clone(), layer_lease, sink_id));
-
         Self {
             _layer: SendSync(layer),
             synchronizer,

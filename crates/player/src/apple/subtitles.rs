@@ -5,7 +5,7 @@ use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{
-    CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
+    kCGColorSpaceSRGB, CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImage,
     CGImageAlphaInfo,
 };
 use objc2_foundation::{NSData, NSString};
@@ -167,7 +167,11 @@ fn compose(
     let cf_data: &objc2_core_foundation::CFData =
         unsafe { &*(std::ptr::from_ref::<NSData>(&data).cast()) };
     let provider = CGDataProvider::with_cf_data(Some(cf_data)).expect("CGDataProvider");
-    let space = CGColorSpace::new_device_rgb().expect("device RGB color space");
+    // Tag subtitle bitmaps explicitly as sRGB so compositing inside an extendedSRGB HDR window
+    // pins caption white cleanly to 1.0 SDR reference white without clamping XDR highlights.
+    let space = unsafe { CGColorSpace::with_name(Some(kCGColorSpaceSRGB)) }
+        .or_else(CGColorSpace::new_device_rgb)
+        .expect("subtitle RGB color space");
     // SAFETY: provider/space valid; bitmap info matches the RGBA bytes.
     let image = unsafe {
         CGImage::new(
