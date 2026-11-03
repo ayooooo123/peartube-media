@@ -655,6 +655,15 @@ impl SharedState {
             if pts <= now + PREROLL {
                 return Preroll::Go;
             }
+            // Audio whose first sample after start or seek lies past `PREROLL`
+            // has nothing to play yet: mark the lane primed so the free clock
+            // can advance up to `pts`, then wait for it.
+            if t.seek_gen == seen_seek && t.pipe(Pipe::Audio).primed != Some(seen_seek) {
+                drop(t);
+                self.pipe_primed(Pipe::Audio, seen_seek);
+                t = self.transport.lock();
+                continue;
+            }
             self.transport_cv.wait(&mut t);
         }
     }

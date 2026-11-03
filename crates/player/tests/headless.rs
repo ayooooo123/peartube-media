@@ -2354,3 +2354,54 @@ fn seek_supersedes_slow_software_video_recovery() {
         assert_eq!(*hash, reference.1, "changed post-seek pixels");
     }
 }
+
+#[test]
+fn late_starting_audio_plays_video_on_free_clock_then_joins_audio() {
+    let _cpu = realtime_test();
+    // Video begins at 0 s while the first audio packet begins at 0.65 s
+    // (past the 100 ms paused preroll window, like Blu-ray TrueHD tracks
+    // whose opening logo has no audio packets until dialogue starts).
+    let bytes = ffmpeg_file("mkv", &[
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=25:duration=2.0",
+        "-itsoffset", "0.65",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1.35",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "25", "-bf", "0",
+        "-c:a", "flac",
+    ]);
+    let path = tempfile("mkv");
+    std::fs::write(&path, &bytes).unwrap();
+    let backend = Headless::new();
+    let player = Player::open(
+        path.to_str().unwrap(),
+        backend.clone(),
+        test_context(),
+        PlayerOptions::default(),
+        |_| {},
+    );
+    let (_, mid) = sample_until(&player, Duration::from_secs(4), |st| {
+        finished(st) || st.position >= Duration::from_millis(350)
+    });
+    assert!(
+        !mid.buffering && mid.position >= Duration::from_millis(350) && mid.error.is_none(),
+        "late-starting audio deadlocked initial preroll: {mid:?}"
+    );
+    // Seek back into the silent intro to prove post-seek preroll also advances.
+    player.seek(Duration::ZERO);
+    let (_, state) = sample_until(&player, Duration::from_secs(8), finished);
+    drop(player);
+    std::fs::remove_file(path).unwrap();
+    assert!(state.ended && state.error.is_none(), "{state:?}");
+
+    let capture = backend.capture();
+    let video = &capture.video[0];
+    let start = *video.flushes.last().expect("seek reset video capture");
+    assert!(
+        video.pts[start..].first().is_some_and(|pts| *pts < Duration::from_millis(100)),
+        "silent intro video frames were skipped instead of playing on free clock: {:?}",
+        &video.pts[start..]
+    );
+    let expected = ffmpeg_video_frames(&bytes);
+    assert_eq!(video.pts.last(), expected.last().map(|f| &f.0), "final picture lost");
+    let audio = &capture.audio[0];
+    assert!(!audio.pcm.is_empty(), "late-starting audio never played");
+}

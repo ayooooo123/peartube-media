@@ -2325,7 +2325,8 @@ fn play_compressed(
             }
             sync_audio_sink(sink, shared, &mut written.running);
             if realtime {
-                match shared.preroll(at, written.running, None, seen_seek, retired) {
+                let ahead = (written.leads != Some(seen_seek)).then_some(Duration::ZERO);
+                match shared.preroll(at, written.running, ahead, seen_seek, retired) {
                     Preroll::Go => {}
                     Preroll::Resync => continue,
                     Preroll::Abort => continue 'packets,
@@ -2612,7 +2613,8 @@ fn write_pcm(
             #[cfg(target_os = "macos")]
             let _timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
             if realtime {
-                match shared.preroll(at, written.running, None, seen_seek, retired) {
+                let ahead = (written.leads != Some(seen_seek)).then_some(Duration::ZERO);
+                match shared.preroll(at, written.running, ahead, seen_seek, retired) {
                     Preroll::Go => {}
                     Preroll::Resync => continue,
                     Preroll::Abort => return false,
