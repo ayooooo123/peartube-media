@@ -76,6 +76,8 @@ pub(crate) struct VideoConfig {
 /// Supported compressed-audio codec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AudioCodec {
+    /// Sample entry `ac-3`, config box `dac3`.
+    Ac3,
     /// Sample entry `ec-3`, config box `dec3`.
     Eac3,
 }

@@ -868,6 +868,18 @@ mod callback_tests {
             }
             self.sink.open(rate, layout)
         }
+        fn open_pcm(
+            &mut self,
+            rate: u32,
+            layout: oxideav_core::ChannelLayout,
+            format: crate::backend::PcmFormat,
+            mode: crate::backend::AudioOutputMode,
+        ) -> Result<(), SinkError> {
+            if self.suspension.active.load(Ordering::SeqCst) {
+                self.suspension.opens_while_suspended.fetch_add(1, Ordering::SeqCst);
+            }
+            self.sink.open_pcm(rate, layout, format, mode)
+        }
         fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
             if let Some(gate) = self.gate.take() {
                 self.entered.send(()).unwrap();
@@ -886,6 +898,29 @@ mod callback_tests {
                 }
             }
             self.sink.write(pcm, pts)
+        }
+        fn write_pcm(
+            &mut self,
+            pcm: crate::backend::PcmSlice<'_>,
+            pts: Duration,
+        ) -> Result<usize, SinkError> {
+            if let Some(gate) = self.gate.take() {
+                self.entered.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).expect("demux did not finish");
+            }
+            if self.suspension.active.load(Ordering::SeqCst) {
+                self.suspension.unavailable_writes.fetch_add(1, Ordering::SeqCst);
+                return Err(SinkError::Unavailable);
+            }
+            if !self.playing {
+                if let Some(probe) = &self.paused_full {
+                    if probe.enabled.load(Ordering::SeqCst) {
+                        let _ = probe.attempts.send(());
+                        return Ok(0);
+                    }
+                }
+            }
+            self.sink.write_pcm(pcm, pts)
         }
         fn play(&mut self) { self.playing = true; self.sink.play(); }
         fn pause(&mut self) { self.playing = false; self.sink.pause(); }

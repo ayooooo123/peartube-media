@@ -178,12 +178,28 @@ impl AudioSink for GatedAudio {
     fn open(&mut self, rate: u32, layout: oxideav_core::ChannelLayout) -> Result<(), SinkError> {
         self.sink.open(rate, layout)
     }
+    fn open_pcm(
+        &mut self,
+        rate: u32,
+        layout: oxideav_core::ChannelLayout,
+        format: player::PcmFormat,
+        mode: player::AudioOutputMode,
+    ) -> Result<(), SinkError> {
+        self.sink.open_pcm(rate, layout, format, mode)
+    }
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
         if let Some((entered, release)) = self.gate.take() {
             entered.send(()).unwrap();
             release.recv_timeout(Duration::from_secs(10)).expect("the test never released the first write");
         }
         self.sink.write(pcm, pts)
+    }
+    fn write_pcm(&mut self, pcm: player::PcmSlice<'_>, pts: Duration) -> Result<usize, SinkError> {
+        if let Some((entered, release)) = self.gate.take() {
+            entered.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(10)).expect("the test never released the first write");
+        }
+        self.sink.write_pcm(pcm, pts)
     }
     fn play(&mut self) {
         self.sink.play();

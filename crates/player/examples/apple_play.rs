@@ -1,18 +1,26 @@
 //! Actual Player/AppleBackend timing smoke; no screen-capture permission.
-//! `sh crates/player/examples/apple_play.sh clip.mkv [--software] [--transport]`
+//! `sh crates/player/examples/apple_play.sh clip.mkv [--software] [--transport]
+//! [--bit-perfect] [--audio-only]`
 //! Requires the flash/beep clip with the 8-bit frame identifier stripe.
 //! Once per second pause and read the actual displayed pixel buffer
 //! (AVFoundation disallows that read while running), decode its frame
 //! number, and compare its PTS with the audio timebase. Loss of the probe
 //! window's visibility invalidates the whole run, even if it later returns.
 //! These are sampled offsets, not continuous presentation timing.
+//!
+//! `APPLE_ENGINE_DUMP=<path>` records the PCM the engine hands the sink;
+//! `PEARTUBE_AUDIO_DUMP=<path>` records the buffers the sink hands CoreAudio,
+//! after its own fold, and prints `APPLE_SINK_OUT` with the real output rate,
+//! channel count and sample format. That second file is the only audio
+//! boundary worth comparing with a reference decode. `--audio-only` skips the
+//! picture gate so surround/high-resolution fixtures with no video can run.
 
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use player::backend::{AudioSink, Backend, Clock, SinkError, SubtitleSink, VideoSink};
-use player::{AppleBackend, Player, PlayerOptions};
-use oxideav_core::{CodecParameters, Packet, VideoFrame};
+use player::{AppleBackend, AudioOutputMode, Player, PlayerOptions};
+use oxideav_core::{ChannelLayout, CodecParameters};
 use objc2_core_foundation::{CFRetained, CFType};
 use objc2_core_video::CVPixelBuffer;
 
@@ -25,7 +33,7 @@ impl Backend for Measured {
     fn audio(&self) -> Box<dyn AudioSink> {
         let sink = self.native.audio();
         *self.audio_clock.lock() = Some(sink.clock());
-        sink
+        Box::new(MeasuredAudio::new(sink))
     }
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
         let sink = self.native.video(clock);
@@ -33,6 +41,133 @@ impl Backend for Measured {
     }
     fn subtitles(&self) -> Box<dyn SubtitleSink> { self.native.subtitles() }
 }
+/// Records the PCM the engine hands to CoreAudio, so the device boundary can
+/// be compared with FFmpeg's decode instead of with the engine's own copy.
+struct MeasuredAudio {
+    sink: Box<dyn AudioSink>,
+    dump: Option<std::fs::File>,
+    opened: Option<(u32, u16, player::backend::PcmFormat)>,
+}
+
+impl MeasuredAudio {
+    fn new(sink: Box<dyn AudioSink>) -> Self {
+        let dump = std::env::var_os("APPLE_ENGINE_DUMP")
+            .and_then(|path| std::fs::File::create(path).ok());
+        Self { sink, dump, opened: None }
+    }
+}
+
+impl AudioSink for MeasuredAudio {
+    fn open(&mut self, sample_rate: u32, layout: ChannelLayout) -> Result<(), SinkError> {
+        self.sink.open(sample_rate, layout)
+    }
+
+    fn open_pcm(
+        &mut self,
+        sample_rate: u32,
+        layout: ChannelLayout,
+        format: player::backend::PcmFormat,
+        mode: AudioOutputMode,
+    ) -> Result<(), SinkError> {
+        let result = self.sink.open_pcm(sample_rate, layout, format, mode);
+        if result.is_ok() {
+            let opened = (sample_rate, layout.channel_count(), format);
+            if self.opened != Some(opened) {
+                self.opened = Some(opened);
+                eprintln!(
+                    "APPLE_AUDIO_FORMAT rate={sample_rate} channels={} format={format:?} mode={mode:?}",
+                    layout.channel_count()
+                );
+            }
+        }
+        result
+    }
+
+    fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
+        self.sink.write(pcm, pts)
+    }
+
+    fn write_pcm(
+        &mut self,
+        pcm: player::backend::PcmSlice<'_>,
+        pts: Duration,
+    ) -> Result<usize, SinkError> {
+        let taken = self.sink.write_pcm(pcm, pts)?;
+        if taken > 0 {
+            // The sink owns a partial-frame count; only the frames it took
+            // left for the device, so only those bytes are evidence.
+            let stride = usize::from(pcm.channels.max(1)) * pcm.format.bytes_per_sample();
+            let end = (taken * stride).min(pcm.data.len());
+            if let Some(file) = self.dump.as_mut() {
+                use std::io::Write as _;
+                let _ = file.write_all(&pcm.data[..end]);
+            }
+        }
+        Ok(taken)
+    }
+
+    fn play(&mut self) {
+        self.sink.play();
+    }
+
+    fn pause(&mut self) {
+        self.sink.pause();
+    }
+
+    fn flush(&mut self) {
+        self.sink.flush();
+    }
+
+    fn drain(&mut self) -> Result<bool, SinkError> {
+        self.sink.drain()
+    }
+
+    fn open_compressed(
+        &mut self,
+        params: &CodecParameters,
+        first_packet: &[u8],
+    ) -> Result<bool, SinkError> {
+        self.sink.open_compressed(params, first_packet)
+    }
+
+    fn open_compressed_with_mode(
+        &mut self,
+        params: &CodecParameters,
+        first_packet: &[u8],
+        mode: AudioOutputMode,
+    ) -> Result<bool, SinkError> {
+        self.sink.open_compressed_with_mode(params, first_packet, mode)
+    }
+
+    fn write_packet(
+        &mut self,
+        packet: &[u8],
+        pts: Duration,
+        frames: u32,
+    ) -> Result<bool, SinkError> {
+        self.sink.write_packet(packet, pts, frames)
+    }
+
+    fn clock(&self) -> Arc<dyn Clock> {
+        self.sink.clock()
+    }
+}
+
+impl Drop for MeasuredAudio {
+    fn drop(&mut self) {
+        if let Some(mut file) = self.dump.take() {
+            use std::io::Write as _;
+            let _ = file.flush();
+            eprintln!(
+                "APPLE_ENGINE_CAPTURED bytes={}",
+                std::env::var_os("APPLE_ENGINE_DUMP")
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .map_or(0, |m| m.len())
+            );
+        }
+    }
+}
+
 struct MeasuredVideo {
     sink: Box<dyn VideoSink>,
     software: bool,
@@ -309,6 +444,8 @@ fn main() {
     let path = std::env::args().nth(1).expect("apple_play clip.mkv [--software] [--transport]");
     let software = std::env::args().any(|a| a == "--software");
     let transport = std::env::args().any(|a| a == "--transport");
+    let bit_perfect = std::env::args().any(|a| a == "--bit-perfect");
+    let audio_only = std::env::args().any(|a| a == "--audio-only");
     let audio_tail = std::env::args().any(|a| a == "--audio-tail-seek");
     let mtm = MainThreadMarker::new().unwrap();
     let app = NSApplication::sharedApplication(mtm);
@@ -358,6 +495,10 @@ fn main() {
     let backend = Arc::new(Measured { native, audio_clock: Mutex::new(None), software });
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if audio_only {
+                measure_audio_only(path, backend, bit_perfect);
+                return;
+            }
             surface_rx.recv_timeout(Duration::from_secs(5))
                 .expect("no visible AppKit surface; launch with apple_play.sh in a graphical session");
             require_surface(dispatch2::run_on_main(|mtm| observe_surface(mtm, "arm", true).1));
@@ -372,7 +513,7 @@ fn main() {
                 panic!("surface-loss check did not block the invalid run");
             }
             if audio_tail { measure_audio_tail(path, backend) }
-            else { measure(path, backend, transport) }
+            else { measure(path, backend, transport, bit_perfect) }
         }));
         if let Err(e) = &result { eprintln!("Apple timing smoke failed: {e:?}"); }
         dispatch2::run_on_main(|_| READBACK.with(|slot| { slot.borrow_mut().take(); }));
@@ -393,8 +534,25 @@ fn main() {
     app.run();
 }
 
-fn measure(path: String, backend: Arc<Measured>, transport: bool) {
-    let player = Player::open(&path, backend.clone(), Arc::new(codecs::context()), PlayerOptions::default(), |_| {});
+/// Audio-only trial: no picture to read back, so the engine is run to the end
+/// and the sink records what crossed into CoreAudio.
+fn measure_audio_only(path: String, backend: Arc<Measured>, bit_perfect: bool) {
+    let options = PlayerOptions {
+        audio_mode: if bit_perfect { AudioOutputMode::BitPerfectPcm } else { AudioOutputMode::Auto },
+        ..PlayerOptions::default()
+    };
+    let player = Player::open(&path, backend, Arc::new(codecs::context()), options, |_| {});
+    let state = player.wait();
+    eprintln!(
+        "APPLE_AUDIO_ONLY ended={} error={:?} position={:?} duration={:?} output={:?}",
+        state.ended, state.error, state.position, state.duration, state.audio_output
+    );
+    assert!(state.error.is_none(), "{state:?}");
+}
+
+fn measure(path: String, backend: Arc<Measured>, transport: bool, bit_perfect: bool) {
+    let options = PlayerOptions { audio_mode: if bit_perfect { AudioOutputMode::BitPerfectPcm } else { AudioOutputMode::Auto }, ..PlayerOptions::default() };
+    let player = Player::open(&path, backend.clone(), Arc::new(codecs::context()), options, |_| {});
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut previous = (0isize, 0isize, 0.0f64);
     let mut offsets = Vec::new();
@@ -455,6 +613,14 @@ fn measure(path: String, backend: Arc<Measured>, transport: bool) {
             // the now-stationary timebase, then inspect its actual pixels.
             std::thread::sleep(Duration::from_millis(50));
             let audio_at = backend.audio_clock.lock().as_ref().and_then(|c| c.now()).unwrap();
+            if offsets.is_empty() {
+                eprintln!(
+                    "APPLE_EDR wants_edr={} preferred_dynamic_range={:?} state_dynamic_range={:?}",
+                    backend.native.wants_edr(),
+                    backend.native.preferred_dynamic_range(),
+                    state.video_dynamic_range,
+                );
+            }
             let frame = displayed_frame(backend.clone()).expect("renderer returned no readable displayed frame");
             let offset = frame as f64 * 40.0 - audio_at.as_secs_f64() * 1000.0;
             eprintln!("APPLE_FRAME audio_s={:.9} video_frame={frame} offset_ms={offset:.6} mono_ns={}",
@@ -568,28 +734,123 @@ fn displayed_frame(backend: Arc<Measured>) -> Option<u32> {
             return None;
         };
         let format = CVPixelBufferGetPixelFormatType(&pixel);
-        eprintln!("APPLE_PIXEL format={format:#010x} width={} height={} planes={}",
-            CVPixelBufferGetWidth(&pixel), CVPixelBufferGetHeight(&pixel), CVPixelBufferGetPlaneCount(&pixel));
-        // Native decoders may return Apple's hardware-compressed '&8v0'.
-        // Never interpret those blocks as luma bytes. Transfer the actual
-        // displayed buffer to linear NV12, reusing one session and buffer.
-        let converted = if format != kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-            && format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            && format != kCVPixelFormatType_32BGRA {
+        let has_att = |name: &str| -> bool {
+            #[link(name = "CoreVideo", kind = "framework")]
+            unsafe extern "C" {
+                fn CVBufferCopyAttachment(
+                    buf: *const std::ffi::c_void,
+                    key: *const objc2_core_foundation::CFString,
+                    mode: *mut u32,
+                ) -> *const CFType;
+            }
+            #[link(name = "CoreFoundation", kind = "framework")]
+            unsafe extern "C" {
+                fn CFRelease(cf: *const CFType);
+            }
+            let k = objc2_core_foundation::CFString::from_str(name);
+            let p = CVBufferCopyAttachment(std::ptr::from_ref(&*pixel).cast(), &*k, std::ptr::null_mut());
+            if p.is_null() {
+                false
+            } else {
+                CFRelease(p);
+                true
+            }
+        };
+        let has_mdcv = has_att("MasteringDisplayColorVolume");
+        let has_clli = has_att("ContentLightLevelInfo");
+        let has_dovi = has_att("DolbyVisionRPUData");
+        let att_text = |name: &str| -> Option<String> {
+            #[link(name = "CoreVideo", kind = "framework")]
+            unsafe extern "C" {
+                fn CVBufferCopyAttachment(
+                    buf: *const std::ffi::c_void,
+                    key: *const objc2_core_foundation::CFString,
+                    mode: *mut u32,
+                ) -> *const CFType;
+            }
+            let key = objc2_core_foundation::CFString::from_str(name);
+            let raw = CVBufferCopyAttachment(std::ptr::from_ref(&*pixel).cast(), &*key, std::ptr::null_mut());
+            if raw.is_null() {
+                return None;
+            }
+            // Copy rule: this reference releases the attachment on drop.
+            let held = CFRetained::from_raw(std::ptr::NonNull::new_unchecked(raw.cast_mut()));
+            held.downcast_ref::<objc2_core_foundation::CFString>().map(|text| text.to_string())
+        };
+        let (primaries, transfer, matrix) = (
+            att_text("ColorPrimaries"),
+            att_text("TransferFunction"),
+            att_text("YCbCrMatrix"),
+        );
+        let compat = att_text("DolbyCompatibilityID");
+        eprintln!(
+            "APPLE_TAGS primaries={primaries:?} transfer={transfer:?} matrix={matrix:?} dovi_compat={compat:?}"
+        );
+        eprintln!(
+            "APPLE_PIXEL format={format:#010x} width={} height={} planes={} mdcv={has_mdcv} clli={has_clli} dovi_rpu={has_dovi}",
+            CVPixelBufferGetWidth(&pixel),
+            CVPixelBufferGetHeight(&pixel),
+            CVPixelBufferGetPlaneCount(&pixel)
+        );
+        let is_linear_10bit = matches!(
+            format,
+            t if t == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                || t == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                || t == u32::from_be_bytes(*b"ptv0")
+                || t == u32::from_be_bytes(*b"ptf0")
+                || t == u32::from_be_bytes(*b"x422")
+                || t == u32::from_be_bytes(*b"xf22")
+                || t == u32::from_be_bytes(*b"x444")
+                || t == u32::from_be_bytes(*b"xf44")
+        );
+        let is_linear_8bit = matches!(
+            format,
+            t if t == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                || t == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+                || t == u32::from_be_bytes(*b"422v")
+                || t == u32::from_be_bytes(*b"422f")
+                || t == u32::from_be_bytes(*b"444v")
+                || t == u32::from_be_bytes(*b"444f")
+                || t == kCVPixelFormatType_32BGRA
+        );
+        // Compressed Apple hardware formats like '&x42' (10-bit) or '&8v0' (8-bit):
+        // keep 10-bit precision on transfer when the source is 10-bit or carries HDR/DV metadata!
+        let want_10bit_transfer = ((format >> 16) & 0xFF) == u32::from(b'x') || has_mdcv || has_clli || has_dovi;
+        let converted = if !is_linear_10bit && !is_linear_8bit {
             Some(READBACK.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let size = (CVPixelBufferGetWidth(&pixel), CVPixelBufferGetHeight(&pixel));
-                if slot.as_ref().is_none_or(|reader| reader.size != size) {
-                    *slot = Some(PixelReadback::new(size)?);
+                if slot
+                    .as_ref()
+                    .is_none_or(|reader| reader.size != size || reader.ten_bit != want_10bit_transfer)
+                {
+                    *slot = Some(PixelReadback::new(size, want_10bit_transfer)?);
                 }
                 slot.as_ref()?.copy(&pixel)
             })?)
-        } else { None };
+        } else {
+            None
+        };
         let pixel = converted.as_deref().unwrap_or(&pixel);
         let format = CVPixelBufferGetPixelFormatType(pixel);
-        let ten_bit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
-        if !ten_bit && format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            && format != kCVPixelFormatType_32BGRA {
+        let ten_bit = matches!(
+            format,
+            t if t == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                || t == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                || t == u32::from_be_bytes(*b"x422")
+                || t == u32::from_be_bytes(*b"xf22")
+                || t == u32::from_be_bytes(*b"x444")
+                || t == u32::from_be_bytes(*b"xf44")
+        );
+        if !ten_bit
+            && format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            && format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            && format != u32::from_be_bytes(*b"422v")
+            && format != u32::from_be_bytes(*b"422f")
+            && format != u32::from_be_bytes(*b"444v")
+            && format != u32::from_be_bytes(*b"444f")
+            && format != kCVPixelFormatType_32BGRA
+        {
             eprintln!("APPLE_READBACK unsupported_pixel_format={format:#010x}");
             return None;
         }
@@ -618,6 +879,40 @@ fn displayed_frame(backend: Arc<Measured>) -> Option<u32> {
                 if bright { frame |= 1 << bit; }
             }
         }
+        if let Some(path) = std::env::var_os("APPLE_FRAME_DUMP") {
+            use std::io::Write as _;
+            let width = CVPixelBufferGetWidth(&pixel) as usize;
+            let height = CVPixelBufferGetHeight(&pixel) as usize;
+            let bps = if ten_bit { 2 } else { 1 };
+            let (base, stride) = if planar {
+                (CVPixelBufferGetBaseAddressOfPlane(&pixel, 0), CVPixelBufferGetBytesPerRowOfPlane(&pixel, 0))
+            } else {
+                (CVPixelBufferGetBaseAddress(&pixel), CVPixelBufferGetBytesPerRow(&pixel))
+            };
+            if let Ok(mut file) = std::fs::File::create(&path) {
+                if !base.is_null() {
+                    for row in 0..height {
+                        let start = base.cast::<u8>().add(row * stride);
+                        let _ = file.write_all(std::slice::from_raw_parts(start, width * bps));
+                    }
+                    if planar && CVPixelBufferGetPlaneCount(&pixel) > 1 {
+                        let (uv, uv_stride) = (
+                            CVPixelBufferGetBaseAddressOfPlane(&pixel, 1),
+                            CVPixelBufferGetBytesPerRowOfPlane(&pixel, 1),
+                        );
+                        if !uv.is_null() {
+                            for row in 0..height.div_ceil(2) {
+                                let start = uv.cast::<u8>().add(row * uv_stride);
+                                let _ = file.write_all(std::slice::from_raw_parts(start, width * bps));
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "APPLE_FRAME_DUMP width={width} height={height} ten_bit={ten_bit} format={format:#010x} video_frame={frame}"
+            );
+        }
         CVPixelBufferUnlockBaseAddress(&pixel, flags);
         (!base.is_null()).then_some(frame)
     });
@@ -643,23 +938,44 @@ struct PixelReadback {
     session: CFRetained<CFType>,
     pixel: CFRetained<CVPixelBuffer>,
     size: (usize, usize),
+    ten_bit: bool,
 }
 
 impl PixelReadback {
-    fn new(size: (usize, usize)) -> Option<Self> {
+    fn new(size: (usize, usize), ten_bit: bool) -> Option<Self> {
         unsafe {
             let mut raw = std::ptr::null_mut();
             let status = VTPixelTransferSessionCreate(std::ptr::null(), &mut raw);
-            if status != 0 { eprintln!("APPLE_READBACK transfer_create_failed={status}"); return None; }
+            if status != 0 {
+                eprintln!("APPLE_READBACK transfer_create_failed={status}");
+                return None;
+            }
             let session = CFRetained::from_raw(std::ptr::NonNull::new(raw)?);
             let mut raw = std::ptr::null_mut();
+            let dst_fmt = if ten_bit {
+                objc2_core_video::kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            } else {
+                objc2_core_video::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            };
             let status = objc2_core_video::CVPixelBufferCreate(
-                None, size.0, size.1, objc2_core_video::kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-                None, std::ptr::NonNull::from(&mut raw),
+                None,
+                size.0,
+                size.1,
+                dst_fmt,
+                None,
+                std::ptr::NonNull::from(&mut raw),
             );
-            if status != 0 { eprintln!("APPLE_READBACK pixel_create_failed={status}"); return None; }
+            if status != 0 {
+                eprintln!("APPLE_READBACK pixel_create_failed={status}");
+                return None;
+            }
             let pixel = CFRetained::from_raw(std::ptr::NonNull::new(raw)?);
-            Some(Self { session, pixel, size })
+            Some(Self {
+                session,
+                pixel,
+                size,
+                ten_bit,
+            })
         }
     }
 

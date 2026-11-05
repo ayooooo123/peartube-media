@@ -6,4 +6,5 @@
 //! CoreAudio; the engine reads the pixel shape and the frame rate.
 
 pub(crate) mod codec;
+pub mod dovi_rpu;
 pub(crate) mod types;

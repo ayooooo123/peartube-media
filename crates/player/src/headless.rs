@@ -13,8 +13,9 @@ use parking_lot::{Mutex, MutexGuard};
 use oxideav_core::{Packet, PixelFormat, VideoFrame};
 
 use crate::backend::{
-    AudioSink, Backend, Clock, ProducerId, SinkError, SubtitleImage, SubtitleSink,
-    VideoControl, VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink, VideoTarget,
+    AudioOutputMode, AudioSink, Backend, Clock, PcmFormat, PcmSlice, ProducerId, SinkError,
+    SubtitleImage, SubtitleSink, VideoControl, VideoError, VideoMode, VideoOutput, VideoRequest,
+    VideoSink, VideoTarget,
 };
 use crate::clock::current_monotonic_ns;
 
@@ -56,6 +57,13 @@ pub struct AudioCapture {
     pub sample_rate: u32,
     pub channels: u16,
     pub pcm: Vec<f32>,
+    /// Bit-exact interleaved little-endian PCM bytes in [`Self::sample_format`],
+    /// untouched by any `f32` conversion.
+    pub exact_pcm: Vec<u8>,
+    pub sample_format: Option<PcmFormat>,
+    pub channel_layout: Option<oxideav_core::ChannelLayout>,
+    /// Compressed packets captured when `Headless::set_passthrough_capture(true)` is enabled.
+    pub compressed_packets: Vec<Vec<u8>>,
     /// One entry per accepted `AudioSink::write`: the pts the engine gave
     /// it and where its samples start in `pcm` (interleaved sample index).
     pub writes: Vec<(Duration, usize)>,
@@ -85,6 +93,7 @@ struct HeadlessInner {
     /// How fast the simulated audio device plays, relative to its sample
     /// rate.
     audio_speed: f64,
+    passthrough_capture: bool,
     video: Vec<VideoCapture>,
     audio: Vec<AudioCapture>,
     subtitles: Vec<SubtitleCapture>,
@@ -298,6 +307,7 @@ impl Headless {
             inner: Arc::new(CaptureStore::new(HeadlessInner {
                 realtime: true,
                 audio_speed: 1.0,
+                passthrough_capture: false,
                 video: Vec::new(),
                 audio: Vec::new(),
                 subtitles: Vec::new(),
@@ -353,6 +363,12 @@ impl Headless {
     pub fn set_audio_speed(&self, speed: f64) {
         assert!(speed.is_finite() && speed > 0.0, "audio speed {speed}");
         self.inner.lock().audio_speed = speed;
+    }
+
+    /// Enables or disables compressed bitstream packet capture on the headless
+    /// audio sink when `PlayerOptions.audio_mode == AudioOutputMode::Passthrough`.
+    pub fn set_passthrough_capture(&self, enabled: bool) {
+        self.inner.lock().passthrough_capture = enabled;
     }
 
     pub fn capture(&self) -> Capture {
@@ -446,6 +462,16 @@ impl HeadlessAudioSink {
 
 impl AudioSink for HeadlessAudioSink {
     fn open(&mut self, sample_rate: u32, layout: oxideav_core::ChannelLayout) -> Result<(), SinkError> {
+        self.open_pcm(sample_rate, layout, PcmFormat::F32, AudioOutputMode::Auto)
+    }
+
+    fn open_pcm(
+        &mut self,
+        sample_rate: u32,
+        layout: oxideav_core::ChannelLayout,
+        format: PcmFormat,
+        _mode: AudioOutputMode,
+    ) -> Result<(), SinkError> {
         let channels = layout.channel_count();
         let mut inner = self.inner.lock();
         let mut device = self.device.lock();
@@ -465,6 +491,13 @@ impl AudioSink for HeadlessAudioSink {
         if let Some(ac) = inner.audio.iter_mut().find(|a| a.stream == stream) {
             ac.sample_rate = sample_rate;
             ac.channels = channels;
+            ac.channel_layout = Some(layout);
+            if ac.sample_format.is_some_and(|prev| prev != format) && !ac.exact_pcm.is_empty() {
+                // Mid-stream sample-format change: normalize previous exact bytes to F32 only if mixed.
+                ac.sample_format = None;
+            } else if ac.exact_pcm.is_empty() {
+                ac.sample_format = Some(format);
+            }
             ac.device_rate = device_rate;
         } else {
             inner.audio.push(AudioCapture {
@@ -473,6 +506,10 @@ impl AudioSink for HeadlessAudioSink {
                 sample_rate,
                 channels,
                 pcm: Vec::new(),
+                exact_pcm: Vec::new(),
+                sample_format: Some(format),
+                channel_layout: Some(layout),
+                compressed_packets: Vec::new(),
                 writes: Vec::new(),
                 flushes: Vec::new(),
                 played: Vec::new(),
@@ -483,6 +520,22 @@ impl AudioSink for HeadlessAudioSink {
     }
 
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError> {
+        let channels = self.device.lock().channels.max(1);
+        let mut bytes = Vec::with_capacity(pcm.len() * 4);
+        for &s in pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        self.write_pcm(
+            PcmSlice {
+                format: PcmFormat::F32,
+                channels,
+                data: &bytes,
+            },
+            pts,
+        )
+    }
+
+    fn write_pcm(&mut self, pcm: PcmSlice<'_>, pts: Duration) -> Result<usize, SinkError> {
         loop {
             let mut inner = self.inner.lock();
             let mut device = self.device.lock();
@@ -490,10 +543,9 @@ impl AudioSink for HeadlessAudioSink {
             if channels == 0 || device.rate == 0 {
                 return Ok(0);
             }
-            let frames = pcm.len() / channels;
+            let frames = pcm.frames();
             let now = current_monotonic_ns();
             if device.run.is_some() && device.played_at(now) >= device.written as f64 {
-                // It ran dry: that playback ended where the audio did.
                 self.stop(&mut inner, &mut device, now);
             }
             let take = if device.realtime {
@@ -504,10 +556,8 @@ impl AudioSink for HeadlessAudioSink {
             };
             if take == 0 && frames > 0 {
                 if !device.playing {
-                    // Paused and full.
                     return Ok(0);
                 }
-                // Playing and full: the device makes room at its own pace.
                 let room = device.capacity() - (device.written as f64 - device.played_at(now));
                 let want = (frames as f64).min(device.capacity() / 4.0).max(1.0);
                 let wait = Duration::from_secs_f64((want - room).max(1.0) / device.frames_per_sec());
@@ -521,18 +571,91 @@ impl AudioSink for HeadlessAudioSink {
                 device.base = Some(pts);
                 device.pcm_base = inner.active_audio().map_or(0, |ac| ac.pcm.len());
             }
+            let taken = pcm.subslice_frames(0, take);
             if let Some(ac) = inner.active_audio() {
                 let offset = ac.pcm.len();
-                ac.pcm.extend_from_slice(&pcm[..take * channels]);
+                let w = taken.format.bytes_per_sample();
+                ac.pcm.reserve(taken.data.len() / w);
+                for b in taken.data.chunks_exact(w) {
+                    ac.pcm.push(PcmSlice::sample_to_f64(taken.format, b) as f32);
+                }
+                if ac.sample_format == Some(taken.format) {
+                    ac.exact_pcm.extend_from_slice(taken.data);
+                } else {
+                    ac.sample_format = None;
+                }
                 ac.writes.push((pts, offset));
             }
             device.written += take as u64;
             if device.realtime && device.playing && device.run.is_none() {
-                // New audio for an idle device plays from now.
                 device.run = Some((device.played, now));
             }
             return Ok(take);
         }
+    }
+
+    fn open_compressed_with_mode(
+        &mut self,
+        params: &oxideav_core::CodecParameters,
+        _first_packet: &[u8],
+        mode: AudioOutputMode,
+    ) -> Result<bool, SinkError> {
+        let mut inner = self.inner.lock();
+        if !inner.passthrough_capture || mode != AudioOutputMode::Passthrough {
+            return Ok(false);
+        }
+        let rate = params.sample_rate.unwrap_or(48_000).max(1);
+        let layout = params.resolved_layout().unwrap_or(oxideav_core::ChannelLayout::Stereo);
+        let channels = layout.channel_count();
+        let mut device = self.device.lock();
+        self.stop(&mut inner, &mut device, current_monotonic_ns());
+        device.realtime = inner.realtime;
+        device.speed = inner.audio_speed;
+        device.rate = rate;
+        device.channels = channels;
+        device.restart();
+        let device_rate = device.frames_per_sec();
+        let stream = inner.active_audio_stream.unwrap_or(0);
+        let codec = params.codec_id.as_str().to_string();
+        if let Some(ac) = inner.audio.iter_mut().find(|a| a.stream == stream) {
+            ac.sample_rate = rate;
+            ac.channels = channels;
+            ac.channel_layout = Some(layout);
+            ac.device_rate = device_rate;
+        } else {
+            inner.audio.push(AudioCapture {
+                stream,
+                codec,
+                sample_rate: rate,
+                channels,
+                pcm: Vec::new(),
+                exact_pcm: Vec::new(),
+                sample_format: None,
+                channel_layout: Some(layout),
+                compressed_packets: Vec::new(),
+                writes: Vec::new(),
+                flushes: Vec::new(),
+                played: Vec::new(),
+                device_rate,
+            });
+        }
+        Ok(true)
+    }
+
+    fn write_packet(&mut self, packet: &[u8], pts: Duration, frames: u32) -> Result<bool, SinkError> {
+        let mut inner = self.inner.lock();
+        let mut device = self.device.lock();
+        if device.base.is_none() {
+            device.base = Some(pts);
+        }
+        if let Some(ac) = inner.active_audio() {
+            ac.compressed_packets.push(packet.to_vec());
+        }
+        device.written += u64::from(frames);
+        if device.realtime && device.playing && device.run.is_none() {
+            device.run = Some((device.played, current_monotonic_ns()));
+        }
+        Ok(true)
     }
 
     fn play(&mut self) {

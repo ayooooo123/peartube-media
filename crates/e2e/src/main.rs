@@ -524,7 +524,7 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStream,
                 return Compare::fail(metric, format!("no canonical PCM for FFmpeg's {:?}", ff.sample_fmt));
             };
             match oracle::audio_pcm(path, ff, pcm)
-                .and_then(|reference| compare::exact_pcm(&cap.pcm, &reference, pcm, cap.channels as usize))
+                .and_then(|reference| compare::exact_pcm_capture(cap, &reference, pcm))
             {
                 Ok(m) => Compare::pass(m),
                 Err(e) => Compare::fail(metric, e),
@@ -809,9 +809,14 @@ fn same_capture(file: &Played, http: &Played, track: &TrackInfo) -> Result<(), S
         }
         Kind::Audio => {
             let (f, h) = (file.capture.audio.iter().find(|c| c.stream == s), http.capture.audio.iter().find(|c| c.stream == s));
-            let layout = |c: Option<&player::AudioCapture>| c.map(|c| (c.channels, c.sample_rate));
+            let layout = |c: Option<&player::AudioCapture>| c.map(|c| (c.channels, c.sample_rate, c.sample_format));
             if layout(f) != layout(h) {
                 return Err(format!("layout {:?} vs file {:?}", layout(h), layout(f)));
+            }
+            if let (Some(fc), Some(hc)) = (f, h) {
+                if fc.sample_format.is_some() && fc.exact_pcm != hc.exact_pcm {
+                    return Err("exact PCM bytes differ between HTTP and file playback".into());
+                }
             }
             let (f, h) = (f.map(|c| &c.pcm[..]).unwrap_or(&[]), h.map(|c| &c.pcm[..]).unwrap_or(&[]));
             match f.iter().zip(h).position(|(a, b)| a.to_bits() != b.to_bits()) {

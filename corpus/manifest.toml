@@ -294,6 +294,16 @@ path = "gen:h264_dts.mkv"
 rows = ["audio:dts", "container:mkv"]
 compare = ["video:md5", "audio:snr:90"]
 
+# DTS-HD Master Audio (XLL lossless 24-bit 5.1 @ 48 kHz and 24-bit 7.1 @ 96 kHz): bit-exact audio:md5.
+[[entry]]
+path = "fate:dts/dcadec-suite/xll_51_24_48_768.dtshd"
+rows = ["audio:dts", "container:raw_dts"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:dts/dcadec-suite/xll_71_24_96_768.dtshd"
+rows = ["audio:dts", "container:raw_dts"]
+compare = ["audio:md5"]
 [[entry]]
 path = "fate:lossless-audio/truehd_5.1.raw"
 rows = ["audio:truehd", "container:mpeg_ps"]
@@ -385,6 +395,20 @@ rows = ["audio:wavpack"]
 compare = ["audio:md5"]
 
 [[entry]]
+path = "fate:wavpack/lossless/24bit-partial.wv"
+rows = ["audio:wavpack"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:wavpack/lossless/32bit_int-partial.wv"
+rows = ["audio:wavpack"]
+compare = ["audio:md5"]
+
+[[entry]]
+path = "fate:wavpack/lossless/dsd.wv"
+rows = ["audio:wavpack"]
+compare = ["audio:snr:90"]
+[[entry]]
 path = "gen:audio_mod.mod"
 rows = ["audio:mod"]
 compare = ["audio:decodes"]
@@ -464,6 +488,10 @@ path = "fate:lossless-audio/als_05_2ch48k16b.mp4"
 rows = ["audio:als", "container:mp4"]
 compare = ["audio:md5"]
 
+[[entry]]
+path = "fate:lossless-audio/als_07_2ch192k32bF.mp4"
+rows = ["audio:als", "container:mp4"]
+compare = ["audio:md5"]
 [[entry]]
 path = "fate:gsm/sample-gsm-8000.mov"
 rows = ["audio:gsm"]

@@ -9,7 +9,7 @@
 //! in software and hands it frames. Either way the video is presented on
 //! the master clock. Subtitles arrive as positioned RGBA images.
 
-use oxideav_core::{ChannelLayout, CodecParameters, Packet, VideoFrame};
+use oxideav_core::{ChannelLayout, CodecParameters, Packet, SampleFormat, VideoFrame};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -24,6 +24,10 @@ pub trait Backend: Send + Sync {
     /// the audio output's clock while audio plays, a free-running one
     /// otherwise (no audio track, or after the audio ended).
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink>;
+    /// Configures content cadence for this playback's video sink.
+    fn video_with_frame_rate(&self, clock: Arc<dyn Clock>, _mode: FrameRateMode) -> Box<dyn VideoSink> {
+        self.video(clock)
+    }
     /// The subtitle overlay for one playback.
     fn subtitles(&self) -> Box<dyn SubtitleSink>;
     /// The app went to the background: release what the platform reclaims
@@ -72,15 +76,172 @@ pub enum SinkError {
     Fatal(String),
 }
 
-/// Audio output. PCM is interleaved f32 in [-1, 1].
+/// Canonical interleaved little-endian PCM sample representation carried from
+/// software decoders to an [`AudioSink`] without float narrowing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcmFormat {
+    /// Unsigned 8-bit (`[0, 255]`, bias 128).
+    U8,
+    /// Signed 16-bit little-endian (`i16`).
+    S16,
+    /// Signed 24-bit packed little-endian (`3` bytes/sample).
+    S24,
+    /// Signed 32-bit little-endian (`i32`, including 24-in-32 MSB-aligned lossless codecs).
+    S32,
+    /// IEEE-754 32-bit float little-endian (`f32` in `[-1, 1]`).
+    F32,
+    /// IEEE-754 64-bit float little-endian (`f64` in `[-1, 1]`).
+    F64,
+}
+
+impl PcmFormat {
+    /// Bytes per single-channel sample in packed interleaved storage.
+    #[inline]
+    pub const fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::S16 => 2,
+            Self::S24 => 3,
+            Self::S32 | Self::F32 => 4,
+            Self::F64 => 8,
+        }
+    }
+
+    /// Maps a decoder's [`SampleFormat`] (packed or planar) to its lossless
+    /// interleaved [`PcmFormat`]. Signed 8-bit widens losslessly to `S16`.
+    #[inline]
+    pub fn from_sample_format(format: SampleFormat) -> Self {
+        match format {
+            SampleFormat::U8 | SampleFormat::U8P => Self::U8,
+            SampleFormat::S8 | SampleFormat::S16 | SampleFormat::S16P => Self::S16,
+            SampleFormat::S24 => Self::S24,
+            SampleFormat::S32 | SampleFormat::S32P => Self::S32,
+            SampleFormat::F64 | SampleFormat::F64P => Self::F64,
+            SampleFormat::F32 | SampleFormat::F32P | _ => Self::F32,
+        }
+    }
+}
+
+/// Audio routing policy from engine to platform [`AudioSink`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AudioOutputMode {
+    /// Preserve native integer/float precision and discrete multichannel LPCM
+    /// when the active endpoint supports the channel count; downmix `>2`
+    /// channels to stereo on 2-channel endpoints. Compressed passthrough stays
+    /// on platform object decoders (Apple E-AC-3/AC-3).
+    #[default]
+    Auto,
+    /// Prefer compressed bitstream passthrough (IEC 61937 AC-3, E-AC-3, TrueHD
+    /// Dolby MAT, DTS, DTS-HD MA / DTS:X HBR; Apple E-AC-3/AC-3), falling back
+    /// to unmixed multichannel bit-exact LPCM.
+    Passthrough,
+    /// Decode in software to bit-exact LPCM, keep discrete multichannel layout
+    /// when supported, and match hardware nominal sample rate on macOS.
+    BitPerfectPcm,
+    /// Always fold `>2` channels into stereo via `StereoMix`.
+    Stereo,
+}
+
+/// Automatic display refresh-rate matching policy (Dune-style AFR).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameRateMode {
+    /// Request seamless/adaptive frame-rate matching (`ANativeWindow` seamless
+    /// on Android, ProMotion frame-rate hints on Apple) without black-screen
+    /// HDMI mode switches.
+    #[default]
+    Seamless,
+    /// Match exact content frame rate (`23.976`, `24`, `25`, `29.97`, `50`,
+    /// `59.94`, `60` Hz) before releasing the priming hold, including physical
+    /// display mode switches where supported.
+    Exact,
+    /// Leave display refresh rate untouched.
+    Off,
+}
+
+/// Borrowed interleaved little-endian PCM frames in their native [`PcmFormat`].
+#[derive(Clone, Copy, Debug)]
+pub struct PcmSlice<'a> {
+    pub format: PcmFormat,
+    pub channels: u16,
+    pub data: &'a [u8],
+}
+
+impl<'a> PcmSlice<'a> {
+    #[inline]
+    pub fn frames(&self) -> usize {
+        let stride = usize::from(self.channels.max(1)) * self.format.bytes_per_sample();
+        self.data.len() / stride.max(1)
+    }
+
+    #[inline]
+    pub fn subslice_frames(&self, start_frame: usize, end_frame: usize) -> Self {
+        let stride = usize::from(self.channels.max(1)) * self.format.bytes_per_sample();
+        let total = self.frames();
+        let s = start_frame.min(total) * stride;
+        let e = end_frame.min(total).max(start_frame.min(total)) * stride;
+        Self {
+            format: self.format,
+            channels: self.channels,
+            data: &self.data[s..e],
+        }
+    }
+
+    /// Converts a single sample byte slice in `format` to normalized `f64` in `[-1, 1]`.
+    #[inline]
+    pub fn sample_to_f64(format: PcmFormat, b: &[u8]) -> f64 {
+        match format {
+            PcmFormat::U8 => (f64::from(b[0]) - 128.0) / 128.0,
+            PcmFormat::S16 => f64::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0,
+            PcmFormat::S24 => {
+                f64::from(i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) / 8_388_608.0
+            }
+            PcmFormat::S32 => {
+                f64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])) / 2_147_483_648.0
+            }
+            PcmFormat::F32 => f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+            PcmFormat::F64 => f64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ]),
+        }
+    }
+
+    /// Converts `self` to interleaved `f32` in `[-1, 1]` for float-only sinks or SNR checks.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        let w = self.format.bytes_per_sample();
+        let mut out = Vec::with_capacity(self.data.len() / w);
+        for b in self.data.chunks_exact(w) {
+            out.push(Self::sample_to_f64(self.format, b) as f32);
+        }
+        out
+    }
+}
+
+/// Audio output. Native sinks consume [`PcmSlice`] directly at full integer or
+/// float precision; legacy callers may still push normalized `f32`.
 pub trait AudioSink: Send {
-    /// Configures the output. Called before the first `write` and again when
-    /// the format changes. PCM channels follow `layout.positions()` where known.
+    /// Configures the output for `f32` PCM. Called by legacy callers or
+    /// the default [`Self::open_pcm`] delegation.
     fn open(&mut self, sample_rate: u32, layout: ChannelLayout) -> Result<(), SinkError>;
-    /// Queues PCM whose first sample plays at media time `pts`. Blocks while
-    /// a playing output's buffer is full; a paused output that is full takes
-    /// nothing (0). Returns how many frames it took.
+    /// Configures the output for `format` and routing `mode`. Native lossless
+    /// sinks override this to keep exact integer/float sample widths and
+    /// discrete multichannel speaker layouts.
+    fn open_pcm(
+        &mut self,
+        sample_rate: u32,
+        layout: ChannelLayout,
+        _format: PcmFormat,
+        _mode: AudioOutputMode,
+    ) -> Result<(), SinkError> {
+        self.open(sample_rate, layout)
+    }
+    /// Queues `f32` PCM whose first sample plays at media time `pts`.
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, SinkError>;
+    /// Queues native-width PCM whose first sample plays at media time `pts`.
+    /// Returns how many frames it took.
+    fn write_pcm(&mut self, pcm: PcmSlice<'_>, pts: Duration) -> Result<usize, SinkError> {
+        let samples = pcm.to_f32_vec();
+        self.write(&samples, pts)
+    }
     /// Starts the output: queued audio plays and the clock runs.
     fn play(&mut self);
     /// Stops the output where it is: the clock stands still, nothing queued
@@ -96,17 +257,33 @@ pub trait AudioSink: Send {
         Ok(true)
     }
     /// Offers the stream compressed (`params`, and its first packet for the
-    /// headers the setup bytes lack), to play with the platform's own decoder,
-    /// which keeps what PCM loses (Dolby Atmos in E-AC-3). `Ok(true)`: packets
-    /// follow through `write_packet` until the next `open`. `Ok(false)`: the
-    /// engine decodes, as for every sink that plays PCM only.
-    fn open_compressed(&mut self, _params: &CodecParameters, _first_packet: &[u8]) -> Result<bool, SinkError> {
+    /// headers the setup bytes lack), to play with the platform's own decoder
+    /// or IEC 61937 bitstream passthrough.
+    fn open_compressed(
+        &mut self,
+        _params: &CodecParameters,
+        _first_packet: &[u8],
+    ) -> Result<bool, SinkError> {
         Ok(false)
+    }
+    /// Mode-aware compressed passthrough entry point.
+    fn open_compressed_with_mode(
+        &mut self,
+        params: &CodecParameters,
+        first_packet: &[u8],
+        _mode: AudioOutputMode,
+    ) -> Result<bool, SinkError> {
+        self.open_compressed(params, first_packet)
     }
     /// Queues one compressed packet of `frames` samples per channel whose first
     /// sample plays at media time `pts`. `Ok(false)`: full or paused, nothing
     /// taken; the caller retries.
-    fn write_packet(&mut self, _packet: &[u8], _pts: Duration, _frames: u32) -> Result<bool, SinkError> {
+    fn write_packet(
+        &mut self,
+        _packet: &[u8],
+        _pts: Duration,
+        _frames: u32,
+    ) -> Result<bool, SinkError> {
         Err(SinkError::Fatal("this output plays PCM only".into()))
     }
     /// The output's clock: the media time of the sample being heard. The

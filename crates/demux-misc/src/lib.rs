@@ -26,6 +26,7 @@
 mod ac3;
 mod av1_cbs;
 mod dirac;
+mod dsd;
 mod h264;
 mod h264_parse;
 mod hevc;
@@ -58,6 +59,7 @@ pub fn register(ctx: &mut RuntimeContext) {
     smf::register(&mut ctx.containers);
     voc::register(&mut ctx.containers);
     caf::register(&mut ctx.containers);
+    dsd::register(&mut ctx.containers);
 }
 
 oxideav_core::register!("demux-misc", register);

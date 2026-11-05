@@ -12,6 +12,8 @@ pub mod annexb;
 pub mod backend;
 #[forbid(unsafe_code)]
 pub mod subtitle_compose;
+#[forbid(unsafe_code)]
+pub mod cue;
 
 pub mod clock;
 #[forbid(unsafe_code)]
@@ -19,7 +21,9 @@ pub mod engine;
 #[forbid(unsafe_code)]
 pub mod headless;
 #[forbid(unsafe_code)]
-mod headers;
+pub mod iec61937;
+#[forbid(unsafe_code)]
+pub mod headers;
 #[forbid(unsafe_code)]
 pub mod source;
 #[forbid(unsafe_code)]
@@ -31,6 +35,10 @@ mod video_owner;
 #[forbid(unsafe_code)]
 mod webvtt_text;
 
+pub use backend::{AudioOutputMode, FrameRateMode, PcmFormat, PcmSlice};
+pub use cue::{Chapter, CueSheet};
+pub use headers::dovi_rpu;
+pub use engine::mkv_meta;
 pub use engine::{Event, OpenError, Player, PlayerOptions, State, Track, TrackKind, CAPTIONS_608, CAPTIONS_708};
 pub use headless::{AudioCapture, Capture, Headless, SubtitleCapture, VideoCapture};
 pub use subs_render::FontOptions;

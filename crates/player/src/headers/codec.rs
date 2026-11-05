@@ -9,7 +9,7 @@ use super::types::*;
 
 /// How the stream's video packets are framed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Framing {
+pub enum Framing {
     LengthPrefixed(u8),
     AnnexB,
 }
@@ -54,9 +54,46 @@ pub(crate) fn video_config(params: &CodecParameters, first_keyframe: &[u8]) -> O
     }
 }
 
-/// None unless codec_id is "eac3" and the headers parse.
+/// Fills a container's unspecified colour description from the bitstream's own
+/// VUI (H.264/HEVC) or sequence-header colour config (AV1).
+///
+/// A remux whose container omits `Colour`/`colour_description` leaves a PQ film
+/// claiming SDR: measured on a 10-bit HEVC file, the engine reported `SDR` for
+/// PQ content, kept the EDR gate closed or handed CoreAnimation BT.709
+/// attachments, and the picture rendered flat and washed out. Android already
+/// consulted the same VUI when building its `MediaFormat`; this makes the
+/// stream parameters agree for every sink and for the reported signal.
+pub(crate) fn fill_color_from_bitstream(params: &mut CodecParameters) {
+    let unspecified = {
+        let sig = &params.color_signal;
+        sig.primaries.is_unspecified()
+            || sig.transfer.is_unspecified()
+            || sig.matrix.is_unspecified()
+    };
+    if !unspecified {
+        return;
+    }
+    let Some(colour) = video_config(params, &[]).and_then(|config| config.colour) else {
+        return;
+    };
+    // 0 is reserved and 2 is "unspecified": neither may be adopted.
+    let usable = |raw: u16| raw != 0 && raw != 2 && raw <= u16::from(u8::MAX);
+    let sig = &mut params.color_signal;
+    if sig.primaries.is_unspecified() && usable(colour.primaries) {
+        sig.primaries = oxideav_core::ColorPrimaries(colour.primaries as u8);
+    }
+    if sig.transfer.is_unspecified() && usable(colour.transfer) {
+        sig.transfer = oxideav_core::TransferCharacteristics(colour.transfer as u8);
+    }
+    if sig.matrix.is_unspecified() && usable(colour.matrix) {
+        sig.matrix = oxideav_core::MatrixCoefficients(colour.matrix as u8);
+    }
+}
+
+/// Parses compressed audio setup (`ac-3` `dac3` or `ec-3` `dec3`) from extradata or the first packet.
 pub(crate) fn audio_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConfig> {
     match params.codec_id.as_str() {
+        "ac3" => ac3_config(params, first_packet),
         "eac3" => eac3_config(params, first_packet),
         _ => None,
     }
@@ -483,8 +520,8 @@ fn h264_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         nal_length_size,
         range,
         colour,
-        mastering_display,
-        content_light,
+        mastering_display: mastering_display.or_else(|| container_mdcv(params)),
+        content_light: content_light.or_else(|| container_clli(params)),
         pixel_aspect,
         frame_rate,
         reorder_depth,
@@ -495,6 +532,33 @@ fn h264_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
 // ---------------------------------------------------------------------------
 // HEVC
 // ---------------------------------------------------------------------------
+
+/// Dolby Vision display management only runs when the format description's
+/// colour description agrees with the record's compatibility id. Measured on
+/// macOS: a compat-1 `dvvC` paired with HLG tags (or with no colour at all)
+/// attaches no `DolbyVisionRPUData` and silently renders the HDR10 base. The
+/// record is the promise; these force the description to keep it.
+fn force_pq_colour(config: &mut VideoConfig) {
+    force_colour(config, 9, 16, 9);
+}
+
+fn force_hlg_colour(config: &mut VideoConfig) {
+    force_colour(config, 9, 18, 9);
+}
+
+fn force_colour(config: &mut VideoConfig, primaries: u16, transfer: u16, matrix: u16) {
+    let mismatched = config.colour.is_none_or(|c| {
+        c.primaries != primaries || c.transfer != transfer || c.matrix != matrix
+    });
+    if mismatched {
+        config.colour = Some(Colour {
+            primaries,
+            transfer,
+            matrix,
+            full_range: false,
+        });
+    }
+}
 
 fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoConfig> {
     let mut vps_list: Vec<Vec<u8>> = Vec::new();
@@ -746,8 +810,8 @@ fn hevc_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoC
         nal_length_size,
         range,
         colour,
-        mastering_display,
-        content_light,
+        mastering_display: mastering_display.or_else(|| container_mdcv(params)),
+        content_light: content_light.or_else(|| container_clli(params)),
         pixel_aspect,
         frame_rate,
         reorder_depth,
@@ -819,8 +883,8 @@ fn av1_config(params: &CodecParameters, first_keyframe: &[u8]) -> Option<VideoCo
         nal_length_size: 0,
         range,
         colour,
-        mastering_display: config_mdcv.or(key_mdcv),
-        content_light: config_clli.or(key_clli),
+        mastering_display: config_mdcv.or(key_mdcv).or_else(|| container_mdcv(params)),
+        content_light: config_clli.or(key_clli).or_else(|| container_clli(params)),
         pixel_aspect: None,
         frame_rate,
         // AV1 shows pictures in decode order: no reordering.
@@ -923,6 +987,99 @@ fn hdr_metadata(data: &[u8]) -> (Option<[u8; 24]>, Option<[u8; 4]>) {
 fn nonzero_clli(bytes: &[u8]) -> Option<[u8; 4]> {
     let arr: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
     (arr != [0, 0, 0, 0]).then_some(arr)
+}
+
+/// Reads container-level 24-byte `mdcv` (Matroska `Colour > MasteringMetadata` or MP4 `mdcv` box).
+pub(crate) fn container_mdcv(params: &CodecParameters) -> Option<[u8; 24]> {
+    if let Some(hex) = params.options.get(crate::engine::mkv_meta::OPT_CONTAINER_MDCV) {
+        if let Some(bytes) = crate::engine::mkv_meta::hex_decode(hex) {
+            if let Ok(arr) = bytes.try_into() {
+                return Some(arr);
+            }
+        }
+    }
+    find_fourcc_box(&params.extradata, b"mdcv").and_then(|b| b.get(..24)?.try_into().ok())
+}
+
+/// Reads container-level 4-byte `clli` (Matroska `MaxCLL`/`MaxFALL` or MP4 `clli` box).
+pub(crate) fn container_clli(params: &CodecParameters) -> Option<[u8; 4]> {
+    if let Some(hex) = params.options.get(crate::engine::mkv_meta::OPT_CONTAINER_CLLI) {
+        if let Some(bytes) = crate::engine::mkv_meta::hex_decode(hex) {
+            return nonzero_clli(&bytes);
+        }
+    }
+    find_fourcc_box(&params.extradata, b"clli").and_then(nonzero_clli)
+}
+
+/// Reads a container-level 24-byte `DOVIDecoderConfigurationRecord` (`dvcC`/`dvvC` box or MKV `BlockAdditionMapping`).
+pub(crate) fn container_dovi_record(params: &CodecParameters) -> Option<Vec<u8>> {
+    if let Some(b) = find_dovi_box(&params.extradata) {
+        return Some(b.to_vec());
+    }
+    params
+        .options
+        .get(crate::engine::mkv_meta::OPT_CONTAINER_DOVI)
+        .and_then(crate::engine::mkv_meta::hex_decode)
+}
+
+fn find_fourcc_box<'a>(bytes: &'a [u8], fourcc: &[u8; 4]) -> Option<&'a [u8]> {
+    let mut i = 0usize;
+    while i + 8 <= bytes.len() {
+        if &bytes[i + 4..i + 8] == fourcc {
+            let size = u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as usize;
+            if size >= 8 && i + size <= bytes.len() {
+                return Some(&bytes[i + 8..i + size]);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Extracts an ITU-T T.35 `HDR10+` (SMPTE ST 2094-40: country `0xB5`, provider `0x003C`,
+/// oriented `0x0001`, application `4`) dynamic metadata payload from an HEVC or AV1 packet.
+pub fn extract_hdr10_plus_t35(codec_id: &str, packet: &[u8], framing: Framing) -> Option<Vec<u8>> {
+    let is_st2094_40 = |p: &[u8]| -> bool {
+        p.len() >= 7
+            && p[0] == 0xB5
+            && p[1] == 0x00
+            && p[2] == 0x3C
+            && p[3] == 0x00
+            && p[4] == 0x01
+            && p[5] == 0x04
+    };
+    match codec_id {
+        "h265" | "hevc" => {
+            for nal in extract_nals(packet, framing) {
+                if nal.len() > 2 && ((nal[0] >> 1) & 0x3F) == 39 {
+                    let rbsp = unescape_rbsp(&nal[2..]);
+                    let mut found = None;
+                    parse_sei_messages(&rbsp, |ptype, payload| {
+                        if ptype == 4 && found.is_none() && is_st2094_40(payload) {
+                            found = Some(payload.to_vec());
+                        }
+                    });
+                    if found.is_some() {
+                        return found;
+                    }
+                }
+            }
+            None
+        }
+        "av1" => {
+            for unit in obu_units(packet).filter(|u| u.kind == 5) {
+                let (meta_type, hdr) = parse_leb128(unit.payload).ok()?;
+                if meta_type == 4 {
+                    let payload = unit.payload.get(hdr..)?;
+                    if is_st2094_40(payload) {
+                        return Some(payload.to_vec());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 /// AV1's HDR_MDCV and the ISOBMFF `mdcv` box (SMPTE ST 2086, as in HEVC's SEI) carry the same
@@ -1364,6 +1521,70 @@ fn eac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioCon
     None
 }
 
+/// Builds the 3-byte `AC3SpecificBox` (`dac3`, ETSI TS 102 366 Annex F) from an AC-3 syncframe.
+fn ac3_config(params: &CodecParameters, first_packet: &[u8]) -> Option<AudioConfig> {
+    let buf = if first_packet.len() >= 7 && first_packet[0] == 0x0B && first_packet[1] == 0x77 {
+        first_packet
+    } else if params.extradata.len() >= 7 && params.extradata[0] == 0x0B && params.extradata[1] == 0x77 {
+        params.extradata.as_slice()
+    } else {
+        return None;
+    };
+    let bsid = buf[5] >> 3;
+    if bsid > 10 {
+        return None;
+    }
+    let fscod = (buf[4] >> 6) & 0x03;
+    if fscod == 3 {
+        return None;
+    }
+    let frmsizecod = buf[4] & 0x3F;
+    if frmsizecod >= 38 {
+        return None;
+    }
+    let bsmod = buf[5] & 0x07;
+    let acmod = (buf[6] >> 5) & 0x07;
+    let mut br = BitReader::new(&buf[6..]);
+    let _ = br.read(3)?; // acmod
+    if (acmod & 1) != 0 && acmod != 1 {
+        br.skip(2)?; // cmixlev
+    }
+    if (acmod & 4) != 0 {
+        br.skip(2)?; // surmixlev
+    }
+    if acmod == 2 {
+        br.skip(2)?; // dsurmod
+    }
+    let lfeon = br.read(1)? as u8;
+    let base_rate = match fscod {
+        0 => 48_000u32,
+        1 => 44_100,
+        2 => 32_000,
+        _ => return None,
+    };
+    let shift = bsid.saturating_sub(8);
+    let sample_rate = base_rate >> shift;
+    const ACMOD_CHANS: [u16; 8] = [2, 1, 2, 3, 3, 4, 4, 5];
+    let channels = ACMOD_CHANS[acmod as usize] + u16::from(lfeon);
+    let bit_rate_code = frmsizecod >> 1;
+    let mut bw = BitWriter::new();
+    bw.write_bits(u32::from(fscod), 2);
+    bw.write_bits(u32::from(bsid), 5);
+    bw.write_bits(u32::from(bsmod), 3);
+    bw.write_bits(u32::from(acmod), 3);
+    bw.write_bits(u32::from(lfeon), 1);
+    bw.write_bits(u32::from(bit_rate_code), 5);
+    bw.write_bits(0, 5);
+    Some(AudioConfig {
+        codec: AudioCodec::Ac3,
+        sample_rate,
+        channels,
+        bits: 16,
+        config: bw.finish(),
+        atmos_joc: None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // BitWriter / BitReader
 // ---------------------------------------------------------------------------
@@ -1638,6 +1859,7 @@ pub(crate) fn apply_dovi(
         Some((7, level, _compat_id, _record)) => {
             let lvl = if level > 0 { level } else { 6 };
             config.range = VideoRange::Pq;
+            force_pq_colour(config);
             config.dovi = Some(DoviConfig {
                 profile: 8,
                 level: lvl,
@@ -1655,6 +1877,7 @@ pub(crate) fn apply_dovi(
                 }
                 4 => {
                     config.range = VideoRange::Hlg;
+                    force_hlg_colour(config);
                     config.dovi = Some(DoviConfig {
                         profile: 8,
                         level: lvl,
@@ -1671,6 +1894,7 @@ pub(crate) fn apply_dovi(
                         build_dovi_record(8, lvl, true, false, true, 1)
                     };
                     config.range = VideoRange::Pq;
+                    force_pq_colour(config);
                     config.dovi = Some(DoviConfig {
                         profile: 8,
                         level: lvl,
@@ -2337,5 +2561,28 @@ mod av1_tests {
         mdcv.extend_from_slice(&50u32.to_be_bytes());
         assert_eq!(mastering, Some(<[u8; 24]>::try_from(&mdcv[..]).unwrap()));
         assert_eq!(light, Some([0x03, 0xE8, 0x01, 0x90]));
+    }
+
+    #[test]
+    fn extracts_hdr10_plus_st2094_40_from_hevc_sei_and_av1_obu() {
+        let st2094 = [0xB5u8, 0x00, 0x3C, 0x00, 0x01, 0x04, 0x01, 0x80];
+        // HEVC prefix SEI NAL (type 39 -> header 0x4E 0x01), payload_type=4, payload_size=8
+        let mut hevc_nal = vec![0x4Eu8, 0x01, 0x04, st2094.len() as u8];
+        hevc_nal.extend_from_slice(&st2094);
+        hevc_nal.push(0x80);
+        let mut hevc_pkt = (hevc_nal.len() as u32).to_be_bytes().to_vec();
+        hevc_pkt.extend_from_slice(&hevc_nal);
+        assert_eq!(
+            extract_hdr10_plus_t35("hevc", &hevc_pkt, Framing::LengthPrefixed(4)).as_deref(),
+            Some(st2094.as_slice())
+        );
+
+        // AV1 Metadata OBU (type 5 -> 0x2A), size=1+8=9, metadata_type=4 (ITUT_T35)
+        let mut av1_pkt = vec![0x2Au8, (1 + st2094.len()) as u8, 0x04];
+        av1_pkt.extend_from_slice(&st2094);
+        assert_eq!(
+            extract_hdr10_plus_t35("av1", &av1_pkt, Framing::AnnexB).as_deref(),
+            Some(st2094.as_slice())
+        );
     }
 }

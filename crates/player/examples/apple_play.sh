@@ -3,7 +3,12 @@ set -eu
 
 : "${CARGO_TARGET_DIR:?Set CARGO_TARGET_DIR to an absolute owned build directory}"
 case "$CARGO_TARGET_DIR" in /*) ;; *) echo "CARGO_TARGET_DIR must be absolute" >&2; exit 2 ;; esac
-clip=$(realpath "${1:?apple_play.sh clip.mkv [--software] [--transport]}")
+clip="${1:?apple_play.sh clip.mkv|http://... [--software] [--transport]}"
+# A local path must be absolute; a stream URL is passed through untouched.
+case "$clip" in
+    http://* | https://*) ;;
+    *) clip=$(realpath "$clip") ;;
+esac
 shift
 cargo build --locked -j 2 --manifest-path "$(dirname "$0")/../Cargo.toml" --example apple_play
 

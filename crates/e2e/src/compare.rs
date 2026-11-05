@@ -140,6 +140,76 @@ pub fn exact_pcm(ours: &[f32], reference: &[u8], format: Pcm, channels: usize) -
     })
 }
 
+/// `audio:md5` over native-width captured bytes (`AudioCapture::exact_pcm`),
+/// lifting the 24-bit `f32` mantissa limit so 32-bit integer (`S32`) and
+/// 64-bit float (`F64`) lossless streams verify every last bit against FFmpeg.
+pub fn exact_pcm_capture(
+    cap: &player::AudioCapture,
+    reference: &[u8],
+    format: Pcm,
+) -> Result<String, String> {
+    let Some(src_fmt) = cap.sample_format else {
+        return exact_pcm(&cap.pcm, reference, format, cap.channels as usize);
+    };
+    let w = format.bytes();
+    if reference.is_empty() {
+        return Err("FFmpeg decoded no samples".into());
+    }
+    if reference.len() % w != 0 {
+        return Err(format!("FFmpeg's PCM is {} bytes, not whole {w}-byte samples", reference.len()));
+    }
+    let src_w = src_fmt.bytes_per_sample();
+    if cap.exact_pcm.len() % src_w != 0 {
+        return Err(format!(
+            "captured exact PCM is {} bytes, not whole {src_w}-byte samples",
+            cap.exact_pcm.len()
+        ));
+    }
+    let bytes: std::borrow::Cow<'_, [u8]> = match (src_fmt, format) {
+        (player::PcmFormat::U8, Pcm::U8)
+        | (player::PcmFormat::S16, Pcm::S16)
+        | (player::PcmFormat::S32, Pcm::S32)
+        | (player::PcmFormat::F32, Pcm::F32)
+        | (player::PcmFormat::F64, Pcm::F64) => std::borrow::Cow::Borrowed(&cap.exact_pcm),
+        (player::PcmFormat::S24, Pcm::S32) => {
+            // FFmpeg has no packed s24 sample_fmt: its 24-bit decoders emit s32 shifted << 8.
+            let mut widened = Vec::with_capacity((cap.exact_pcm.len() / 3) * 4);
+            for b in cap.exact_pcm.chunks_exact(3) {
+                widened.extend_from_slice(&[0, b[0], b[1], b[2]]);
+            }
+            std::borrow::Cow::Owned(widened)
+        }
+        (player::PcmFormat::S16, Pcm::S32) => {
+            let mut widened = Vec::with_capacity(cap.exact_pcm.len() * 2);
+            for b in cap.exact_pcm.chunks_exact(2) {
+                widened.extend_from_slice(&[0, 0, b[0], b[1]]);
+            }
+            std::borrow::Cow::Owned(widened)
+        }
+        _ => {
+            // Fallback across distinct integer/float grids when safe.
+            return exact_pcm(&cap.pcm, reference, format, cap.channels as usize);
+        }
+    };
+    let per_frame = usize::from(cap.channels.max(1));
+    let (got, want) = (bytes.len() / w / per_frame, reference.len() / w / per_frame);
+    let (md5_got, md5_want) = (refcheck::md5_hex(&bytes), refcheck::md5_hex(reference));
+    if bytes.as_ref() == reference {
+        return Ok(format!("samples={got} md5={md5_got}"));
+    }
+    let mismatch = bytes.chunks(w).zip(reference.chunks(w)).position(|(a, b)| a != b);
+    Err(match mismatch {
+        Some(i) => format!(
+            "md5 {md5_got} vs FFmpeg {md5_want}: first difference at sample {} (channel {}); {got} vs {want} samples",
+            i / per_frame,
+            i % per_frame
+        ),
+        None => format!(
+            "md5 {md5_got} vs FFmpeg {md5_want}: {got} samples vs FFmpeg {want} (the common part is equal)"
+        ),
+    })
+}
+
 /// How many interleaved samples a lossy decode may run long or short: one
 /// frame of FFmpeg's decoder for this stream (its largest), times the
 /// channel count.
@@ -417,6 +487,45 @@ mod tests {
         let ours: Vec<f32> = v32.iter().map(|&v| v as f32 / 2147483648.0).collect();
         let err = exact_pcm(&ours, &bytes, Pcm::S32, 1).unwrap_err();
         assert!(err.contains("unverifiable"), "{err}");
+    }
+
+    #[test]
+    fn exact_pcm_capture_verifies_full_32bit_int_and_64bit_float_samples() {
+        let v32 = [0x1234_5679i32, -0x7654_3211i32, i32::MAX, i32::MIN];
+        let bytes32: Vec<u8> = v32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let cap32 = player::AudioCapture {
+            stream: 0,
+            codec: "flac".into(),
+            sample_rate: 96_000,
+            channels: 2,
+            pcm: v32.iter().map(|&v| v as f32 / 2147483648.0).collect(),
+            exact_pcm: bytes32.clone(),
+            sample_format: Some(player::PcmFormat::S32),
+            channel_layout: None,
+            compressed_packets: Vec::new(),
+            writes: Vec::new(),
+            flushes: Vec::new(),
+            played: Vec::new(),
+            device_rate: 96_000.0,
+        };
+        assert!(exact_pcm_capture(&cap32, &bytes32, Pcm::S32).is_ok());
+        let mut wrong32 = bytes32.clone();
+        wrong32[0] ^= 1; // Flip the single lowest bit (bit 0, invisible to f32!)
+        let err = exact_pcm_capture(&cap32, &wrong32, Pcm::S32).unwrap_err();
+        assert!(err.contains("first difference at sample 0"), "{err}");
+
+        let v64 = [std::f64::consts::PI * 0.25, -std::f64::consts::SQRT_2 * 0.5];
+        let bytes64: Vec<u8> = v64.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let cap64 = player::AudioCapture {
+            sample_format: Some(player::PcmFormat::F64),
+            exact_pcm: bytes64.clone(),
+            pcm: v64.iter().map(|&v| v as f32).collect(),
+            ..cap32
+        };
+        assert!(exact_pcm_capture(&cap64, &bytes64, Pcm::F64).is_ok());
+        let mut wrong64 = bytes64.clone();
+        wrong64[0] ^= 1; // Flip LSB of IEEE-754 f64 mantissa
+        assert!(exact_pcm_capture(&cap64, &wrong64, Pcm::F64).is_err());
     }
 
     #[test]

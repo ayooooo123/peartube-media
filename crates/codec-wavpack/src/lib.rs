@@ -9,7 +9,7 @@ pub mod common;
 pub mod decoder;
 pub mod demuxer;
 pub mod dsd;
-
+pub mod dsd_codec;
 use common::WV_MAX_CHANNELS;
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecTag, ContainerRegistry,
@@ -38,6 +38,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
                 CodecTag::wave_format(0x5756),
             ]),
     );
+    dsd_codec::register_dsd_codecs(reg);
 }
 
 pub fn register_containers(reg: &mut ContainerRegistry) {

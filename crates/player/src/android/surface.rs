@@ -1618,3 +1618,123 @@ pub(crate) fn write_yv12_locked_guard(
     }
     true
 }
+
+/// Android's semi-planar 10-bit YCbCr 4:2:0 format (`HAL_PIXEL_FORMAT_YCBCR_P010 = 0x36`, API 30+).
+pub(crate) const HAL_PIXEL_FORMAT_YCBCR_P010: i32 = 0x36;
+
+/// Negotiates content frame rate (`23.976`, `24.0`, `25.0`, `29.97`, `50.0`, `59.94`, `60.0` Hz)
+/// on `window` via `ANativeWindow_setFrameRateWithChangeStrategy` (API 31+) or
+/// `ANativeWindow_setFrameRate` (API 30+), falling back safely to a no-op on API 29.
+#[cfg(target_os = "android")]
+pub(crate) fn set_window_frame_rate(window: &NativeWindow, fps: f32, seamless_only: bool) {
+    if !fps.is_finite() || !(1.0..=240.0).contains(&fps) {
+        return;
+    }
+    const FRAME_RATE_COMPATIBILITY_FIXED_SOURCE: i8 = 1;
+    const CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS: i8 = 0;
+    const CHANGE_FRAME_RATE_ALWAYS: i8 = 1;
+    unsafe {
+        let lib = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
+        if lib.is_null() {
+            return;
+        }
+        let raw_win = window.ptr().as_ptr().cast::<std::ffi::c_void>();
+        let sym31 = libc::dlsym(lib, c"ANativeWindow_setFrameRateWithChangeStrategy".as_ptr());
+        if !sym31.is_null() {
+            type Fn31 = unsafe extern "C" fn(*mut std::ffi::c_void, f32, i8, i8) -> i32;
+            let f: Fn31 = std::mem::transmute(sym31);
+            let strategy = if seamless_only {
+                CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS
+            } else {
+                CHANGE_FRAME_RATE_ALWAYS
+            };
+            let _ = f(raw_win, fps, FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, strategy);
+            return;
+        }
+        let sym30 = libc::dlsym(lib, c"ANativeWindow_setFrameRate".as_ptr());
+        if !sym30.is_null() {
+            type Fn30 = unsafe extern "C" fn(*mut std::ffi::c_void, f32, i8) -> i32;
+            let f: Fn30 = std::mem::transmute(sym30);
+            let _ = f(raw_win, fps, FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+        }
+    }
+}
+
+/// Writes a 10/12/16-bit 4:2:0 planar picture (`Yuv420P10Le`/`12Le`/`16Le`) into a locked
+/// `HAL_PIXEL_FORMAT_YCBCR_P010` window buffer (`MSB-aligned 16-bit Y` followed by interleaved
+/// `MSB-aligned 16-bit Cb, Cr`), preserving full 10-bit HDR/Hi10P precision on Android.
+#[cfg(target_os = "android")]
+pub(crate) fn write_p010_locked_guard(
+    guard: &mut ndk::native_window::NativeWindowBufferLockGuard<'_>,
+    w: u32,
+    h: u32,
+    src_bits: u32,
+    y_plane: (&[u8], usize),
+    u_plane: (&[u8], usize),
+    v_plane: (&[u8], usize),
+) -> bool {
+    if i32::from(guard.format()) != HAL_PIXEL_FORMAT_YCBCR_P010 {
+        return false;
+    }
+    let bits = guard.bits();
+    if bits.is_null() {
+        return false;
+    }
+    let buf_w = guard.width();
+    let buf_h = guard.height();
+    let stride_px = guard.stride();
+    if (w as usize, h as usize) != (buf_w, buf_h)
+        || buf_w < 2
+        || buf_h < 2
+        || (buf_w & 1) != 0
+        || (buf_h & 1) != 0
+        || stride_px < buf_w
+    {
+        return false;
+    }
+    let row_bytes = stride_px * 2;
+    let Some(y_bytes) = row_bytes.checked_mul(buf_h) else { return false };
+    let Some(uv_bytes) = row_bytes.checked_mul(buf_h / 2) else { return false };
+    let Some(total_bytes) = y_bytes.checked_add(uv_bytes) else { return false };
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(bits.cast::<std::mem::MaybeUninit<u8>>(), total_bytes)
+    };
+    let shift = 16u32.saturating_sub(src_bits.clamp(10, 16));
+    let map_u16 = |b0: u8, b1: u8| -> [u8; 2] {
+        ((u16::from_le_bytes([b0, b1]) << shift) & 0xFFC0).to_le_bytes()
+    };
+    let (y_src, ys) = y_plane;
+    for r in 0..buf_h {
+        let s = r * ys;
+        let d = r * row_bytes;
+        if s + buf_w * 2 > y_src.len() {
+            return false;
+        }
+        for x in 0..buf_w {
+            let px = map_u16(y_src[s + x * 2], y_src[s + x * 2 + 1]);
+            dst[d + x * 2].write(px[0]);
+            dst[d + x * 2 + 1].write(px[1]);
+        }
+    }
+    let (u_src, us) = u_plane;
+    let (v_src, vs) = v_plane;
+    let cw = buf_w / 2;
+    let ch = buf_h / 2;
+    for r in 0..ch {
+        let su = r * us;
+        let sv = r * vs;
+        let d = y_bytes + r * row_bytes;
+        if su + cw * 2 > u_src.len() || sv + cw * 2 > v_src.len() {
+            return false;
+        }
+        for x in 0..cw {
+            let cb = map_u16(u_src[su + x * 2], u_src[su + x * 2 + 1]);
+            let cr = map_u16(v_src[sv + x * 2], v_src[sv + x * 2 + 1]);
+            dst[d + x * 4].write(cb[0]);
+            dst[d + x * 4 + 1].write(cb[1]);
+            dst[d + x * 4 + 2].write(cr[0]);
+            dst[d + x * 4 + 3].write(cr[1]);
+        }
+    }
+    true
+}

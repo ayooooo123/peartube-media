@@ -222,8 +222,56 @@ impl AudioSink for AudioSinkWrapper {
         self.inner.lock().open(sample_rate, layout)
     }
 
+    fn open_pcm(
+        &mut self,
+        sample_rate: u32,
+        layout: oxideav_core::ChannelLayout,
+        format: crate::backend::PcmFormat,
+        mode: crate::backend::AudioOutputMode,
+    ) -> Result<(), crate::backend::SinkError> {
+        self.inner.lock().open_pcm(sample_rate, layout, format, mode)
+    }
+
     fn write(&mut self, pcm: &[f32], pts: Duration) -> Result<usize, crate::backend::SinkError> {
         self.inner.lock().write(pcm, pts)
+    }
+
+    fn write_pcm(
+        &mut self,
+        pcm: crate::backend::PcmSlice<'_>,
+        pts: Duration,
+    ) -> Result<usize, crate::backend::SinkError> {
+        self.inner.lock().write_pcm(pcm, pts)
+    }
+
+    fn open_compressed(
+        &mut self,
+        params: &oxideav_core::CodecParameters,
+        first_packet: &[u8],
+    ) -> Result<bool, crate::backend::SinkError> {
+        self.inner.lock().open_compressed(params, first_packet)
+    }
+
+    fn open_compressed_with_mode(
+        &mut self,
+        params: &oxideav_core::CodecParameters,
+        first_packet: &[u8],
+        mode: crate::backend::AudioOutputMode,
+    ) -> Result<bool, crate::backend::SinkError> {
+        self.inner.lock().open_compressed_with_mode(params, first_packet, mode)
+    }
+
+    fn write_packet(
+        &mut self,
+        packet: &[u8],
+        pts: Duration,
+        frames: u32,
+    ) -> Result<bool, crate::backend::SinkError> {
+        self.inner.lock().write_packet(packet, pts, frames)
+    }
+
+    fn drain(&mut self) -> Result<bool, crate::backend::SinkError> {
+        self.inner.lock().drain()
     }
 
     fn play(&mut self) {
@@ -341,7 +389,15 @@ impl Backend for AndroidBackend {
     }
 
     fn video(&self, clock: Arc<dyn Clock>) -> Box<dyn VideoSink> {
-        let sink = AndroidVideoSink::new(self.shared.clone(), clock);
+        self.video_with_frame_rate(clock, crate::backend::FrameRateMode::Seamless)
+    }
+
+    fn video_with_frame_rate(
+        &self,
+        clock: Arc<dyn Clock>,
+        mode: crate::backend::FrameRateMode,
+    ) -> Box<dyn VideoSink> {
+        let sink = AndroidVideoSink::new(self.shared.clone(), clock, mode);
         let sink_arc = Arc::new(Mutex::new(sink));
         *self.shared.active_video.lock() = Some(Arc::downgrade(&sink_arc));
         Box::new(VideoSinkWrapper { inner: sink_arc })

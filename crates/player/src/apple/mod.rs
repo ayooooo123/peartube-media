@@ -275,28 +275,31 @@ pub struct WindowSlotMetrics {
 /// all `raw_window_handle` and AppKit `NSView` FFI so desktop UI crates stay
 /// `#![forbid(unsafe_code)]` while keeping GPUI's controls strictly above the picture
 /// in both windowed and native macOS fullscreen modes.
+/// Safe macOS window slot behind a GPUI/winit content view: places the video
+/// `NSView` strictly below `main_view` inside the host window (preserving native
+/// macOS Fullscreen Spaces, window dragging, and GPUI HUD overlays) while promoting
+/// the host `NSWindow` color space to `extendedSRGBColorSpace` so HDR10, HLG, and
+/// Dolby Vision `IOSurface`s keep full XDR/EDR headroom.
 #[cfg(target_os = "macos")]
 pub struct AppleWindowSlot {
     backend: Arc<AppleBackend>,
     view: Retained<NSView>,
     main_view: Retained<NSView>,
+    prev_color_space: Option<Retained<objc2_app_kit::NSColorSpace>>,
     last_rect: std::cell::Cell<[f64; 4]>,
 }
 
 #[cfg(target_os = "macos")]
 impl AppleWindowSlot {
-    /// Returns macOS AppKit's configured `[NSEvent doubleClickInterval]` plus a
-    /// small scheduling margin so a pending single-click never fires before AppKit's
-    /// `click_count == 2` event arrives.
     pub fn double_click_interval() -> Duration {
         let secs = objc2_app_kit::NSEvent::doubleClickInterval().clamp(0.15, 0.75);
         Duration::from_secs_f64(secs) + Duration::from_millis(20)
     }
 
-    /// Inserts an empty `NSView` below `window`'s main view on the main thread.
+    /// Opens a video `NSView` slot strictly below `window`'s main view on the main thread.
     pub fn open(window: &impl raw_window_handle::HasWindowHandle) -> Result<Self, String> {
         use objc2::{MainThreadMarker, MainThreadOnly};
-        use objc2_app_kit::{NSAutoresizingMaskOptions, NSWindowOrderingMode};
+        use objc2_app_kit::{NSAutoresizingMaskOptions, NSColorSpace, NSWindowOrderingMode};
         use objc2_foundation::NSRect;
         use raw_window_handle::RawWindowHandle;
 
@@ -305,23 +308,31 @@ impl AppleWindowSlot {
         let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
             return Err("No AppKit window".into());
         };
-        // SAFETY: `window` is borrowed for this call on the main thread; its `ns_view` is live.
         let main_view = unsafe { Retained::retain(appkit.ns_view.cast::<NSView>().as_ptr()) }
             .ok_or("Null AppKit NSView")?;
-        // SAFETY: the window's content/theme view outlives this call.
         let parent = unsafe { main_view.superview() }.ok_or("Window view has no superview")?;
         let view = NSView::initWithFrame(NSView::alloc(mtm), NSRect::ZERO);
         view.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
+
         parent.addSubview_positioned_relativeTo(&view, NSWindowOrderingMode::Below, Some(&main_view));
+        let prev_color_space = if let Some(host) = main_view.window() {
+            let prev = host.colorSpace();
+            let space = NSColorSpace::extendedSRGBColorSpace();
+            host.setColorSpace(Some(&space));
+            prev
+        } else {
+            None
+        };
+
         let backend = AppleBackend::new();
-        // SAFETY: `view` is a live NSView kept alive by `self` until `Drop` detaches.
         unsafe { backend.attach(Retained::as_ptr(&view) as *mut std::ffi::c_void) };
         Ok(Self {
             backend,
             view,
             main_view,
+            prev_color_space,
             last_rect: std::cell::Cell::new([0.0; 4]),
         })
     }
@@ -334,7 +345,7 @@ impl AppleWindowSlot {
         &self.backend
     }
 
-    /// Places the subview in points from the window content's top-left: `[left, top, width, height]`.
+    /// Places the slot in points from the window content's top-left: `[left, top, width, height]`.
     pub fn set_frame(&self, [left, top, width, height]: [f64; 4]) {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
         let next = [left, top, width, height];
@@ -342,7 +353,6 @@ impl AppleWindowSlot {
             return;
         }
         self.last_rect.set(next);
-        // SAFETY: parent holds `self.view` until `Drop` removes it on main thread.
         if let Some(parent) = unsafe { self.view.superview() } {
             let y = if parent.isFlipped() {
                 top
@@ -412,6 +422,96 @@ impl Drop for AppleWindowSlot {
     fn drop(&mut self) {
         self.backend.detach();
         self.view.removeFromSuperview();
+        if let Some(host) = self.main_view.window() {
+            if let Some(prev) = self.prev_color_space.take() {
+                host.setColorSpace(Some(&prev));
+            }
+        }
+    }
+}
+
+/// Switches the main macOS CoreGraphics display to an exact or integer-multiple
+/// refresh rate (`23.976`, `24.0`, `25.0`, `29.97`, `50.0`, `59.94`, `60.0` Hz)
+/// at matching pixel resolution when `mode == FrameRateMode::Exact`.
+#[cfg(target_os = "macos")]
+pub fn match_macos_display_refresh_rate(fps: f64, mode: crate::backend::FrameRateMode) -> bool {
+    if mode != crate::backend::FrameRateMode::Exact || !fps.is_finite() || fps <= 0.0 {
+        return false;
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayCopyDisplayMode(display: u32) -> *const std::ffi::c_void;
+        fn CGDisplayCopyAllDisplayModes(
+            display: u32,
+            options: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CGDisplaySetDisplayMode(
+            display: u32,
+            mode: *const std::ffi::c_void,
+            options: *const std::ffi::c_void,
+        ) -> i32;
+        fn CGDisplayModeGetPixelWidth(mode: *const std::ffi::c_void) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: *const std::ffi::c_void) -> usize;
+        fn CGDisplayModeGetRefreshRate(mode: *const std::ffi::c_void) -> f64;
+        fn CGDisplayModeIsUsableForDesktopGUI(mode: *const std::ffi::c_void) -> bool;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(the_array: *const objc2_core_foundation::CFType) -> isize;
+        fn CFArrayGetValueAtIndex(
+            the_array: *const objc2_core_foundation::CFType,
+            idx: isize,
+        ) -> *mut std::ffi::c_void;
+        fn CFRelease(cf: *const objc2_core_foundation::CFType);
+    }
+    unsafe {
+        let disp = CGMainDisplayID();
+        let cur = CGDisplayCopyDisplayMode(disp);
+        if cur.is_null() {
+            return false;
+        }
+        let cur_w = CGDisplayModeGetPixelWidth(cur);
+        let cur_h = CGDisplayModeGetPixelHeight(cur);
+        let cur_hz = CGDisplayModeGetRefreshRate(cur);
+        CFRelease(cur.cast());
+        if (cur_hz - fps).abs() < 0.02 || (cur_hz > 0.0 && ((cur_hz / fps).round() * fps - cur_hz).abs() < 0.03) {
+            return true;
+        }
+        let modes = CGDisplayCopyAllDisplayModes(disp, std::ptr::null());
+        if modes.is_null() {
+            return false;
+        }
+        let count = CFArrayGetCount(modes.cast());
+        let mut best: Option<(*const std::ffi::c_void, f64)> = None;
+        for i in 0..count {
+            let m = CFArrayGetValueAtIndex(modes.cast(), i) as *const std::ffi::c_void;
+            if m.is_null() || !CGDisplayModeIsUsableForDesktopGUI(m) {
+                continue;
+            }
+            if CGDisplayModeGetPixelWidth(m) != cur_w || CGDisplayModeGetPixelHeight(m) != cur_h {
+                continue;
+            }
+            let hz = CGDisplayModeGetRefreshRate(m);
+            if hz <= 0.0 {
+                continue;
+            }
+            let mult = (hz / fps).round().max(1.0);
+            let err = (hz - mult * fps).abs();
+            if err < 0.03 {
+                let score = if mult == 1.0 { err } else { 0.1 + err };
+                if best.is_none_or(|(_, b_score)| score < b_score) {
+                    best = Some((m, score));
+                }
+            }
+        }
+        let ok = if let Some((chosen, _)) = best {
+            CGDisplaySetDisplayMode(disp, chosen, std::ptr::null()) == 0
+        } else {
+            false
+        };
+        CFRelease(modes.cast());
+        ok
     }
 }
 

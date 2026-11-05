@@ -7,7 +7,7 @@ use super::backend::BackendShared;
 use super::surface::{SurfaceBinding, SurfaceBindingLease, SurfaceId};
 use crate::annexb::convert_packet_to_annex_b;
 use crate::backend::{
-    Clock, FrameDecision, PictureReady, PreparedFrameId, ProducerId, SinkError, VideoControl,
+    Clock, FrameDecision, FrameRateMode, PictureReady, PreparedFrameId, ProducerId, SinkError, VideoControl,
     VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink, VideoTarget,
 };
 use crate::clock::current_monotonic_ns;
@@ -810,17 +810,19 @@ pub struct AndroidVideoSink {
     mailbox: Arc<VideoMailbox>,
     owner_ticket: Option<OwnerTicket>,
     prefer_software: bool,
+    frame_rate_mode: FrameRateMode,
     terminally_retired: bool,
     terminal_error: Option<VideoError>,
 }
 
 impl AndroidVideoSink {
-    pub fn new(backend: Arc<BackendShared>, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(backend: Arc<BackendShared>, clock: Arc<dyn Clock>, frame_rate_mode: FrameRateMode) -> Self {
         Self {
             backend,
             clock,
             mailbox: Arc::new(VideoMailbox::new()),
             owner_ticket: None,
+            frame_rate_mode,
             prefer_software: false,
             terminally_retired: false,
             terminal_error: None,
@@ -902,7 +904,13 @@ impl VideoSink for AndroidVideoSink {
         if let Some(ticket) = &self.owner_ticket {
             if let Poll::Ready(Err(e)) = ticket.poll() {
                 self.owner_ticket = None;
-                return Poll::Ready(Err(VideoError::Sink(SinkError::Fatal(e))));
+                // See `push_packet`'s note: a platform decoder that took the
+                // native owner down with it must not end the film.
+                return Poll::Ready(Err(if matches!(request.target, VideoTarget::Compressed { .. }) {
+                    VideoError::Sink(SinkError::Fallback(e))
+                } else {
+                    VideoError::Sink(SinkError::Fatal(e))
+                }));
             }
         }
 
@@ -923,13 +931,14 @@ impl VideoSink for AndroidVideoSink {
             let backend = self.backend.clone();
             let clock = self.clock.clone();
             let prefer_sw = self.prefer_software;
+            let frame_rate_mode = self.frame_rate_mode;
             let wake = {
                 let ctrl = request.control.clone();
                 Arc::new(move || ctrl.wake())
             };
 
             match try_spawn(
-                move || run_video_owner(mailbox, backend, clock, prefer_sw),
+                move || run_video_owner(mailbox, backend, clock, prefer_sw, frame_rate_mode),
                 wake,
             ) {
                 Ok(ticket) => self.owner_ticket = Some(ticket),
@@ -947,7 +956,13 @@ impl VideoSink for AndroidVideoSink {
         if let Some(ticket) = &self.owner_ticket {
             if let Poll::Ready(Err(e)) = ticket.poll() {
                 self.owner_ticket = None;
-                return Poll::Ready(Err(VideoError::Sink(SinkError::Fatal(e))));
+                // A platform decoder that took its native owner down with it
+                // must not end the film; the engine switches to software.
+                return Poll::Ready(Err(if matches!(request.target, VideoTarget::Compressed { .. }) {
+                    VideoError::Sink(SinkError::Fallback(e))
+                } else {
+                    VideoError::Sink(SinkError::Fatal(e))
+                }));
             }
         }
 
@@ -1046,6 +1061,7 @@ struct CodecMeta {
     csd_progress: CsdProgress,
     current_producer: ProducerId,
     codec_epoch: u64,
+    convert_p7_to_81: bool,
 }
 
 struct CodecSession {
@@ -1689,13 +1705,26 @@ fn run_codec_session(
                                             },
                                         });
                                     } else {
+                                        let source_bytes: std::borrow::Cow<'_, [u8]> = if meta.convert_p7_to_81 {
+                                            let framing = if meta.packets_are_annex_b {
+                                                crate::headers::codec::Framing::AnnexB
+                                            } else {
+                                                crate::headers::codec::Framing::LengthPrefixed(meta.nal_length_size as u8)
+                                            };
+                                            match crate::headers::dovi_rpu::rewrite_p7_packet_to_p81(&packet.data, framing) {
+                                                Some(rewritten) => std::borrow::Cow::Owned(rewritten),
+                                                None => std::borrow::Cow::Borrowed(&packet.data),
+                                            }
+                                        } else {
+                                            std::borrow::Cow::Borrowed(&packet.data)
+                                        };
                                         let annex_b_data = if !meta.packets_are_annex_b {
                                             convert_packet_to_annex_b(
-                                                &packet.data,
+                                                &source_bytes,
                                                 meta.nal_length_size,
                                             )
                                         } else {
-                                            packet.data
+                                            source_bytes.into_owned()
                                         };
                                         let raw_dest = in_buf.buffer_mut();
                                         if raw_dest.len() < annex_b_data.len() {
@@ -1708,6 +1737,19 @@ fn run_codec_session(
                                             drop(annex_b_data);
                                             mailbox.release_input_credit();
                                         } else {
+                                            let hdr10p_codec = match meta.mime.as_str() {
+                                                "video/hevc" | "video/dolby-vision" => Some(("hevc", crate::headers::codec::Framing::AnnexB)),
+                                                "video/av01" => Some(("av1", crate::headers::codec::Framing::AnnexB)),
+                                                _ => None,
+                                            };
+                                            if let Some((cid, frm)) = hdr10p_codec {
+                                                let probe_slice: &[u8] = if cid == "av1" { &packet.data } else { &annex_b_data };
+                                                if let Some(t35) = crate::headers::codec::extract_hdr10_plus_t35(cid, probe_slice, frm) {
+                                                    let mut hdr_params = MediaFormat::new();
+                                                    hdr_params.set_buffer("hdr10-plus-info", &t35);
+                                                    let _ = codec.set_parameters(hdr_params);
+                                                }
+                                            }
                                             write_bytes_to_uninit(raw_dest, &annex_b_data);
                                             let pts_us = pts.as_micros() as u64;
                                             let flags = if random_access {
@@ -1865,6 +1907,13 @@ fn session_can_reuse(
 
 /// Stop/delete codec and drop window BEFORE healthy lease release (C2).
 /// Failures quarantine the lease (drop without release_healthy).
+///
+/// A codec being thrown away is not a playback failure. Some decoders answer
+/// `ErrorUnknown` from `stop()` once they have erred or been stopped elsewhere;
+/// measured on LineageOS Android TV (Pi 4), turning that into a fatal sink
+/// error killed a playback that had already given the codec up. The surface is
+/// still quarantined, because nothing about it can be trusted after a codec
+/// failed on it, but the playback keeps its life.
 fn teardown_codec_resources(
     session: Option<CodecSession>,
     window: &mut Option<NativeWindow>,
@@ -1872,14 +1921,16 @@ fn teardown_codec_resources(
     quarantine_on_error: bool,
 ) -> Result<(), String> {
     if let Some(session) = session {
-        if let Err(e) = session.codec.stop() {
-            let _ = window.take();
-            // Drop lease without healthy release → quarantine (C2).
+        let CodecSession { codec, .. } = session;
+        if let Err(e) = codec.stop() {
+            eprintln!("[peartube-android] codec stop failed: {e:?}; quarantining its surface");
+            drop(codec);
+            drop(window.take());
             let _ = lease.take();
-            return Err(format!("codec stop failed: {e:?}"));
+            return Ok(());
         }
         // MediaCodec Drop may panic; catch via owner catch_unwind at pool level.
-        drop(session.codec);
+        drop(codec);
     }
     drop(window.take());
     if let Some(l) = lease.take() {
@@ -1897,6 +1948,7 @@ fn run_video_owner(
     backend: Arc<BackendShared>,
     clock: Arc<dyn Clock>,
     prefer_software: bool,
+    frame_rate_mode: FrameRateMode,
 ) -> Result<(), String> {
     let mut active_codec: Option<CodecSession> = None;
     let mut active_lease: Option<SurfaceBindingLease> = None;
@@ -2084,6 +2136,7 @@ fn run_video_owner(
                                                     binding.id(),
                                                     req.output_revision,
                                                     prefer_software,
+                                                    frame_rate_mode,
                                                     epoch,
                                                 ) {
                                                     Ok(session) => {
@@ -2210,13 +2263,17 @@ fn run_video_owner(
                                                         Err(error),
                                                     );
                                                 } else {
+                                                    if frame_rate_mode != FrameRateMode::Off {
+                                                        if let Some(fps) = resolve_nominal_fps(params) {
+                                                            super::surface::set_window_frame_rate(&window, fps, frame_rate_mode == FrameRateMode::Seamless);
+                                                        }
+                                                    }
                                                     active_lease = Some(lease);
                                                     current_binding = Some(binding.clone());
                                                     current_window = Some(window);
                                                     applied_sw_geometry = None;
                                                     yv12_rejected = false;
                                                     mailbox.bump_codec_epoch();
-                                                    // Frames must NOT report Configured without window/lease.
                                                     mailbox.set_transition_result(
                                                         req.producer,
                                                         Ok(VideoMode::Frames),
@@ -2326,6 +2383,73 @@ fn run_video_owner(
                                 let (yv12_ds, rgba_cs, full_range) =
                                     resolve_sw_color(sw_params, &frame, src_fmt, w, h);
                                 let mut decision_checked = false;
+                                let p010_bits = match src_fmt {
+                                    PixelFormat::Yuv420P10Le => Some(10u32),
+                                    PixelFormat::Yuv420P12Le => Some(12),
+                                    PixelFormat::Yuv420P16Le => Some(16),
+                                    _ => None,
+                                };
+                                if let Some(src_bits) = p010_bits.filter(|_| frame.planes.len() >= 3 && (w & 1) == 0 && (h & 1) == 0) {
+                                    let should_present = match prepared {
+                                        Some(token) => match mailbox.await_frame_decision(
+                                            token,
+                                            producer,
+                                            &accepted,
+                                            frame_epoch,
+                                            &backend,
+                                        ) {
+                                            DecisionResult::Present => true,
+                                            DecisionResult::Discard | DecisionResult::Cancelled => {
+                                                mailbox.release_input_credit();
+                                                false
+                                            }
+                                        },
+                                        None => {
+                                            if !mailbox.await_frame_policy(&accepted, frame_epoch, &backend) {
+                                                mailbox.release_input_credit();
+                                                false
+                                            } else {
+                                                true
+                                            }
+                                        }
+                                    };
+                                    if !should_present {
+                                        continue;
+                                    }
+                                    decision_checked = true;
+                                    let p010_fmt = super::surface::HAL_PIXEL_FORMAT_YCBCR_P010;
+                                    let p010_ds_id = i32::from(yv12_ds);
+                                    if applied_sw_geometry == Some((w, h, p010_fmt, p010_ds_id))
+                                        || window
+                                            .set_buffers_geometry(
+                                                w as i32,
+                                                h as i32,
+                                                Some(HardwareBufferFormat::from(p010_fmt)),
+                                            )
+                                            .is_ok()
+                                    {
+                                        applied_sw_geometry = Some((w, h, p010_fmt, p010_ds_id));
+                                        let _ = window.set_buffers_data_space(yv12_ds);
+                                        if let Ok(mut guard) = window.lock(None) {
+                                            if super::surface::write_p010_locked_guard(
+                                                &mut guard,
+                                                w,
+                                                h,
+                                                src_bits,
+                                                (&frame.planes[0].data, frame.planes[0].stride),
+                                                (&frame.planes[1].data, frame.planes[1].stride),
+                                                (&frame.planes[2].data, frame.planes[2].stride),
+                                            ) {
+                                                drop(guard);
+                                                ready.ready(pts);
+                                                mailbox.release_input_credit();
+                                                continue;
+                                            }
+                                            drop(guard);
+                                        }
+                                        applied_sw_geometry = None;
+                                    }
+                                }
                                 let can_try_yv12 = !yv12_rejected
                                     && src_fmt == PixelFormat::Yuv420P
                                     && frame.planes.len() >= 3
@@ -2643,6 +2767,7 @@ fn configure_and_start_codec(
     surface_id: SurfaceId,
     output_revision: u64,
     force_software: bool,
+    frame_rate_mode: FrameRateMode,
     codec_epoch: u64,
 ) -> Result<CodecSession, VideoError> {
     let check_current = || -> Result<(), VideoError> {
@@ -2658,46 +2783,109 @@ fn configure_and_start_codec(
         Ok(())
     };
     check_current()?;
-    let mime = match codec_id_to_mime(&params.codec_id.0) {
+    let base_mime = match codec_id_to_mime(&params.codec_id.0) {
         Some(m) => m,
         None => return Err(VideoError::Unsupported),
     };
 
-    let (csd0, csd1, nal_len_size, packets_annex_b) = extract_csd(mime, &params.extradata);
+    if frame_rate_mode != FrameRateMode::Off {
+        if let Some(fps) = resolve_nominal_fps(params) {
+            super::surface::set_window_frame_rate(window, fps, frame_rate_mode == FrameRateMode::Seamless);
+        }
+    }
+
+    let mut parsed_cfg = crate::headers::codec::video_config(params, &[]);
+    let dovi_box = crate::headers::codec::container_dovi_record(params);
+    if let Some(cfg) = &mut parsed_cfg {
+        crate::headers::codec::apply_dovi(
+            cfg,
+            dovi_box.as_deref(),
+            &[],
+            crate::headers::codec::video_framing(params),
+        );
+    }
+    let dovi_cfg = parsed_cfg.as_ref().and_then(|c| c.dovi.clone());
+    let convert_p7_to_81 = dovi_cfg.as_ref().is_some_and(|d| d.convert_p7_to_81);
+
+    let (csd0, csd1, nal_len_size, packets_annex_b) = extract_csd(base_mime, &params.extradata);
+
+    let build_media_format = |target_mime: &str, dovi_rec: Option<&[u8; 24]>| -> MediaFormat {
+        let mut format = MediaFormat::new();
+        format.set_str("mime", target_mime);
+        if let Some(w) = params.width {
+            format.set_i32("width", w as i32);
+        }
+        if let Some(h) = params.height {
+            format.set_i32("height", h as i32);
+        }
+        let max_input = match (params.width, params.height) {
+            (Some(w), Some(h)) if w > 1920 || h > 1080 => 16 * 1024 * 1024,
+            _ => 8 * 1024 * 1024,
+        };
+        format.set_i32("max-input-size", max_input);
+        if !csd0.is_empty() {
+            format.set_buffer("csd-0", &csd0);
+        }
+        if !csd1.is_empty() {
+            format.set_buffer("csd-1", &csd1);
+        }
+        if let Some(rec) = dovi_rec {
+            format.set_buffer("csd-2", rec);
+        }
+        apply_android_hdr_and_color_keys(&mut format, params, parsed_cfg.as_ref());
+        format
+    };
+
+    // Prefer hardware Dolby Vision (`video/dolby-vision` + `csd-2` dvcC/dvvC) when the stream
+    // carries DV metadata, falling back cleanly to `video/hevc` HDR10 when the device lacks DV.
+    if !force_software && base_mime == "video/hevc" {
+        if let Some(dv) = &dovi_cfg {
+            if let Some(dv_codec) = MediaCodec::from_decoder_type("video/dolby-vision") {
+                check_current()?;
+                let dv_fmt = build_media_format("video/dolby-vision", Some(&dv.record));
+                if dv_codec.configure(&dv_fmt, Some(window), MediaCodecDirection::Decoder).is_ok() {
+                    check_current()?;
+                    if dv_codec.start().is_ok() {
+                        return Ok(CodecSession {
+                            codec: dv_codec,
+                            meta: CodecMeta {
+                                mime: "video/dolby-vision".to_string(),
+                                width: params.width.unwrap_or(0),
+                                height: params.height.unwrap_or(0),
+                                csd0,
+                                csd1,
+                                nal_length_size: nal_len_size,
+                                packets_are_annex_b: packets_annex_b,
+                                bound_surface_id: surface_id,
+                                output_revision,
+                                prefer_software: false,
+                                has_seen_output: false,
+                                csd_progress: CsdProgress::Done,
+                                current_producer: request.producer,
+                                codec_epoch,
+                                convert_p7_to_81,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     let codec = if force_software {
-        match software_decoder_name(mime).and_then(MediaCodec::from_codec_name) {
+        match software_decoder_name(base_mime).and_then(MediaCodec::from_codec_name) {
             Some(c) => c,
             None => return Err(VideoError::Unsupported),
         }
     } else {
-        match MediaCodec::from_decoder_type(mime) {
+        match MediaCodec::from_decoder_type(base_mime) {
             Some(c) => c,
             None => return Err(VideoError::Unsupported),
         }
     };
     check_current()?;
 
-    let mut format = MediaFormat::new();
-    format.set_str("mime", mime);
-    if let Some(w) = params.width {
-        format.set_i32("width", w as i32);
-    }
-    if let Some(h) = params.height {
-        format.set_i32("height", h as i32);
-    }
-    let max_input = match (params.width, params.height) {
-        (Some(w), Some(h)) if w > 1920 || h > 1080 => 16 * 1024 * 1024,
-        _ => 8 * 1024 * 1024,
-    };
-    format.set_i32("max-input-size", max_input);
-    if !csd0.is_empty() {
-        format.set_buffer("csd-0", &csd0);
-    }
-    if !csd1.is_empty() {
-        format.set_buffer("csd-1", &csd1);
-    }
-
+    let format = build_media_format(base_mime, None);
     check_current()?;
 
     match codec.configure(&format, Some(window), MediaCodecDirection::Decoder) {
@@ -2715,7 +2903,7 @@ fn configure_and_start_codec(
         Ok(()) => Ok(CodecSession {
             codec,
             meta: CodecMeta {
-                mime: mime.to_string(),
+                mime: base_mime.to_string(),
                 width: params.width.unwrap_or(0),
                 height: params.height.unwrap_or(0),
                 csd0,
@@ -2729,11 +2917,109 @@ fn configure_and_start_codec(
                 csd_progress: CsdProgress::Done,
                 current_producer: request.producer,
                 codec_epoch,
+                convert_p7_to_81,
             },
         }),
         Err(e) => Err(VideoError::Sink(SinkError::Fallback(format!(
             "start: {e:?}"
         )))),
+    }
+}
+
+fn resolve_nominal_fps(params: &CodecParameters) -> Option<f32> {
+    params
+        .frame_rate
+        .filter(|r| r.num > 0 && r.den > 0)
+        .map(|r| (r.num as f64 / r.den as f64) as f32)
+        .or_else(|| {
+            crate::headers::codec::video_config(params, &[])
+                .and_then(|c| c.frame_rate)
+                .map(|f| f as f32)
+        })
+        .filter(|&fps| fps.is_finite() && (1.0..=240.0).contains(&fps))
+}
+
+/// Populates Android `MediaFormat` `color-standard`, `color-transfer`, `color-range`, and
+/// 25-byte CTA-861.3 Type 1 `hdr-static-info` from stream VUI/OBU or Matroska `VideoColour`.
+fn apply_android_hdr_and_color_keys(
+    format: &mut MediaFormat,
+    params: &CodecParameters,
+    cfg: Option<&crate::headers::types::VideoConfig>,
+) {
+    let sig = params.color_signal;
+    let primaries = cfg
+        .and_then(|c| c.colour.map(|col| col.primaries))
+        .unwrap_or(u16::from(sig.primaries.0));
+    let transfer = cfg
+        .and_then(|c| c.colour.map(|col| col.transfer))
+        .unwrap_or(u16::from(sig.transfer.0));
+    let matrix = cfg
+        .and_then(|c| c.colour.map(|col| col.matrix))
+        .unwrap_or(u16::from(sig.matrix.0));
+    let full = cfg
+        .and_then(|c| c.colour.map(|col| col.full_range))
+        .or_else(|| sig.range.full_range_flag());
+
+    // Android MediaFormat COLOR_STANDARD_*: BT709=1, BT601_PAL=2, BT601_NTSC=4, BT2020=6
+    let color_std = if primaries == 9 || matrix == 9 || matrix == 10 {
+        Some(6)
+    } else if primaries == 1 || matrix == 1 {
+        Some(1)
+    } else if primaries == 5 || matrix == 5 {
+        Some(2)
+    } else if primaries == 6 || matrix == 6 {
+        Some(4)
+    } else {
+        None
+    };
+    if let Some(cs) = color_std {
+        format.set_i32("color-standard", cs);
+    }
+
+    // Android MediaFormat COLOR_TRANSFER_*: LINEAR=1, SDR_VIDEO=3, ST2084=6, HLG=7
+    let color_trc = match transfer {
+        16 => Some(6),
+        18 => Some(7),
+        8 => Some(1),
+        1 | 6 | 14 | 15 => Some(3),
+        _ => None,
+    };
+    if let Some(ct) = color_trc {
+        format.set_i32("color-transfer", ct);
+    }
+    if let Some(is_full) = full {
+        format.set_i32("color-range", if is_full { 1 } else { 2 });
+    }
+
+    let mdcv = cfg
+        .and_then(|c| c.mastering_display)
+        .or_else(|| crate::headers::codec::container_mdcv(params));
+    let clli = cfg
+        .and_then(|c| c.content_light)
+        .or_else(|| crate::headers::codec::container_clli(params));
+    if mdcv.is_some() || clli.is_some() {
+        let mut static_info = [0u8; 25];
+        static_info[0] = 0; // CTA-861.3 Type 1 descriptor ID
+        if let Some(m) = mdcv {
+            // Convert ISO big-endian u16 G,B,R,WP coordinates to CTA-861.3 little-endian u16.
+            for i in 0..8 {
+                let v = u16::from_be_bytes([m[i * 2], m[i * 2 + 1]]);
+                static_info[1 + i * 2..3 + i * 2].copy_from_slice(&v.to_le_bytes());
+            }
+            let max_lum_0001 = u32::from_be_bytes([m[16], m[17], m[18], m[19]]);
+            let min_lum_0001 = u32::from_be_bytes([m[20], m[21], m[22], m[23]]);
+            let max_nits = ((max_lum_0001 + 5_000) / 10_000).min(u32::from(u16::MAX)) as u16;
+            let min_units = min_lum_0001.min(u32::from(u16::MAX)) as u16;
+            static_info[17..19].copy_from_slice(&max_nits.to_le_bytes());
+            static_info[19..21].copy_from_slice(&min_units.to_le_bytes());
+        }
+        if let Some(c) = clli {
+            let max_cll = u16::from_be_bytes([c[0], c[1]]);
+            let max_fall = u16::from_be_bytes([c[2], c[3]]);
+            static_info[21..23].copy_from_slice(&max_cll.to_le_bytes());
+            static_info[23..25].copy_from_slice(&max_fall.to_le_bytes());
+        }
+        format.set_buffer("hdr-static-info", &static_info);
     }
 }
 

@@ -18,13 +18,14 @@ mod aspect;
 mod captions;
 mod entry;
 mod decode_order;
-
+pub mod mkv_meta;
 pub use captions::{CAPTIONS_608, CAPTIONS_708};
 
 use std::task::Poll;
 use crate::backend::{
-    AudioSink, Backend, Clock, FrameDecision, PictureReady, PreparedFrameId, ProducerId,
-    SinkError, VideoControl, VideoError, VideoMode, VideoRequest, VideoSink, VideoTarget,
+    AudioOutputMode, AudioSink, Backend, Clock, FrameDecision, FrameRateMode, PcmFormat,
+    PcmSlice, PictureReady, PreparedFrameId, ProducerId, SinkError, VideoControl, VideoError,
+    VideoMode, VideoRequest, VideoSink, VideoTarget,
 };
 use crate::clock::MasterClock;
 use crate::headless::find_headless;
@@ -60,6 +61,17 @@ pub struct PlayerOptions {
     pub soundfont: Option<PathBuf>,
     /// Runtime font discovery; a fixed directory disables OS fallback.
     pub fonts: subs_render::FontOptions,
+    /// Audio output precision, multichannel, and bitstream passthrough routing.
+    pub audio_mode: AudioOutputMode,
+    /// Display refresh-rate matching policy (Dune-style AFR).
+    pub frame_rate_mode: FrameRateMode,
+    /// Reconstructs true 12-bit Dolby Vision Profile 7 FEL (`BL` + `NAL_UNSPEC63` `EL` +
+    /// 3-channel MMR + Lanczos-3 2× upsampling + NLQ residual) via dual software HEVC
+    /// decoders, surpassing FFmpeg `libavcodec`'s 10-bit BL-only decode.
+    pub prefer_fel_12bit: bool,
+    /// Uses the 128-tap 4-term Blackman-Harris 64-bit `f64` linear-phase ultrasonic DSD
+    /// filter (`>95 dB` stopband attenuation above 28 kHz) instead of 48-tap `dsd2pcm`.
+    pub steep_dsd_filter: bool,
 }
 
 impl Default for PlayerOptions {
@@ -71,6 +83,10 @@ impl Default for PlayerOptions {
             realtime: true,
             soundfont: None,
             fonts: subs_render::FontOptions::default(),
+            audio_mode: AudioOutputMode::Auto,
+            frame_rate_mode: FrameRateMode::Seamless,
+            prefer_fel_12bit: false,
+            steep_dsd_filter: false,
         }
     }
 }
@@ -90,6 +106,7 @@ pub struct State {
     pub ended: bool,
     pub error: Option<String>,
     pub tracks: Vec<Track>,
+    pub chapters: Vec<crate::cue::Chapter>,
     pub audio: Option<u32>,
     pub video: Option<u32>,
     pub subtitle: Option<u32>,
@@ -100,6 +117,14 @@ pub struct State {
     pub video_pixel_aspect: Option<(u32, u32)>,
     pub video_fps: Option<f64>,
     pub video_decoder: Option<String>,
+    /// Dynamic-range signal summary (`"Dolby Vision P7 FEL (12-bit)"`, `"Dolby Vision P8.1"`, `"HDR10+"`, `"HDR10"`, `"HLG"`, `"SDR"`).
+    pub video_dynamic_range: Option<String>,
+    /// Decoded or bitstream active bit depth (`8`, `10`, `12`, `16`).
+    pub video_bit_depth: Option<u8>,
+    /// Chroma subsampling (`"4:2:0"`, `"4:2:2"`, `"4:4:4"`).
+    pub video_chroma: Option<String>,
+    /// Active audio sink transport & precision (`"Passthrough · TRUEHD (48.0 kHz)"`, `"PCM · 24-bit 96.0 kHz · 7.1"`).
+    pub audio_output: Option<String>,
     pub dropped_frames: u64,
     /// Trim work lost to input limits. Playback continues with untrimmed
     /// samples; this is not an audio decoder error.
@@ -508,6 +533,10 @@ struct SharedState {
     lanes: Mutex<Vec<Arc<Lane>>>,
     ctx: Arc<RuntimeContext>,
     soundfont: Option<PathBuf>,
+    pub(crate) audio_mode: AudioOutputMode,
+    pub(crate) frame_rate_mode: FrameRateMode,
+    pub(crate) prefer_fel_12bit: bool,
+    pub(crate) steep_dsd_filter: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -613,6 +642,10 @@ impl Player {
             lanes: Mutex::new(Vec::new()),
             ctx,
             soundfont: options.soundfont.clone(),
+            audio_mode: options.audio_mode,
+            frame_rate_mode: options.frame_rate_mode,
+            prefer_fel_12bit: options.prefer_fel_12bit,
+            steep_dsd_filter: options.steep_dsd_filter,
         });
 
         let url_owned = url.to_string();
@@ -780,8 +813,54 @@ fn run_player_pipeline(
     //    engine keeps its monitor: starvation reports drive the buffering
     //    hold, suspend/resume pause the download. A VobSub index (`.idx`)
     //    plays from its program stream (`.sub`): that is the source.
-    let vobsub = crate::source::vobsub_stream_url(&url);
-    let mut source = match open_source(vobsub.as_deref().unwrap_or(&url)) {
+    // Resolve `.cue` disc sheets before opening the underlying lossless audio stream.
+    let mut initial_chapters: Vec<crate::cue::Chapter> = Vec::new();
+    let effective_url = {
+        let path_part = url.split('?').next().unwrap_or(&url);
+        if path_part.len() > 4 && path_part[path_part.len() - 4..].eq_ignore_ascii_case(".cue") {
+            let mut cue_src = match open_source(&url) {
+                Ok(s) => s,
+                Err(e) => {
+                    if !shared.stopped.load(Ordering::SeqCst) {
+                        set_error(&shared, format!("failed to open CUE sheet: {e}"));
+                    }
+                    return;
+                }
+            };
+            let mut raw = Vec::new();
+            use std::io::Read;
+            if let Err(e) = (&mut cue_src)
+                .take((crate::cue::MAX_CUE_BYTES + 1) as u64)
+                .read_to_end(&mut raw)
+            {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, format!("failed to read CUE sheet: {e}"));
+                }
+                return;
+            }
+            let text = String::from_utf8_lossy(&raw);
+            let sheet = crate::cue::parse_cue_sheet(&text);
+            let Some(audio_file) = sheet.audio_file.as_deref() else {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, "CUE sheet declares no safe local FILE entry".into());
+                }
+                return;
+            };
+            let Some(resolved) = crate::cue::resolve_sibling_url(&url, audio_file) else {
+                if !shared.stopped.load(Ordering::SeqCst) {
+                    set_error(&shared, "failed to resolve CUE audio FILE sibling".into());
+                }
+                return;
+            };
+            initial_chapters = sheet.chapters;
+            resolved
+        } else {
+            url.clone()
+        }
+    };
+
+    let vobsub = crate::source::vobsub_stream_url(&effective_url);
+    let mut source = match open_source(vobsub.as_deref().unwrap_or(&effective_url)) {
         Ok(s) => s,
         Err(e) => {
             if !shared.stopped.load(Ordering::SeqCst) {
@@ -799,16 +878,11 @@ fn run_player_pipeline(
     });
     *shared.source.lock() = Some(monitor);
     if shared.stopped.load(Ordering::SeqCst) {
-        // Dropped while the source opened: `Player::drop` neither waited for
-        // this thread nor could stop a source that did not exist yet.
         return;
     }
 
     let demuxer = if vobsub.is_some() {
-        // 2-3. VobSub: the index, read whole as it opens, beside the
-        //    program stream (FFmpeg's vobsub demuxer pairs them the same
-        //    way). No probe: no registered container reads the pair.
-        let opened = open_source(&url).map_err(|e| e.to_string()).and_then(|index| {
+        let opened = open_source(&effective_url).map_err(|e| e.to_string()).and_then(|index| {
             subs_bitmap::open_vobsub(Box::new(index), Box::new(source)).map_err(|e| e.to_string())
         });
         match opened {
@@ -821,8 +895,7 @@ fn run_player_pipeline(
             }
         }
     } else {
-        // 2. Probe (rule from engine-api.md, same as refcheck), then rewind.
-        let container = match probe_container(&url, &mut source, &shared) {
+        let container = match probe_container(&effective_url, &mut source, &shared) {
             Ok(c) => c,
             Err(e) => {
                 if !shared.stopped.load(Ordering::SeqCst) {
@@ -832,16 +905,30 @@ fn run_player_pipeline(
             }
         };
 
-        // 3. Demuxer. Container codec tags resolve through the registry —
-        //    the mpeg4video fork claims Matroska's MPEG-4 Part 2 CodecIDs
-        //    (V_MPEG4/ISO/ASP, //SP, //AP) directly.
-        match ctx.containers.open_demuxer(&container, Box::new(source), &ctx.codecs) {
-            Ok(d) => d,
-            Err(e) => {
-                if !shared.stopped.load(Ordering::SeqCst) {
-                    set_error(&shared, format!("failed to open demuxer: {e}"));
+        if container == "matroska" || container == "webm" {
+            match mkv_meta::open_mkv_enriched(Box::new(source), &ctx.codecs) {
+                Ok((d, mkv_chaps)) => {
+                    if initial_chapters.is_empty() {
+                        initial_chapters = mkv_chaps;
+                    }
+                    d
                 }
-                return;
+                Err(e) => {
+                    if !shared.stopped.load(Ordering::SeqCst) {
+                        set_error(&shared, format!("failed to open demuxer: {e}"));
+                    }
+                    return;
+                }
+            }
+        } else {
+            match ctx.containers.open_demuxer(&container, Box::new(source), &ctx.codecs) {
+                Ok(d) => d,
+                Err(e) => {
+                    if !shared.stopped.load(Ordering::SeqCst) {
+                        set_error(&shared, format!("failed to open demuxer: {e}"));
+                    }
+                    return;
+                }
             }
         }
     };
@@ -929,8 +1016,18 @@ fn run_player_pipeline(
     let current_subtitle = *shared.wanted_subtitle.lock();
 
     {
+        if initial_chapters.is_empty() {
+            for (k, v) in demuxer.metadata() {
+                if k.eq_ignore_ascii_case("CUESHEET") {
+                    initial_chapters = crate::cue::parse_cue_sheet(v).chapters;
+                    break;
+                }
+            }
+        }
+        crate::cue::finalize_chapter_ends(&mut initial_chapters, duration);
         let mut st = shared.state.lock();
         st.tracks = tracks;
+        st.chapters = initial_chapters;
         st.audio = current_audio;
         st.video = current_video;
         st.subtitle = current_subtitle;
@@ -956,13 +1053,17 @@ fn run_player_pipeline(
                     .filter(|fps| (1.0..=240.0).contains(fps))
             })
         });
-        st.video_decoder = current_video.map(|idx| {
-            streams
-                .iter()
-                .find(|s| s.index == idx)
-                .map(|s| s.params.codec_id.as_str().to_string())
-                .unwrap_or_default()
-        });
+        #[cfg(target_os = "macos")]
+        if let Some(fps) = st.video_fps {
+            let _ = crate::apple::match_macos_display_refresh_rate(fps, shared.frame_rate_mode);
+        }
+        if let Some(vs) = current_video.and_then(|idx| streams.iter().find(|s| s.index == idx)) {
+            st.video_decoder = Some(vs.params.codec_id.as_str().to_string());
+            let (dr, bd, chr) = describe_video_signal(&vs.params, shared.prefer_fel_12bit);
+            st.video_dynamic_range = Some(dr);
+            st.video_bit_depth = bd;
+            st.video_chroma = chr;
+        }
     }
     notify_changed(&shared);
 
@@ -1143,7 +1244,7 @@ fn spawn_video(
 ) -> PipelineThread {
     let consumer = Consumer::new(lane, demux_cv);
     let live = Live::new(shared, Pipe::Video);
-    let sink = shared.backend.video(shared.sink_clock());
+    let sink = shared.backend.video_with_frame_rate(shared.sink_clock(), shared.frame_rate_mode);
     let (shared, lane, demux_cv) = (Arc::clone(shared), Arc::clone(lane), Arc::clone(demux_cv));
     PipelineThread::spawn("peartube-video", move |retired| {
         let _guards = (live, consumer);
@@ -1999,12 +2100,21 @@ fn run_audio_thread(
             decoder_params.options.insert("soundfont", path);
         }
     }
-    // E-AC-3 goes to an output that takes it compressed: the platform's own
-    // decoder keeps the Dolby Atmos objects PCM loses. When the output plays
-    // PCM only, or stops taking packets, decoding takes over from the packet
-    // it has not played.
+    if shared.steep_dsd_filter && decoder_params.codec_id.as_str().starts_with("dsd_") {
+        decoder_params.options.insert("dsd_mode", "steep64");
+    }
+    // In `Auto` and `Passthrough`, offer AC-3, E-AC-3, DTS/DTS-HD MA, and TrueHD/MLP
+    // compressed bitstreams to the sink first: Android TV HDMI eARC AVRs receive pure
+    // IEC 61937 MAT/DTS-HD bitstreams and Apple receives AC-3/E-AC-3 Atmos, while any
+    // non-passthrough endpoint declines cleanly and falls straight back to bit-exact PCM.
     let mut pending = None;
-    if stream.params.codec_id.as_str() == "eac3" {
+    let try_passthrough = match shared.audio_mode {
+        AudioOutputMode::Auto | AudioOutputMode::Passthrough => {
+            matches!(stream.params.codec_id.as_str(), "ac3" | "eac3" | "dts" | "truehd" | "mlp")
+        }
+        AudioOutputMode::BitPerfectPcm | AudioOutputMode::Stereo => false,
+    };
+    if try_passthrough {
         match play_compressed(&stream, sink, &lane, &demux_cv, &shared, realtime, &retired) {
             Passthrough::Played => return,
             Passthrough::Declined(packet) => pending = packet,
@@ -2026,9 +2136,15 @@ fn run_audio_thread(
         }
     };
 
+    let initial_format = stream
+        .params
+        .sample_format
+        .map(PcmFormat::from_sample_format)
+        .unwrap_or(PcmFormat::F32);
     let mut out = AudioOut {
         rate: stream.params.sample_rate.unwrap_or(48000),
         layout: stream.params.resolved_layout().unwrap_or(ChannelLayout::Stereo),
+        format: initial_format,
         open: false,
         written: Written::default(),
         seen_seek_target: 0,
@@ -2036,7 +2152,13 @@ fn run_audio_thread(
     };
     // The output may come from the previous track: none of that plays on.
     sink.flush();
-    out.open = sink.open(out.rate, out.layout).is_ok();
+    out.open = sink.open_pcm(out.rate, out.layout, out.format, shared.audio_mode).is_ok();
+    if out.open {
+        let desc = describe_pcm_output(out.format, out.rate, out.layout, shared.audio_mode);
+        if shared.state.lock().audio_output.replace(desc.clone()) != Some(desc) {
+            notify_changed(&shared);
+        }
+    }
     let mut starved = false;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
@@ -2277,6 +2399,17 @@ fn play_compressed(
             Pop::Packet(p) => p,
             Pop::Wake => continue,
             Pop::Eof => {
+                while !quit() && shared.seek_gen.load(Ordering::SeqCst) == seen_seek {
+                    sync_audio_sink(sink, shared, &mut written.running);
+                    match sink.drain() {
+                        Ok(true) | Err(_) => break,
+                        Ok(false) => {
+                            if !shared.wait_output(seen_seek, retired) {
+                                break;
+                            }
+                        }
+                    }
+                }
                 // The output plays what it holds before the pipeline ends.
                 if let (true, Some(end), Some(leads)) = (realtime, written.end, written.leads) {
                     if leads == seen_seek {
@@ -2295,13 +2428,31 @@ fn play_compressed(
             }
         };
         if !opened {
-            match sink.open_compressed(&stream.params, &queued.packet.data) {
-                Ok(true) => opened = true,
+            match sink.open_compressed_with_mode(
+                &stream.params,
+                &queued.packet.data,
+                shared.audio_mode,
+            ) {
+                Ok(true) => {
+                    opened = true;
+                    let sr_khz = f64::from(stream.params.sample_rate.unwrap_or(48_000)) / 1000.0;
+                    let desc = format!(
+                        "Passthrough · {} ({sr_khz:.1} kHz)",
+                        stream.params.codec_id.as_str().to_uppercase()
+                    );
+                    if shared.state.lock().audio_output.replace(desc.clone()) != Some(desc) {
+                        notify_changed(shared);
+                    }
+                }
                 _ => return Passthrough::Declined(Some(queued)),
             }
         }
         let packet = &queued.packet;
-        let frames = crate::headers::codec::eac3_frame_samples(&packet.data).unwrap_or(1536);
+        let frames = crate::iec61937::packet_frame_samples(
+            stream.params.codec_id.as_str(),
+            &packet.data,
+            stream.params.sample_rate.unwrap_or(48_000),
+        );
         let span = f64::from(frames) / rate;
         let start = match packet.pts {
             Some(pts) => packet.time_base.seconds_of(pts),
@@ -2366,10 +2517,12 @@ fn play_compressed(
     Passthrough::Played
 }
 
-/// Decoded audio on its way to the sink: interleaved f32 in its own layout
-/// and the time its first sample plays.
+/// Decoded audio on its way to the sink: exact little-endian interleaved bytes
+/// in its native [`PcmFormat`] so 24/32-bit integer and 64-bit float masters
+/// never lose their bottom bits before touching the sink.
 struct Chunk {
-    pcm: Vec<f32>,
+    bytes: Vec<u8>,
+    format: PcmFormat,
     channels: usize,
     layout: ChannelLayout,
     rate: u32,
@@ -2378,9 +2531,16 @@ struct Chunk {
     begins: bool,
 }
 
+impl Chunk {
+    #[inline]
+    fn frame_stride(&self) -> usize {
+        self.channels.max(1) * self.format.bytes_per_sample()
+    }
+}
+
 impl Pcm for Chunk {
     fn samples(&self) -> usize {
-        self.pcm.len() / self.channels.max(1)
+        self.bytes.len() / self.frame_stride()
     }
 
     fn rate(&self) -> u32 {
@@ -2388,18 +2548,28 @@ impl Pcm for Chunk {
     }
 
     fn retained_bytes(&self) -> usize {
-        self.pcm.capacity() * std::mem::size_of::<f32>()
+        self.bytes.capacity()
     }
 
     fn drop_front(&mut self, n: usize) {
-        self.pcm.drain(..n.saturating_mul(self.channels).min(self.pcm.len()));
+        let cut = n.saturating_mul(self.frame_stride()).min(self.bytes.len());
+        self.bytes.drain(..cut);
         self.pts += n as f64 / f64::from(self.rate.max(1));
     }
 
     fn split_off(&mut self, n: usize) -> Self {
-        let rest = self.pcm.split_off(n.saturating_mul(self.channels).min(self.pcm.len()));
+        let at = n.saturating_mul(self.frame_stride()).min(self.bytes.len());
+        let rest = self.bytes.split_off(at);
         let pts = self.pts + n as f64 / f64::from(self.rate.max(1));
-        Chunk { pcm: rest, channels: self.channels, layout: self.layout, rate: self.rate, pts, begins: false }
+        Chunk {
+            bytes: rest,
+            format: self.format,
+            channels: self.channels,
+            layout: self.layout,
+            rate: self.rate,
+            pts,
+            begins: false,
+        }
     }
 
     fn begins_presentation(&mut self) {
@@ -2418,26 +2588,42 @@ fn decoded_chunk(
     decoded_end: &mut Option<f64>,
 ) -> Chunk {
     let layout = audio_trim::frame_layout(decoder.output_audio_format(), &stream.params, af);
-    let (format, rate, channels) = (layout.sample_format, layout.sample_rate, layout.channels as usize);
-    let pcm = convert_audio_to_f32(af, format, channels);
+    let (raw_format, rate, channels) = (
+        layout.sample_format,
+        layout.sample_rate,
+        layout.channels as usize,
+    );
+    let (format, bytes) = pack_audio_interleaved(af, raw_format, channels);
     let pts = match (af.pts.or(packet_pts.take()), *decoded_end) {
         (Some(ticks), _) => stream.time_base.seconds_of(ticks),
         (None, Some(end)) => end,
         (None, None) => 0.0,
     };
-    let frames = pcm.len() / channels.max(1);
+    let stride = channels.max(1) * format.bytes_per_sample();
+    let frames = bytes.len() / stride;
     *decoded_end = Some(pts + frames as f64 / f64::from(rate.max(1)));
-    let layout = stream.params.resolved_layout()
+    let layout = stream
+        .params
+        .resolved_layout()
         .filter(|layout| usize::from(layout.channel_count()) == channels)
         .unwrap_or_else(|| ChannelLayout::from_count(channels as u16));
-    Chunk { pcm, channels, layout, rate, pts, begins: false }
+    Chunk {
+        bytes,
+        format,
+        channels,
+        layout,
+        rate,
+        pts,
+        begins: false,
+    }
 }
 
 /// What an audio pipeline's output is set up for and has taken.
 struct AudioOut {
-    /// The layout the sink was last opened with, and whether that worked.
+    /// The layout and sample format the sink was last opened with, and whether that worked.
     rate: u32,
     layout: ChannelLayout,
+    format: PcmFormat,
     open: bool,
     written: Written,
     /// The newest seek generation whose target the output has reached.
@@ -2467,10 +2653,10 @@ fn present_kept(
 }
 
 /// One chunk of decoded audio to the sink, which is (re)opened for its
-/// layout. Samples stamped before zero precede the presentation (codec
-/// priming no container trim covered), unless a declared start skip just
-/// came off: those begin the presentation at zero, as FFmpeg plays them.
-/// After a seek, those before its target never play.
+/// layout and sample format. Samples stamped before zero precede the
+/// presentation (codec priming no container trim covered), unless a declared
+/// start skip just came off: those begin the presentation at zero, as FFmpeg
+/// plays them. After a seek, those before its target never play.
 fn present_audio(
     sink: &mut dyn AudioSink,
     shared: &SharedState,
@@ -2480,53 +2666,61 @@ fn present_audio(
     realtime: bool,
     retired: &AtomicBool,
 ) -> bool {
-    let Chunk { mut pcm, channels, layout, rate: sample_rate, pts, begins } = chunk;
-    if !out.open || sample_rate != out.rate || layout != out.layout {
+    let stride = chunk.frame_stride();
+    let Chunk {
+        mut bytes,
+        format,
+        channels,
+        layout,
+        rate: sample_rate,
+        pts,
+        begins,
+    } = chunk;
+    if !out.open || sample_rate != out.rate || layout != out.layout || format != out.format {
         out.rate = sample_rate;
         out.layout = layout;
+        out.format = format;
         out.written.reopen(shared);
-        out.open = sink.open(out.rate, out.layout).is_ok();
+        out.open = sink
+            .open_pcm(out.rate, out.layout, out.format, shared.audio_mode)
+            .is_ok();
+        if out.open {
+            let desc = describe_pcm_output(out.format, out.rate, out.layout, shared.audio_mode);
+            if shared.state.lock().audio_output.replace(desc.clone()) != Some(desc) {
+                notify_changed(shared);
+            }
+        }
     }
     let sink_failed = !out.open;
 
-    // Clamping undeclared priming stamped before zero to zero would overlap
-    // the first real samples on the output's timeline. Declared priming is
-    // gone already; what follows it starts the presentation even when the
-    // container's timestamps disagree with its skip.
     let mut pts_secs = pts;
     if pts_secs < 0.0 {
         if !begins {
             let before = (-pts_secs * f64::from(sample_rate)).round() as usize;
-            pcm.drain(..(before.saturating_mul(channels)).min(pcm.len()));
+            bytes.drain(..(before.saturating_mul(stride)).min(bytes.len()));
         }
         pts_secs = 0.0;
     }
 
-    // Drop pre-target output after a seek: audio before the target never
-    // reaches the sink. The chunk that holds the target loses its samples
-    // before it, so the clock restarts at the target with the target's own
-    // sample.
     if let Some(seek) = *shared.active_seek.lock() {
         if seek.generation > out.seen_seek_target && pts_secs < seek.target {
-            let frames = pcm.len() / channels.max(1);
+            let frames = bytes.len() / stride;
             let before = ((seek.target - pts_secs) * f64::from(sample_rate)).round() as usize;
             if before < frames {
-                pcm.drain(..before * channels);
+                bytes.drain(..before * stride);
                 pts_secs = seek.target;
             } else {
-                pcm.clear();
+                bytes.clear();
             }
         }
-        if !pcm.is_empty() {
+        if !bytes.is_empty() {
             out.seen_seek_target = seen_seek;
         }
     }
-    if pcm.is_empty() {
+    if bytes.is_empty() {
         return true;
     }
 
-    // A failed output cannot prime; let the remaining streams run. A
-    // working output primes only after it has actually taken PCM.
     if sink_failed {
         if out.primed != Some(seen_seek) {
             out.primed = Some(seen_seek);
@@ -2539,7 +2733,23 @@ fn present_audio(
         Some(end) if (pts_secs - end.as_secs_f64()).abs() < AUDIO_ALIGN_SECS => end,
         _ => chunk_pts,
     };
-    write_pcm(sink, shared, &pcm, layout, sample_rate, pts, seen_seek, realtime, &mut out.written, retired)
+    let slice = PcmSlice {
+        format,
+        channels: channels.max(1) as u16,
+        data: &bytes,
+    };
+    write_pcm(
+        sink,
+        shared,
+        slice,
+        layout,
+        sample_rate,
+        pts,
+        seen_seek,
+        realtime,
+        &mut out.written,
+        retired,
+    )
 }
 
 /// What an audio pipeline knows about its output across writes.
@@ -2592,7 +2802,7 @@ fn sync_audio_sink(sink: &mut dyn AudioSink, shared: &SharedState, applied: &mut
 fn write_pcm(
     sink: &mut dyn AudioSink,
     shared: &SharedState,
-    pcm: &[f32],
+    pcm: PcmSlice<'_>,
     layout: ChannelLayout,
     rate: u32,
     pts: Duration,
@@ -2601,14 +2811,14 @@ fn write_pcm(
     written: &mut Written,
     retired: &AtomicBool,
 ) -> bool {
-    let channels = usize::from(layout.channel_count()).max(1);
     let rate = rate.max(1);
     let chunk = (rate as usize / 50).max(1);
-    let frames = pcm.len() / channels;
+    let frames = pcm.frames();
     let mut done = 0;
     while done < frames {
         let at = pts + Duration::from_secs_f64(done as f64 / f64::from(rate));
         sync_audio_sink(sink, shared, &mut written.running);
+        let until = frames.min(done + chunk);
         let result = {
             #[cfg(target_os = "macos")]
             let _timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
@@ -2620,15 +2830,15 @@ fn write_pcm(
                     Preroll::Abort => return false,
                 }
             }
-            let until = frames.min(done + chunk);
-            sink.write(&pcm[done * channels..until * channels], at)
+            sink.write_pcm(pcm.subslice_frames(done, until), at)
         };
-        let until = frames.min(done + chunk);
         match result {
             Ok(0) => {
                 // Full (or paused): retain these samples and retry once the
                 // output can drain.
-                if !shared.wait_output(seen_seek, retired) { return false; }
+                if !shared.wait_output(seen_seek, retired) {
+                    return false;
+                }
             }
             Ok(n) => {
                 done += n.min(until - done);
@@ -2641,18 +2851,18 @@ fn write_pcm(
             }
             Err(SinkError::Unavailable) => {
                 // Suspended: the platform's resume recreates the output.
-                // Reopening here would restart it in the background. Keep
-                // the samples; the free clock leads until audio plays again.
                 if written.leads.is_some() {
                     written.reopen(shared);
                 }
-                if !shared.wait_resumed(seen_seek, retired) { return false; }
+                if !shared.wait_resumed(seen_seek, retired) {
+                    return false;
+                }
             }
             Err(_) => {
                 // Sink refused (device lost): keep the engine alive and
                 // reopen it for the next samples.
                 written.reopen(shared);
-                let _ = sink.open(rate, layout);
+                let _ = sink.open_pcm(rate, layout, pcm.format, shared.audio_mode);
                 return true;
             }
         }
@@ -2660,59 +2870,74 @@ fn write_pcm(
     true
 }
 
-fn convert_audio_to_f32(
+/// Packs an [`oxideav_core::AudioFrame`] (planar or interleaved) into
+/// interleaved little-endian bytes of its lossless [`PcmFormat`] without
+/// narrowing 32-bit integers or 64-bit floats through `f32`.
+fn pack_audio_interleaved(
     af: &oxideav_core::AudioFrame,
     format: SampleFormat,
     channels: usize,
-) -> Vec<f32> {
+) -> (PcmFormat, Vec<u8>) {
     let n = af.samples as usize;
-    let mut out = Vec::with_capacity(n * channels);
-    for i in 0..n {
-        for c in 0..channels {
-            out.push(sample_f32(format, &af.data, channels, c, i));
-        }
+    let ch = channels.max(1);
+    let dst_fmt = PcmFormat::from_sample_format(format);
+    let dst_w = dst_fmt.bytes_per_sample();
+    if n == 0 || af.data.is_empty() {
+        return (dst_fmt, Vec::new());
     }
-    out
-}
 
-fn sample_f32(
-    format: SampleFormat,
-    data: &[Vec<u8>],
-    channels: usize,
-    c: usize,
-    i: usize,
-) -> f32 {
-    let (plane, index) = if format.is_planar() {
-        if c < data.len() {
-            (&data[c], i)
-        } else {
-            (&data[0], i)
+    // Fast path: already packed interleaved in the exact wire representation.
+    if !format.is_planar() && format != SampleFormat::S8 {
+        let src_w = format.bytes_per_sample();
+        if src_w == dst_w {
+            let needed = n.saturating_mul(ch).saturating_mul(dst_w);
+            let plane = &af.data[0];
+            if plane.len() >= needed {
+                return (dst_fmt, plane[..needed].to_vec());
+            }
         }
-    } else {
-        (&data[0], i * channels + c)
-    };
-    let w = format.bytes_per_sample();
-    let start = index * w;
-    if start + w > plane.len() {
-        return 0.0;
     }
-    let b = &plane[start..start + w];
-    match format {
-        SampleFormat::U8 | SampleFormat::U8P => (b[0] as f32 - 128.0) / 128.0,
-        SampleFormat::S8 => (b[0] as i8 as f32) / 128.0,
-        SampleFormat::S16 | SampleFormat::S16P => i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
-        SampleFormat::S24 => (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8388608.0,
-        SampleFormat::S32 | SampleFormat::S32P => {
-            i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32 / 2147483648.0
+
+    let src_w = format.bytes_per_sample();
+    let mut out = Vec::with_capacity(n.saturating_mul(ch).saturating_mul(dst_w));
+    for i in 0..n {
+        for c in 0..ch {
+            let (plane, index) = if format.is_planar() {
+                let p = if c < af.data.len() { &af.data[c] } else { &af.data[0] };
+                (p, i)
+            } else {
+                (&af.data[0], i * ch + c)
+            };
+            let start = index.saturating_mul(src_w);
+            if start + src_w > plane.len() {
+                match dst_fmt {
+                    PcmFormat::U8 => out.push(128),
+                    _ => out.extend(std::iter::repeat_n(0u8, dst_w)),
+                }
+                continue;
+            }
+            let b = &plane[start..start + src_w];
+            match format {
+                SampleFormat::S8 => {
+                    let widened = (b[0] as i8 as i16) << 8;
+                    out.extend_from_slice(&widened.to_le_bytes());
+                }
+                SampleFormat::U8
+                | SampleFormat::U8P
+                | SampleFormat::S16
+                | SampleFormat::S16P
+                | SampleFormat::S24
+                | SampleFormat::S32
+                | SampleFormat::S32P
+                | SampleFormat::F32
+                | SampleFormat::F32P
+                | SampleFormat::F64
+                | SampleFormat::F64P => out.extend_from_slice(b),
+                _ => out.extend(std::iter::repeat_n(0u8, dst_w)),
+            }
         }
-        SampleFormat::F32 | SampleFormat::F32P => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-        SampleFormat::F64 | SampleFormat::F64P => {
-            f64::from_le_bytes(b.try_into().unwrap_or([0; 8])) as f32
-        }
-        // Non-exhaustive upstream: treat anything new as silence rather than
-        // panicking on untrusted input.
-        _ => 0.0,
     }
+    (dst_fmt, out)
 }
 
 struct PipelineVideoControl {
@@ -2818,6 +3043,7 @@ struct VideoSession {
     recovery_deadline: Option<Instant>,
     control: Arc<PipelineVideoControl>,
     sw_decoder: Option<Box<dyn Decoder>>,
+    fel_composer: Option<FelSoftwareComposer>,
     frame_format: Option<CodecParameters>,
     decoded_params: CodecParameters,
     output_watch: OutputParamsWatch,
@@ -2838,6 +3064,9 @@ struct VideoSession {
     phase: VideoPhase,
     /// Decoder flush issued once per EOF episode.
     decoder_flushed: bool,
+    /// A platform decoder that never showed a picture already got its one
+    /// software rescue; a second silent deadline is a real failure.
+    software_rescue_used: bool,
     /// Packets the software decoder refused in a row (damaged input).
     refused_packets: u32,
     /// Sink finish sealed once per EOF episode.
@@ -2903,6 +3132,7 @@ impl VideoSession {
             recovery_deadline: None,
             control,
             sw_decoder: None,
+            fel_composer: None,
             frame_format: None,
             decoded_params: stream.params.clone(),
             output_watch: OutputParamsWatch::new(),
@@ -2921,6 +3151,7 @@ impl VideoSession {
             pending_format_change: None,
             phase: VideoPhase::Feeding,
             decoder_flushed: false,
+            software_rescue_used: false,
             refused_packets: 0,
             sink_finish_sealed: false,
             fps_probe: None,
@@ -3061,6 +3292,43 @@ impl VideoSession {
             }
         };
         self.rebuild_request(target, self.effective_deadline());
+    }
+
+    /// A decoder switch must not inherit the allowance the failed decoder
+    /// already spent, or the replacement is declared dead on the very next
+    /// poll. Measured on LineageOS Android TV (Pi 4): the platform decoder
+    /// gave up inside the startup window, the software handoff inherited the
+    /// expired deadline, and the film ended before software could draw.
+    fn renew_after_decoder_switch(&mut self) {
+        self.recovering = None;
+        self.recovery_deadline = None;
+        self.deadline = self.control.active_now() + READY_TIMEOUT;
+    }
+
+    /// A platform decoder that accepted the stream and then showed nothing is
+    /// a device fault, not a reason to end the film: measured on LineageOS
+    /// Android TV (Pi 4), MediaCodec configured H.264, delivered no picture,
+    /// failed its own stop(), and sometimes answered NULL input buffers until
+    /// the `ndk` crate panicked. The software decoder played the same clip to
+    /// the end with zero dropped frames. Returns true when the rescue was
+    /// armed and the caller should continue; one rescue per session.
+    fn rescue_silent_platform_decoder(&mut self, shared: &SharedState, stream: &StreamInfo) -> bool {
+        if !self.target_compressed || self.software_rescue_used {
+            return false;
+        }
+        self.software_rescue_used = true;
+        match make_decoder(&shared.ctx, &stream.params) {
+            Ok(d) => {
+                self.sw_decoder = Some(d);
+                self.renew_after_decoder_switch();
+                self.new_producer_for_software_fallback(shared);
+                true
+            }
+            Err(e) => {
+                video_decoder_failed(shared, e);
+                true
+            }
+        }
     }
 
     fn new_producer_for_software_fallback(&mut self, shared: &SharedState) {
@@ -3388,15 +3656,26 @@ impl VideoSession {
                     format_changed |= self.decoded_params.pixel_format != Some(format);
                     self.decoded_params.pixel_format = Some(format);
                 }
+                let mut vf = vf;
+                if let Some(fel) = self.fel_composer.as_mut() {
+                    let (bw, bh) = (
+                        self.decoded_params.width.unwrap_or(0),
+                        self.decoded_params.height.unwrap_or(0),
+                    );
+                    if let Some(composed) = fel.compose_if_ready(&vf, bw, bh) {
+                        vf = composed;
+                        format_changed |=
+                            self.decoded_params.pixel_format != Some(oxideav_core::PixelFormat::Yuv420P16Le);
+                        self.decoded_params.pixel_format = Some(oxideav_core::PixelFormat::Yuv420P16Le);
+                    }
+                }
                 format_changed |= self.frame_format.is_none();
 
                 let seed = self.packet_pts_seed.take();
                 let ticks = self.frame_clock.time(vf.pts, seed);
                 let frame_pts_secs = stream.time_base.seconds_of(ticks).max(0.0);
                 let pts = Duration::from_secs_f64(frame_pts_secs);
-
                 if format_changed {
-                    // One existing transition installs all output fields before
                     // the retained picture, including rate, colour and layers.
                     self.pending_format_change = Some(Arc::new(self.decoded_params.clone()));
                 }
@@ -3478,6 +3757,7 @@ fn run_video_thread(
     let seen_seek = shared.seek_gen.load(Ordering::SeqCst);
     let (deadline, is_recovery) = VideoSession::deadline_for_generation(&shared, seen_seek);
     let output = sink.output();
+    let want_fel_12bit = shared.prefer_fel_12bit && is_dovi_profile7_hevc(&stream.params);
     let mut session = VideoSession::new(
         &stream,
         &shared,
@@ -3485,8 +3765,31 @@ fn run_video_thread(
         seen_seek,
         output.revision,
         deadline,
-        true,
+        !want_fel_12bit,
     );
+    if want_fel_12bit {
+        match open_fel_software_pair(&shared.ctx, &stream.params) {
+            Ok((bl_dec, fel)) => {
+                session.sw_decoder = Some(bl_dec);
+                session.fel_composer = Some(fel);
+                let mut st = shared.state.lock();
+                st.video_dynamic_range = Some("Dolby Vision P7 FEL (12-bit)".into());
+                st.video_bit_depth = Some(12);
+            }
+            Err(_) => {
+                // Fall back cleanly to standard compressed hardware decode if software HEVC unavailable.
+                session = VideoSession::new(
+                    &stream,
+                    &shared,
+                    &retired,
+                    seen_seek,
+                    output.revision,
+                    deadline,
+                    true,
+                );
+            }
+        }
+    }
     if is_recovery {
         session.recovery_deadline = Some(deadline);
     }
@@ -3510,15 +3813,22 @@ fn run_video_thread(
             let (new_deadline, is_recovery) = VideoSession::deadline_for_generation(&shared, gen_now);
             session.new_producer_for_seek(gen_now, new_deadline, is_recovery, &shared);
             if session.sw_decoder.is_some() {
-                match make_decoder(&shared.ctx, &stream.params) {
-                    Ok(d) => session.sw_decoder = Some(d),
-                    Err(e) => {
-                        let mut st = shared.state.lock();
-                        let _ = st.error.get_or_insert_with(|| format!("video decoder failed to restart: {e}"));
-                        st.video = None;
-                        drop(st);
-                        notify_changed(&shared);
-                        return;
+                if session.fel_composer.is_some() {
+                    if let Ok((bl_dec, fel)) = open_fel_software_pair(&shared.ctx, &stream.params) {
+                        session.sw_decoder = Some(bl_dec);
+                        session.fel_composer = Some(fel);
+                    }
+                } else {
+                    match make_decoder(&shared.ctx, &stream.params) {
+                        Ok(d) => session.sw_decoder = Some(d),
+                        Err(e) => {
+                            let mut st = shared.state.lock();
+                            let _ = st.error.get_or_insert_with(|| format!("video decoder failed to restart: {e}"));
+                            st.video = None;
+                            drop(st);
+                            notify_changed(&shared);
+                            return;
+                        }
                     }
                 }
             }
@@ -3591,8 +3901,25 @@ fn run_video_thread(
                         VideoMode::Retired => None,
                     };
                     if let Some(decoder) = decoder {
-                        let label = format!("{} · {decoder}", session.params.codec_id.as_str());
-                        let changed = shared.state.lock().video_decoder.replace(label.clone()) != Some(label);
+                        let label = if session.fel_composer.is_some() {
+                            "hevc · Dolby Vision FEL 12-bit (Dual HEVC)".to_string()
+                        } else {
+                            format!("{} · {decoder}", session.params.codec_id.as_str())
+                        };
+                        let (dr, bd, chr) = describe_video_signal(
+                            &session.decoded_params,
+                            session.fel_composer.is_some(),
+                        );
+                        let changed = {
+                            let mut st = shared.state.lock();
+                            let mut c = st.video_decoder.replace(label.clone()) != Some(label);
+                            c |= st.video_dynamic_range.replace(dr.clone()) != Some(dr);
+                            c |= st.video_bit_depth != bd;
+                            st.video_bit_depth = bd;
+                            c |= st.video_chroma != chr;
+                            st.video_chroma = chr;
+                            c
+                        };
                         if changed {
                             notify_changed(&shared);
                         }
@@ -3606,6 +3933,7 @@ fn run_video_thread(
                     match make_decoder(&shared.ctx, &stream.params) {
                         Ok(d) => {
                             session.sw_decoder = Some(d);
+                            session.renew_after_decoder_switch();
                             session.new_producer_for_software_fallback(&shared);
                             continue;
                         }
@@ -3634,6 +3962,9 @@ fn run_video_thread(
         if (session.mode.is_none() || !session.first_picture_reported)
             && session.control.active_now() >= session.effective_deadline()
         {
+            if session.rescue_silent_platform_decoder(&shared, &stream) {
+                continue;
+            }
             set_error(
                 &shared,
                 "platform video decoder produced no presentable picture before the seek deadline".into(),
@@ -3749,6 +4080,7 @@ fn run_video_thread(
                             session.sw_decoder = Some(d);
                             // Retain the packet through software handoff; never clone.
                             session.retained_packet = Some(QueuedPacket { packet, metadata });
+                            session.renew_after_decoder_switch();
                             session.new_producer_for_software_fallback(&shared);
                             continue;
                         }
@@ -3813,6 +4145,9 @@ fn run_video_thread(
 
                     let waiting = !session.first_picture_reported;
                     if waiting && session.control.active_now() >= session.effective_deadline() {
+                        if session.rescue_silent_platform_decoder(&shared, &stream) {
+                            continue;
+                        }
                         set_error(
                             &shared,
                             "platform video decoder produced no presentable picture before the seek deadline"
@@ -3890,6 +4225,7 @@ fn run_video_thread(
                             match make_decoder(&shared.ctx, &stream.params) {
                                 Ok(d) => {
                                     session.sw_decoder = Some(d);
+                                    session.renew_after_decoder_switch();
                                     session.new_producer_for_software_fallback(&shared);
                                     continue;
                                 }
@@ -3924,7 +4260,11 @@ fn run_video_thread(
                     }
                     // Carry packet PTS for untimed decoded pictures.
                     session.packet_pts_seed = packet.pts;
-                    let send_res = {
+                    let send_res = if let Some(fel) = session.fel_composer.as_mut() {
+                        let bl_pkt = fel.feed_stdl_packet(&packet);
+                        let decoder = session.sw_decoder.as_mut().unwrap();
+                        std::panic::catch_unwind(AssertUnwindSafe(|| decoder.send_packet(&bl_pkt)))
+                    } else {
                         let decoder = session.sw_decoder.as_mut().unwrap();
                         std::panic::catch_unwind(AssertUnwindSafe(|| decoder.send_packet(&packet)))
                     };
@@ -3962,6 +4302,9 @@ fn run_video_thread(
                 if !session.decoder_flushed {
                     if let Some(dec) = session.sw_decoder.as_mut() {
                         let _ = dec.flush();
+                    }
+                    if let Some(fel) = session.fel_composer.as_mut() {
+                        fel.flush_el();
                     }
                     session.decoder_flushed = true;
                 }
@@ -4056,6 +4399,9 @@ fn run_video_thread(
                     session.observe_readiness(&shared);
                     if !session.first_picture_reported {
                         if session.control.active_now() >= session.effective_deadline() {
+                            if session.rescue_silent_platform_decoder(&shared, &stream) {
+                                continue;
+                            }
                             set_error(
                                 &shared,
                                 "platform video decoder produced no presentable picture before the seek deadline"
@@ -4355,4 +4701,198 @@ mod vc1_fps_tests {
         let fps = vc1_extradata_fps(&params).expect("vc1 fps");
         assert!((fps - 24_000.0 / 1_001.0).abs() < 1e-6, "got {fps}");
     }
+}
+
+/// Dual-HEVC software composer for Dolby Vision Profile 7 FEL (`BL` + `NAL_UNSPEC63` `EL` + RPU).
+struct FelSoftwareComposer {
+    el_decoder: Box<dyn Decoder>,
+    framing: crate::headers::codec::Framing,
+    pending_el: VecDeque<VideoFrame>,
+    pending_rpu: VecDeque<(Option<i64>, crate::headers::dovi_rpu::ParsedRpu)>,
+    el_dims: Option<(u32, u32)>,
+}
+
+impl FelSoftwareComposer {
+    fn feed_stdl_packet(&mut self, packet: &Packet) -> Packet {
+        use crate::headers::dovi_rpu::{
+            DoviElType, rewrite_p7_packet_to_p81, split_stdl_fel_access_unit,
+        };
+        let (_bl_annexb, el_opt, rpu_opt) = split_stdl_fel_access_unit(&packet.data, self.framing);
+        if let Some(rpu) = rpu_opt {
+            if rpu.el_type == Some(DoviElType::Fel) {
+                self.pending_rpu.push_back((packet.pts, rpu));
+                if let Some(el_au) = el_opt {
+                    let mut el_pkt = Packet::new(packet.stream_index, packet.time_base, el_au);
+                    el_pkt.pts = packet.pts;
+                    el_pkt.dts = packet.dts;
+                    el_pkt.duration = packet.duration;
+                    el_pkt.flags = packet.flags;
+                    if std::panic::catch_unwind(AssertUnwindSafe(|| self.el_decoder.send_packet(&el_pkt))).is_ok() {
+                        self.drain_el();
+                    }
+                }
+            }
+        }
+        let clean_bl = rewrite_p7_packet_to_p81(&packet.data, self.framing)
+            .unwrap_or_else(|| packet.data.clone());
+        let mut bl_pkt = Packet::new(packet.stream_index, packet.time_base, clean_bl);
+        bl_pkt.pts = packet.pts;
+        bl_pkt.dts = packet.dts;
+        bl_pkt.duration = packet.duration;
+        bl_pkt.flags = packet.flags;
+        bl_pkt
+    }
+
+    fn drain_el(&mut self) {
+        loop {
+            match std::panic::catch_unwind(AssertUnwindSafe(|| self.el_decoder.receive_frame())) {
+                Ok(Ok(Frame::Video(evf))) => {
+                    if let Some((w, h)) = self.el_decoder.output_video_dimensions() {
+                        self.el_dims = Some((w, h));
+                    }
+                    self.pending_el.push_back(evf);
+                }
+                Ok(Ok(Frame::StreamParams(_))) => continue,
+                _ => break,
+            }
+        }
+    }
+
+    fn flush_el(&mut self) {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| self.el_decoder.flush()));
+        self.drain_el();
+    }
+
+    fn compose_if_ready(&mut self, bl_vf: &VideoFrame, bl_w: u32, bl_h: u32) -> Option<VideoFrame> {
+        if bl_w == 0 || bl_h == 0 {
+            return None;
+        }
+        let el_pos = if let Some(bpts) = bl_vf.pts {
+            self.pending_el.iter().position(|e| e.pts == Some(bpts)).or(Some(0))
+        } else {
+            Some(0)
+        }?;
+        let el_vf = self.pending_el.remove(el_pos)?;
+        let rpu_pos = if let Some(bpts) = bl_vf.pts {
+            self.pending_rpu.iter().position(|(p, _)| *p == Some(bpts)).or(Some(0))
+        } else {
+            Some(0)
+        }?;
+        let (_, rpu) = self.pending_rpu.remove(rpu_pos)?;
+        let (ew, eh) = self.el_dims.unwrap_or(((bl_w / 2).max(1), (bl_h / 2).max(1)));
+        crate::headers::dovi_rpu::reconstruct_fel_frame(bl_vf, &el_vf, &rpu, bl_w, bl_h, ew, eh)
+    }
+}
+
+fn is_dovi_profile7_hevc(params: &CodecParameters) -> bool {
+    if !matches!(params.codec_id.as_str(), "hevc" | "h265") {
+        return false;
+    }
+    crate::headers::codec::container_dovi_record(params)
+        .or_else(|| crate::headers::codec::find_dovi_box(&params.extradata).map(|b| b.to_vec()))
+        .is_some_and(|rec| rec.len() >= 4 && ((rec[2] >> 1) & 0x7F) == 7)
+}
+
+fn open_fel_software_pair(
+    ctx: &RuntimeContext,
+    params: &CodecParameters,
+) -> std::result::Result<(Box<dyn Decoder>, FelSoftwareComposer), oxideav_core::Error> {
+    let bl_dec = make_decoder(ctx, params)?;
+    let el_params = CodecParameters::video(oxideav_core::CodecId::new("hevc"));
+    let el_dec = make_decoder(ctx, &el_params)?;
+    let framing = crate::headers::codec::video_framing(params);
+    Ok((
+        bl_dec,
+        FelSoftwareComposer {
+            el_decoder: el_dec,
+            framing,
+            pending_el: VecDeque::new(),
+            pending_rpu: VecDeque::new(),
+            el_dims: None,
+        },
+    ))
+}
+
+fn describe_video_signal(
+    params: &CodecParameters,
+    fel_active: bool,
+) -> (String, Option<u8>, Option<String>) {
+    use oxideav_core::{PixelFormat, TransferCharacteristics};
+    let dovi = crate::headers::codec::container_dovi_record(params)
+        .or_else(|| crate::headers::codec::find_dovi_box(&params.extradata).map(|b| b.to_vec()))
+        .filter(|rec| rec.len() >= 4)
+        .map(|rec| ((rec[2] >> 1) & 0x7F, (rec[3] >> 4) & 0x0F));
+    let dr = if fel_active {
+        "Dolby Vision P7 FEL (12-bit)".to_string()
+    } else if let Some((profile, compat_id)) = dovi {
+        match profile {
+            7 => "Dolby Vision P7 -> P8.1".to_string(),
+            8 if compat_id == 4 => "Dolby Vision P8.4 (HLG)".to_string(),
+            8 => "Dolby Vision P8.1".to_string(),
+            5 => "Dolby Vision P5".to_string(),
+            p => format!("Dolby Vision P{p}"),
+        }
+    } else if matches!(params.color_signal.transfer, TransferCharacteristics::SMPTE_ST2084)
+        || crate::headers::codec::container_mdcv(params).is_some()
+    {
+        "HDR10".to_string()
+    } else if matches!(params.color_signal.transfer, TransferCharacteristics::ARIB_STD_B67) {
+        "HLG".to_string()
+    } else {
+        "SDR".to_string()
+    };
+    let (mut bd, chr) = match params.pixel_format {
+        Some(PixelFormat::Yuv420P | PixelFormat::YuvJ420P | PixelFormat::Nv12) => (Some(8), Some("4:2:0".into())),
+        Some(PixelFormat::Yuv422P | PixelFormat::YuvJ422P | PixelFormat::Yuyv422 | PixelFormat::Uyvy422) => (Some(8), Some("4:2:2".into())),
+        Some(PixelFormat::Yuv444P | PixelFormat::YuvJ444P | PixelFormat::Gbrp8) => (Some(8), Some("4:4:4".into())),
+        Some(PixelFormat::Yuv420P10Le) => (Some(10), Some("4:2:0".into())),
+        Some(PixelFormat::Yuv422P10Le) => (Some(10), Some("4:2:2".into())),
+        Some(PixelFormat::Yuv444P10Le) => (Some(10), Some("4:4:4".into())),
+        Some(PixelFormat::Yuv420P12Le) => (Some(12), Some("4:2:0".into())),
+        Some(PixelFormat::Yuv422P12Le) => (Some(12), Some("4:2:2".into())),
+        Some(PixelFormat::Yuv444P12Le) => (Some(12), Some("4:4:4".into())),
+        Some(PixelFormat::Yuv420P16Le) => (Some(if fel_active { 12 } else { 16 }), Some("4:2:0".into())),
+        Some(PixelFormat::Yuv422P16Le) => (Some(16), Some("4:2:2".into())),
+        Some(PixelFormat::Yuv444P16Le) => (Some(16), Some("4:4:4".into())),
+        _ => (None, None),
+    };
+    if fel_active {
+        bd = Some(12);
+    } else if bd.is_none() && dovi.is_some() {
+        bd = Some(10);
+    }
+    (dr, bd, chr)
+}
+
+fn describe_pcm_output(
+    fmt: PcmFormat,
+    rate: u32,
+    layout: ChannelLayout,
+    mode: AudioOutputMode,
+) -> String {
+    let fmt_str = match fmt {
+        PcmFormat::U8 => "8-bit PCM",
+        PcmFormat::S16 => "16-bit PCM",
+        PcmFormat::S24 => "24-bit PCM",
+        PcmFormat::S32 => "32-bit PCM",
+        PcmFormat::F32 => "32-bit float",
+        PcmFormat::F64 => "64-bit float",
+    };
+    let ch_str = if mode == AudioOutputMode::Stereo && layout.channel_count() > 2 {
+        "2.0 downmix".to_string()
+    } else {
+        match layout {
+            ChannelLayout::Mono => "1.0".into(),
+            ChannelLayout::Stereo => "2.0".into(),
+            ChannelLayout::Surround51 => "5.1".into(),
+            ChannelLayout::Surround71 => "7.1".into(),
+            other => format!("{}ch", other.channel_count()),
+        }
+    };
+    let khz = f64::from(rate) / 1000.0;
+    let prefix = match mode {
+        AudioOutputMode::BitPerfectPcm => "Bit-Perfect",
+        _ => "Lossless",
+    };
+    format!("{prefix} · {fmt_str} {khz:.1} kHz · {ch_str}")
 }

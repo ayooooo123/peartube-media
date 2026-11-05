@@ -1,5 +1,5 @@
 use oxideav_core::{ChannelLayout, ChannelPosition};
-
+use crate::backend::PcmSlice;
 /// Stereo speaker mix in the core's canonical channel order. Center and side
 /// channels use -3 dB, rear center -6 dB; LFE is omitted from the full-range mix.
 /// One common gain preserves balance while reserving correlated-signal headroom.
@@ -44,6 +44,7 @@ impl StereoMix {
     }
 
     /// Returns input frames represented in `output`; never consumes a partial frame.
+    #[cfg(test)]
     pub(crate) fn mix(&self, pcm: &[f32], output: &mut [f32]) -> usize {
         let frames = (pcm.len() / self.channels).min(output.len() / 2);
         for (input, stereo) in pcm.chunks_exact(self.channels)
@@ -55,6 +56,34 @@ impl StereoMix {
                 mixed[1] += sample * gain[1];
             }
             stereo.copy_from_slice(&mixed);
+        }
+        frames
+    }
+
+    /// Mixes native-width [`PcmSlice`] (`U8`, `S16`, `S24`, `S32`, `F32`, `F64`)
+    /// to stereo `f32` using 64-bit accumulation so 24/32-bit surround folds down
+    /// without intermediate mantissa grit.
+    pub(crate) fn mix_pcm(&self, pcm: PcmSlice<'_>, output: &mut [f32]) -> usize {
+        let w = pcm.format.bytes_per_sample();
+        let frame_bytes = self.channels * w;
+        if frame_bytes == 0 {
+            return 0;
+        }
+        let frames = (pcm.data.len() / frame_bytes).min(output.len() / 2);
+        for (frame_raw, stereo) in pcm
+            .data
+            .chunks_exact(frame_bytes)
+            .take(frames)
+            .zip(output.chunks_exact_mut(2))
+        {
+            let mut mixed = [0.0_f64; 2];
+            for (sample_bytes, gain) in frame_raw.chunks_exact(w).zip(&self.gains[..self.channels]) {
+                let s = PcmSlice::sample_to_f64(pcm.format, sample_bytes);
+                mixed[0] += s * f64::from(gain[0]);
+                mixed[1] += s * f64::from(gain[1]);
+            }
+            stereo[0] = mixed[0] as f32;
+            stereo[1] = mixed[1] as f32;
         }
         frames
     }

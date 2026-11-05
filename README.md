@@ -60,6 +60,17 @@ player.suspend(); player.resume();
 let state = player.state(); // position, duration, playing, buffering, ended, error, tracks
 ```
 
+### Lossless audio, bitstream passthrough, Dolby Vision Profile 7 & AFR
+
+- **Full-width lossless PCM (`PcmFormat` / `PcmSlice`)**: `engine` packs decoded frames into interleaved little-endian `U8`, `S16`, `S24`, `S32`, `F32`, or `F64` without narrowing through `f32`, preserving all 32 integer bits (`wavpack/lossless/32bit_int-partial.wv`, 32-bit FLAC/WAV) and all 64 IEEE-754 bits (`pcm_f64le`). `Headless::AudioCapture::exact_pcm` and `e2e::compare::exact_pcm_capture` verify full-width byte identity against FFmpeg (`audio:md5`), including 24-bit 5.1/7.1 96 kHz DTS-HD Master Audio (`XLL`) and 192 kHz 32-bit float MPEG-4 ALS.
+- **Multichannel LPCM, macOS bit-perfect clock & IEC 61937 HDMI passthrough (`PlayerOptions::audio_mode`)**:
+  - `AudioOutputMode::Auto` preserves native signed-integer/float `AudioStreamBasicDescription` (`16/24/32-bit int`, `32/64-bit float`) and discrete multichannel `AudioChannelLayout` (keeping `LFE`, rear, side and height channels) when the active output endpoint supports the channel count, folding `>2` channels via 64-bit `StereoMix` only on 2-channel endpoints.
+  - `AudioOutputMode::BitPerfectPcm` keeps discrete multichannel LPCM, matches macOS CoreAudio `kAudioDevicePropertyNominalSampleRate` to the source rate when supported and hands the device back to the rate it had before when the playback ends, and opens Android AAudio in `PCM_I16` / `PCM_I24_PACKED` / `PCM_I32` with multichannel speaker masks (`AAudioStreamBuilder_setChannelMask`).
+  - `AudioOutputMode::Passthrough` enables Apple `ac-3` (`dac3`) + `ec-3` (`dec3`) compressed output and Android `AAUDIO_FORMAT_IEC61937` bitstream output driven by the pure-Rust `player::iec61937::Iec61937Packetizer` (AC-3, E-AC-3 Atmos, DTS Core, DTS-HD MA / DTS:X 8ch 192 kHz HBR, and Dolby TrueHD Atmos in Dolby MAT 2.0 8ch 192 kHz HBR — verified byte-for-byte against FFmpeg `-f spdif`).
+- **Standalone DSD (`.dsf` / `.dff`) & CUE disc sheets**: `demux-misc` opens Sony `.dsf` and Philips DSDIFF `.dff` (`FRM8 ... DSD `) streams; `codec-wavpack` registers `dsd_lsbf`, `dsd_msbf`, `dsd_lsbf_planar` and `dsd_msbf_planar` decoders (48-tap FIR SDM→PCM matching FFmpeg `dsd2pcm` by default, a 512-tap 64-bit Blackman-Harris low-pass with −92 dB ultrasonic rejection through `PlayerOptions::steep_dsd_filter` / `dsd_mode = "steep64"`, or 24-in-32 `0x05`/`0xFA` DoP framing via `dsd_mode = "dop"`). `player::cue` resolves `.cue` files and embedded `CUESHEET` / Matroska `Chapters` onto `State::chapters` at exact `1/75 s` CD sector boundaries.
+- **Matroska HDR/DV bridge, Dolby Vision Profile 7 & 12-bit FEL**: `engine::mkv_meta` opens Matroska/WebM through `oxideav_mkv::demux::open_typed` to export `BlockAdditionMapping` (`dvcC`/`dvvC` Dolby Vision records, ITU-T T.35 `HDR10+`) and `VideoColour` (`MasteringMetadata` `mdcv` + `MaxCLL`/`MaxFALL` `clli`) onto `StreamInfo::params`, feeding HEVC, AV1, and VP9 Profile 2 HDR10 on both Apple and Android (`video/dolby-vision` + `csd-2` + 25-byte CTA-861.3 `hdr-static-info`). `player::dovi_rpu` rewrites Profile 7 STDL/DTDL packets into CRC-verified Profile 8.1 RPUs (preserving CMv2.9 and CMv4.0 L1/L2/L5/L6/L8 dynamic trims while stripping EL NALs) for hardware decoders, and provides safe-Rust 12-bit FEL dual-layer reconstruction (`reconstruct_fel_frame`: 6-tap Lanczos-3 2× EL upscale + polynomial/MMR mapping + Linear Deadzone NLQ).
+- **Unmolested 4:2:2 / 4:4:4 / 10–16-bit software video, macOS EDR isolation & AFR**: Apple's software sink pools `422v`/`444v`, 10-bit `x420`/`x422`/`x444` and 16-bit `ptv0`/`ptf0` `IOSurface` buffers with direct plane packing (no 4:2:0 subsampling, and 12-bit FEL samples are not narrowed); Android's software sink adds 10-bit `HAL_PIXEL_FORMAT_YCBCR_P010` before `YV12`/`RGBA_8888`. `AppleWindowSlot` puts the video `NSView` strictly below the host content view, keeping native fullscreen Spaces and the HUD above the picture, and promotes the host `NSWindow` to `extendedSRGBColorSpace`; `FrameRateMode` negotiates `ANativeWindow_setFrameRate` on Android and `CGDisplayMode` refresh-rate matching on macOS.
+
 ### MIDI and a user-selected SoundFont
 
 `codec-midi` replaces the built-in tone renderer with a safe-Rust port of
@@ -630,6 +641,58 @@ its actual beep samples. CSV artifacts go in
 suite three times for acceptance. Do not overlap realtime measurements with
 builds or throughput benchmarks. Dropped flashes or late host timer wakeups
 are failures, not permission to loosen the bound.
+
+### Hardware output boundary (measured)
+
+`crates/player/examples/apple_play.sh` was run against real hardware: an Apple
+M1 Pro MacBook Pro, its built-in speakers and its internal Liquid Retina XDR
+panel. `PEARTUBE_AUDIO_DUMP` captures the sink's own buffers, i.e. what
+CoreAudio is asked to render *after* any fold, and `--audio-only` runs fixtures
+that have no picture.
+
+| Check | Measured |
+|---|---|
+| 8 s H.264 + 48 kHz/16-bit stereo PCM, `Auto` | 1,536,000 bytes, S16 2 ch 48 kHz, SHA-256 identical to `ffmpeg -f s16le` |
+| Same clip, `BitPerfectPcm` | identical bytes; the default output device moved 96 kHz → 48 kHz for the stream and was handed back to 96 kHz when playback ended |
+| 4 s 5.1 96 kHz/24-bit, `BitPerfectPcm` | 6 ch S24 at 96 kHz to CoreAudio, byte-identical to `ffmpeg -f s24le` |
+| Same clip, `Auto` on the 2-channel endpoint | folded to 2 ch F32 at 96 kHz; FL/FR at 0 dB, FC/BL/BR at −3 dB, LFE absent (−177 dB), peak 0.20, no clipping |
+| Displayed picture vs audio timebase, stereo | 7 samples, −8.2 to −15.7 ms; 200/200 frames, 0 dropped, final frame correct at EOS |
+| 10-bit PQ HDR10 with mastering and light metadata | displayed buffer `0x26787630`, 2 planes, `mdcv=true clli=true`; offsets −8.6 to −13.2 ms |
+| Real 102 GB Dolby Vision P8.1 remux over the peer stream | format description carries `ITU_R_2020` / `SMPTE_ST_2084_PQ` / `ITU_R_2020`, `mdcv=true clli=true dovi_rpu=true`, EDR headroom 6.7× of 16×, 1329 frames with 0 dropped |
+
+Dolby Vision presentation is now measured live on macOS, not assumed. The signal that
+matters is compositor-side: `DolbyVisionRPUData` plus `DolbyCompatibilityID` on the
+presented buffer, with colour that agrees with the record's compatibility id. The real
+P8.1 remux presents `dovi_compat=Some("1")` with `dovi_rpu=true`; a plain HDR10 file
+presents neither; an SDR file stays clamped. Two rules this forced:
+
+- A record only drives display management when the format description's colour matches
+  it: compat 1 must be `SMPTE_ST_2084_PQ`, compat 4 `ITU_R_2100_HLG`. A mismatch (or no
+  colour at all) silently renders the HDR10 base, so the profile branches now force the
+  pairing the record promises.
+- Profiles 7 and 8 need no `dvh1`: `hvc1` + `dvcC`/`dvvC` + in-band RPU NALs is the
+  packaging Apple itself produces, and `dvh1` changes nothing there. Profile 7 is
+  rewritten to 8.1 with its RPUs rebuilt, so it keeps Dolby's per-scene trims; only the
+  FEL residual is lost. Profile 5 keeps `dvh1`.
+
+One more fix came out of the same run. The HEVC format description carried
+mastering metadata and the Dolby Vision atoms but never `ColorPrimaries`,
+`TransferFunction` or `YCbCrMatrix`, so the layer treated PQ code values as default
+BT.709 SDR and the picture rendered flat and washed out; the VP9 builder had always
+carried them. It now does too, and a container that omits `Colour` falls back to the
+bitstream VUI instead of claiming SDR. H.264's parameter-set constructor accepts no
+extension dictionary, so H.264 HDR still lacks a colour description until that path
+builds an `avcC` atom dictionary.
+
+The rate hand-back is a fix this measurement forced: before it, a 48 kHz film
+left the whole machine's output device at 48 kHz after the player was dropped,
+and only an outside change moved it back. Every other app then resampled.
+
+None of this reads the DAC or an AVR. It is the app→CoreAudio and
+app→WindowServer boundary: HDMI bitstream audio, a receiver's own decoding, and
+a panel's actual HDR rendering still need a capture at the cable. The portable
+Pi receiver drives `mpv` over HDMI and could not be measured from this machine,
+because the Pi on the LAN answered SSH but held no authorized key for it.
 
 On macOS, the dedicated realtime audio/video workers use a scoped Mach
 time-constraint policy for paced waits and audio device writes: 20 ms
