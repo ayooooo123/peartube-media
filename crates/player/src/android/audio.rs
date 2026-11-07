@@ -72,6 +72,75 @@ unsafe fn builder_set_channel_mask(builder: &mut AudioStreamBuilder, mask: u32) 
     true
 }
 
+// android.media constants, checked with `javap -constants` against android.jar (API 36).
+const JAVA_USAGE_MEDIA: i32 = 1;
+const JAVA_CONTENT_TYPE_MOVIE: i32 = 3;
+
+fn java_bitstream_encoding(codec: Iec61937Codec) -> i32 {
+    match codec {
+        Iec61937Codec::Ac3 => 5,          // ENCODING_AC3
+        Iec61937Codec::Eac3 => 6,         // ENCODING_E_AC3
+        Iec61937Codec::DtsCore => 7,      // ENCODING_DTS
+        Iec61937Codec::DtsHd { .. } => 8, // ENCODING_DTS_HD
+        Iec61937Codec::TrueHd => 14,      // ENCODING_DOLBY_TRUEHD
+    }
+}
+
+fn java_pcm_encoding(format: PcmFormat) -> i32 {
+    match format {
+        PcmFormat::S16 => 2,  // ENCODING_PCM_16BIT
+        PcmFormat::S24 => 21, // ENCODING_PCM_24BIT_PACKED
+        PcmFormat::S32 => 22, // ENCODING_PCM_32BIT
+        _ => 4,               // ENCODING_PCM_FLOAT
+    }
+}
+
+/// Java's CHANNEL_OUT_* bits are AAudio's channel bits shifted up by two.
+fn java_channel_mask(channels: u16) -> i32 {
+    match channels {
+        0..=2 => 12,  // CHANNEL_OUT_STEREO
+        3..=6 => 252, // CHANNEL_OUT_5POINT1
+        _ => 6396,    // CHANNEL_OUT_7POINT1_SURROUND
+    }
+}
+
+/// `AudioTrack.isDirectPlaybackSupported` (API 29): whether the current route (an HDMI
+/// sink, say) plays this format itself. No JavaVM yet or any Java failure answers false,
+/// so callers fall back to the mixed stereo path.
+fn direct_playback_supported(encoding: i32, sample_rate: u32, java_mask: i32) -> bool {
+    use jni::objects::JValue;
+    let Some(vm) = super::surface::SurfaceRegistry::global().java_vm() else {
+        return false;
+    };
+    let Ok(mut env) = vm.attach_current_thread() else {
+        return false;
+    };
+    let supported = env.with_local_frame(8, |env| -> jni::errors::Result<bool> {
+        let fb = env.new_object("android/media/AudioFormat$Builder", "()V", &[])?;
+        let set = "(I)Landroid/media/AudioFormat$Builder;";
+        env.call_method(&fb, "setEncoding", set, &[JValue::Int(encoding)])?;
+        env.call_method(&fb, "setSampleRate", set, &[JValue::Int(sample_rate.min(i32::MAX as u32) as i32)])?;
+        env.call_method(&fb, "setChannelMask", set, &[JValue::Int(java_mask)])?;
+        let format = env.call_method(&fb, "build", "()Landroid/media/AudioFormat;", &[])?.l()?;
+        let ab = env.new_object("android/media/AudioAttributes$Builder", "()V", &[])?;
+        let set = "(I)Landroid/media/AudioAttributes$Builder;";
+        env.call_method(&ab, "setUsage", set, &[JValue::Int(JAVA_USAGE_MEDIA)])?;
+        env.call_method(&ab, "setContentType", set, &[JValue::Int(JAVA_CONTENT_TYPE_MOVIE)])?;
+        let attrs = env.call_method(&ab, "build", "()Landroid/media/AudioAttributes;", &[])?.l()?;
+        env.call_static_method(
+            "android/media/AudioTrack",
+            "isDirectPlaybackSupported",
+            "(Landroid/media/AudioFormat;Landroid/media/AudioAttributes;)Z",
+            &[JValue::Object(&format), JValue::Object(&attrs)],
+        )?
+        .z()
+    });
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    supported.unwrap_or(false)
+}
+
 pub struct AndroidAudioSink {
     clock: AudioClock,
     sample_rate: u32,
@@ -164,9 +233,12 @@ impl AndroidAudioSink {
         mode: AudioOutputMode,
     ) -> Result<(), SinkError> {
         let channels = layout.channel_count();
-        let want_multichannel = matches!(mode, AudioOutputMode::BitPerfectPcm | AudioOutputMode::Passthrough)
-            && channels > 2;
-        let mask = if want_multichannel { aaudio_channel_mask(layout) } else { None };
+        let mask = (channels > 2).then(|| aaudio_channel_mask(layout)).flatten().filter(|&m| match mode {
+            AudioOutputMode::BitPerfectPcm | AudioOutputMode::Passthrough => true,
+            // Auto keeps every channel only where the route plays them directly; elsewhere it folds to stereo.
+            AudioOutputMode::Auto => direct_playback_supported(java_pcm_encoding(format), rate, (m << 2) as i32),
+            AudioOutputMode::Stereo => false,
+        });
 
         if matches!(format, PcmFormat::S16 | PcmFormat::S24 | PcmFormat::S32) || mask.is_some() {
             if let Ok(mut b) = AudioStreamBuilder::new() {
@@ -431,7 +503,8 @@ impl AudioSink for AndroidAudioSink {
         _first_packet: &[u8],
         mode: AudioOutputMode,
     ) -> Result<bool, SinkError> {
-        if mode != AudioOutputMode::Passthrough {
+        let auto = mode == AudioOutputMode::Auto;
+        if !auto && mode != AudioOutputMode::Passthrough {
             return Ok(false);
         }
         let source_rate = params.sample_rate.unwrap_or(48_000);
@@ -441,8 +514,20 @@ impl AudioSink for AndroidAudioSink {
         if self.suspended {
             return Ok(false);
         }
+        // Auto sends a bitstream only to a route that reports playing it; otherwise the decoder's PCM takes over.
+        if auto
+            && !direct_playback_supported(
+                java_bitstream_encoding(codec),
+                source_rate,
+                java_channel_mask(params.channels.unwrap_or(2)),
+            )
+        {
+            return Ok(false);
+        }
         if !self.open_iec_stream(codec, source_rate)? {
-            if matches!(codec, Iec61937Codec::DtsHd { .. })
+            // Explicit Passthrough may drop DTS-HD to its lossy core; Auto decodes the lossless stream instead.
+            if !auto
+                && matches!(codec, Iec61937Codec::DtsHd { .. })
                 && self.open_iec_stream(Iec61937Codec::DtsCore, source_rate)?
             {
                 self.sample_rate = source_rate;
@@ -534,4 +619,8 @@ impl AudioSink for AndroidAudioSink {
     }
 
     fn clock(&self) -> Arc<dyn Clock> { Arc::new(self.clock.clone()) }
+
+    fn output_channels(&self) -> Option<u16> {
+        (self.output_channels > 0).then_some(self.output_channels)
+    }
 }

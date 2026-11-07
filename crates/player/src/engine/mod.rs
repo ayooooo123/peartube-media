@@ -2154,7 +2154,7 @@ fn run_audio_thread(
     sink.flush();
     out.open = sink.open_pcm(out.rate, out.layout, out.format, shared.audio_mode).is_ok();
     if out.open {
-        let desc = describe_pcm_output(out.format, out.rate, out.layout, shared.audio_mode);
+        let desc = describe_pcm_output(out.format, out.rate, out.layout, shared.audio_mode, sink.output_channels());
         if shared.state.lock().audio_output.replace(desc.clone()) != Some(desc) {
             notify_changed(&shared);
         }
@@ -2685,7 +2685,7 @@ fn present_audio(
             .open_pcm(out.rate, out.layout, out.format, shared.audio_mode)
             .is_ok();
         if out.open {
-            let desc = describe_pcm_output(out.format, out.rate, out.layout, shared.audio_mode);
+            let desc = describe_pcm_output(out.format, out.rate, out.layout, shared.audio_mode, sink.output_channels());
             if shared.state.lock().audio_output.replace(desc.clone()) != Some(desc) {
                 notify_changed(shared);
             }
@@ -4869,7 +4869,10 @@ fn describe_pcm_output(
     rate: u32,
     layout: ChannelLayout,
     mode: AudioOutputMode,
+    output_channels: Option<u16>,
 ) -> String {
+    let folded = layout.channel_count() > 2
+        && (mode == AudioOutputMode::Stereo || output_channels.is_some_and(|n| n < layout.channel_count()));
     let fmt_str = match fmt {
         PcmFormat::U8 => "8-bit PCM",
         PcmFormat::S16 => "16-bit PCM",
@@ -4878,19 +4881,17 @@ fn describe_pcm_output(
         PcmFormat::F32 => "32-bit float",
         PcmFormat::F64 => "64-bit float",
     };
-    let ch_str = if mode == AudioOutputMode::Stereo && layout.channel_count() > 2 {
-        "2.0 downmix".to_string()
-    } else {
-        match layout {
-            ChannelLayout::Mono => "1.0".into(),
-            ChannelLayout::Stereo => "2.0".into(),
-            ChannelLayout::Surround51 => "5.1".into(),
-            ChannelLayout::Surround71 => "7.1".into(),
-            other => format!("{}ch", other.channel_count()),
-        }
+    let source = match layout {
+        ChannelLayout::Mono => "1.0".into(),
+        ChannelLayout::Stereo => "2.0".into(),
+        ChannelLayout::Surround51 => "5.1".into(),
+        ChannelLayout::Surround71 => "7.1".into(),
+        other => format!("{}ch", other.channel_count()),
     };
+    let ch_str = if folded { format!("{source} → 2.0 downmix") } else { source };
     let khz = f64::from(rate) / 1000.0;
     let prefix = match mode {
+        _ if folded => "PCM",
         AudioOutputMode::BitPerfectPcm => "Bit-Perfect",
         _ => "Lossless",
     };

@@ -289,6 +289,10 @@ pub trait AudioSink: Send {
     /// The output's clock: the media time of the sample being heard. The
     /// playback's master clock while audio plays.
     fn clock(&self) -> Arc<dyn Clock>;
+    /// Channels the output actually plays after any fold, when the sink knows.
+    fn output_channels(&self) -> Option<u16> {
+        None
+    }
 }
 
 /// A producer-bound observation that a decoded target picture reached the

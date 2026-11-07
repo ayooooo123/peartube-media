@@ -289,6 +289,10 @@ impl AudioSink for AudioSinkWrapper {
     fn clock(&self) -> Arc<dyn Clock> {
         self.inner.lock().clock()
     }
+
+    fn output_channels(&self) -> Option<u16> {
+        self.inner.lock().output_channels()
+    }
 }
 
 struct VideoSinkWrapper {

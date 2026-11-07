@@ -1008,6 +1008,10 @@ impl AudioSink for AppleAudioSink {
     fn clock(&self) -> Arc<dyn Clock> {
         self.clock.clone()
     }
+
+    fn output_channels(&self) -> Option<u16> {
+        (self.output_channels > 0).then_some(self.output_channels as u16)
+    }
 }
 
 impl Drop for AppleAudioSink {
