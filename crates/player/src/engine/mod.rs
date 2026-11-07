@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1135,6 +1136,8 @@ fn run_player_pipeline(
         replay: VecDeque::new(),
         subtitle_read_ahead: streams.iter().filter(|s| s.params.media_type == MediaType::Subtitle)
             .map(|s| (s.index, PacketQueue::default())).collect(),
+        last_non_audio: None,
+        refresh_until: None,
     };
     let video_stream = find_stream(&streams, current_video);
     let audio_stream = find_stream(&streams, current_audio);
@@ -1146,7 +1149,7 @@ fn run_player_pipeline(
     run.video_thread =
         video_stream.map(|stream| spawn_video(&shared, stream, &video_lane, &demux_cv, realtime));
     run.audio_thread =
-        audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime));
+        audio_stream.map(|stream| spawn_audio(&shared, stream, &audio_lane, &demux_cv, realtime, None));
     shared.beside_media.store(run.video_thread.is_some() || run.audio_thread.is_some(), Ordering::SeqCst);
     run.sub_thread = find_stream(&streams, current_subtitle)
         .map(|stream| spawn_subtitles(&shared, stream, &sub_lane, &demux_cv, realtime, &options.fonts, run.demuxer.attachments(), false));
@@ -1266,6 +1269,7 @@ fn spawn_audio(
     lane: &Arc<Lane>,
     demux_cv: &Arc<Condvar>,
     realtime: bool,
+    start_at: Option<Duration>,
 ) -> PipelineThread {
     let consumer = Consumer::new(lane, demux_cv);
     let live = Live::new(shared, Pipe::Audio);
@@ -1292,7 +1296,7 @@ fn spawn_audio(
             // calls included.
             let failed = Arc::clone(&shared);
             let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired)
+                run_audio_thread(stream, sink, lane, demux_cv, shared, realtime, retired, start_at)
             }));
             if run.is_err() {
                 audio_failed(&failed, "audio pipeline failed".into());
@@ -1479,11 +1483,22 @@ struct Run<'a> {
     replay: VecDeque<Read>,
     /// Future packets retained even while their subtitle track is inactive.
     subtitle_read_ahead: Vec<(u32, PacketQueue)>,
+    last_non_audio: Option<PacketFence>,
+    refresh_until: Option<PacketFence>,
 }
 
 /// One demuxer read: the packet and its metadata, the read's error, or the
 /// demuxer's panic.
 type Read = std::thread::Result<oxideav_core::Result<QueuedPacket>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PacketFence(u32, Option<i64>, Option<i64>, u64);
+
+fn packet_fence(packet: &Packet) -> PacketFence {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    packet.data.hash(&mut hash);
+    PacketFence(packet.stream_index, packet.pts, packet.dts, hash.finish())
+}
 
 /// Reads the demuxer's next packet with its metadata, catching a panic.
 fn read_packet(demuxer: &mut dyn Demuxer) -> Read {
@@ -1612,6 +1627,19 @@ fn run_demux_loop(run: &mut Run<'_>) {
         match packet_res {
             Ok(Ok(packet)) => {
                 let stream_id = packet.packet.stream_index;
+                if let Some(fence) = run.refresh_until {
+                    if let Some(end) = packet_end_secs(&packet.packet) {
+                        if Some(stream_id) == run.current_audio {
+                            shared.demuxed(Pipe::Audio, end);
+                        }
+                    }
+                    if Some(stream_id) == run.current_audio {
+                        run.audio_lane.push(packet);
+                    } else if packet_fence(&packet.packet) == fence {
+                        run.refresh_until = None;
+                    }
+                    continue;
+                }
                 if let Some((_, cache)) = run.subtitle_read_ahead.iter_mut().find(|(index, _)| *index == stream_id) {
                     let now = shared.master.now().unwrap_or_default().as_secs_f64();
                     while cache.front().is_some_and(|p| subtitle_start(&p.packet) <= now) {
@@ -1649,6 +1677,11 @@ fn run_demux_loop(run: &mut Run<'_>) {
                         }
                     }
                 }
+                if pipe == Some(Pipe::Video)
+                    || run.subtitle_read_ahead.iter().any(|(index, _)| *index == stream_id)
+                {
+                    run.last_non_audio = Some(packet_fence(&packet.packet));
+                }
                 match pipe {
                     Some(Pipe::Video) => run.video_lane.push(packet),
                     Some(Pipe::Audio) => run.audio_lane.push(packet),
@@ -1661,6 +1694,10 @@ fn run_demux_loop(run: &mut Run<'_>) {
                 }
             }
             Ok(Err(oxideav_core::Error::Eof)) => {
+                if run.refresh_until.take().is_some() {
+                    shared.request_seek(shared.master.now().unwrap_or_default());
+                    continue;
+                }
                 captions.finish(run);
                 eof = true;
                 run.video_lane.push_eof();
@@ -1720,6 +1757,8 @@ fn do_seek(run: &mut Run<'_>, pending: SeekTarget, generation: u64, eof: &mut bo
     run.video_lane.clear_for_seek(generation);
     run.audio_lane.clear_for_seek(generation);
     run.sub_lane.clear_for_seek(generation);
+    run.last_non_audio = None;
+    run.refresh_until = None;
     run.replay.clear();
     for (_, cache) in &mut run.subtitle_read_ahead { cache.clear(); }
     *eof = false;
@@ -1926,12 +1965,8 @@ fn read_to_recovery(run: &mut Run<'_>, video: u32, params: &CodecParameters) -> 
     None
 }
 
-/// `select_audio` / `select_subtitle` took effect: retire the replaced
-/// pipeline, start the new one, and refresh the headless registry entry. A
-/// new audio track resumes where playback is: the demuxer re-reads from the
-/// clock's position (a refresh seek) instead of starting the track wherever
-/// it has read ahead to. A subtitle switch never seeks: the new track shows
-/// from its next cue the demuxer reads.
+/// Switch the selected pipeline while keeping already-delivered picture and
+/// subtitle packets intact; audio alone re-reads from the playback clock.
 fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
     let shared = run.shared;
 
@@ -1993,13 +2028,37 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
         );
     }
 
+    *active = [run.current_video, run.current_audio, run.current_subtitle]
+        .into_iter()
+        .flatten()
+        .collect();
+    active.extend(run.subtitle_read_ahead.iter().map(|(index, _)| *index));
+    active.sort_unstable();
+    active.dedup();
+    let _ = run.demuxer.set_active_streams(active);
+
     let realtime = run.options.realtime;
     if audio_changed {
         let stream = find_stream(run.streams, run.current_audio)
             .filter(|s| s.params.media_type == MediaType::Audio);
         if let Some(stream) = stream {
-            shared.request_seek(shared.master.now().unwrap_or_default());
-            run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime));
+            let target = shared.master.now().unwrap_or_default();
+            let refresh = if !sub_changed && run.replay.is_empty() {
+                run.current_video.zip(run.last_non_audio)
+                    .filter(|(_, fence)| Some(fence.0) == run.current_video
+                        || run.subtitle_read_ahead.iter().any(|(index, _)| *index == fence.0))
+                    .filter(|(video, _)| seek(run, *video, run.video_tb.ticks_of(target.as_secs_f64())))
+                    .map(|(_, fence)| fence)
+            } else {
+                None
+            };
+            if let Some(fence) = refresh {
+                run.refresh_until = Some(fence);
+                shared.pipe_pending(Pipe::Audio, shared.seek_gen.load(Ordering::SeqCst));
+            } else {
+                shared.request_seek(target);
+            }
+            run.audio_thread = Some(spawn_audio(shared, stream, run.audio_lane, run.demux_cv, realtime, refresh.map(|_| target)));
         }
     }
     // Subtitles beside video or audio, running or new, end with them.
@@ -2020,14 +2079,6 @@ fn apply_selection_switch(run: &mut Run<'_>, active: &mut Vec<u32>) {
         }
     }
 
-    *active = [run.current_video, run.current_audio, run.current_subtitle]
-        .into_iter()
-        .flatten()
-        .collect();
-    active.extend(run.subtitle_read_ahead.iter().map(|(index, _)| *index));
-    active.sort_unstable();
-    active.dedup();
-    let _ = run.demuxer.set_active_streams(active);
 }
 
 fn subtitle_start(packet: &Packet) -> f64 {
@@ -2089,6 +2140,7 @@ fn run_audio_thread(
     shared: Arc<SharedState>,
     realtime: bool,
     retired: Arc<AtomicBool>,
+    start_at: Option<Duration>,
 ) {
     let mut decoder_params = stream.params.clone();
     if decoder_params.codec_id.as_str() == "midi" {
@@ -2115,7 +2167,7 @@ fn run_audio_thread(
         AudioOutputMode::BitPerfectPcm | AudioOutputMode::Stereo => false,
     };
     if try_passthrough {
-        match play_compressed(&stream, sink, &lane, &demux_cv, &shared, realtime, &retired) {
+        match play_compressed(&stream, sink, &lane, &demux_cv, &shared, realtime, &retired, start_at) {
             Passthrough::Played => return,
             Passthrough::Declined(packet) => pending = packet,
         }
@@ -2149,6 +2201,7 @@ fn run_audio_thread(
         written: Written::default(),
         seen_seek_target: 0,
         primed: None,
+        start_at,
     };
     // The output may come from the previous track: none of that plays on.
     sink.flush();
@@ -2188,6 +2241,7 @@ fn run_audio_thread(
             seen_seek = gen_now;
             sink.flush();
             out.written.running = None;
+            out.start_at = None;
             out.written.end = None;
             trimmer.reset();
             decoded_end = None;
@@ -2368,6 +2422,7 @@ fn play_compressed(
     shared: &SharedState,
     realtime: bool,
     retired: &AtomicBool,
+    mut start_at: Option<Duration>,
 ) -> Passthrough {
     let quit = || shared.stopped.load(Ordering::SeqCst) || retired.load(Ordering::SeqCst);
     let rate = f64::from(stream.params.sample_rate.unwrap_or(48000).max(1));
@@ -2391,6 +2446,7 @@ fn play_compressed(
             sink.flush();
             written.running = None;
             written.end = None;
+            start_at = None;
         }
         let applied = written.running;
         let woken = || quit() || Some(shared.running()) != applied;
@@ -2461,13 +2517,16 @@ fn play_compressed(
         if start + span <= 0.0 {
             continue;
         }
-        if let Some(seek) = *shared.active_seek.lock() {
-            if seek.generation > seen_seek_target {
-                if start + span <= seek.target {
-                    continue;
-                }
-                seen_seek_target = seek.generation;
+        let target = start_at.map(|t| t.as_secs_f64()).or_else(|| {
+            shared.active_seek.lock().as_ref()
+                .filter(|seek| seek.generation > seen_seek_target)
+                .map(|seek| seek.target)
+        });
+        if let Some(target) = target {
+            if start + span <= target {
+                continue;
             }
+            seen_seek_target = seen_seek;
         }
         let at = Duration::from_secs_f64(start.max(0.0));
         loop {
@@ -2486,6 +2545,7 @@ fn play_compressed(
             match sink.write_packet(&packet.data, at, frames) {
                 Ok(true) => {
                     written.end = Some(at + Duration::from_secs_f64(span));
+                    start_at = None;
                     if written.leads != Some(seen_seek) {
                         written.leads = Some(seen_seek);
                         shared.master.follow_audio(sink.clock(), seen_seek);
@@ -2628,6 +2688,7 @@ struct AudioOut {
     written: Written,
     /// The newest seek generation whose target the output has reached.
     seen_seek_target: u64,
+    start_at: Option<Duration>,
     /// The seek generation a failed output last let the playback go for.
     primed: Option<u64>,
 }
@@ -2702,19 +2763,25 @@ fn present_audio(
         pts_secs = 0.0;
     }
 
-    if let Some(seek) = *shared.active_seek.lock() {
-        if seek.generation > out.seen_seek_target && pts_secs < seek.target {
+    let target = out.start_at.map(|at| at.as_secs_f64()).or_else(|| {
+        shared.active_seek.lock().as_ref()
+            .filter(|seek| seek.generation > out.seen_seek_target)
+            .map(|seek| seek.target)
+    });
+    if let Some(target) = target {
+        if pts_secs < target {
             let frames = bytes.len() / stride;
-            let before = ((seek.target - pts_secs) * f64::from(sample_rate)).round() as usize;
+            let before = ((target - pts_secs) * f64::from(sample_rate)).round() as usize;
             if before < frames {
                 bytes.drain(..before * stride);
-                pts_secs = seek.target;
+                pts_secs = target;
             } else {
                 bytes.clear();
             }
         }
         if !bytes.is_empty() {
             out.seen_seek_target = seen_seek;
+            out.start_at = None;
         }
     }
     if bytes.is_empty() {

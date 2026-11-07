@@ -444,6 +444,32 @@ fn clock_waits_for_decoded_target_not_for_compressed_input() {
 }
 
 #[test]
+fn soundtrack_switch_does_not_restart_presenting_video() {
+    let path = fixture::tmp("compressed_soundtrack_switch.mkv");
+    fixture::encode(&["-f", "lavfi", "-i", "testsrc2=size=160x96:rate=25:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+        "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=6",
+        "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264", "-preset", "ultrafast",
+        "-x264-params", "keyint=50:min-keyint=50:scenecut=0:bframes=2",
+        "-c:a", "pcm_s16le", "-f", "matroska"], &path);
+    let backend = Platform::new(true, true, 4);
+    let (player, events) = open(&path, backend.clone());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while player.state().position < Duration::from_millis(800) {
+        assert!(Instant::now() < deadline, "video did not start: {:?}", player.state());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    player.select_audio(Some(2));
+    ended(&player, &events, Duration::from_secs(15));
+    assert_eq!(player.state().audio, Some(2));
+    drop(player);
+    let seen = backend.observed.0.lock();
+    assert!(!seen.blocked, "soundtrack switch restarted the platform decoder");
+    assert!(seen.ready.iter().all(|(generation, _, _)| *generation == 0));
+    assert!(seen.shown.last().is_some_and(|(_, pts, _)| *pts >= Duration::from_millis(5900)));
+}
+
+#[test]
 fn compressed_start_and_seek_hide_partial_recovery_pictures() {
     let (_, cut) = fixture::intra_refresh("compressed_intra_refresh");
     let expected = fixture::reference_pts(&cut);

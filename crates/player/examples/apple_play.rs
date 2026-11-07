@@ -1,6 +1,5 @@
 //! Actual Player/AppleBackend timing smoke; no screen-capture permission.
-//! `sh crates/player/examples/apple_play.sh clip.mkv [--software] [--transport]
-//! [--bit-perfect] [--audio-only]`
+//! `sh crates/player/examples/apple_play.sh clip.mkv [--software] [--transport] [--switch-audio] [--bit-perfect] [--audio-only]`
 //! Requires the flash/beep clip with the 8-bit frame identifier stripe.
 //! Once per second pause and read the actual displayed pixel buffer
 //! (AVFoundation disallows that read while running), decode its frame
@@ -256,6 +255,9 @@ impl VideoSink for MeasuredVideo {
                 eprintln!("APPLE_VIDEO mode={mode:?} mono_ns={}", player::clock::current_monotonic_ns());
             }
         }
+        if let std::task::Poll::Ready(Err(error)) = &poll {
+            eprintln!("APPLE_TRANSITION_ERROR {error:?}");
+        }
         poll
     }
 
@@ -267,6 +269,12 @@ impl VideoSink for MeasuredVideo {
         random_access: bool,
     ) -> Result<(), player::backend::VideoError> {
         let entered_ns = player::clock::current_monotonic_ns();
+        if pts >= Duration::from_secs(1779) && pts < Duration::from_millis(1780800) {
+            if let Some(p) = packet.as_ref() {
+                eprintln!("APPLE_INPUT pts={:.3} key={random_access} bytes={} prefix={:02x?}",
+                    pts.as_secs_f64(), p.data.len(), &p.data[..p.data.len().min(24)]);
+            }
+        }
         let result = self.sink.push_packet(producer, packet, pts, random_access);
         if result.is_ok() {
             eprintln!(
@@ -274,6 +282,9 @@ impl VideoSink for MeasuredVideo {
                 player::clock::current_monotonic_ns(),
                 pts.as_secs_f64()
             );
+        }
+        if let Err(error) = &result {
+            eprintln!("APPLE_PACKET_ERROR {error:?}");
         }
         result
     }
@@ -447,6 +458,8 @@ fn main() {
     let bit_perfect = std::env::args().any(|a| a == "--bit-perfect");
     let audio_only = std::env::args().any(|a| a == "--audio-only");
     let audio_tail = std::env::args().any(|a| a == "--audio-tail-seek");
+    let switch_audio = std::env::args().any(|a| a == "--switch-audio");
+    let observe_source = std::env::args().any(|a| a == "--observe-source");
     let mtm = MainThreadMarker::new().unwrap();
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -512,8 +525,12 @@ fn main() {
                 check_surface("intentional_loss");
                 panic!("surface-loss check did not block the invalid run");
             }
+            if observe_source {
+                observe_source_stalls(path, backend);
+                return;
+            }
             if audio_tail { measure_audio_tail(path, backend) }
-            else { measure(path, backend, transport, bit_perfect) }
+            else { measure(path, backend, transport, bit_perfect, switch_audio) }
         }));
         if let Err(e) = &result { eprintln!("Apple timing smoke failed: {e:?}"); }
         dispatch2::run_on_main(|_| READBACK.with(|slot| { slot.borrow_mut().take(); }));
@@ -534,6 +551,34 @@ fn main() {
     app.run();
 }
 
+fn observe_source_stalls(path: String, backend: Arc<Measured>) {
+    let player = Player::open(&path, backend, Arc::new(codecs::context()), PlayerOptions::default(), |_| {});
+    let open_until = Instant::now() + Duration::from_secs(20);
+    while player.state().duration.is_none() && Instant::now() < open_until {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let duration = player.state().duration.expect("movie duration");
+    let seek_seconds = std::env::args().find_map(|arg| arg.strip_prefix("--seek-seconds=")?.parse::<u64>().ok()).unwrap_or(1780);
+    let target = Duration::from_secs(seek_seconds).min(duration.saturating_sub(Duration::from_secs(2)));
+    player.seek(target);
+    let until = Instant::now() + Duration::from_secs(25);
+    let start = Instant::now();
+    let mut last = None;
+    let mut last_report = Instant::now() - Duration::from_secs(2);
+    while Instant::now() < until {
+        let state = player.state();
+        if last != Some(state.buffering) || last_report.elapsed() >= Duration::from_secs(2) {
+            eprintln!("APPLE_SOURCE wall={:.3} position={:.3} buffering={} decoder={:?} signal={:?} audio={:?} dropped={} error={:?}",
+                start.elapsed().as_secs_f64(), state.position.as_secs_f64(), state.buffering,
+                state.video_decoder, state.video_dynamic_range, state.audio_output, state.dropped_frames, state.error);
+            last = Some(state.buffering);
+            last_report = Instant::now();
+        }
+        if state.error.is_some() || state.ended { break; }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Audio-only trial: no picture to read back, so the engine is run to the end
 /// and the sink records what crossed into CoreAudio.
 fn measure_audio_only(path: String, backend: Arc<Measured>, bit_perfect: bool) {
@@ -550,7 +595,7 @@ fn measure_audio_only(path: String, backend: Arc<Measured>, bit_perfect: bool) {
     assert!(state.error.is_none(), "{state:?}");
 }
 
-fn measure(path: String, backend: Arc<Measured>, transport: bool, bit_perfect: bool) {
+fn measure(path: String, backend: Arc<Measured>, transport: bool, bit_perfect: bool, switch_audio: bool) {
     let options = PlayerOptions { audio_mode: if bit_perfect { AudioOutputMode::BitPerfectPcm } else { AudioOutputMode::Auto }, ..PlayerOptions::default() };
     let player = Player::open(&path, backend.clone(), Arc::new(codecs::context()), options, |_| {});
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -629,7 +674,10 @@ fn measure(path: String, backend: Arc<Measured>, transport: bool, bit_perfect: b
             next_sample = Duration::from_secs(audio_at.as_secs() + 1) + Duration::from_millis(8);
             player.play();
         }
-        if transport && !swapped && state.position > Duration::from_millis(2200) {
+        if switch_audio && !swapped && state.position > Duration::from_millis(2200) {
+            player.select_audio(Some(2));
+            swapped = true;
+        } else if transport && !swapped && state.position > Duration::from_millis(2200) {
             player.pause();
             let held = player.state().position;
             std::thread::sleep(Duration::from_millis(250));
@@ -653,7 +701,8 @@ fn measure(path: String, backend: Arc<Measured>, transport: bool, bit_perfect: b
     eprintln!("APPLE_EOS expected_frame={last} displayed={shown:?} mono_ns={}", player::clock::current_monotonic_ns());
     assert_eq!(shown, Some(last), "final reordered frame not displayed at end of stream");
     assert!(offsets.len() >= 4, "insufficient renderer readback samples: {offsets:?}");
-    eprintln!("Apple sampled offsets_ms={offsets:?} final_metrics={previous:?} transport={swapped}");
+    if switch_audio { assert_eq!(player.state().audio, Some(2), "soundtrack did not switch"); }
+    eprintln!("Apple sampled offsets_ms={offsets:?} final_metrics={previous:?} transport={transport} switch_audio={switch_audio}");
     assert!(offsets.iter().all(|v| v.abs() <= 40.0), "displayed video/audio offset exceeds 40 ms: {offsets:?}");
     drop(player);
 }
