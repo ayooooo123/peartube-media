@@ -1,10 +1,10 @@
 use super::clock::{AudioClock, AudioClockState, SendAudioStream};
-use crate::audio_mix::StereoMix;
+use crate::audio_mix::{StereoMix, android_surround_order, reorder_frames};
 use crate::backend::{AudioOutputMode, AudioSink, Clock, PcmFormat, PcmSlice, SinkError};
 use crate::clock::current_monotonic_ns;
 use crate::iec61937::{Iec61937Codec, Iec61937Packetizer};
 use ndk::audio::{AudioDirection, AudioFormat, AudioPerformanceMode, AudioStreamBuilder};
-use oxideav_core::{ChannelLayout, ChannelPosition};
+use oxideav_core::ChannelLayout;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,18 +12,6 @@ use std::time::Duration;
 const AAUDIO_FORMAT_PCM_I24_PACKED: i32 = ndk_sys::AAUDIO_FORMAT_PCM_I24_PACKED as i32;
 const AAUDIO_FORMAT_PCM_I32: i32 = ndk_sys::AAUDIO_FORMAT_PCM_I32 as i32;
 const AAUDIO_FORMAT_IEC61937: i32 = ndk_sys::AAUDIO_FORMAT_IEC61937 as i32;
-
-/// Without a channel-mask binding AAudio places channels by its default order for the count
-/// (AOSP `audio_channel_out_mask_from_count`: 6 = FL FR FC LFE BL BR, 8 adds SL SR). Only
-/// layouts already in that order go out multichannel; the rest fold to stereo.
-fn aaudio_default_order(layout: ChannelLayout) -> bool {
-    use ChannelPosition::*;
-    matches!(
-        layout.positions(),
-        [FrontLeft, FrontRight, FrontCenter, LowFrequency, BackLeft | SideLeft, BackRight | SideRight]
-            | [FrontLeft, FrontRight, FrontCenter, LowFrequency, BackLeft, BackRight, SideLeft, SideRight]
-    )
-}
 
 // android.media constants, checked with `javap -constants` against android.jar (API 36).
 const JAVA_USAGE_MEDIA: i32 = 1;
@@ -128,6 +116,9 @@ pub struct AndroidAudioSink {
     mode: AudioOutputMode,
     layout: ChannelLayout,
     mix: Option<StereoMix>,
+    /// Source channel per output slot when a 5.1/7.1 layout differs from Android's default order.
+    order: Option<[u8; 8]>,
+    reorder_buf: Vec<u8>,
     stereo: [f32; 2048],
     iec: Option<Iec61937Packetizer>,
     iec_buf: Vec<u8>,
@@ -150,6 +141,8 @@ impl AndroidAudioSink {
                 mode: AudioOutputMode::Auto,
                 layout: ChannelLayout::Stereo,
                 mix: None,
+                order: None,
+                reorder_buf: Vec::new(),
                 stereo: [0.0; 2048],
                 iec: None,
                 iec_buf: Vec::new(),
@@ -211,8 +204,8 @@ impl AndroidAudioSink {
         mode: AudioOutputMode,
     ) -> Result<(), SinkError> {
         let channels = layout.channel_count();
-        let multichannel = channels > 2
-            && aaudio_default_order(layout)
+        let order = if channels > 2 { android_surround_order(layout) } else { None };
+        let multichannel = order.is_some()
             && match mode {
                 AudioOutputMode::BitPerfectPcm | AudioOutputMode::Passthrough => true,
                 // Auto keeps every channel only where the route plays them directly; elsewhere it folds to stereo.
@@ -223,11 +216,11 @@ impl AndroidAudioSink {
             };
         if channels > 2 && !multichannel {
             route_log(&format!(
-                "pcm {channels}ch {:?} mode={mode:?} default_order={}: folding to stereo",
-                layout.positions(),
-                aaudio_default_order(layout)
+                "pcm {channels}ch {:?} mode={mode:?} android_order={order:?}: folding to stereo",
+                layout.positions()
             ));
         }
+        self.order = None;
 
         if matches!(format, PcmFormat::S16 | PcmFormat::S24 | PcmFormat::S32) || multichannel {
             if let Ok(mut b) = AudioStreamBuilder::new() {
@@ -270,6 +263,8 @@ impl AndroidAudioSink {
                     self.mix = if out_ch < channels {
                         Some(StereoMix::new(layout).map_err(|e| SinkError::Fatal(e.into()))?)
                     } else {
+                        // Identity orders (5.1) need no copy.
+                        self.order = order.filter(|o| o.iter().take(usize::from(channels)).enumerate().any(|(i, &c)| usize::from(c) != i));
                         None
                     };
                     self.install_stream(stream, rate);
@@ -442,11 +437,22 @@ impl AudioSink for AndroidAudioSink {
         let (ptr, frames): (*const std::ffi::c_void, usize) = if let Some(mix) = &self.mix {
             let n = mix.mix_pcm(pcm, &mut self.stereo);
             (self.stereo.as_ptr().cast(), n)
-        } else if pcm.format == self.output_format {
-            (pcm.data.as_ptr().cast(), total_frames)
         } else {
-            f32_fallback = pcm.to_f32_vec();
-            (f32_fallback.as_ptr().cast(), total_frames)
+            let (data, width): (&[u8], usize) = if pcm.format == self.output_format {
+                (pcm.data, self.output_format.bytes_per_sample())
+            } else {
+                f32_fallback = pcm.to_f32_vec();
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(f32_fallback.as_ptr().cast::<u8>(), f32_fallback.len() * 4)
+                };
+                (bytes, 4)
+            };
+            if let Some(order) = &self.order {
+                reorder_frames(data, width, &order[..usize::from(self.channels)], &mut self.reorder_buf);
+                (self.reorder_buf.as_ptr().cast(), total_frames)
+            } else {
+                (data.as_ptr().cast(), total_frames)
+            }
         };
         if frames == 0 {
             return Ok(0);
