@@ -1771,6 +1771,7 @@ dependencies = [
  "libc",
  "md5",
  "ndk",
+ "ndk-sys",
  "objc2",
  "objc2-app-kit",
  "objc2-av-foundation",

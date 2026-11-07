@@ -9,9 +9,9 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 
-const AAUDIO_FORMAT_PCM_I24_PACKED: i32 = 3;
-const AAUDIO_FORMAT_PCM_I32: i32 = 4;
-const AAUDIO_FORMAT_IEC61937: i32 = 0x0D;
+const AAUDIO_FORMAT_PCM_I24_PACKED: i32 = ndk_sys::AAUDIO_FORMAT_PCM_I24_PACKED as i32;
+const AAUDIO_FORMAT_PCM_I32: i32 = ndk_sys::AAUDIO_FORMAT_PCM_I32 as i32;
+const AAUDIO_FORMAT_IEC61937: i32 = ndk_sys::AAUDIO_FORMAT_IEC61937 as i32;
 
 fn aaudio_channel_mask(layout: ChannelLayout) -> Option<u32> {
     let n = usize::from(layout.channel_count());
@@ -260,6 +260,10 @@ impl AndroidAudioSink {
         let Ok(stream) = b.open_stream() else {
             return Ok(false);
         };
+        // A stream opened as anything but IEC 61937 would play the bitstream as PCM noise.
+        if i32::from(stream.format()) != AAUDIO_FORMAT_IEC61937 {
+            return Ok(false);
+        }
         self.iec_carrier_rate = carrier_rate;
         self.iec_carrier_channels = carrier_ch;
         self.install_stream(stream, carrier_rate);
