@@ -13,63 +13,16 @@ const AAUDIO_FORMAT_PCM_I24_PACKED: i32 = ndk_sys::AAUDIO_FORMAT_PCM_I24_PACKED 
 const AAUDIO_FORMAT_PCM_I32: i32 = ndk_sys::AAUDIO_FORMAT_PCM_I32 as i32;
 const AAUDIO_FORMAT_IEC61937: i32 = ndk_sys::AAUDIO_FORMAT_IEC61937 as i32;
 
-fn aaudio_channel_mask(layout: ChannelLayout) -> Option<u32> {
-    let n = usize::from(layout.channel_count());
-    if n <= 2 {
-        return None;
-    }
-    let mut mask = 0u32;
-    for i in 0..n {
-        let bit = match layout.position(i)? {
-            ChannelPosition::FrontLeft => 1 << 0,
-            ChannelPosition::FrontRight => 1 << 1,
-            ChannelPosition::FrontCenter => 1 << 2,
-            ChannelPosition::LowFrequency => 1 << 3,
-            ChannelPosition::BackLeft => 1 << 4,
-            ChannelPosition::BackRight => 1 << 5,
-            ChannelPosition::FrontLeftOfCenter => 1 << 6,
-            ChannelPosition::FrontRightOfCenter => 1 << 7,
-            ChannelPosition::BackCenter => 1 << 8,
-            ChannelPosition::SideLeft => 1 << 9,
-            ChannelPosition::SideRight => 1 << 10,
-            ChannelPosition::TopFrontLeft => 1 << 12,
-            ChannelPosition::TopFrontRight => 1 << 14,
-            ChannelPosition::TopBackLeft => 1 << 15,
-            ChannelPosition::TopBackRight => 1 << 17,
-            _ => return None,
-        };
-        mask |= bit;
-    }
-    Some(mask)
-}
-
-unsafe fn builder_set_raw_format(builder: &mut AudioStreamBuilder, raw_fmt: i32) {
-    type FnSetFmt = unsafe extern "C" fn(*mut std::ffi::c_void, i32);
-    let lib = unsafe { libc::dlopen(c"libaaudio.so".as_ptr(), libc::RTLD_NOW) };
-    if !lib.is_null() {
-        let sym = unsafe { libc::dlsym(lib, c"AAudioStreamBuilder_setFormat".as_ptr()) };
-        if !sym.is_null() {
-            let f: FnSetFmt = unsafe { std::mem::transmute(sym) };
-            let raw_ptr = unsafe { *(builder as *mut AudioStreamBuilder as *mut *mut std::ffi::c_void) };
-            unsafe { f(raw_ptr, raw_fmt) };
-        }
-    }
-}
-
-unsafe fn builder_set_channel_mask(builder: &mut AudioStreamBuilder, mask: u32) -> bool {
-    type FnSetMask = unsafe extern "C" fn(*mut std::ffi::c_void, u32);
-    let lib = unsafe { libc::dlopen(c"libaaudio.so".as_ptr(), libc::RTLD_NOW) };
-    if lib.is_null() {
-        return false;
-    }
-    let sym = unsafe { libc::dlsym(lib, c"AAudioStreamBuilder_setChannelMask".as_ptr()) };
-    if sym.is_null() {
-        return false;
-    }
-    let f: FnSetMask = unsafe { std::mem::transmute(sym) };
-    let raw_ptr = unsafe { *(builder as *mut AudioStreamBuilder as *mut *mut std::ffi::c_void) };
-    unsafe { f(raw_ptr, mask) };
-    true
+/// Without a channel-mask binding AAudio places channels by its default order for the count
+/// (AOSP `audio_channel_out_mask_from_count`: 6 = FL FR FC LFE BL BR, 8 adds SL SR). Only
+/// layouts already in that order go out multichannel; the rest fold to stereo.
+fn aaudio_default_order(layout: ChannelLayout) -> bool {
+    use ChannelPosition::*;
+    matches!(
+        layout.positions(),
+        [FrontLeft, FrontRight, FrontCenter, LowFrequency, BackLeft | SideLeft, BackRight | SideRight]
+            | [FrontLeft, FrontRight, FrontCenter, LowFrequency, BackLeft, BackRight, SideLeft, SideRight]
+    )
 }
 
 // android.media constants, checked with `javap -constants` against android.jar (API 36).
@@ -233,14 +186,18 @@ impl AndroidAudioSink {
         mode: AudioOutputMode,
     ) -> Result<(), SinkError> {
         let channels = layout.channel_count();
-        let mask = (channels > 2).then(|| aaudio_channel_mask(layout)).flatten().filter(|&m| match mode {
-            AudioOutputMode::BitPerfectPcm | AudioOutputMode::Passthrough => true,
-            // Auto keeps every channel only where the route plays them directly; elsewhere it folds to stereo.
-            AudioOutputMode::Auto => direct_playback_supported(java_pcm_encoding(format), rate, (m << 2) as i32),
-            AudioOutputMode::Stereo => false,
-        });
+        let multichannel = channels > 2
+            && aaudio_default_order(layout)
+            && match mode {
+                AudioOutputMode::BitPerfectPcm | AudioOutputMode::Passthrough => true,
+                // Auto keeps every channel only where the route plays them directly; elsewhere it folds to stereo.
+                AudioOutputMode::Auto => {
+                    direct_playback_supported(java_pcm_encoding(format), rate, java_channel_mask(channels))
+                }
+                AudioOutputMode::Stereo => false,
+            };
 
-        if matches!(format, PcmFormat::S16 | PcmFormat::S24 | PcmFormat::S32) || mask.is_some() {
+        if matches!(format, PcmFormat::S16 | PcmFormat::S24 | PcmFormat::S32) || multichannel {
             if let Ok(mut b) = AudioStreamBuilder::new() {
                 b = b.sample_rate(rate as i32).direction(AudioDirection::Output);
                 b = match mode {
@@ -249,41 +206,24 @@ impl AndroidAudioSink {
                     }
                     _ => b.performance_mode(AudioPerformanceMode::LowLatency),
                 };
-                let out_ch = if let Some(m) = mask {
-                    if unsafe { builder_set_channel_mask(&mut b, m) } {
-                        channels
-                    } else {
-                        b = b.channel_count(i32::from(channels.min(2)));
-                        channels.min(2)
-                    }
-                } else {
-                    b = b.channel_count(i32::from(channels.min(2)));
-                    channels.min(2)
-                };
-                let target_fmt = if out_ch < channels {
-                    b = b.format(AudioFormat::PCM_Float);
-                    PcmFormat::F32
+                let out_ch = if multichannel { channels } else { channels.min(2) };
+                b = b.channel_count(i32::from(out_ch));
+                let (target_fmt, aaudio_fmt) = if out_ch < channels {
+                    (PcmFormat::F32, AudioFormat::PCM_Float)
                 } else {
                     match format {
-                        PcmFormat::S16 => {
-                            b = b.format(AudioFormat::PCM_I16);
-                            PcmFormat::S16
-                        }
-                        PcmFormat::S24 => {
-                            unsafe { builder_set_raw_format(&mut b, AAUDIO_FORMAT_PCM_I24_PACKED) };
-                            PcmFormat::S24
-                        }
-                        PcmFormat::S32 => {
-                            unsafe { builder_set_raw_format(&mut b, AAUDIO_FORMAT_PCM_I32) };
-                            PcmFormat::S32
-                        }
-                        _ => {
-                            b = b.format(AudioFormat::PCM_Float);
-                            PcmFormat::F32
-                        }
+                        PcmFormat::S16 => (PcmFormat::S16, AudioFormat::PCM_I16),
+                        PcmFormat::S24 => (PcmFormat::S24, AudioFormat::from(AAUDIO_FORMAT_PCM_I24_PACKED)),
+                        PcmFormat::S32 => (PcmFormat::S32, AudioFormat::from(AAUDIO_FORMAT_PCM_I32)),
+                        _ => (PcmFormat::F32, AudioFormat::PCM_Float),
                     }
                 };
-                if let Ok(stream) = b.open_stream() {
+                b = b.format(aaudio_fmt);
+                // A stream AAudio opened in another shape would be fed bytes it reads differently.
+                if let Ok(stream) = b.open_stream()
+                    && stream.format() == aaudio_fmt
+                    && stream.channel_count() == i32::from(out_ch)
+                {
                     self.output_channels = out_ch;
                     self.output_format = target_fmt;
                     self.mix = if out_ch < channels {
@@ -328,12 +268,12 @@ impl AndroidAudioSink {
             .channel_count(i32::from(carrier_ch))
             .direction(AudioDirection::Output)
             .performance_mode(AudioPerformanceMode::None);
-        unsafe { builder_set_raw_format(&mut b, AAUDIO_FORMAT_IEC61937) };
-        let Ok(stream) = b.open_stream() else {
+        let iec = AudioFormat::from(AAUDIO_FORMAT_IEC61937);
+        let Ok(stream) = b.format(iec).open_stream() else {
             return Ok(false);
         };
         // A stream opened as anything but IEC 61937 would play the bitstream as PCM noise.
-        if i32::from(stream.format()) != AAUDIO_FORMAT_IEC61937 {
+        if stream.format() != iec || stream.channel_count() != i32::from(carrier_ch) {
             return Ok(false);
         }
         self.iec_carrier_rate = carrier_rate;
