@@ -2653,7 +2653,7 @@ fn decoded_chunk(
         layout.sample_rate,
         layout.channels as usize,
     );
-    let (format, bytes) = pack_audio_interleaved(af, raw_format, channels);
+    let (format, mut bytes) = pack_audio_interleaved(af, raw_format, channels);
     let pts = match (af.pts.or(packet_pts.take()), *decoded_end) {
         (Some(ticks), _) => stream.time_base.seconds_of(ticks),
         (None, Some(end)) => end,
@@ -2667,6 +2667,10 @@ fn decoded_chunk(
         .resolved_layout()
         .filter(|layout| usize::from(layout.channel_count()) == channels)
         .unwrap_or_else(|| ChannelLayout::from_count(channels as u16));
+    // Decoders write FFmpeg's channel order; the chunk carries the core layout's.
+    if let Some(order) = crate::channel_order::from_ffmpeg_order(layout) {
+        crate::channel_order::reorder_interleaved(&mut bytes, format.bytes_per_sample(), order);
+    }
     Chunk {
         bytes,
         format,

@@ -108,19 +108,6 @@ pub(crate) fn android_surround_order(layout: ChannelLayout) -> Option<[u8; 8]> {
     Some(order)
 }
 
-/// Rewrites interleaved frames so output channel `i` carries source channel `order[i]`.
-#[cfg(any(target_os = "android", test))]
-pub(crate) fn reorder_frames(src: &[u8], sample_bytes: usize, order: &[u8], dst: &mut Vec<u8>) {
-    dst.clear();
-    dst.reserve(src.len());
-    for frame in src.chunks_exact(sample_bytes * order.len()) {
-        for &c in order {
-            let at = usize::from(c) * sample_bytes;
-            dst.extend_from_slice(&frame[at..at + sample_bytes]);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,12 +183,5 @@ mod tests {
         assert_eq!(android_surround_order(ChannelLayout::Surround61), None);
         assert_eq!(android_surround_order(ChannelLayout::Quad), None);
         assert_eq!(android_surround_order(ChannelLayout::DiscreteN(8)), None);
-
-        // Two S16 frames of channels 0..8 tagged by frame: the side and rear pairs swap.
-        let src: Vec<u8> = (0..2u16).flat_map(|f| (0..8u16).flat_map(move |c| (f * 100 + c).to_le_bytes())).collect();
-        let mut dst = Vec::new();
-        reorder_frames(&src, 2, &[0, 1, 2, 3, 6, 7, 4, 5], &mut dst);
-        let got: Vec<u16> = dst.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-        assert_eq!(got, [0, 1, 2, 3, 6, 7, 4, 5, 100, 101, 102, 103, 106, 107, 104, 105]);
     }
 }

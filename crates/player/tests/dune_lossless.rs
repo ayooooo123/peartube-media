@@ -129,7 +129,13 @@ fn player_preserves_full_32bit_integer_and_64bit_float_lsb_bits_end_to_end() {
 #[test]
 fn player_decodes_24bit_96khz_71_dts_hd_master_audio_bit_exact_with_lfe_layout() {
     let path = refcheck::fate("dts/dcadec-suite/xll_71_24_96_768.dtshd");
-    let reference = ffmpeg_raw_pcm(&path, "s32le", "pcm_s32le");
+    let mut reference = ffmpeg_raw_pcm(&path, "s32le", "pcm_s32le");
+    // FFmpeg writes 7.1 as FL FR FC LFE BL BR SL SR; the player hands sinks the core's order.
+    player::channel_order::reorder_interleaved(
+        &mut reference,
+        4,
+        player::channel_order::from_ffmpeg_order(ChannelLayout::Surround71).unwrap(),
+    );
 
     let headless = Headless::new();
     let opts = PlayerOptions {

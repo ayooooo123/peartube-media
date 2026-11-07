@@ -1,5 +1,6 @@
 use super::clock::{AudioClock, AudioClockState, SendAudioStream};
-use crate::audio_mix::{StereoMix, android_surround_order, reorder_frames};
+use crate::audio_mix::{StereoMix, android_surround_order};
+use crate::channel_order::reorder_interleaved;
 use crate::backend::{AudioOutputMode, AudioSink, Clock, PcmFormat, PcmSlice, SinkError};
 use crate::clock::current_monotonic_ns;
 use crate::iec61937::{Iec61937Codec, Iec61937Packetizer};
@@ -448,7 +449,9 @@ impl AudioSink for AndroidAudioSink {
                 (bytes, 4)
             };
             if let Some(order) = &self.order {
-                reorder_frames(data, width, &order[..usize::from(self.channels)], &mut self.reorder_buf);
+                self.reorder_buf.clear();
+                self.reorder_buf.extend_from_slice(data);
+                reorder_interleaved(&mut self.reorder_buf, width, &order[..usize::from(self.channels)]);
                 (self.reorder_buf.as_ptr().cast(), total_frames)
             } else {
                 (data.as_ptr().cast(), total_frames)

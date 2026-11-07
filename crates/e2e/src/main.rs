@@ -524,6 +524,10 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStream,
                 return Compare::fail(metric, format!("no canonical PCM for FFmpeg's {:?}", ff.sample_fmt));
             };
             match oracle::audio_pcm(path, ff, pcm)
+                .map(|mut reference| {
+                    in_capture_order(cap, &mut reference, pcm.bytes());
+                    reference
+                })
                 .and_then(|reference| compare::exact_pcm_capture(cap, &reference, pcm))
             {
                 Ok(m) => Compare::pass(m),
@@ -532,7 +536,7 @@ fn compare_audio(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStream,
         }
         Policy::AudioSnr(floor) => {
             let slack = oracle::audio_frames(path, ff).and_then(|frames| compare::lossy_slack(&frames, cap.channels));
-            let reference = oracle::audio_f32(path, ff);
+            let reference = oracle::audio_f32(path, ff).map(|r| f32_in_capture_order(cap, r));
             match (slack, reference) {
                 (Ok(slack), Ok(reference)) => {
                     let mut c = compare::snr_pcm(&cap.pcm, &reference, slack, floor);
@@ -554,7 +558,7 @@ fn audio_diagnostics(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStr
     }
     let snr = check_audio_layout(cap, ff).and_then(|()| {
         let slack = compare::lossy_slack(&oracle::audio_frames(path, ff)?, cap.channels)?;
-        refcheck::try_snr_db(&oracle::audio_f32(path, ff)?, &cap.pcm, slack)
+        refcheck::try_snr_db(&f32_in_capture_order(cap, oracle::audio_f32(path, ff)?), &cap.pcm, slack)
     });
     floors
         .iter()
@@ -564,6 +568,20 @@ fn audio_diagnostics(path: &Path, cap: &player::AudioCapture, ff: &oracle::FfStr
             Err(e) => format!("snr for the diagnostic {floor} dB: {e}"),
         })
         .collect()
+}
+
+/// FFmpeg's decode in the channel order the player hands its sinks (it moves
+/// three layouts from FFmpeg's order to the core's, see `player::channel_order`).
+fn in_capture_order(cap: &player::AudioCapture, reference: &mut [u8], sample_bytes: usize) {
+    if let Some(order) = cap.channel_layout.and_then(player::channel_order::from_ffmpeg_order) {
+        player::channel_order::reorder_interleaved(reference, sample_bytes, order);
+    }
+}
+
+fn f32_in_capture_order(cap: &player::AudioCapture, reference: Vec<f32>) -> Vec<f32> {
+    let mut bytes: Vec<u8> = reference.iter().flat_map(|v| v.to_le_bytes()).collect();
+    in_capture_order(cap, &mut bytes, 4);
+    bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
 }
 
 /// The decoded cues of one subtitle stream against FFmpeg's decode of `ff`,

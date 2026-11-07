@@ -11,6 +11,8 @@ pub mod annexb;
 #[forbid(unsafe_code)]
 pub mod backend;
 #[forbid(unsafe_code)]
+pub mod channel_order;
+#[forbid(unsafe_code)]
 pub mod subtitle_compose;
 #[forbid(unsafe_code)]
 pub mod cue;
