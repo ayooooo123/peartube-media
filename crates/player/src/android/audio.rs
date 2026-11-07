@@ -57,16 +57,35 @@ fn java_channel_mask(channels: u16) -> i32 {
     }
 }
 
+#[link(name = "log")]
+unsafe extern "C" {
+    fn __android_log_write(prio: i32, tag: *const std::ffi::c_char, text: *const std::ffi::c_char) -> i32;
+}
+
+/// Output-route decisions go to logcat under `peartube-audio`, so a device's choice can be read back.
+fn route_log(msg: &str) {
+    if let Ok(text) = std::ffi::CString::new(msg) {
+        // 4 = ANDROID_LOG_INFO
+        unsafe { __android_log_write(4, c"peartube-audio".as_ptr(), text.as_ptr()) };
+    }
+}
+
 /// `AudioTrack.isDirectPlaybackSupported` (API 29): whether the current route (an HDMI
 /// sink, say) plays this format itself. No JavaVM yet or any Java failure answers false,
-/// so callers fall back to the mixed stereo path.
+/// so callers fall back to the mixed stereo path; each answer and failure is logged.
 fn direct_playback_supported(encoding: i32, sample_rate: u32, java_mask: i32) -> bool {
     use jni::objects::JValue;
+    let what = format!("direct encoding={encoding} rate={sample_rate} mask={java_mask}");
     let Some(vm) = super::surface::SurfaceRegistry::global().java_vm() else {
+        route_log(&format!("{what}: no JavaVM yet"));
         return false;
     };
-    let Ok(mut env) = vm.attach_current_thread() else {
-        return false;
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => {
+            route_log(&format!("{what}: attach failed: {e}"));
+            return false;
+        }
     };
     let supported = env.with_local_frame(8, |env| -> jni::errors::Result<bool> {
         let fb = env.new_object("android/media/AudioFormat$Builder", "()V", &[])?;
@@ -89,7 +108,13 @@ fn direct_playback_supported(encoding: i32, sample_rate: u32, java_mask: i32) ->
         .z()
     });
     if env.exception_check().unwrap_or(false) {
+        // Prints the Java exception to logcat (System.err) before clearing it.
+        let _ = env.exception_describe();
         let _ = env.exception_clear();
+    }
+    match &supported {
+        Ok(yes) => route_log(&format!("{what}: {yes}")),
+        Err(e) => route_log(&format!("{what}: JNI error: {e}")),
     }
     supported.unwrap_or(false)
 }
@@ -196,6 +221,13 @@ impl AndroidAudioSink {
                 }
                 AudioOutputMode::Stereo => false,
             };
+        if channels > 2 && !multichannel {
+            route_log(&format!(
+                "pcm {channels}ch {:?} mode={mode:?} default_order={}: folding to stereo",
+                layout.positions(),
+                aaudio_default_order(layout)
+            ));
+        }
 
         if matches!(format, PcmFormat::S16 | PcmFormat::S24 | PcmFormat::S32) || multichannel {
             if let Ok(mut b) = AudioStreamBuilder::new() {
@@ -220,7 +252,16 @@ impl AndroidAudioSink {
                 };
                 b = b.format(aaudio_fmt);
                 // A stream AAudio opened in another shape would be fed bytes it reads differently.
-                if let Ok(stream) = b.open_stream()
+                let opened = b.open_stream();
+                match &opened {
+                    Ok(s) => route_log(&format!(
+                        "pcm open rate={rate} channels={out_ch} format={aaudio_fmt:?}: got format={:?} channels={}",
+                        s.format(),
+                        s.channel_count()
+                    )),
+                    Err(e) => route_log(&format!("pcm open rate={rate} channels={out_ch} format={aaudio_fmt:?}: {e:?}")),
+                }
+                if let Ok(stream) = opened
                     && stream.format() == aaudio_fmt
                     && stream.channel_count() == i32::from(out_ch)
                 {
@@ -269,9 +310,18 @@ impl AndroidAudioSink {
             .direction(AudioDirection::Output)
             .performance_mode(AudioPerformanceMode::None);
         let iec = AudioFormat::from(AAUDIO_FORMAT_IEC61937);
-        let Ok(stream) = b.format(iec).open_stream() else {
-            return Ok(false);
+        let stream = match b.format(iec).open_stream() {
+            Ok(s) => s,
+            Err(e) => {
+                route_log(&format!("iec open {codec:?} rate={carrier_rate} channels={carrier_ch}: {e:?}"));
+                return Ok(false);
+            }
         };
+        route_log(&format!(
+            "iec open {codec:?} rate={carrier_rate} channels={carrier_ch}: got format={:?} channels={}",
+            stream.format(),
+            stream.channel_count()
+        ));
         // A stream opened as anything but IEC 61937 would play the bitstream as PCM noise.
         if stream.format() != iec || stream.channel_count() != i32::from(carrier_ch) {
             return Ok(false);
