@@ -858,10 +858,13 @@ impl Compressed {
             return None;
         }
         let keep = |nal: &&[u8]| nal.len() < 2 || !matches!((nal[0] >> 1) & 0x3f, 8 | 9);
-        let size = split_length_prefixed(data, self.length_size)
+        let (size, has_picture) = split_length_prefixed(data, self.length_size)
             .filter(keep)
-            .map(|nal| self.length_size + nal.len())
-            .sum();
+            .fold((0, false), |(size, has_picture), nal| (
+                size + self.length_size + nal.len(),
+                has_picture || nal.len() >= 2 && (nal[0] >> 1) & 0x3f <= 31,
+            ));
+        if !has_picture { return Some(Vec::new()); }
         let mut kept = Vec::with_capacity(size);
         for nal in split_length_prefixed(data, self.length_size).filter(keep) {
             kept.extend_from_slice(&(nal.len() as u32).to_be_bytes()[4 - self.length_size..]);
@@ -5759,6 +5762,43 @@ mod tests {
         ColorPrimaries, ColorSignal, MatrixCoefficients, Rational, TransferCharacteristics,
         VideoPlane,
     };
+
+    #[test]
+    fn leading_hevc_rasl_with_dolby_rpu_never_reaches_videotoolbox() {
+        let mut raw = ptr::null_mut();
+        assert_eq!(unsafe {
+            CVPixelBufferCreate(
+                ptr::null(), 16, 16, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                ptr::null(), &mut raw,
+            )
+        }, 0);
+        let pixel = unsafe { CFRetained::from_raw(NonNull::new(raw).unwrap()) };
+        let format = unsafe { format_for_pixel_buffer(&pixel, 16, 16).unwrap() };
+        let mut compressed = Compressed {
+            kind: CompressedKind::Hevc,
+            length_size: 4,
+            annex_b: false,
+            format,
+            reorder_depth: 0,
+            primed: false,
+            first_irap: true,
+            discard_rasl: false,
+            present_from: Duration::ZERO,
+            params: oxideav_core::CodecParameters::video(oxideav_core::CodecId::new("hevc")),
+            headers: StreamHeaders::default(),
+            vp9: None,
+        };
+        let au = |kinds: &[u8]| kinds.iter().flat_map(|kind|
+            [0, 0, 0, 3, kind << 1, 1, 0]
+        ).collect::<Vec<_>>();
+        assert_eq!(compressed.filter_leading(&au(&[21])), None);
+        assert_eq!(
+            compressed.filter_leading(&au(&[35, 34, 39, 8, 8, 62])),
+            Some(Vec::new()),
+            "an RPU-only sample after the RASL picture is stripped makes VideoToolbox fail",
+        );
+        assert_eq!(compressed.filter_leading(&au(&[35, 34, 39, 1, 62])), None);
+    }
 
     #[test]
     fn test_pack_yuv420p10le_to_p010_shifts_and_interleaves() {
