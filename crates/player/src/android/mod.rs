@@ -26,4 +26,15 @@ pub use surface::{
     SurfaceRetirement, SurfaceRetirementError, SurfaceRetirementStatus,
     TOTAL_SURFACE_CREDITS,
 };
+
+pub(crate) fn log_audio_error(message: &str) {
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(priority: std::ffi::c_int, tag: *const std::ffi::c_char, text: *const std::ffi::c_char) -> std::ffi::c_int;
+    }
+    if let Ok(message) = std::ffi::CString::new(message.replace('\0', "\\0")) {
+        // SAFETY: both strings are NUL-terminated and live through the call.
+        unsafe { __android_log_write(5, c"peartube-audio".as_ptr(), message.as_ptr()); }
+    }
+}
 pub use video::AndroidVideoSink;

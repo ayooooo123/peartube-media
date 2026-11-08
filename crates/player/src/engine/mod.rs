@@ -2071,6 +2071,29 @@ fn record_trim_fallbacks(shared: &SharedState, trimmer: &mut Trimmer<Chunk>) {
     }
 }
 
+fn log_audio_decode_error<T>(
+    stream: &StreamInfo,
+    packet: &Packet,
+    operation: &str,
+    failure: std::thread::Result<oxideav_core::Result<T>>,
+    count: &mut u64,
+) {
+    *count += 1;
+    if *count > 3 && !count.is_power_of_two() { return; }
+    let error = match failure {
+        Ok(Err(error)) => error.to_string(),
+        Err(panic) => format!("panic: {}", panic.downcast_ref::<&str>().copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("non-string payload")),
+        Ok(Ok(_)) => return,
+    };
+    let message = format!("audio decoder {} stream={} {operation}: {error}; pts={:?} time_base={:?} size={} error_count={count}",
+        stream.params.codec_id.as_str(), stream.index, packet.pts, stream.time_base, packet.data.len());
+    #[cfg(target_os = "android")]
+    crate::android::log_audio_error(&message);
+    #[cfg(not(target_os = "android"))]
+    eprintln!("{message}");
+}
+
 /// Packet lanes → decoder → sink, for one audio stream. The sink follows the
 /// clock's run state (`play`/`pause`); while the clock stands still, PCM goes
 /// out only up to `PREROLL` past it. From its first samples of each seek the
@@ -2108,6 +2131,8 @@ fn run_audio_thread(
     // IEC 61937 MAT/DTS-HD bitstreams and Apple receives AC-3/E-AC-3 Atmos, while any
     // non-passthrough endpoint declines cleanly and falls straight back to bit-exact PCM.
     let mut pending = None;
+    // Keep the packet's epoch through slow sink setup; saved-position seeks can arrive there.
+    let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
     let try_passthrough = match shared.audio_mode {
         AudioOutputMode::Auto | AudioOutputMode::Passthrough => {
             matches!(stream.params.codec_id.as_str(), "ac3" | "eac3" | "dts" | "truehd" | "mlp")
@@ -2117,7 +2142,10 @@ fn run_audio_thread(
     if try_passthrough {
         match play_compressed(&stream, sink, &lane, &demux_cv, &shared, realtime, &retired) {
             Passthrough::Played => return,
-            Passthrough::Declined(packet) => pending = packet,
+            Passthrough::Declined(generation, packet) => {
+                seen_seek = generation;
+                pending = packet;
+            }
         }
     }
     let decoder_delay = audio_trim::take_decoder_delay(&mut decoder_params);
@@ -2161,7 +2189,7 @@ fn run_audio_thread(
     }
     let mut starved = false;
     let mut consecutive_errors = 0;
-    let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
+    let mut logged_errors = 0u64;
     let mut trimmer: Trimmer<Chunk> = Trimmer::with_decoder_delay(decoder_delay);
     let mut kept: Vec<Chunk> = Vec::new();
     // Where the decoder's output so far ends: where a frame without a pts
@@ -2186,6 +2214,7 @@ fn run_audio_thread(
         let gen_now = shared.seek_gen.load(Ordering::SeqCst);
         if gen_now != seen_seek {
             seen_seek = gen_now;
+            pending = None;
             sink.flush();
             out.written.running = None;
             out.written.end = None;
@@ -2294,7 +2323,8 @@ fn run_audio_thread(
                 trimmer.packet(&packet, metadata.audio_trim);
                 record_trim_fallbacks(&shared, &mut trimmer);
             }
-            Ok(Err(_)) | Err(_) => {
+            failure => {
+                log_audio_decode_error(&stream, &packet, "send_packet", failure, &mut logged_errors);
                 consecutive_errors += 1;
                 if consecutive_errors >= 3 {
                     audio_failed(&shared, format!("audio decoder failed 3 times on stream {}", stream.index));
@@ -2325,7 +2355,8 @@ fn run_audio_thread(
                 }
                 Ok(Err(oxideav_core::Error::NeedMore))
                 | Ok(Err(oxideav_core::Error::Eof)) => break,
-                Ok(Err(_)) | Err(_) => {
+                failure => {
+                    log_audio_decode_error(&stream, &packet, "receive_frame", failure, &mut logged_errors);
                     consecutive_errors += 1;
                     if consecutive_errors >= 3 {
                         audio_failed(&shared, format!("audio decoder failed 3 times on stream {}", stream.index));
@@ -2353,7 +2384,7 @@ enum Passthrough {
     /// The stream played through to its end, a stop, or a retirement.
     Played,
     /// The output plays PCM: decode, starting with this packet if any.
-    Declined(Option<QueuedPacket>),
+    Declined(u64, Option<QueuedPacket>),
 }
 
 /// Plays `stream` compressed through `sink`, packet by packet, with the
@@ -2444,7 +2475,7 @@ fn play_compressed(
                         notify_changed(shared);
                     }
                 }
-                _ => return Passthrough::Declined(Some(queued)),
+                _ => return Passthrough::Declined(seen_seek, Some(queued)),
             }
         }
         let packet = &queued.packet;
@@ -2509,7 +2540,7 @@ fn play_compressed(
                 Err(_) => {
                     // The output stopped taking packets: decode from the next one.
                     written.reopen(shared);
-                    return Passthrough::Declined(None);
+                    return Passthrough::Declined(seen_seek, None);
                 }
             }
         }
