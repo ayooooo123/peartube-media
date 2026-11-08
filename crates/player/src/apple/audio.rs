@@ -417,7 +417,10 @@ pub struct AppleAudioSink {
     clock_anchor: SampleClockAnchor,
     format_desc: Option<CFRetained<CMAudioFormatDescription>>,
     ready: ReadyFlag,
-    requesting: std::cell::Cell<bool>,
+    /// A `requestMediaDataWhenReady` block is registered. The block unregisters itself
+    /// on first call: AVFoundation re-invokes a registered block in a tight loop while
+    /// the renderer stays ready and nothing is enqueued (for example while buffering).
+    requesting: Arc<std::sync::atomic::AtomicBool>,
     /// Set by the first emitted buffer, or the first one after an explicit flush.
     /// Format reopens preserve it; unanchored `play`/`pause` record intent.
     anchored: bool,
@@ -495,7 +498,7 @@ impl AppleAudioSink {
             clock_anchor: SampleClockAnchor::default(),
             format_desc: None,
             ready,
-            requesting: std::cell::Cell::new(false),
+            requesting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             anchored: false,
             playing: false,
             compressed: false,
@@ -521,9 +524,15 @@ impl AppleAudioSink {
         // Register the pull callback once; it fires on `queue` whenever the
         // renderer becomes ready again.
         let pair = self.ready.clone();
-        let was_requesting = self.requesting.get();
-        if !was_requesting {
+        if !self.requesting.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let renderer = Retained::clone(&self.audio_renderer.0);
+            let requesting = self.requesting.clone();
             let block = RcBlock::new(move || {
+                unsafe {
+                    let renderer: &AVSampleBufferAudioRenderer = &renderer;
+                    let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
+                }
+                requesting.store(false, std::sync::atomic::Ordering::Release);
                 let (lock, cvar) = &*pair;
                 let mut ready = lock.lock().expect("ready lock");
                 *ready = true;
@@ -534,7 +543,6 @@ impl AppleAudioSink {
                 let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
                 let _: () = objc2::msg_send![renderer, requestMediaDataWhenReadyOnQueue: &*queue, usingBlock: &*block];
             }
-            self.requesting.set(true);
         }
         // A bounded wait returns control to the engine so it can pause,
         // seek or stop even when the renderer stops requesting data.
@@ -1022,12 +1030,11 @@ impl Drop for AppleAudioSink {
             *slot = None;
         }
         drop(slot);
-        if self.requesting.get() {
+        if self.requesting.swap(false, std::sync::atomic::Ordering::AcqRel) {
             unsafe {
                 let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
                 let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
             }
-            self.requesting.set(false);
         }
         // Video may still own this synchronizer. Retire only the audio
         // renderer; stopping the shared clock would freeze the video tail.
