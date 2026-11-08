@@ -6,9 +6,14 @@ use oxideav_core::{Error, Frame, MediaType};
 fn remux_audio_midfile_restart() {
     let root = std::env::var_os("PEARTUBE_CORPUS_DIR").map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join("projects/peartube-media-corpus"));
+    let flac = std::env::temp_dir().join(format!("peartube-audio-resync-{}.mka", std::process::id()));
+    let status = std::process::Command::new(refcheck::pinned_ffmpeg())
+        .args(["-v", "error", "-nostdin", "-y", "-i"]).arg(root.join("audio.flac"))
+        .args(["-map", "0:a:0", "-c:a", "copy"]).arg(&flac).status().unwrap();
+    assert!(status.success(), "FLAC Matroska remux failed");
     let ctx = codecs::context();
-    for name in ["h264_truehd.mkv", "h264_eac3.mkv", "h264_dts.mkv", "audio.flac"] {
-        let path = root.join(name);
+    for path in [root.join("h264_truehd.mkv"), root.join("h264_eac3.mkv"), root.join("h264_dts.mkv"), flac.clone()] {
+        let name = path.file_name().unwrap().to_string_lossy();
         let format = refcheck::probe_container(&ctx, &path).unwrap();
         let mut demux = ctx.containers.open_demuxer(&format, Box::new(File::open(&path).unwrap()), &ctx.codecs).unwrap();
         let stream = demux.streams().iter().find(|s| s.params.media_type == MediaType::Audio).unwrap().clone();
@@ -43,6 +48,7 @@ fn remux_audio_midfile_restart() {
             eprintln!("{name}: restart AU {start}, first audio after {} AUs", output_at.unwrap()+1);
         }
     }
+    std::fs::remove_file(flac).unwrap();
 }
 
 use std::sync::{Arc, mpsc};
