@@ -257,6 +257,8 @@ pub(crate) struct MailboxState {
     /// Untagged layer notifications request a current native-status observation.
     renderer_status_dirty: bool,
     renderer_status_checking: bool,
+    /// A one-shot renderer pull callback will wake the owner when capacity returns.
+    renderer_capacity_waiting: bool,
     /// Same-seek reset=false: already-accepted predecessor still authorized for
     /// native enqueue after latest_producer advanced.
     pub(crate) authorized_predecessor: Option<ProducerId>,
@@ -293,6 +295,7 @@ impl Mailbox {
                 current_error: None,
                 renderer_status_dirty: false,
                 renderer_status_checking: false,
+                renderer_capacity_waiting: false,
                 authorized_predecessor: None,
                 authorized_seek: 0,
                 last_enqueued_producer: None,
@@ -681,10 +684,9 @@ impl Mailbox {
         state.retired
             || state.setup_pending
             || state.renderer_status_dirty
-            || state.input_slot.is_some()
-            || drain_outstanding
+            || (!state.renderer_capacity_waiting
+                && (state.input_slot.is_some() || drain_outstanding || has_held_output))
             || state.control_revision != applied_control_revision
-            || has_held_output
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2160,6 +2162,28 @@ impl AppleMain {
             let capacity = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
                 with_renderer(&layer_for_enqueue, |renderer| unsafe {
                     let ready_now: bool = objc2::msg_send![renderer, isReadyForMoreMediaData];
+                    if !ready_now {
+                        mailbox_cb.lock().renderer_capacity_waiting = true;
+                        let bridge = Arc::downgrade(&this);
+                        let mailbox = Arc::downgrade(&mailbox_cb);
+                        let block = block2::RcBlock::new(move || {
+                            if let Some(bridge) = bridge.upgrade() {
+                                with_renderer(&bridge.layer, |renderer| {
+                                    let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
+                                });
+                            }
+                            if let Some(mailbox) = mailbox.upgrade() {
+                                mailbox.lock().renderer_capacity_waiting = false;
+                                mailbox.condvar.notify_all();
+                            }
+                        });
+                        let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
+                        let _: () = objc2::msg_send![
+                            renderer,
+                            requestMediaDataWhenReadyOnQueue: &*this.main,
+                            usingBlock: &*block
+                        ];
+                    }
                     ready_now
                 })
             }));
@@ -2321,6 +2345,9 @@ impl AppleMain {
 
         self.main.exec_async(move || {
             let res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+                with_renderer(&layer_for_unbind, |renderer| {
+                    let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
+                });
                 this.pse_disabled.store(false, Ordering::Release);
                 if this.edr_applied.swap(false, Ordering::AcqRel) {
                     super::set_layer_edr(&layer_for_unbind.0, false);
@@ -2853,12 +2880,18 @@ fn owner_loop(
                 mailbox
                     .condvar
                     .wait_for(&mut state, Duration::from_millis(50));
+                if !Mailbox::owner_wait_predicate(
+                    &state, applied_control_revision, held_output.is_some(),
+                ) {
+                    continue;
+                }
             }
             if state.retired {
                 (None, None, true, None)
             } else {
                 let setup = if state.setup_pending {
                     state.setup_pending = false;
+                    state.renderer_capacity_waiting = false;
                     state.desired_request.clone()
                 } else {
                     None
@@ -3339,7 +3372,9 @@ fn owner_loop(
         }
 
         // Retry held output (after setup so preserving authorization is live).
-        if let Some(held) = held_output.take() {
+        if !mailbox.lock().renderer_capacity_waiting
+            && let Some(held) = held_output.take()
+        {
             if let Some(req) = &active_request {
                 let threshold = applied_present_from.unwrap_or(Duration::ZERO);
                 let allow = mailbox.wait_for_published_request(
@@ -5759,6 +5794,35 @@ mod tests {
         ColorPrimaries, ColorSignal, MatrixCoefficients, Rational, TransferCharacteristics,
         VideoPlane,
     };
+
+    #[test]
+    fn renderer_backpressure_parks_media_but_not_controls() {
+        let mailbox = Mailbox::new();
+        let mut state = mailbox.lock();
+        state.input_slot = Some(MailboxInput::Packet {
+            producer: ProducerId(1),
+            packet: Packet::new(0, oxideav_core::TimeBase::new(1, 1000), Vec::new()),
+            pts: Duration::ZERO,
+            random_access: true,
+        });
+        state.drain_requested = Some(ProducerId(1));
+        state.renderer_capacity_waiting = true;
+        assert!(!Mailbox::owner_wait_predicate(&state, 0, true));
+        state.control_revision = 1;
+        assert!(Mailbox::owner_wait_predicate(&state, 0, true));
+        state.control_revision = 0;
+        state.setup_pending = true;
+        assert!(Mailbox::owner_wait_predicate(&state, 0, true));
+        state.setup_pending = false;
+        state.renderer_status_dirty = true;
+        assert!(Mailbox::owner_wait_predicate(&state, 0, true));
+        state.renderer_status_dirty = false;
+        state.retired = true;
+        assert!(Mailbox::owner_wait_predicate(&state, 0, true));
+        state.retired = false;
+        state.renderer_capacity_waiting = false;
+        assert!(Mailbox::owner_wait_predicate(&state, 0, true));
+    }
 
     #[test]
     fn test_pack_yuv420p10le_to_p010_shifts_and_interleaves() {
