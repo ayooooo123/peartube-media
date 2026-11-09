@@ -429,10 +429,12 @@ parse or decompress a codec configuration, stays within the master's 32 MiB
 limit at its peak and after the open; a CodecPrivate decodes in the room kept
 for parsing it and its stored form's charge passes to the decoded one, and a
 Tags master replaced between Clusters frees its entries' room in one pass. The
-Cues index keeps at most 32 MiB:
-past that, or past damage, it keeps the CuePoints before it, and a seek past
-the last point kept for its track, or with no Cues, scans the Clusters from
-the first one (a known read cost on large remote files). Cluster
+Cues keep at most 48 MiB: 24 MiB for compact seek entries and 24 MiB for the
+optional typed CuePoint tree. A full typed tree no longer truncates the seek
+index: Interstellar's 304,612 cues otherwise lost late coverage and its first
+98% seek scanned the movie, while Avatar's 132,884 cues fit. The demuxer regression
+bounds heap and per-seek reads. Only a cut compact index, damaged Cues, or no Cues
+requires scanning past the last retained entry for a track. Cluster
 records, their index, the EncryptedBlocks and SilentTracks numbers they keep,
 and the CRC-32 statuses share one 32 MiB budget, lists included, and are
 recorded once even when a seek revisits them. A block past the budget is
