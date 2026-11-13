@@ -1727,7 +1727,14 @@ fn lanes_full(run: &Run<'_>) -> bool {
         let (secs, bytes) = lane.queued(tb);
         bytes >= max_bytes || (pace && secs >= QUEUE_MAX_SECS)
     };
-    full(run.video_lane, run.video_tb, VIDEO_MAX_BYTES, true)
+    // Video that decodes slower than real time piles up in its lane while the
+    // audio lane drains. Pacing video at QUEUE_MAX_SECS then parks the demuxer
+    // before it reaches the next audio: the audio clock stops, the video
+    // consumer waits on it, and playback freezes (2856x2160 AV1 on a Pixel 5a
+    // stopped at 16.5 s with video 5.0 s queued, audio 0). While audio starves,
+    // video is held by its byte bound alone.
+    let audio_starved = run.audio_thread.is_some() && run.audio_lane.queued(run.audio_tb).1 == 0;
+    full(run.video_lane, run.video_tb, VIDEO_MAX_BYTES, !audio_starved)
         || full(run.audio_lane, run.audio_tb, AUDIO_MAX_BYTES, !priming)
         || full(run.sub_lane, run.sub_tb, SUB_MAX_BYTES, !priming)
 }
