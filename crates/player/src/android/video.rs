@@ -3046,8 +3046,14 @@ fn extract_csd(mime: &str, extradata: &[u8]) -> (Vec<u8>, Vec<u8>, usize, bool) 
                 nal_len_size = nls;
             }
         }
-    } else if !extradata.is_empty() {
-        csd0 = extradata.to_vec();
+    } else {
+        // Only H.264/HEVC (and Dolby Vision over HEVC) packets are length-prefixed NAL units.
+        // AV1 OBUs, VP8/VP9 frames and the MPEG video formats go to MediaCodec as they are:
+        // run through the NAL converter, an AV1 packet's first bytes became a bogus length.
+        packets_annex_b = mime != "video/dolby-vision";
+        if !extradata.is_empty() {
+            csd0 = extradata.to_vec();
+        }
     }
 
     (csd0, csd1, nal_len_size, packets_annex_b)
