@@ -146,7 +146,7 @@ fn gen_vlc(bits: &[u8], syms: Option<&[u8]>, mod_three_bits_offset: i32) -> Vlc 
     Vlc::init_sparse(maxbits.min(9), &entries).expect("RV34 VLC tables are valid")
 }
 
-static TABLES: LazyLock<Rv34Tables> = LazyLock::new(build_rv34_tables);
+static TABLES: LazyLock<Box<Rv34Tables>> = LazyLock::new(|| Box::new(build_rv34_tables()));
 
 fn rv34_tables() -> &'static Rv34Tables {
     &TABLES
@@ -154,36 +154,35 @@ fn rv34_tables() -> &'static Rv34Tables {
 
 /// `rv34_init_tables`.
 fn build_rv34_tables() -> Rv34Tables {
-    {
-        let mut intra = Vec::with_capacity(NUM_INTRA_TABLES);
-        for i in 0..NUM_INTRA_TABLES {
-            let cbppattern = (0..2).map(|j| gen_vlc(&RV34_TABLE_INTRA_CBPPAT[i][j], None, 4)).collect();
-            let cbp = (0..2)
-                .map(|j| std::array::from_fn(|k| gen_vlc(&RV34_TABLE_INTRA_CBP[i][j + k * 2], Some(&RV34_CBP_CODE), -1)))
-                .collect();
-            let first_pattern = (0..4).map(|j| gen_vlc(&RV34_TABLE_INTRA_FIRSTPAT[i][j], None, 3)).collect();
-            intra.push(Rv34Vlc {
-                cbppattern,
-                cbp,
-                first_pattern,
-                second_pattern: std::array::from_fn(|j| gen_vlc(&RV34_TABLE_INTRA_SECONDPAT[i][j], None, 0)),
-                third_pattern: std::array::from_fn(|j| gen_vlc(&RV34_TABLE_INTRA_THIRDPAT[i][j], None, 0)),
-                coefficient: gen_vlc(&RV34_INTRA_COEFF[i], None, -1),
-            });
-        }
-        let mut inter = Vec::with_capacity(NUM_INTER_TABLES);
-        for i in 0..NUM_INTER_TABLES {
-            inter.push(Rv34Vlc {
-                cbppattern: vec![gen_vlc(&RV34_INTER_CBPPAT[i], None, 4)],
-                cbp: vec![std::array::from_fn(|j| gen_vlc(&RV34_INTER_CBP[i][j], Some(&RV34_CBP_CODE), -1))],
-                first_pattern: (0..2).map(|j| gen_vlc(&RV34_TABLE_INTER_FIRSTPAT[i][j], None, 3)).collect(),
-                second_pattern: std::array::from_fn(|j| gen_vlc(&RV34_TABLE_INTER_SECONDPAT[i][j], None, 0)),
-                third_pattern: std::array::from_fn(|j| gen_vlc(&RV34_TABLE_INTER_THIRDPAT[i][j], None, 0)),
-                coefficient: gen_vlc(&RV34_INTER_COEFF[i], None, -1),
-            });
-        }
-        Rv34Tables { intra, inter }
+    let raw = unpack_rv34_vlc_lengths();
+    let mut intra = Vec::with_capacity(NUM_INTRA_TABLES);
+    for i in 0..NUM_INTRA_TABLES {
+        let cbppattern = (0..2).map(|j| gen_vlc(&raw.intra_cbppat[i][j], None, 4)).collect();
+        let cbp = (0..2)
+            .map(|j| std::array::from_fn(|k| gen_vlc(&raw.intra_cbp[i][j + k * 2], Some(&RV34_CBP_CODE), -1)))
+            .collect();
+        let first_pattern = (0..4).map(|j| gen_vlc(&raw.intra_firstpat[i][j], None, 3)).collect();
+        intra.push(Rv34Vlc {
+            cbppattern,
+            cbp,
+            first_pattern,
+            second_pattern: std::array::from_fn(|j| gen_vlc(&raw.intra_secondpat[i][j], None, 0)),
+            third_pattern: std::array::from_fn(|j| gen_vlc(&raw.intra_thirdpat[i][j], None, 0)),
+            coefficient: gen_vlc(&raw.intra_coeff[i], None, -1),
+        });
     }
+    let mut inter = Vec::with_capacity(NUM_INTER_TABLES);
+    for i in 0..NUM_INTER_TABLES {
+        inter.push(Rv34Vlc {
+            cbppattern: vec![gen_vlc(&raw.inter_cbppat[i], None, 4)],
+            cbp: vec![std::array::from_fn(|j| gen_vlc(&raw.inter_cbp[i][j], Some(&RV34_CBP_CODE), -1))],
+            first_pattern: (0..2).map(|j| gen_vlc(&raw.inter_firstpat[i][j], None, 3)).collect(),
+            second_pattern: std::array::from_fn(|j| gen_vlc(&raw.inter_secondpat[i][j], None, 0)),
+            third_pattern: std::array::from_fn(|j| gen_vlc(&raw.inter_thirdpat[i][j], None, 0)),
+            coefficient: gen_vlc(&raw.inter_coeff[i], None, -1),
+        });
+    }
+    Rv34Tables { intra, inter }
 }
 
 /// Which VLC set the current macroblock uses (`r->cur_vlcs`).

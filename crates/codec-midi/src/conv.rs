@@ -22,15 +22,15 @@ struct Tables {
     interp: [[f64; 4]; INTERP_MAX],
 }
 
-static TABLES: LazyLock<Tables> = LazyLock::new(|| {
-    let mut t = Tables {
+static TABLES: LazyLock<Box<Tables>> = LazyLock::new(|| {
+    let mut t = Box::new(Tables {
         ct2hz: [0.0; CENTS_HZ_SIZE],
         cb2amp: [0.0; CB_AMP_SIZE],
         concave: [0.0; VEL_CB_SIZE],
         convex: [0.0; VEL_CB_SIZE],
         pan: [0.0; PAN_SIZE],
         interp: [[0.0; 4]; INTERP_MAX],
-    };
+    });
     for (i, v) in t.ct2hz.iter_mut().enumerate() {
         *v = 6.875 * 2.0f64.powf(i as f64 / 1200.0);
     }

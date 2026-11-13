@@ -24,7 +24,7 @@ struct Mpc7Tables {
     quant_vlc: [[Vlc; 2]; 7],
 }
 
-static TABLES: LazyLock<Mpc7Tables> = LazyLock::new(|| {
+static TABLES: LazyLock<Box<Mpc7Tables>> = LazyLock::new(|| Box::new({
         // scfi_vlc
         let mut scfi_lens = [0i8; 4];
         let mut scfi_syms = [0i16; 4];
@@ -71,7 +71,7 @@ static TABLES: LazyLock<Mpc7Tables> = LazyLock::new(|| {
         }
 
         Mpc7Tables { scfi_vlc, dscf_vlc, hdr_vlc, quant_vlc }
-});
+}));
 
 fn get_tables() -> &'static Mpc7Tables {
     &TABLES

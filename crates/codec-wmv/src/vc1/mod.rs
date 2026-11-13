@@ -152,7 +152,7 @@ fn vlc_cb<C: Copy + Into<u32>>(bits: u32, codes: &[C], lens: &[u8]) -> Vlc {
     Vlc::new(bits, &pairs, None)
 }
 
-pub(crate) static VLCS: LazyLock<Vc1Vlcs> = LazyLock::new(|| Vc1Vlcs {
+pub(crate) static VLCS: LazyLock<Box<Vc1Vlcs>> = LazyLock::new(|| Box::new(Vc1Vlcs {
     imode: vlc_cb(4, &VC1_IMODE_CODES, &VC1_IMODE_BITS),
     norm2: vlc_cb(3, &VC1_NORM2_CODES, &VC1_NORM2_BITS),
     norm6: vlc_cb(9, &VC1_NORM6_CODES, &VC1_NORM6_BITS),
@@ -196,7 +196,7 @@ pub(crate) static VLCS: LazyLock<Vc1Vlcs> = LazyLock::new(|| Vc1Vlcs {
         ],
     ],
     msmp4_mb_i: Vlc::new(9, &MSMP4_MB_I_TABLE.iter().map(|e| (e[0] as u32, e[1] as u8)).collect::<Vec<_>>(), None),
-});
+}));
 
 /// Which VLC table a picture-level selector points at.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]

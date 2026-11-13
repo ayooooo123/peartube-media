@@ -111,7 +111,7 @@ fn v2_dc_table(tab: &[[u8; 2]; 13]) -> Vec<(u32, u8)> {
     out
 }
 
-pub(crate) static TABLES: LazyLock<MsTables> = LazyLock::new(|| {
+pub(crate) static TABLES: LazyLock<Box<MsTables>> = LazyLock::new(|| Box::new({
     let mv = |vals: &[u16; 1100], lens: &[u8; 1100]| {
         let syms: Vec<i32> = vals.iter().map(|&v| v as i32).collect();
         let lens: Vec<i8> = lens.iter().map(|&l| l as i8).collect();
@@ -162,7 +162,7 @@ pub(crate) static TABLES: LazyLock<MsTables> = LazyLock::new(|| {
         h263_cbpy: Vlc::new(6, &pairs_u8(&H263_CBPY_TAB), None),
         h263_mv: Vlc::new(9, &pairs_u8(&MVTAB), None),
     }
-});
+}));
 
 // ───────────────────────── decoder state ─────────────────────────
 

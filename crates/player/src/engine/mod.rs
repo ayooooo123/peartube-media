@@ -2205,13 +2205,21 @@ fn run_audio_thread(
     };
     // The output may come from the previous track: none of that plays on.
     sink.flush();
-    out.open = sink.open_pcm(out.rate, out.layout, out.format, shared.audio_mode).is_ok();
-    if out.open {
-        let desc = describe_pcm_output(out.format, out.rate, out.layout, shared.audio_mode, sink.output_channels());
-        if shared.state.lock().audio_output.replace(desc.clone()) != Some(desc) {
-            notify_changed(&shared);
+    // Lossless codecs whose container header omits `sample_format` (e.g. TrueHD/MLP in MKV,
+    // which decodes S32/S16 rather than F32) open once on the first decoded chunk so the
+    // renderer is not opened as F32 and immediately torn down and reopened as S32.
+    if stream.params.sample_format.is_some() {
+        out.open = sink.open_pcm(out.rate, out.layout, out.format, shared.audio_mode).is_ok();
+        if out.open {
+            let desc = describe_pcm_output(out.format, out.rate, out.layout, shared.audio_mode, sink.output_channels());
+            if shared.state.lock().audio_output.replace(desc.clone()) != Some(desc) {
+                notify_changed(&shared);
+            }
         }
     }
+    let is_mlp_family = matches!(decoder_params.codec_id.as_str(), "truehd" | "mlp");
+    let mut preseek_mlp_gop: Vec<QueuedPacket> = Vec::new();
+    let mut preseek_replay: VecDeque<QueuedPacket> = VecDeque::new();
     let mut starved = false;
     let mut consecutive_errors = 0;
     let mut seen_seek = shared.seek_gen.load(Ordering::SeqCst);
@@ -2245,6 +2253,8 @@ fn run_audio_thread(
             out.written.end = None;
             trimmer.reset();
             decoded_end = None;
+            preseek_mlp_gop.clear();
+            preseek_replay.clear();
             decoder = match make_decoder(&shared.ctx, &decoder_params) {
                 Ok(d) => d,
                 Err(e) => {
@@ -2261,9 +2271,12 @@ fn run_audio_thread(
         let applied = out.written.running;
         let woken = || quit() || Some(shared.running()) != applied;
         let report = |dry| shared.pipe_starved(Pipe::Audio, dry);
-        let popped = match pending.take() {
-            Some(packet) => Pop::Packet(packet),
-            None => lane.pop(seen_seek, &demux_cv, woken, &mut starved, report),
+        let popped = if let Some(replayed) = preseek_replay.pop_front() {
+            Pop::Packet(replayed)
+        } else if let Some(packet) = pending.take() {
+            Pop::Packet(packet)
+        } else {
+            lane.pop(seen_seek, &demux_cv, woken, &mut starved, report)
         };
         let QueuedPacket { packet, metadata } = match popped {
             Pop::Packet(p) => p,
@@ -2337,6 +2350,50 @@ fn run_audio_thread(
                 break;
             }
         };
+
+        // After a seek into a long video GOP, TrueHD/MLP carries ~1,200 access units per
+        // second, with self-contained Major Sync headers (`0xF872_6FBA`/`0xF872_6FBB`) every
+        // ~33-100 ms. Keep only the access units since the latest Major Sync prior to the
+        // seek target so pre-seek audio fast-forwards in microseconds while still decoding
+        // bit-exact lossless samples from the last Major Sync before `target`.
+        if is_mlp_family
+            && preseek_replay.is_empty()
+            && (out.start_at.is_some() || out.seen_seek_target != seen_seek)
+        {
+            let seek_target = out.start_at.map(|at| at.as_secs_f64()).or_else(|| {
+                shared
+                    .active_seek
+                    .lock()
+                    .as_ref()
+                    .filter(|seek| seek.generation > out.seen_seek_target)
+                    .map(|seek| seek.target)
+            });
+            if let Some(target) = seek_target {
+                let pkt_secs = packet
+                    .pts
+                    .or(packet.dts)
+                    .filter(|_| stream.time_base.is_valid())
+                    .map(|ts| stream.time_base.seconds_of(ts).max(0.0));
+                if let Some(ps) = pkt_secs {
+                    if ps + 0.005 < target && preseek_mlp_gop.len() < 160 {
+                        let d = &packet.data;
+                        if d.len() >= 32
+                            && (u32::from_be_bytes([d[4], d[5], d[6], d[7]]) & 0xffff_fffe)
+                                == 0xf872_6fba
+                        {
+                            preseek_mlp_gop.clear();
+                        }
+                        preseek_mlp_gop.push(QueuedPacket { packet, metadata });
+                        continue;
+                    }
+                }
+                if !preseek_mlp_gop.is_empty() {
+                    preseek_replay.extend(preseek_mlp_gop.drain(..));
+                    preseek_replay.push_back(QueuedPacket { packet, metadata });
+                    continue;
+                }
+            }
+        }
 
         // Decode one packet under catch_unwind. A decoder that panics or
         // errors 3 times in a row on this stream disables it: the track goes
@@ -3384,7 +3441,7 @@ impl VideoSession {
     /// the end with zero dropped frames. Returns true when the rescue was
     /// armed and the caller should continue; one rescue per session.
     fn rescue_silent_platform_decoder(&mut self, shared: &SharedState, stream: &StreamInfo) -> bool {
-        if !self.target_compressed || self.software_rescue_used {
+        if !self.target_compressed || self.software_rescue_used || self.mode.is_none() {
             return false;
         }
         self.software_rescue_used = true;

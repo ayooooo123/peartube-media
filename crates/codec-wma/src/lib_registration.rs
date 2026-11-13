@@ -42,28 +42,34 @@ pub fn register(ctx: &mut RuntimeContext) {
 }
 
 pub fn register_codecs(reg: &mut CodecRegistry) {
-    reg.register(
-        CodecInfo::new(CodecId::new("wmav1"))
+    for (id, tag) in [("wmav1", Some(0x0160)), ("wma1", None)] {
+        let mut info = CodecInfo::new(CodecId::new(id))
             .with_resolution_priority(50)
             .capabilities(
                 CodecCapabilities::audio("wmav1_sw_dec")
                     .with_max_channels(2)
                     .with_priority(50),
             )
-            .decoder(make_wmav1)
-            .tag(CodecTag::wave_format(0x0160)),
-    );
-    reg.register(
-        CodecInfo::new(CodecId::new("wmav2"))
+            .decoder(make_wmav1);
+        if let Some(t) = tag {
+            info = info.tag(CodecTag::wave_format(t));
+        }
+        reg.register(info);
+    }
+    for (id, tag) in [("wmav2", Some(0x0161)), ("wma2", None)] {
+        let mut info = CodecInfo::new(CodecId::new(id))
             .with_resolution_priority(50)
             .capabilities(
                 CodecCapabilities::audio("wmav2_sw_dec")
                     .with_max_channels(2)
                     .with_priority(50),
             )
-            .decoder(make_wmav2)
-            .tag(CodecTag::wave_format(0x0161)),
-    );
+            .decoder(make_wmav2);
+        if let Some(t) = tag {
+            info = info.tag(CodecTag::wave_format(t));
+        }
+        reg.register(info);
+    }
     reg.register(
         CodecInfo::new(CodecId::new("wmapro"))
             .with_resolution_priority(50)

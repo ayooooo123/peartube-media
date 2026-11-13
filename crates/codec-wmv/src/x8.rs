@@ -35,7 +35,7 @@ fn x8_vlc(nb_bits: u32, table: &[[u8; 2]]) -> Vlc {
     Vlc::from_lengths(nb_bits, &lens, Some(&syms), 0)
 }
 
-static TABLES: LazyLock<X8Tables> = LazyLock::new(|| {
+static TABLES: LazyLock<Box<X8Tables>> = LazyLock::new(|| Box::new({
     let mut ac = Vec::with_capacity(32);
     for i in 0..2 {
         for j in 0..2 {
@@ -53,7 +53,7 @@ static TABLES: LazyLock<X8Tables> = LazyLock::new(|| {
     let orient_high = (0..2).map(|i| x8_vlc(OR_VLC_BITS, &X8_ORIENT_HIGHQUANT_TABLE[i])).collect();
     let orient_low = (0..4).map(|i| x8_vlc(OR_VLC_BITS, &X8_ORIENT_LOWQUANT_TABLE[i])).collect();
     X8Tables { ac, dc, orient_high, orient_low }
-});
+}));
 
 /// `ac_decode_table` of intrax8.c.
 const AC_DECODE_TABLE: [u32; 27] = {

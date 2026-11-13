@@ -554,7 +554,7 @@ fn main() {
 fn observe_source_stalls(path: String, backend: Arc<Measured>) {
     let player = Player::open(&path, backend, Arc::new(codecs::context()), PlayerOptions::default(), |_| {});
     let open_until = Instant::now() + Duration::from_secs(20);
-    while player.state().duration.is_none() && Instant::now() < open_until {
+    while player.state().duration.is_none() && player.state().error.is_none() && Instant::now() < open_until {
         std::thread::sleep(Duration::from_millis(100));
     }
     let duration = player.state().duration.expect("movie duration");

@@ -20,6 +20,7 @@ pub fn msb_mask(bits: u32) -> i32 {
 /// `MAX_BLOCKSIZE + MAX_FIR_ORDER` entries (FFmpeg splits one
 /// `[2][MAX_BLOCKSIZE + MAX_FIR_ORDER]` buffer). `samples` is the
 /// block-strided column of the sample buffer for this channel.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn mlp_filter_channel(
     firbuf: &mut [i32],
@@ -36,42 +37,36 @@ pub fn mlp_filter_channel(
     channel: usize,
     blockpos: usize,
 ) {
-    // FFmpeg walks `sample_buffer += MAX_CHANNELS` per sample from
-    // &sample_buffer[blockpos][channel].
-    for i in 0..blocksize {
-        let residual = sample_buffer[blockpos + i][channel];
+    // Keep the 8-tap FIR and IIR delay lines in stack/register arrays across
+    // the block instead of shifting memory 16 times per sample.
+    let mut fir = [0i32; MAX_FIR_ORDER];
+    let mut iir = [0i32; MAX_IIR_ORDER];
+    fir.copy_from_slice(&firbuf[..MAX_FIR_ORDER]);
+    iir.copy_from_slice(&iirbuf[..MAX_IIR_ORDER]);
+    let fc = &fircoeff[..firorder.min(MAX_FIR_ORDER)];
+    let ic = &iircoeff[..iirorder.min(MAX_IIR_ORDER)];
+    let ch = channel.min(MAX_CHANNELS - 1);
+
+    for row in &mut sample_buffer[blockpos..blockpos + blocksize] {
+        let residual = row[ch];
         let mut accum: i64 = 0;
-
-        // FFmpeg: *--firbuf walks DOWN from firbuf = state + MAX_BLOCKSIZE,
-        // i.e. the newest samples sit below MAX_BLOCKSIZE and the filter
-        // state above. We model firbuf[i] = state[MAX_BLOCKSIZE + i] where
-        // index 0 is the most recent sample (see the caller's buffer setup).
-        for order in 0..firorder {
-            accum += (firbuf[order] as i64) * (fircoeff[order] as i64);
+        for (s, c) in fir.iter().zip(fc.iter()) {
+            accum += (*s as i64) * (*c as i64);
         }
-        for order in 0..iirorder {
-            accum += (iirbuf[order] as i64) * (iircoeff[order] as i64);
+        for (s, c) in iir.iter().zip(ic.iter()) {
+            accum += (*s as i64) * (*c as i64);
         }
-
         accum >>= filter_shift;
         let result = (accum as i32).wrapping_add(residual) & mask;
-
-        // FFmpeg's pointer walk (*--firbuf) shifts the WHOLE window every
-        // sample, regardless of the active filter order — the saved state
-        // must reproduce that, or a later order increase would see a
-        // different history than FFmpeg's.
-        for order in (1..MAX_FIR_ORDER).rev() {
-            firbuf[order] = firbuf[order - 1];
-        }
-        firbuf[0] = result;
         let diff = result.wrapping_sub(accum as i32);
-        for order in (1..MAX_IIR_ORDER).rev() {
-            iirbuf[order] = iirbuf[order - 1];
-        }
-        iirbuf[0] = diff;
 
-        sample_buffer[blockpos + i][channel] = result;
+        fir = [result, fir[0], fir[1], fir[2], fir[3], fir[4], fir[5], fir[6]];
+        iir = [diff, iir[0], iir[1], iir[2]];
+        row[ch] = result;
     }
+
+    firbuf[..MAX_FIR_ORDER].copy_from_slice(&fir);
+    iirbuf[..MAX_IIR_ORDER].copy_from_slice(&iir);
 }
 
 /// `ff_mlp_rematrix_channel`: apply one primitive matrix to the samples.
@@ -81,6 +76,7 @@ pub fn mlp_filter_channel(
 /// `index` is FFmpeg's `num_primitive_matrices - mat` (drives the noise
 /// stepping).
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn mlp_rematrix_channel(
     samples: &mut [[i32; MAX_CHANNELS]],
     coeffs: &[i32; MAX_CHANNELS],
@@ -117,6 +113,7 @@ pub fn mlp_rematrix_channel(
 /// `ch_assign` channel permutation, applying output shifts, and update the
 /// running lossless check data.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 pub fn pack_output(
     mut lossless_check_data: i32,
     blockpos: usize,

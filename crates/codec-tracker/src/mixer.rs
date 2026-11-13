@@ -137,12 +137,12 @@ fn wfir_table(cutoff: f64, ty: u8) -> Vec<i16> {
 }
 
 /// The resampler tables (`CResampler`), built once.
-pub static RESAMPLER: LazyLock<Resampler> = LazyLock::new(|| Resampler {
+pub static RESAMPLER: LazyLock<Box<Resampler>> = LazyLock::new(|| Box::new(Resampler {
     kaiser: getsinc(9.6377, 0.97),
     down13: getsinc(8.5, 0.5),
     down2: getsinc(7.0, 0.425),
     wfir: wfir_table(0.97, WFIR_KAISER4T),
-});
+}));
 
 /// Sample point types the kernels read.
 trait SampleIn: Copy {

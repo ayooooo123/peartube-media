@@ -99,28 +99,28 @@ pub struct VlcSet {
 }
 
 impl VlcSet {
-    pub fn new(mode_idx: usize) -> Self {
-        let filter_params = VlcTree::from_packed(&FILTER_PARAM_DEF[mode_idx], FILTERPARAM_ELEMENTS);
-        let bias = VlcTree::from_packed(&BIAS_DEF[mode_idx], BIAS_ELEMENTS);
-        let coding_mode = VlcTree::from_packed(&CODING_MODE_DEF[mode_idx], CODING_MODE_ELEMENTS);
+    fn from_raw(raw: &RalfRawTables, mode_idx: usize) -> Self {
+        let filter_params = VlcTree::from_packed(&raw.filter_param[mode_idx], FILTERPARAM_ELEMENTS);
+        let bias = VlcTree::from_packed(&raw.bias[mode_idx], BIAS_ELEMENTS);
+        let coding_mode = VlcTree::from_packed(&raw.coding_mode[mode_idx], CODING_MODE_ELEMENTS);
 
         let mut filter_coeffs = Vec::with_capacity(10);
         for j in 0..10 {
             let mut row = Vec::with_capacity(11);
             for k in 0..11 {
-                row.push(VlcTree::from_packed(&FILTER_COEFFS_DEF[mode_idx][j][k], FILTER_COEFFS_ELEMENTS));
+                row.push(VlcTree::from_packed(&raw.filter_coeffs[mode_idx][j][k], FILTER_COEFFS_ELEMENTS));
             }
             filter_coeffs.push(row);
         }
 
         let mut short_codes = Vec::with_capacity(15);
         for j in 0..15 {
-            short_codes.push(VlcTree::from_packed(&SHORT_CODES_DEF[mode_idx][j], SHORT_CODES_ELEMENTS));
+            short_codes.push(VlcTree::from_packed(&raw.short_codes[mode_idx][j], SHORT_CODES_ELEMENTS));
         }
 
         let mut long_codes = Vec::with_capacity(125);
         for j in 0..125 {
-            long_codes.push(VlcTree::from_packed(&LONG_CODES_DEF[mode_idx][j], LONG_CODES_ELEMENTS));
+            long_codes.push(VlcTree::from_packed(&raw.long_codes[mode_idx][j], LONG_CODES_ELEMENTS));
         }
 
         Self {
@@ -132,6 +132,18 @@ impl VlcSet {
             long_codes,
         }
     }
+}
+
+fn shared_vlc_sets() -> &'static [VlcSet; 3] {
+    static SETS: std::sync::LazyLock<Box<[VlcSet; 3]>> = std::sync::LazyLock::new(|| {
+        let raw = unpack_ralf_tables();
+        Box::new([
+            VlcSet::from_raw(&raw, 0),
+            VlcSet::from_raw(&raw, 1),
+            VlcSet::from_raw(&raw, 2),
+        ])
+    });
+    &SETS
 }
 
 #[inline]
@@ -163,7 +175,7 @@ pub struct RalfDecoder {
     channels: usize,
     sample_rate: u32,
     max_frame_size: usize,
-    sets: [VlcSet; 3],
+    sets: &'static [VlcSet; 3],
     channel_data: [[i32; 4096]; 2],
     filter_params: usize,
     filter_length: usize,
@@ -200,7 +212,7 @@ impl RalfDecoder {
         }
         let max_frame_size = raw_max_size.max(sample_rate as usize);
 
-        let sets = [VlcSet::new(0), VlcSet::new(1), VlcSet::new(2)];
+        let sets = shared_vlc_sets();
 
         Ok(Self {
             codec_id: CodecId::new("ralf"),

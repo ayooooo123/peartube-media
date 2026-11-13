@@ -19,6 +19,7 @@ const SUP_PGS_MAGIC: u16 = 0x5047; // "PG"
 
 pub(crate) fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("sup", open);
+    reg.register_demuxer("pgs", open);
     reg.register_extension_with_priority("sup", "sup", RESOLUTION_PRIORITY);
     reg.register_probe_with_priority("sup", probe, RESOLUTION_PRIORITY);
 }

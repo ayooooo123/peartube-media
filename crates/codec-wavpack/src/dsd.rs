@@ -84,8 +84,8 @@ pub const HTAPS: [f64; 48] = [
     3.130441005359396e-08,
 ];
 
-static CTABLES: LazyLock<[[f64; 256]; 6]> = LazyLock::new(|| {
-    let mut tables = [[0.0f64; 256]; 6];
+static CTABLES: LazyLock<Box<[[f64; 256]; 6]>> = LazyLock::new(|| {
+    let mut tables = Box::new([[0.0f64; 256]; 6]);
     for e in 0..256 {
         let mut acc = [0.0f64; 6];
         for m in 0..8 {

@@ -31,7 +31,7 @@ fn init_table(nb_bits: usize, tab: &[[u8; 2]]) -> Vlc {
     Vlc::init_from_lengths(nb_bits as u32, &lens, &syms, 0).expect("RV40 VLC tables are valid")
 }
 
-static TABLES: LazyLock<Rv40Tables> = LazyLock::new(|| {
+static TABLES: LazyLock<Box<Rv40Tables>> = LazyLock::new(|| Box::new({
     let aic_top = init_table(AIC_TOP_BITS, &RV40_AIC_TOP_VLC_TAB);
     // Every tenth mode-1 table is empty.
     let aic_mode1 = (0..AIC_MODE1_NUM).map(|i| (i % 10 != 9).then(|| init_table(AIC_MODE1_BITS, &AIC_MODE1_VLC_TABS[i]))).collect();
@@ -46,7 +46,7 @@ static TABLES: LazyLock<Rv40Tables> = LazyLock::new(|| {
     let ptype = (0..NUM_PTYPE_VLCS).map(|i| init_table(PTYPE_VLC_BITS, &PTYPE_VLC_TABS[i])).collect();
     let btype = (0..NUM_BTYPE_VLCS).map(|i| init_table(BTYPE_VLC_BITS, &BTYPE_VLC_TABS[i])).collect();
     Rv40Tables { aic_top, aic_mode1, aic_mode2, ptype, btype }
-});
+}));
 
 pub(super) fn rv40_tables() -> &'static Rv40Tables {
     &TABLES

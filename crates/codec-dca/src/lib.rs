@@ -70,6 +70,7 @@ pub fn register_codecs(reg: &mut oxideav_core::CodecRegistry) {
             .with_resolution_priority(RESOLUTION_PRIORITY)
             .tag(oxideav_core::CodecTag::wave_format(0x2001))
             .tag(oxideav_core::CodecTag::matroska("A_DTS"))
+            .tag(oxideav_core::CodecTag::fourcc(b"dts "))
             .tag(oxideav_core::CodecTag::fourcc(b"dtsc"))
             .tag(oxideav_core::CodecTag::fourcc(b"dtsh"))
             .tag(oxideav_core::CodecTag::fourcc(b"dtsl"))

@@ -50,7 +50,7 @@ enum DsdFilterMode {
 /// windowed-sinc low-pass FIR (`cutoff = 24.0 kHz` at DSD64, reaching -92 dB stopband
 /// by ~54 kHz) in 64-bit `f64` precision — suppressing DSD sigma-delta ultrasonic noise
 /// >50 dB cleaner than FFmpeg's 48-tap `f32` `dsd2pcm`.
-static STEEP64_CTABLES: LazyLock<[[f64; 256]; 32]> = LazyLock::new(|| {
+static STEEP64_CTABLES: LazyLock<Box<[[f64; 256]; 32]>> = LazyLock::new(|| {
     const TAPS: usize = 512;
     const HALF: usize = TAPS / 2; // 256 taps = 32 bytes
     const FC: f64 = 24_000.0 / 2_822_400.0;
@@ -75,7 +75,7 @@ static STEEP64_CTABLES: LazyLock<[[f64; 256]; 32]> = LazyLock::new(|| {
     for v in &mut h {
         *v /= sum;
     }
-    let mut tables = [[0.0f64; 256]; 32];
+    let mut tables = Box::new([[0.0f64; 256]; 32]);
     for pair in 0..32 {
         let mut bit_weights = [0.0f64; 8];
         for b in 0..8 {
@@ -111,7 +111,7 @@ impl Steep64State {
     }
 
     fn translate(&mut self, src: &[u8], stride: usize, samples: usize, dst: &mut [f64]) {
-        let tables = &*STEEP64_CTABLES;
+        let tables: &[[f64; 256]; 32] = &STEEP64_CTABLES;
         for i in 0..samples {
             self.hist.copy_within(0..63, 1);
             self.hist[0] = src[i * stride];

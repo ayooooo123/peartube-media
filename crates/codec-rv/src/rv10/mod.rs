@@ -127,7 +127,7 @@ fn rv10_build_vlc(len_count: &[u16; 15], sym_rl: &[[u8; 2]]) -> Vlc {
     Vlc::init_from_lengths(DC_VLC_BITS, &lens, &syms, 0).expect("RV10 DC VLC tables are valid")
 }
 
-static TABLES: LazyLock<H263Tables> = LazyLock::new(|| {
+static TABLES: LazyLock<Box<H263Tables>> = LazyLock::new(|| Box::new({
     let intra: Vec<(u32, u32)> = INTRA_MCBPC_BITS.iter().zip(INTRA_MCBPC_CODE.iter()).map(|(&b, &c)| (b as u32, c as u32)).collect();
     let inter: Vec<(u32, u32)> = INTER_MCBPC_BITS.iter().zip(INTER_MCBPC_CODE.iter()).map(|(&b, &c)| (b as u32, c as u32)).collect();
     let rl_inter = RlTable { n: 102, last: 58, table_vlc: &INTER_VLC, table_run: &INTER_RUN, table_level: &INTER_LEVEL };
@@ -158,7 +158,7 @@ static TABLES: LazyLock<H263Tables> = LazyLock::new(|| {
         rv_dc_lum,
         rv_dc_chrom,
     }
-});
+}));
 
 pub(crate) fn tables() -> &'static H263Tables {
     &TABLES

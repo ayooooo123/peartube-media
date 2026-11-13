@@ -1666,6 +1666,10 @@ pub(crate) struct AppleMain {
     edr_applied: AtomicBool,
     /// True once `EnablePSEMitigation = false` has been applied to the active `FigImageQueue`.
     pse_disabled: AtomicBool,
+    /// Cached `isReadyForMoreMediaData` state; avoids flooding the main queue while full.
+    renderer_ready: AtomicBool,
+    /// True while a one-shot `requestMediaDataWhenReadyOnQueue` callback is armed on main.
+    media_ready_armed: AtomicBool,
 }
 
 impl AppleMain {
@@ -1692,11 +1696,17 @@ impl AppleMain {
             stream_edr: AtomicBool::new(false),
             edr_applied: AtomicBool::new(false),
             pse_disabled: AtomicBool::new(false),
+            renderer_ready: AtomicBool::new(true),
+            media_ready_armed: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn set_stream_edr(&self, enabled: bool) {
         self.stream_edr.store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn is_renderer_ready(&self) -> bool {
+        self.renderer_ready.load(Ordering::Acquire)
     }
 
     fn work_cancelled(
@@ -2055,6 +2065,15 @@ impl AppleMain {
             }
             this.pse_disabled.store(false, Ordering::Release);
             let res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+            let disarm_ready = this.media_ready_armed.swap(false, Ordering::AcqRel);
+            this.renderer_ready.store(true, Ordering::Release);
+            if disarm_ready {
+                let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                    with_renderer(&layer_for_flush, |renderer| unsafe {
+                        let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
+                    });
+                }));
+            }
                 match renderer_path(&layer_for_flush) {
                     RendererPath::Modern => {
                         let renderer: Retained<AVSampleBufferVideoRenderer> =
@@ -2125,6 +2144,10 @@ impl AppleMain {
         if !mailbox.wait_for_published_request(&control, producer, seek_gen) {
             return Err(VideoError::Superseded);
         }
+        if !self.renderer_ready.load(Ordering::Acquire) {
+            *returned.lock() = Some(sample);
+            return Err(VideoError::Sink(SinkError::WouldBlock));
+        }
         let ticket = match self.acquire_operation_slot(&control, producer, seek_gen, Some(&mailbox)) {
             Ok(ticket) => ticket,
             Err(error) => {
@@ -2177,10 +2200,41 @@ impl AppleMain {
                 }
             };
             if !ready_now {
+                this.renderer_ready.store(false, Ordering::Release);
+                if !this.media_ready_armed.swap(true, Ordering::AcqRel) {
+                    let this_ready = Arc::clone(&this);
+                    let layer_ready = SendSync(layer_for_enqueue.0.clone());
+                    let mailbox_ready = Arc::clone(&mailbox_cb);
+                    let control_ready = Arc::clone(&control_cb);
+                    let main_queue = this.main.clone();
+                    let ready_block = block2::RcBlock::new(move || {
+                        if this_ready.media_ready_armed.swap(false, Ordering::AcqRel) {
+                            let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                                with_renderer(&layer_ready, |renderer| unsafe {
+                                    let _: () =
+                                        objc2::msg_send![renderer, stopRequestingMediaData];
+                                });
+                            }));
+                        }
+                        this_ready.renderer_ready.store(true, Ordering::Release);
+                        mailbox_ready.condvar.notify_all();
+                        control_ready.wake();
+                    });
+                    let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                        with_renderer(&layer_for_enqueue, |renderer| unsafe {
+                            let _: () = objc2::msg_send![
+                                renderer,
+                                requestMediaDataWhenReadyOnQueue: &*main_queue,
+                                usingBlock: &*ready_block
+                            ];
+                        });
+                    }));
+                }
                 *returned_cb.lock() = Some(sample);
                 this.complete_ticket(ticket, Err("renderer_not_ready".into()));
                 return;
             }
+            this.renderer_ready.store(true, Ordering::Release);
 
             let want_edr =
                 this.stream_edr.load(Ordering::Acquire) || unsafe { sample_needs_edr(&sample) };
@@ -2323,6 +2377,14 @@ impl AppleMain {
         self.stream_edr.store(false, Ordering::Release);
 
         self.main.exec_async(move || {
+            if this.media_ready_armed.swap(false, Ordering::AcqRel) {
+                let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                    with_renderer(&layer_for_unbind, |renderer| unsafe {
+                        let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
+                    });
+                }));
+            }
+            this.renderer_ready.store(true, Ordering::Release);
             let res = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
                 this.pse_disabled.store(false, Ordering::Release);
                 if this.edr_applied.swap(false, Ordering::AcqRel) {
@@ -2850,12 +2912,18 @@ fn owner_loop(
             if !Mailbox::owner_wait_predicate(
                 &state,
                 applied_control_revision,
-                held_output.is_some(),
+                held_output.is_some() && main_bridge.is_renderer_ready(),
             ) {
-                // Timed wait so VT failure cells still progress without a wake.
-                mailbox
-                    .condvar
-                    .wait_for(&mut state, Duration::from_millis(50));
+                // Timed wait so VT failure cells or fallback polling still progress cleanly.
+                let timeout = if held_output.is_some() {
+                    Duration::from_millis(8)
+                } else {
+                    Duration::from_millis(50)
+                };
+                mailbox.condvar.wait_for(&mut state, timeout);
+                if held_output.is_some() {
+                    main_bridge.renderer_ready.store(true, Ordering::Release);
+                }
             }
             if state.retired {
                 (None, None, true, None)
@@ -3371,6 +3439,30 @@ fn owner_loop(
                             if input_credit {
                                 mailbox.release_input_credit();
                             }
+                            if let Some(AppleDevice::Compressed {
+                                compressed,
+                                decoder: Some(dec),
+                                ready,
+                                ..
+                            }) = device.as_mut()
+                            {
+                                if let Err(e) = drain_decoded_pictures(
+                                    compressed,
+                                    dec,
+                                    ready,
+                                    held.producer,
+                                    &main_bridge,
+                                    &mailbox,
+                                    &req.control,
+                                    held.seek_gen,
+                                    &mut held_output,
+                                    false,
+                                    false,
+                                ) {
+                                    mailbox.report_error(held.producer, e, &req.control);
+                                }
+                            }
+                            req.control.wake();
                         }
                         Err(VideoError::Sink(SinkError::WouldBlock) | VideoError::Superseded) => {
                             if let Some(s) = returned.lock().take() {
@@ -3414,7 +3506,21 @@ fn owner_loop(
                 if let Some(req) = &active_request {
                     req.control.wake();
                 }
-            } else if held_output.is_some() {
+            } else if held_output.is_some()
+                && !(matches!(inp, MailboxInput::Packet { .. })
+                    && held_output
+                        .as_ref()
+                        .is_some_and(|h| !h.input_credit && h.producer == inp_producer)
+                    && matches!(
+                        device.as_ref(),
+                        Some(AppleDevice::Compressed {
+                            compressed,
+                            decoder: Some(dec),
+                            ..
+                        }) if compressed.primed
+                            && dec.output.pictures.lock().len() <= dec.output.reorder_depth + 1
+                    ))
+            {
                 // New media admission blocked until predecessor/bridge credit completes.
                 // Put input back.
                 {
@@ -3490,6 +3596,21 @@ fn owner_loop(
                                         }
                                     }
                                 }
+                            }
+                        }
+                        if let (
+                            Some(h),
+                            Some(AppleDevice::Compressed {
+                                decoder: Some(dec),
+                                ..
+                            }),
+                        ) = (held_output.as_mut(), device.as_ref())
+                        {
+                            if !h.input_credit
+                                && h.producer == inp_producer
+                                && dec.output.pictures.lock().len() > dec.output.reorder_depth + 1
+                            {
+                                h.input_credit = true;
                             }
                         }
                         // Retain input credit while a held sample still charges it.
@@ -3957,6 +4078,7 @@ fn process_compressed_packet(
         seek_gen,
         held_output,
         false,
+        true,
     )
 }
 
@@ -3972,6 +4094,7 @@ fn drain_decoded_pictures(
     seek_gen: u64,
     held_output: &mut Option<HeldSample>,
     all: bool,
+    owns_input_credit: bool,
 ) -> Result<(), VideoError> {
     loop {
         if held_output.is_some() {
@@ -4016,6 +4139,8 @@ fn drain_decoded_pictures(
             Ok(()) => {}
             Err(VideoError::Sink(SinkError::WouldBlock) | VideoError::Superseded) => {
                 if let Some(s) = returned.lock().take() {
+                    let headroom = !all
+                        && dec.output.pictures.lock().len() <= dec.output.reorder_depth + 1;
                     *held_output = Some(HeldSample {
                         sample: s,
                         pts: out_pts,
@@ -4023,7 +4148,7 @@ fn drain_decoded_pictures(
                         is_ready_candidate: is_cand,
                         ready: ready.clone(),
                         seek_gen,
-                        input_credit: true,
+                        input_credit: owns_input_credit && !headroom,
                     });
                 }
                 break;
@@ -4078,6 +4203,7 @@ fn ensure_vp9_session(
             control,
             seek_gen,
             held_output,
+            true,
             true,
         )?;
         // Pictures still queued after a blocked enqueue stay in the shared

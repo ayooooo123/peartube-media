@@ -6,7 +6,7 @@ use std::time::Duration;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
 pub const RING_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB
-const CHUNK_SIZE: usize = 128 * 1024; // 128 KiB per read
+const CHUNK_SIZE: usize = 512 * 1024; // 512 KiB per read (matches Hyperblobs block quantum)
 
 pub trait ReadSeekSend: Read + Seek + Send + 'static {}
 impl<T: Read + Seek + Send + 'static> ReadSeekSend for T {}

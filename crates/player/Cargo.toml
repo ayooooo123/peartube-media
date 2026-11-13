@@ -63,7 +63,7 @@ raw-window-handle = "0.6"
 objc2-ui-kit = "0.3"
 
 [dev-dependencies]
-oxideav-subtitle = { workspace = true, features = ["text"] }
+oxideav-subtitle.workspace = true
 oxideav-mp4.workspace = true
 oxideav-ogg.workspace = true
 oxideav-h264.workspace = true

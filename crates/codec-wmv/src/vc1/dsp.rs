@@ -505,68 +505,74 @@ fn mspel_op(d: &mut u8, v: i32, avg: bool) {
     }
 }
 
-#[inline(always)]
-fn filter_16bits_mode<const MODE: i32>(a: i32, b: i32, c: i32, d: i32) -> i32 {
-    match MODE {
-        1 => -4 * a + 53 * b + 18 * c - 3 * d,
-        2 => -a + 9 * b + 9 * c - d,
-        _ => -3 * a + 18 * b + 53 * c - 4 * d,
-    }
-}
+// Shared 4-tap bicubic weights keep all 16 subpel phases in one tight hole instead of 60 bloated clones.
+const MSPEL_TAPS: [[i32; 4]; 4] = [
+    [0, 0, 0, 0],
+    [-4, 53, 18, -3],
+    [-1, 9, 9, -1],
+    [-3, 18, 53, -4],
+];
+const MSPEL_ROUND: [i32; 4] = [0, 32, 8, 32];
+const MSPEL_SHIFT: [u32; 4] = [0, 6, 4, 6];
+const MSPEL_HV_SHIFT: [i32; 4] = [0, 5, 1, 5];
 
 #[inline(always)]
-fn mspel_filter_mode<const MODE: i32>(a: i32, b: i32, c: i32, d: i32, r: i32) -> i32 {
-    match MODE {
-        1 => (-4 * a + 53 * b + 18 * c - 3 * d + 32 - r) >> 6,
-        2 => (-a + 9 * b + 9 * c - d + 8 - r) >> 4,
-        _ => (-3 * a + 18 * b + 53 * c - 4 * d + 32 - r) >> 6,
-    }
-}
-
-#[inline(always)]
-fn mspel_write<const AVG: bool>(d: &mut u8, v: i32) {
+fn mspel_put_or_avg(d: &mut u8, v: i32, avg: bool) {
     let c = v.clamp(0, 255) as u8;
-    if AVG {
-        *d = ((u16::from(*d) + u16::from(c) + 1) >> 1) as u8;
-    } else {
-        *d = c;
-    }
+    *d = if avg { ((u16::from(*d) + u16::from(c) + 1) >> 1) as u8 } else { c };
 }
 
-#[inline(always)]
-fn mspel_vert_only<const N: usize, const AVG: bool, const VMODE: i32>(
-    dst: &mut [u8], doff: usize, dstride: usize, src: &Src, r: i32,
+fn vc1_mspel_fixed<const N: usize, const W: usize>(
+    dst: &mut [u8], doff: usize, dstride: usize, src: &Src, dxy: usize, rnd: i32, avg: bool,
 ) {
-    for j in 0..N {
-        let jy = j as isize;
-        let (a, b, c, d) = (src.row(0, jy - 1, N), src.row(0, jy, N), src.row(0, jy + 1, N), src.row(0, jy + 2, N));
-        let drow = &mut dst[doff + j * dstride..doff + j * dstride + N];
-        for i in 0..N {
-            mspel_write::<AVG>(&mut drow[i], mspel_filter_mode::<VMODE>(a[i] as i32, b[i] as i32, c[i] as i32, d[i] as i32, r));
+    let hmode = dxy & 3;
+    let vmode = (dxy >> 2) & 3;
+    if vmode == 0 && hmode == 0 {
+        for y in 0..N {
+            let s = src.row(0, y as isize, N);
+            let d = &mut dst[doff + y * dstride..doff + y * dstride + N];
+            if avg {
+                for i in 0..N {
+                    d[i] = ((u16::from(d[i]) + u16::from(s[i]) + 1) >> 1) as u8;
+                }
+            } else {
+                d.copy_from_slice(s);
+            }
         }
+        return;
     }
-}
-
-#[inline(always)]
-fn mspel_horiz_only<const N: usize, const AVG: bool, const HMODE: i32>(
-    dst: &mut [u8], doff: usize, dstride: usize, src: &Src, rnd: i32,
-) {
-    for j in 0..N {
-        let s = src.row(-1, j as isize, N + 3);
-        let (s0, s1, s2, s3) = (&s[..N], &s[1..N + 1], &s[2..N + 2], &s[3..N + 3]);
-        let drow = &mut dst[doff + j * dstride..doff + j * dstride + N];
-        for i in 0..N {
-            mspel_write::<AVG>(&mut drow[i], mspel_filter_mode::<HMODE>(s0[i] as i32, s1[i] as i32, s2[i] as i32, s3[i] as i32, rnd));
+    if vmode == 0 {
+        let [w0, w1, w2, w3] = MSPEL_TAPS[hmode];
+        let bias = MSPEL_ROUND[hmode] - rnd;
+        let sh = MSPEL_SHIFT[hmode];
+        for j in 0..N {
+            let s = src.row(-1, j as isize, N + 3);
+            let drow = &mut dst[doff + j * dstride..doff + j * dstride + N];
+            for i in 0..N {
+                let v = (w0 * s[i] as i32 + w1 * s[i + 1] as i32 + w2 * s[i + 2] as i32 + w3 * s[i + 3] as i32 + bias) >> sh;
+                mspel_put_or_avg(&mut drow[i], v, avg);
+            }
         }
+        return;
     }
-}
-
-#[inline(always)]
-fn mspel_hv<const N: usize, const W: usize, const AVG: bool, const VMODE: i32, const HMODE: i32>(
-    dst: &mut [u8], doff: usize, dstride: usize, src: &Src, rnd: i32,
-) {
-    const SHIFT_VALUE: [i32; 4] = [0, 5, 1, 5];
-    let shift = (SHIFT_VALUE[HMODE as usize] + SHIFT_VALUE[VMODE as usize]) >> 1;
+    if hmode == 0 {
+        let [w0, w1, w2, w3] = MSPEL_TAPS[vmode];
+        let bias = MSPEL_ROUND[vmode] - (1 - rnd);
+        let sh = MSPEL_SHIFT[vmode];
+        for j in 0..N {
+            let jy = j as isize;
+            let (a, b, c, d) = (src.row(0, jy - 1, N), src.row(0, jy, N), src.row(0, jy + 1, N), src.row(0, jy + 2, N));
+            let drow = &mut dst[doff + j * dstride..doff + j * dstride + N];
+            for i in 0..N {
+                let v = (w0 * a[i] as i32 + w1 * b[i] as i32 + w2 * c[i] as i32 + w3 * d[i] as i32 + bias) >> sh;
+                mspel_put_or_avg(&mut drow[i], v, avg);
+            }
+        }
+        return;
+    }
+    let [vw0, vw1, vw2, vw3] = MSPEL_TAPS[vmode];
+    let [hw0, hw1, hw2, hw3] = MSPEL_TAPS[hmode];
+    let shift = (MSPEL_HV_SHIFT[hmode] + MSPEL_HV_SHIFT[vmode]) >> 1;
     let rv = (1 << (shift - 1)) + rnd - 1;
     let rh = 64 - rnd;
     for j in 0..N {
@@ -574,63 +580,23 @@ fn mspel_hv<const N: usize, const W: usize, const AVG: bool, const VMODE: i32, c
         let (a, b, c, d) = (src.row(-1, jy - 1, W), src.row(-1, jy, W), src.row(-1, jy + 1, W), src.row(-1, jy + 2, W));
         let mut tmp = [0i16; W];
         for i in 0..W {
-            let v = filter_16bits_mode::<VMODE>(a[i] as i32, b[i] as i32, c[i] as i32, d[i] as i32);
+            let v = vw0 * a[i] as i32 + vw1 * b[i] as i32 + vw2 * c[i] as i32 + vw3 * d[i] as i32;
             tmp[i] = ((v + rv) >> shift) as i16;
         }
-        let (t0, t1, t2, t3) = (&tmp[..N], &tmp[1..N + 1], &tmp[2..N + 2], &tmp[3..N + 3]);
         let drow = &mut dst[doff + j * dstride..doff + j * dstride + N];
         for i in 0..N {
-            let v = filter_16bits_mode::<HMODE>(t0[i] as i32, t1[i] as i32, t2[i] as i32, t3[i] as i32);
-            mspel_write::<AVG>(&mut drow[i], (v + rh) >> 7);
+            let v = hw0 * tmp[i] as i32 + hw1 * tmp[i + 1] as i32 + hw2 * tmp[i + 2] as i32 + hw3 * tmp[i + 3] as i32;
+            mspel_put_or_avg(&mut drow[i], (v + rh) >> 7, avg);
         }
-    }
-}
-
-fn vc1_mspel_fixed<const N: usize, const W: usize, const AVG: bool>(
-    dst: &mut [u8], doff: usize, dstride: usize, src: &Src, dxy: usize, rnd: i32,
-) {
-    let hmode = (dxy & 3) as i32;
-    let vmode = (dxy >> 2) as i32;
-    match (vmode, hmode) {
-        (0, 0) => {
-            for y in 0..N {
-                let s = src.row(0, y as isize, N);
-                let d = &mut dst[doff + y * dstride..doff + y * dstride + N];
-                if AVG {
-                    for i in 0..N {
-                        d[i] = ((u16::from(d[i]) + u16::from(s[i]) + 1) >> 1) as u8;
-                    }
-                } else {
-                    d.copy_from_slice(s);
-                }
-            }
-        }
-        (0, 1) => mspel_horiz_only::<N, AVG, 1>(dst, doff, dstride, src, rnd),
-        (0, 2) => mspel_horiz_only::<N, AVG, 2>(dst, doff, dstride, src, rnd),
-        (0, _) => mspel_horiz_only::<N, AVG, 3>(dst, doff, dstride, src, rnd),
-        (1, 0) => mspel_vert_only::<N, AVG, 1>(dst, doff, dstride, src, 1 - rnd),
-        (2, 0) => mspel_vert_only::<N, AVG, 2>(dst, doff, dstride, src, 1 - rnd),
-        (_, 0) => mspel_vert_only::<N, AVG, 3>(dst, doff, dstride, src, 1 - rnd),
-        (1, 1) => mspel_hv::<N, W, AVG, 1, 1>(dst, doff, dstride, src, rnd),
-        (1, 2) => mspel_hv::<N, W, AVG, 1, 2>(dst, doff, dstride, src, rnd),
-        (1, _) => mspel_hv::<N, W, AVG, 1, 3>(dst, doff, dstride, src, rnd),
-        (2, 1) => mspel_hv::<N, W, AVG, 2, 1>(dst, doff, dstride, src, rnd),
-        (2, 2) => mspel_hv::<N, W, AVG, 2, 2>(dst, doff, dstride, src, rnd),
-        (2, _) => mspel_hv::<N, W, AVG, 2, 3>(dst, doff, dstride, src, rnd),
-        (_, 1) => mspel_hv::<N, W, AVG, 3, 1>(dst, doff, dstride, src, rnd),
-        (_, 2) => mspel_hv::<N, W, AVG, 3, 2>(dst, doff, dstride, src, rnd),
-        (_, _) => mspel_hv::<N, W, AVG, 3, 3>(dst, doff, dstride, src, rnd),
     }
 }
 
 /// `put_/avg_vc1_mspel_mc` (8x8 and 16x16) for `dxy = hmode + 4 * vmode`.
 #[allow(clippy::too_many_arguments)]
 pub fn vc1_mspel_mc(dst: &mut [u8], doff: usize, dstride: usize, src: &Src, n: usize, dxy: usize, rnd: i32, avg: bool) {
-    match (n, avg) {
-        (16, false) => vc1_mspel_fixed::<16, 19, false>(dst, doff, dstride, src, dxy, rnd),
-        (16, true) => vc1_mspel_fixed::<16, 19, true>(dst, doff, dstride, src, dxy, rnd),
-        (8, false) => vc1_mspel_fixed::<8, 11, false>(dst, doff, dstride, src, dxy, rnd),
-        (8, true) => vc1_mspel_fixed::<8, 11, true>(dst, doff, dstride, src, dxy, rnd),
+    match n {
+        16 => vc1_mspel_fixed::<16, 19>(dst, doff, dstride, src, dxy, rnd, avg),
+        8 => vc1_mspel_fixed::<8, 11>(dst, doff, dstride, src, dxy, rnd, avg),
         _ => {
             let hmode = (dxy & 3) as i32;
             let vmode = (dxy >> 2) as i32;

@@ -62,23 +62,45 @@ fn video_info(id: &'static str, implementation: &'static str) -> CodecInfo {
         .with_resolution_priority(RESOLUTION_PRIORITY)
 }
 
+/// Sniffs out ISO MPEG-4 Part 2 start codes hiding under a lying MS-MPEG-4 FourCC so we reject
+/// impostors cleanly at the gate instead of choking mid-stream.
+pub fn probe_is_msmpeg4(ctx: &oxideav_core::ProbeContext) -> f32 {
+    match ctx.packet.or(ctx.header) {
+        Some(data) => {
+            let end = data.len().min(512);
+            for w in data[..end].windows(4) {
+                if w[0] == 0 && w[1] == 0 && w[2] == 1
+                    && (matches!(w[3], 0xB0..=0xBF) || (0x20..=0x2F).contains(&w[3]))
+                {
+                    return 0.0;
+                }
+            }
+            1.0
+        }
+        None => 0.6,
+    }
+}
+
 /// Register the MS-MPEG-4 v1/v2/v3, WMV1 and WMV2 decoders.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     use msmpeg4::{MsDecoder, MsVersion};
-    // MS-MPEG-4 v1/v2/v3: the same FourCCs FFmpeg's riff.c maps.
+    // MS-MPEG-4 v1/v2/v3: the same FourCCs FFmpeg's riff.c maps, plus bitstream mislabel guard.
     reg.register(
         video_info(CODEC_ID_MSMPEG4V1, "msmpeg4v1_pear_sw")
             .decoder(|p| Ok(Box::new(MsDecoder::new(p, MsVersion::V1)?)))
+            .probe(probe_is_msmpeg4)
             .tags([CodecTag::fourcc(b"MPG4"), CodecTag::fourcc(b"MP41")]),
     );
     reg.register(
         video_info(CODEC_ID_MSMPEG4V2, "msmpeg4v2_pear_sw")
             .decoder(|p| Ok(Box::new(MsDecoder::new(p, MsVersion::V2)?)))
+            .probe(probe_is_msmpeg4)
             .tags([CodecTag::fourcc(b"MP42"), CodecTag::fourcc(b"DIV2")]),
     );
     reg.register(
         video_info(CODEC_ID_MSMPEG4V3, "msmpeg4v3_pear_sw")
             .decoder(|p| Ok(Box::new(MsDecoder::new(p, MsVersion::V3)?)))
+            .probe(probe_is_msmpeg4)
             .tags([
                 CodecTag::fourcc(b"MP43"),
                 CodecTag::fourcc(b"DIV3"),
@@ -93,6 +115,10 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
                 CodecTag::fourcc(b"3IVD"),
                 CodecTag::matroska("V_MPEG4/MS/V3"),
             ]),
+    );
+    reg.register(
+        video_info("div3", "msmpeg4v3_pear_sw")
+            .decoder(|p| Ok(Box::new(MsDecoder::new(p, MsVersion::V3)?))),
     );
     // WMV1 / WMV2: FourCC 'WMV1' / 'WMV2' (ASF, AVI, MKV V_MS/VFW/FOURCC).
     reg.register(

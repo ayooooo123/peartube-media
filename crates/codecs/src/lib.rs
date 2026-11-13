@@ -93,31 +93,21 @@ pub fn register_all(ctx: &mut RuntimeContext) {
         oxideav_mjpeg::__oxideav_entry,
         oxideav_mpeg12video::__oxideav_entry,
         oxideav_mpeg4video::__oxideav_entry,
-        oxideav_msmpeg4::__oxideav_entry,
-        oxideav_svq::__oxideav_entry,
         oxideav_theora::__oxideav_entry,
         oxideav_vc2::__oxideav_entry,
-        oxideav_vp6::__oxideav_entry,
         oxideav_vp8::__oxideav_entry,
         oxideav_vp9::__oxideav_entry,
         // Audio
         oxideav_aac::__oxideav_entry,
         oxideav_ac3::__oxideav_entry,
         oxideav_adpcm::__oxideav_entry,
-        oxideav_cook::__oxideav_entry,
-        oxideav_dts::__oxideav_entry,
         oxideav_flac::__oxideav_entry,
         oxideav_g711::__oxideav_entry,
         codec_mp2::register,
         oxideav_mp3::__oxideav_entry,
         oxideav_opus::__oxideav_entry,
-        oxideav_speex::__oxideav_entry,
         oxideav_vorbis::__oxideav_entry,
-        oxideav_wma::__oxideav_entry,
-        // Subtitles
-        oxideav_ass::__oxideav_entry,
-        oxideav_sub_image::__oxideav_entry,
-        oxideav_subtitle::__oxideav_entry,
+        oxideav_subtitle::register_unshadowed_decode,
     ] {
         register(ctx);
     }

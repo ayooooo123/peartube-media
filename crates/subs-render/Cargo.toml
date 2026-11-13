@@ -15,7 +15,7 @@ roxmltree = "0.20"
 unicode-bidi = "0.3.18"
 unicode-linebreak = "0.1.5"
 unicode-script = "0.5.8"
-oxideav-subtitle = { workspace = true, features = ["text"] }
+oxideav-subtitle.workspace = true
 
 [dev-dependencies]
 refcheck = { path = "../refcheck" }

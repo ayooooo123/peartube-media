@@ -8,7 +8,6 @@ publish.workspace = true
 
 [dependencies]
 oxideav-core.workspace = true
-oxideav-subtitle.workspace = true
 roxmltree = "0.20"
 
 [dev-dependencies]
@@ -20,3 +19,4 @@ oxideav-mkv.workspace = true
 oxideav-mp4.workspace = true
 oxideav-ogg.workspace = true
 oxideav-ass.workspace = true
+oxideav-subtitle.workspace = true

@@ -34,7 +34,7 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     let codecs: [(&str, &[&[u8; 4]], PixelFormat); 4] = [
         ("vp5", &[b"VP50"], PixelFormat::Yuv420P),
         ("vp6", &[b"VP60", b"VP61", b"VP62"], PixelFormat::Yuv420P),
-        ("vp6f", &[b"VP6F", b"FLV4"], PixelFormat::Yuv420P),
+        ("vp6f", &[b"VP6F", b"vp6f", b"FLV4"], PixelFormat::Yuv420P),
         ("vp6a", &[b"VP6A"], PixelFormat::Yuva420P),
     ];
     for (id, fourccs, pix) in codecs {
@@ -44,13 +44,15 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
             .with_priority(PRIORITY)
             .with_max_size(4080, 4080);
         caps.accepted_pixel_formats = vec![pix];
-        reg.register(
-            CodecInfo::new(CodecId::new(id))
-                .capabilities(caps)
-                .with_resolution_priority(PRIORITY)
-                .decoder(make_decoder)
-                .tags(fourccs.iter().map(|f| CodecTag::fourcc(f))),
-        );
+        let mut info = CodecInfo::new(CodecId::new(id))
+            .capabilities(caps)
+            .with_resolution_priority(PRIORITY)
+            .decoder(make_decoder)
+            .tags(fourccs.iter().map(|f| CodecTag::fourcc(f)));
+        if id == "vp6" {
+            info = info.tag(CodecTag::matroska("V_VP6"));
+        }
+        reg.register(info);
     }
 }
 

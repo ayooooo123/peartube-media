@@ -182,6 +182,7 @@ struct MkvRichDemuxer {
     streams: Vec<StreamInfo>,
     /// Per-stream BlockAddID carrying ITU-T T.35 (HDR10+) dynamic metadata, if any.
     t35_add_ids: Vec<Option<u64>>,
+    active_streams: Option<Vec<u32>>,
 }
 
 impl Demuxer for MkvRichDemuxer {
@@ -193,8 +194,21 @@ impl Demuxer for MkvRichDemuxer {
         &self.streams
     }
 
+    fn set_active_streams(&mut self, stream_indices: &[u32]) {
+        self.inner.set_active_streams(stream_indices);
+        self.active_streams = Some(stream_indices.to_vec());
+    }
+
     fn next_packet(&mut self) -> Result<Packet> {
-        let mut pkt = self.inner.next_packet()?;
+        let mut pkt = loop {
+            let pkt = self.inner.next_packet()?;
+            if let Some(active) = &self.active_streams {
+                if !active.contains(&pkt.stream_index) {
+                    continue;
+                }
+            }
+            break pkt;
+        };
         let si = pkt.stream_index as usize;
         // When an AV1 track carries ITU-T T.35 HDR10+ dynamic metadata in a
         // Matroska BlockAddition (`BlockAddIDType == 4`), prepend it as an AV1
@@ -328,6 +342,7 @@ pub fn open_mkv_enriched(
             inner,
             streams,
             t35_add_ids,
+            active_streams: None,
         }),
         chapters,
     ))

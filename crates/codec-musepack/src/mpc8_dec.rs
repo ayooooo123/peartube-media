@@ -32,7 +32,7 @@ struct Mpc8Tables {
     quant_vlc: [[Vlc; 2]; 4],
 }
 
-static TABLES: LazyLock<Mpc8Tables> = LazyLock::new(|| {
+static TABLES: LazyLock<Box<Mpc8Tables>> = LazyLock::new(|| Box::new({
     let mut q_syms = &MPC8_Q_SYMS[..];
     let mut scfi_syms = &MPC8_SCFI_SYMS[..];
     let mut dscf_syms = &MPC8_DSCF_SYMS[..];
@@ -97,7 +97,7 @@ static TABLES: LazyLock<Mpc8Tables> = LazyLock::new(|| {
         q3_vlc,
         quant_vlc,
     }
-});
+}));
 
 pub struct Mpc8Decoder {
     synth: MpaSynth,

@@ -23,8 +23,8 @@ const MDCT_SIZE: usize = 512;
 const ATRAC3_VLC_BITS: u32 = 8;
 
 /// `mdct_window` (`init_imdct_window`).
-static MDCT_WINDOW: LazyLock<[f32; MDCT_SIZE]> = LazyLock::new(|| {
-    let mut w = [0f32; MDCT_SIZE];
+static MDCT_WINDOW: LazyLock<Box<[f32; MDCT_SIZE]>> = LazyLock::new(|| {
+    let mut w = Box::new([0f32; MDCT_SIZE]);
     let pi = std::f64::consts::PI;
     for (i, j) in (0..128).zip((128..256).rev()) {
         // `float wi = sin(...) + 1.0;`: the sum is rounded, in double.

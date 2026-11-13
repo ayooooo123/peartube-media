@@ -205,7 +205,7 @@ fn vlc(tab: &[[u8; 2]]) -> Vlc {
     Vlc::from_lengths(tab.iter().map(|&[sym, len]| (i32::from(sym), i32::from(len))), -1).expect("qdm2 VLC table")
 }
 
-static TABLES: LazyLock<Tables> = LazyLock::new(|| {
+static TABLES: LazyLock<Box<Tables>> = LazyLock::new(|| Box::new({
     // softclip_table_init
     let dfl = f64::from(SOFTCLIP_THRESHOLD - 32767);
     let delta = (1.0 / -dfl) as f32;
@@ -306,7 +306,7 @@ static TABLES: LazyLock<Tables> = LazyLock::new(|| {
         type34: vlc(&TAB_TYPE34),
         fft_tone_offset,
     }
-});
+}));
 
 /// `qdm2_get_vlc`
 fn get_vlc(gb: &mut GetBitsLe, vlc: &Vlc, flag: bool) -> i32 {

@@ -10,6 +10,7 @@ publish.workspace = true
 # The player never encodes or muxes: OxideAV siblings' register functions
 # then leave their encoders and muxers unreferenced, and LTO drops them.
 oxideav-core = { workspace = true, features = ["decode-only"] }
+oxideav-pixfmt = { workspace = true, features = ["decode-only"] }
 oxideav-avi.workspace = true
 oxideav-basic.workspace = true
 oxideav-dvd.workspace = true
@@ -31,29 +32,20 @@ oxideav-indeo.workspace = true
 oxideav-mjpeg.workspace = true
 oxideav-mpeg12video.workspace = true
 oxideav-mpeg4video.workspace = true
-oxideav-msmpeg4.workspace = true
-oxideav-svq.workspace = true
 oxideav-theora.workspace = true
 oxideav-vc2.workspace = true
-oxideav-vp6.workspace = true
 oxideav-vp8.workspace = true
 oxideav-vp9.workspace = true
 oxideav-aac.workspace = true
 oxideav-ac3.workspace = true
 oxideav-adpcm.workspace = true
-oxideav-cook.workspace = true
-oxideav-dts.workspace = true
 oxideav-flac.workspace = true
 oxideav-g711.workspace = true
 codec-midi = { path = "../codec-midi" }
 codec-mp2 = { path = "../codec-mp2" }
 oxideav-mp3.workspace = true
 oxideav-opus.workspace = true
-oxideav-speex.workspace = true
 oxideav-vorbis.workspace = true
-oxideav-wma.workspace = true
-oxideav-ass.workspace = true
-oxideav-sub-image.workspace = true
 oxideav-subtitle.workspace = true
 demux-asf = { path = "../demux-asf" }
 codec-mlp = { path = "../codec-mlp" }
