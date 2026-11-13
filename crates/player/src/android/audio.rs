@@ -10,6 +10,11 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Every PCM stream opens in the normal performance mode. LowLatency let Android pick an
+/// exclusive MMAP endpoint when it was free and the shared mixer when it was not, and the
+/// stream is reopened on every seek: on a Pixel 9 Pro the same passage played at full level
+/// on MMAP and quieter on the mixer, changing from one seek to the next.
+const MEDIA_PERFORMANCE_MODE: AudioPerformanceMode = AudioPerformanceMode::None;
 const AAUDIO_FORMAT_PCM_I24_PACKED: i32 = ndk_sys::AAUDIO_FORMAT_PCM_I24_PACKED as i32;
 const AAUDIO_FORMAT_PCM_I32: i32 = ndk_sys::AAUDIO_FORMAT_PCM_I32 as i32;
 const AAUDIO_FORMAT_IEC61937: i32 = ndk_sys::AAUDIO_FORMAT_IEC61937 as i32;
@@ -226,12 +231,7 @@ impl AndroidAudioSink {
         if matches!(format, PcmFormat::S16 | PcmFormat::S24 | PcmFormat::S32) || multichannel {
             if let Ok(mut b) = AudioStreamBuilder::new() {
                 b = b.sample_rate(rate as i32).direction(AudioDirection::Output);
-                b = match mode {
-                    AudioOutputMode::BitPerfectPcm | AudioOutputMode::Passthrough => {
-                        b.performance_mode(AudioPerformanceMode::None)
-                    }
-                    _ => b.performance_mode(AudioPerformanceMode::LowLatency),
-                };
+                b = b.performance_mode(MEDIA_PERFORMANCE_MODE);
                 let out_ch = if multichannel { channels } else { channels.min(2) };
                 b = b.channel_count(i32::from(out_ch));
                 let (target_fmt, aaudio_fmt) = if out_ch < channels {
@@ -281,7 +281,7 @@ impl AndroidAudioSink {
             .sample_rate(rate as i32)
             .format(AudioFormat::PCM_Float)
             .direction(AudioDirection::Output)
-            .performance_mode(AudioPerformanceMode::LowLatency)
+            .performance_mode(MEDIA_PERFORMANCE_MODE)
             .open_stream()
             .map_err(|e| SinkError::Fatal(format!("AAudio open: {e:?}")))?;
         self.output_channels = out_ch;
