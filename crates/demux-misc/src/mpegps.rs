@@ -1461,6 +1461,10 @@ impl Demuxer for MpegPsDemuxer {
 
 pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("mpeg", open_mpegps);
+    // oxideav-mpegts registers its own program-stream demuxer as `mpegps`,
+    // with a probe that wins ties against this one (it registers first).
+    // Replace that probe by name so program streams always open here.
+    reg.register_probe("mpegps", |_| 0);
     reg.register_probe("mpeg", probe_mpegps);
     reg.register_extension("mpg", "mpeg");
     reg.register_extension("mpeg", "mpeg");

@@ -5,9 +5,11 @@
 //! (`refcheck::pinned_ffmpeg`, 2da55bf), frame for frame: every frame's
 //! size, pixel format and MD5, in output order.
 //!
-//! FFmpeg decodes with `-idct simple`, the C `ff_simple_idct_put_int16_8bit`
-//! the fork's IDCT reproduces (this host's default picks NEON assembly whose
-//! scan-table permutation rounds some blocks differently), and
+//! FFmpeg decodes with `-cpuflags 0`: its own IDCT choice, run as C code.
+//! That is the C `ff_simple_idct_put_int16_8bit` the fork's default IDCT
+//! reproduces (this host's default picks NEON assembly whose scan-table
+//! permutation rounds some blocks differently), or the XviD IDCT FFmpeg
+//! switches to for a stream an XviD encoder signed, as the fork does. Also
 //! `-noautoscale`, which keeps each frame at the size it decodes at where a
 //! stream changes size (FATE's resolution-change tests scale to the first
 //! size instead).
@@ -53,7 +55,7 @@ fn ffmpeg_frames(path: &Path) -> Vec<FrameSig> {
     let md5s = refcheck::parse_framemd5(&run(
         &ffmpeg,
         &[
-            "-v", "error", "-nostdin", "-idct", "simple", "-i", input, "-map", "0:v:0", "-fps_mode", "passthrough",
+            "-v", "error", "-nostdin", "-cpuflags", "0", "-i", input, "-map", "0:v:0", "-fps_mode", "passthrough",
             "-noautoscale", "-pix_fmt", &pix_fmt, "-f", "framemd5", "-",
         ],
     ));
