@@ -2531,10 +2531,7 @@ fn run_video_owner(
                                                         &frame,
                                                         FrameInfo::new(src_fmt, w, h),
                                                         PixelFormat::Rgba,
-                                                        &oxideav_pixfmt::ConvertOptions {
-                                                            color_space: rgba_cs,
-                                                            ..Default::default()
-                                                        },
+                                                        &oxideav_pixfmt::ConvertOptions::new().with_color_space(rgba_cs),
                                                     ),
                                                 ) && guard.width() >= w as usize
                                                     && guard.height() >= h as usize
@@ -2588,10 +2585,7 @@ fn run_video_owner(
                                     &frame,
                                     frame_info,
                                     PixelFormat::Rgba,
-                                    &oxideav_pixfmt::ConvertOptions {
-                                        color_space: rgba_cs,
-                                        ..Default::default()
-                                    },
+                                    &oxideav_pixfmt::ConvertOptions::new().with_color_space(rgba_cs),
                                 ) {
                                     Ok(rgba_frame) => {
                                         if !decision_checked {
