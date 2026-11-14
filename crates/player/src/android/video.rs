@@ -2867,12 +2867,17 @@ fn configure_and_start_codec(
     }
 
     let codec = if force_software {
-        match software_decoder_name(base_mime).and_then(MediaCodec::from_codec_name) {
+        let dav1d = (base_mime == "video/av01").then(|| MediaCodec::from_codec_name(DAV1D_DECODER)).flatten();
+        match dav1d.or_else(|| software_decoder_name(base_mime).and_then(MediaCodec::from_codec_name)) {
             Some(c) => c,
             None => return Err(VideoError::Unsupported),
         }
     } else {
         match MediaCodec::from_decoder_type(base_mime) {
+            // With no AV1 hardware, Android picks its libgav1 component; its dav1d one is faster.
+            Some(c) if base_mime == "video/av01" && c.name().is_ok_and(|n| n == "c2.android.av1.decoder") => {
+                MediaCodec::from_codec_name(DAV1D_DECODER).unwrap_or(c)
+            }
             Some(c) => c,
             None => return Err(VideoError::Unsupported),
         }
@@ -3052,6 +3057,10 @@ fn extract_csd(mime: &str, extradata: &[u8]) -> (Vec<u8>, Vec<u8>, usize, bool) 
 
     (csd0, csd1, nal_len_size, packets_annex_b)
 }
+
+/// Android's dav1d AV1 component (media mainline). On a Pixel 5a, a 2856x2160 AV1 film decoded
+/// to a Surface at 1.40x real time through it and 0.89x through `c2.android.av1.decoder` (libgav1).
+const DAV1D_DECODER: &str = "c2.android.av1-dav1d.decoder";
 
 fn software_decoder_name(mime: &str) -> Option<&'static str> {
     match mime {
