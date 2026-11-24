@@ -208,7 +208,15 @@ impl Read for ReadAheadSource {
                     buf[first_chunk..to_read].copy_from_slice(&state.buffer[..second_chunk]);
                 }
                 state.cur_pos += to_read as u64;
-                self.shared.worker_cv.notify_one();
+                // Wake the read-ahead worker only when a full chunk can be
+                // written or evicted; waking on every tiny EBML header read
+                // ping-pongs the ring mutex with the demuxer thread.
+                let keep = (state.capacity / 8) as u64;
+                let buffered = (state.head_pos - state.tail_pos) as usize;
+                let reclaimable = state.cur_pos.saturating_sub(state.tail_pos.saturating_add(keep)) as usize;
+                if state.capacity.saturating_sub(buffered) + reclaimable >= CHUNK_SIZE {
+                    self.shared.worker_cv.notify_one();
+                }
                 break Ok(to_read);
             }
 

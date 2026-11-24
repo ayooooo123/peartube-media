@@ -35,7 +35,7 @@ use objc2_quartz_core::CAAutoresizingMask;
 
 use crate::apple::audio::AppleAudioSink;
 use crate::apple::clock::AppleClock;
-use crate::apple::subtitles::AppleSubtitleSink;
+use crate::apple::subtitles::{aspect_fit_subrect, AppleSubtitleSink, SubtitlePlacement};
 use crate::apple::util::SendSync;
 use crate::apple::video::AppleVideoSink;
 use crate::backend::{AudioSink, Backend, Clock, SubtitleSink, VideoSink};
@@ -55,6 +55,8 @@ pub struct AppleBackend {
     container: Mutex<Option<SendSync<Retained<CALayer>>>>,
     video_layer: SendSync<Retained<objc2_av_foundation::AVSampleBufferDisplayLayer>>,
     subtitle_layer: SendSync<Retained<CALayer>>,
+    subtitle_image_layer: SendSync<Retained<CALayer>>,
+    subtitle_placement: Arc<Mutex<Option<SubtitlePlacement>>>,
     frame: Mutex<[f64; 4]>,
     /// Audio renderers made from now on are muted (see `set_muted`).
     muted: AtomicBool,
@@ -97,6 +99,9 @@ impl AppleBackend {
         }
         let subtitle_layer = CALayer::new();
         subtitle_layer.setMasksToBounds(true);
+        let subtitle_image_layer = CALayer::new();
+        subtitle_image_layer.setHidden(true);
+        subtitle_layer.addSublayer(&subtitle_image_layer);
         let main = main_queue();
         std::sync::Arc::new(Self {
             playback: Arc::new(Mutex::new(None)),
@@ -104,6 +109,8 @@ impl AppleBackend {
             container: Mutex::new(None),
             video_layer: SendSync(video_layer),
             subtitle_layer: SendSync(subtitle_layer),
+            subtitle_image_layer: SendSync(subtitle_image_layer),
+            subtitle_placement: Arc::new(Mutex::new(None)),
             frame: Mutex::new([0.0; 4]),
             muted: AtomicBool::new(false),
             layer_lease: Arc::new(parking_lot::Mutex::new(video::LayerLeaseState::new())),
@@ -204,6 +211,10 @@ impl AppleBackend {
         container.setFrame(cg);
         self.video_layer.setFrame(content);
         self.subtitle_layer.setFrame(content);
+        if let Some(placement) = *self.subtitle_placement.lock().expect("subtitle placement lock") {
+            let sub = aspect_fit_subrect(content, self.subtitle_layer.isGeometryFlipped(), placement);
+            self.subtitle_image_layer.setFrame(sub);
+        }
         CATransaction::commit();
         let _ = &self.main;
     }
@@ -286,6 +297,7 @@ pub struct AppleWindowSlot {
     view: Retained<NSView>,
     main_view: Retained<NSView>,
     prev_color_space: Option<Retained<objc2_app_kit::NSColorSpace>>,
+    prev_max_drawables: Option<usize>,
     last_rect: std::cell::Cell<[f64; 4]>,
 }
 
@@ -325,6 +337,7 @@ impl AppleWindowSlot {
         } else {
             None
         };
+        let prev_max_drawables = set_metal_layer_max_drawables(&main_view, 2);
 
         let backend = AppleBackend::new();
         unsafe { backend.attach(Retained::as_ptr(&view) as *mut std::ffi::c_void) };
@@ -333,6 +346,7 @@ impl AppleWindowSlot {
             view,
             main_view,
             prev_color_space,
+            prev_max_drawables,
             last_rect: std::cell::Cell::new([0.0; 4]),
         })
     }
@@ -418,8 +432,30 @@ impl AppleWindowSlot {
 }
 
 #[cfg(target_os = "macos")]
+fn set_metal_layer_max_drawables(view: &NSView, count: usize) -> Option<usize> {
+    let layer = view.layer()?;
+    unsafe {
+        let get_sel = objc2::sel!(maximumDrawableCount);
+        let set_sel = objc2::sel!(setMaximumDrawableCount:);
+        if !objc2::msg_send![&*layer, respondsToSelector: get_sel]
+            || !objc2::msg_send![&*layer, respondsToSelector: set_sel]
+        {
+            return None;
+        }
+        let prev: usize = objc2::msg_send![&*layer, maximumDrawableCount];
+        if prev != count {
+            let _: () = objc2::msg_send![&*layer, setMaximumDrawableCount: count];
+        }
+        Some(prev)
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl Drop for AppleWindowSlot {
     fn drop(&mut self) {
+        if let Some(prev) = self.prev_max_drawables.take() {
+            let _ = set_metal_layer_max_drawables(&self.main_view, prev);
+        }
         self.backend.detach();
         self.view.removeFromSuperview();
         if let Some(host) = self.main_view.window() {
@@ -625,10 +661,11 @@ impl Backend for AppleBackend {
     }
 
     fn subtitles(&self) -> Box<dyn SubtitleSink> {
-        let layer = self.subtitle_layer.0.clone();
-        let ptr = SendPtr(Retained::into_raw(layer));
-        let layer = unsafe { Retained::from_raw(ptr.0) }.expect("layer null");
-        Box::new(AppleSubtitleSink::new(layer))
+        Box::new(AppleSubtitleSink::new(
+            self.subtitle_layer.0.clone(),
+            self.subtitle_image_layer.0.clone(),
+            Arc::clone(&self.subtitle_placement),
+        ))
     }
 
     fn suspend(&self) {
