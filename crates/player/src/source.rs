@@ -141,6 +141,8 @@ impl ReadAheadSource {
         let worker_thread = std::thread::Builder::new()
             .name("peartube-source-readahead".into())
             .spawn(move || {
+                #[cfg(target_os = "macos")]
+                crate::clock::pin_ecore();
                 worker_loop(reader, shared_clone);
             })
             .expect("failed to spawn source read-ahead thread");

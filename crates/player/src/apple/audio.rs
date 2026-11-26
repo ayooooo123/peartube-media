@@ -11,11 +11,12 @@
 //! buffer kisses the next without container-rounding clicks.
 
 use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use dispatch2::{DispatchQueue, DispatchQueueAttr};
+use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_av_foundation::{
@@ -351,8 +352,9 @@ fn endpoint_output_channels() -> usize {
 /// `write` until the renderer pulls; this callback is what wakes it.
 type ReadyFlag = Arc<(Mutex<bool>, Condvar)>;
 
-/// Floor per `CMSampleBuffer` (matches AetherEngine's 1024-sample floor, scaled
-/// to >= 25 ms so 96/192 kHz streams never dip under an 11.6 ms HAL cycle).
+/// Floor per `CMSampleBuffer` (~100 ms so CoreMedia/AVFoundation enqueue and
+/// queue-duration bookkeeping runs 10x/s instead of 40x/s while staying well
+/// inside the 2-second renderer buffer and matching `DISCONTINUITY_SECS`).
 const MIN_BUFFER_SAMPLES: usize = 1024;
 /// Source PTS jump large enough to count as a real timeline discontinuity
 /// rather than container millisecond rounding jitter.
@@ -360,7 +362,7 @@ const DISCONTINUITY_SECS: f64 = 0.100;
 
 #[inline]
 fn min_buffer_frames(sample_rate: u32) -> usize {
-    ((sample_rate as usize) / 40).max(MIN_BUFFER_SAMPLES)
+    ((sample_rate as usize) / 10).max(MIN_BUFFER_SAMPLES)
 }
 
 /// Gapless integer-tick clock anchor: locks onto the first frame's PTS and
@@ -417,7 +419,8 @@ pub struct AppleAudioSink {
     clock_anchor: SampleClockAnchor,
     format_desc: Option<CFRetained<CMAudioFormatDescription>>,
     ready: ReadyFlag,
-    requesting: std::cell::Cell<bool>,
+    ready_armed: Arc<AtomicBool>,
+    ready_queue: DispatchRetained<DispatchQueue>,
     /// Set by the first emitted buffer, or the first one after an explicit flush.
     /// Format reopens preserve it; unanchored `play`/`pause` record intent.
     anchored: bool,
@@ -495,7 +498,8 @@ impl AppleAudioSink {
             clock_anchor: SampleClockAnchor::default(),
             format_desc: None,
             ready,
-            requesting: std::cell::Cell::new(false),
+            ready_armed: Arc::new(AtomicBool::new(false)),
+            ready_queue: DispatchQueue::new("peartube.audio.ready", DispatchQueueAttr::SERIAL),
             anchored: false,
             playing: false,
             compressed: false,
@@ -508,7 +512,7 @@ impl AppleAudioSink {
 
     fn wait_ready(&self) -> bool {
         // Fast path: renderer is accepting data right now.
-        let ready_now = unsafe {
+        let ready_now: bool = unsafe {
             let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
             objc2::msg_send![renderer, isReadyForMoreMediaData]
         };
@@ -518,31 +522,55 @@ impl AppleAudioSink {
         if !self.playing {
             return false;
         }
-        // Register the pull callback once; it fires on `queue` whenever the
-        // renderer becomes ready again.
-        let pair = self.ready.clone();
-        let was_requesting = self.requesting.get();
-        if !was_requesting {
+        // Clear the flag before arming the one-shot callback so an immediate
+        // wakeup cannot be missed between here and the condvar wait.
+        {
+            let (lock, _) = &*self.ready;
+            *lock.lock().expect("ready lock") = false;
+        }
+        // Arm a one-shot pull callback: stop requesting immediately on first
+        // firing so AVFoundation's `AVMediaDataRequester` does not spin at
+        // 100% CPU while the audio thread is decoding the next frame.
+        if !self.ready_armed.swap(true, Ordering::AcqRel) {
+            let pair = Arc::clone(&self.ready);
+            let armed = Arc::clone(&self.ready_armed);
+            let renderer_cb = SendSync(self.audio_renderer.0.clone());
             let block = RcBlock::new(move || {
+                let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+                    let renderer: &AVSampleBufferAudioRenderer = &renderer_cb.0;
+                    let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
+                }));
+                armed.store(false, Ordering::Release);
                 let (lock, cvar) = &*pair;
-                let mut ready = lock.lock().expect("ready lock");
-                *ready = true;
-                cvar.notify_all();
+                if let Ok(mut ready) = lock.lock() {
+                    *ready = true;
+                    cvar.notify_all();
+                }
             });
-            let queue = DispatchQueue::new("peartube.audio.ready", DispatchQueueAttr::SERIAL);
-            unsafe {
+            let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
                 let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
-                let _: () = objc2::msg_send![renderer, requestMediaDataWhenReadyOnQueue: &*queue, usingBlock: &*block];
-            }
-            self.requesting.set(true);
+                let _: () = objc2::msg_send![
+                    renderer,
+                    requestMediaDataWhenReadyOnQueue: &*self.ready_queue,
+                    usingBlock: &*block
+                ];
+            }));
         }
         // A bounded wait returns control to the engine so it can pause,
         // seek or stop even when the renderer stops requesting data.
+        let deadline = Instant::now() + Duration::from_millis(20);
         let (lock, cvar) = &*self.ready;
-        let guard = lock.lock().expect("ready lock");
-        let (guard, _) = cvar
-            .wait_timeout(guard, Duration::from_millis(20))
-            .expect("ready condvar");
+        let mut guard = lock.lock().expect("ready lock");
+        while !*guard {
+            let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            let (g, res) = cvar.wait_timeout(guard, rem).expect("ready condvar");
+            guard = g;
+            if res.timed_out() {
+                break;
+            }
+        }
         drop(guard);
         unsafe {
             let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
@@ -1026,12 +1054,11 @@ impl Drop for AppleAudioSink {
             *slot = None;
         }
         drop(slot);
-        if self.requesting.get() {
-            unsafe {
+        if self.ready_armed.swap(false, Ordering::AcqRel) {
+            let _ = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
                 let renderer: &AVSampleBufferAudioRenderer = &self.audio_renderer;
                 let _: () = objc2::msg_send![renderer, stopRequestingMediaData];
-            }
-            self.requesting.set(false);
+            }));
         }
         // Video may still own this synchronizer. Retire only the audio
         // renderer; stopping the shared clock would freeze the video tail.

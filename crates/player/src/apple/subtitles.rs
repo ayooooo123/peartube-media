@@ -152,9 +152,11 @@ impl crate::backend::SubtitleSink for AppleSubtitleSink {
                     // and a display pass would replace these contents.
                     layer.setContents(Some(contents));
                     layer.setHidden(false);
+                    parent.setHidden(false);
                 } else {
                     layer.setContents(None);
                     layer.setHidden(true);
+                    parent.setHidden(true);
                 }
             }
             CATransaction::commit();

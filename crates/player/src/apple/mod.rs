@@ -85,6 +85,7 @@ impl AppleBackend {
     pub fn new() -> std::sync::Arc<Self> {
         // SAFETY: plain allocation on the main thread.
         let video_layer = unsafe { objc2_av_foundation::AVSampleBufferDisplayLayer::new() };
+        video_layer.setOpaque(true);
         // Keep the layer collared in SDR (`preferredDynamicRange = "standard"`, `wantsEDR = false`)
         // until an actual HDR/Dolby Vision stream spreads it open: on macOS 26+, `AVSampleBufferDisplayLayer`
         // defaults `preferredDynamicRange` to `"high"`, which bypasses SDR clamping even when `wantsEDR` is false.
@@ -99,6 +100,7 @@ impl AppleBackend {
         }
         let subtitle_layer = CALayer::new();
         subtitle_layer.setMasksToBounds(true);
+        subtitle_layer.setHidden(true);
         let subtitle_image_layer = CALayer::new();
         subtitle_image_layer.setHidden(true);
         subtitle_layer.addSublayer(&subtitle_image_layer);
@@ -147,6 +149,7 @@ impl AppleBackend {
         let autoresize = CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable;
         let container = CALayer::new();
         container.setMasksToBounds(true);
+        container.setOpaque(true);
         container.setBackgroundColor(Some(&black_background()));
         container.setAutoresizingMask(autoresize);
         self.video_layer.setAutoresizingMask(autoresize);
@@ -155,6 +158,7 @@ impl AppleBackend {
         container.addSublayer(&*self.subtitle_layer);
         view.setWantsLayer(true);
         if let Some(view_layer) = view.layer() {
+            view_layer.setOpaque(true);
             view_layer.setBackgroundColor(Some(&black_background()));
             view_layer.addSublayer(&container);
         }
@@ -298,7 +302,9 @@ pub struct AppleWindowSlot {
     main_view: Retained<NSView>,
     prev_color_space: Option<Retained<objc2_app_kit::NSColorSpace>>,
     prev_max_drawables: Option<usize>,
+    saved_window_bg: std::cell::RefCell<Option<(bool, Retained<objc2_app_kit::NSColor>)>>,
     last_rect: std::cell::Cell<[f64; 4]>,
+    overlay_visible: std::cell::Cell<bool>,
 }
 
 #[cfg(target_os = "macos")]
@@ -347,8 +353,42 @@ impl AppleWindowSlot {
             main_view,
             prev_color_space,
             prev_max_drawables,
+            saved_window_bg: std::cell::RefCell::new(None),
             last_rect: std::cell::Cell::new([0.0; 4]),
+            overlay_visible: std::cell::Cell::new(true),
         })
+    }
+
+    /// Shows or hides the host view's `CAMetalLayer` above the video slot while
+    /// keeping `main_view` itself visible for AppKit mouse/keyboard hit-testing.
+    /// When the overlay is hidden, also marks the host `NSWindow` opaque with a
+    /// solid black background so macOS CoreAnimation can promote
+    /// `AVSampleBufferDisplayLayer` to hardware Detached Video scanout instead
+    /// of compositing 4K frames against desktop content in WindowServer.
+    pub fn set_overlay_visible(&self, visible: bool) {
+        if self.overlay_visible.get() == visible {
+            return;
+        }
+        self.overlay_visible.set(visible);
+        if let Some(layer) = self.main_view.layer() {
+            CATransaction::begin();
+            CATransaction::setDisableActions(true);
+            layer.setHidden(!visible);
+            CATransaction::commit();
+        }
+        if let Some(host) = self.main_view.window() {
+            if !visible {
+                let mut saved = self.saved_window_bg.borrow_mut();
+                if saved.is_none() {
+                    *saved = Some((host.isOpaque(), host.backgroundColor()));
+                }
+                host.setOpaque(true);
+                host.setBackgroundColor(Some(&objc2_app_kit::NSColor::blackColor()));
+            } else if let Some((was_opaque, prev_bg)) = self.saved_window_bg.borrow_mut().take() {
+                host.setOpaque(was_opaque);
+                host.setBackgroundColor(Some(&prev_bg));
+            }
+        }
     }
 
     pub fn backend(&self) -> Arc<dyn Backend> {
@@ -453,6 +493,7 @@ fn set_metal_layer_max_drawables(view: &NSView, count: usize) -> Option<usize> {
 #[cfg(target_os = "macos")]
 impl Drop for AppleWindowSlot {
     fn drop(&mut self) {
+        self.set_overlay_visible(true);
         if let Some(prev) = self.prev_max_drawables.take() {
             let _ = set_metal_layer_max_drawables(&self.main_view, prev);
         }

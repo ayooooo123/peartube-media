@@ -464,6 +464,17 @@ pub(crate) mod timing {
     }
 }
 
+/// On macOS Apple Silicon, `QOS_CLASS_BACKGROUND` (0x09) strictly pins continuous
+/// decode/demux/read-ahead producer threads onto efficiency cores (~3.5x less
+/// total energy per unit work than P-cores, 0 ms P-core time).
+#[cfg(target_os = "macos")]
+pub(crate) fn pin_ecore() {
+    // SAFETY: updates only the calling thread's QoS class.
+    unsafe {
+        let _ = libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
+    }
+}
+
 /// iOS schedules a thread by its QoS class, and an engine thread that never
 /// sets one runs at the default class, which the scheduler may move to the
 /// efficiency cores under load. Decode and demux ask for user-initiated; the

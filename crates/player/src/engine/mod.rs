@@ -655,6 +655,8 @@ impl Player {
         let init_thread = std::thread::Builder::new()
             .name("peartube-player-pipeline".into())
             .spawn(move || {
+                #[cfg(target_os = "macos")]
+                crate::clock::pin_ecore();
                 #[cfg(target_os = "ios")]
                 crate::clock::request_qos(false);
                 run_player_pipeline(url_owned, options, shared_clone);
@@ -906,8 +908,9 @@ fn run_player_pipeline(
             }
         };
 
+        let buffered_source = std::io::BufReader::with_capacity(64 * 1024, source);
         if container == "matroska" || container == "webm" {
-            match mkv_meta::open_mkv_enriched(Box::new(source), &ctx.codecs) {
+            match mkv_meta::open_mkv_enriched(Box::new(buffered_source), &ctx.codecs) {
                 Ok((d, mkv_chaps)) => {
                     if initial_chapters.is_empty() {
                         initial_chapters = mkv_chaps;
@@ -922,7 +925,7 @@ fn run_player_pipeline(
                 }
             }
         } else {
-            match ctx.containers.open_demuxer(&container, Box::new(source), &ctx.codecs) {
+            match ctx.containers.open_demuxer(&container, Box::new(buffered_source), &ctx.codecs) {
                 Ok(d) => d,
                 Err(e) => {
                     if !shared.stopped.load(Ordering::SeqCst) {
@@ -1279,11 +1282,7 @@ fn spawn_audio(
     PipelineThread::spawn("peartube-audio", move |retired| {
         let _guards = (live, consumer);
         #[cfg(target_os = "macos")]
-        if realtime {
-            if let Err(error) = crate::clock::timing::initialize_worker() {
-                eprintln!("macOS audio worker scheduling setup failed: {error}");
-            }
-        }
+        crate::clock::pin_ecore();
         #[cfg(target_os = "ios")]
         crate::clock::request_qos(true);
         let mut output = AudioOutput {
@@ -2955,8 +2954,6 @@ fn write_pcm(
         sync_audio_sink(sink, shared, &mut written.running);
         let until = frames.min(done + chunk);
         let result = {
-            #[cfg(target_os = "macos")]
-            let _timing = if realtime { crate::clock::timing::Guard::enter() } else { None };
             if realtime {
                 let ahead = (written.leads != Some(seen_seek)).then_some(Duration::ZERO);
                 match shared.preroll(at, written.running, ahead, seen_seek, retired) {
