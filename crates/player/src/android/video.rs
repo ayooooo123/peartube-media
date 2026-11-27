@@ -1528,7 +1528,7 @@ fn run_codec_session(
                             mailbox.confirm_eos(producer);
                         }
                     }
-                } else if target <= now + 28_000_000 {
+                } else if target <= now + 60_000_000 {
                     let held_buf = held_output.take().unwrap();
                     if let Err(e) =
                         codec.release_output_buffer_at_time(held_buf.buffer, target)
@@ -1547,7 +1547,7 @@ fn run_codec_session(
                         }
                     }
                 } else {
-                    let wait_ns = ((target - 24_000_000).max(now + 1_000_000) - now) as u64;
+                    let wait_ns = ((target - 54_000_000).max(now + 1_000_000) - now) as u64;
                     next_release_wait = Some(Duration::from_nanos(wait_ns).min(Duration::from_millis(8)));
                     break;
                 }

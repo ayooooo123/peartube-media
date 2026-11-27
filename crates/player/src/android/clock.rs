@@ -20,6 +20,7 @@ pub(super) struct AudioClockState {
     pub held_frames: f64,
     pub started_ns: i64,
     pub resume_read_frames: f64,
+    pub last_read_frames: f64,
     pub resume_written: u64,
     pub read_anchor: Option<(f64, i64)>,
     pub write_anchor: Option<(f64, i64)>,
@@ -38,6 +39,7 @@ impl AudioClockState {
             held_frames: 0.0,
             started_ns: 0,
             resume_read_frames: 0.0,
+            last_read_frames: 0.0,
             resume_written: 0,
             read_anchor: None,
             write_anchor: None,
@@ -84,13 +86,31 @@ impl AudioClockState {
 
         // Direct HDMI IEC61937 streams (AudioStreamLegacy on Android TV) often omit
         // `AAudioStream_getTimestamp`. Once playback genuinely advances past the
-        // start/resume watermark, anchor to `frames_read()` (or blocking `write()`
-        // pacing if the HAL leaves `frames_read()` stuck) so video presentation can
-        // track the live audio clock instead of stalling forever on frame 0.
+        // start/resume watermark, anchor to `frames_read()` with a gentle PLL (so
+        // discrete 32–64 ms ALSA DMA bursts do not jerk video frame targets across
+        // 23.976 Hz VSYNC boundaries), or fall back to blocking `write()` pacing.
         if read_frames > self.resume_read_frames {
-            let clamped = read_frames.clamp(self.held_frames, self.written as f64);
-            if self.read_anchor.is_none_or(|(prev, _)| clamped > prev) {
-                self.read_anchor = Some((clamped, now_ns));
+            let raw_read = read_frames.min(self.written as f64);
+            if raw_read > self.last_read_frames {
+                self.last_read_frames = raw_read;
+                match self.read_anchor {
+                    None => {
+                        self.read_anchor = Some((raw_read.max(self.held_frames), now_ns));
+                    }
+                    Some((anc_frame, anc_ns)) => {
+                        let predicted = anc_frame
+                            + (now_ns - anc_ns) as f64 * f64::from(self.rate) / 1e9;
+                        let err = raw_read - predicted;
+                        let max_snap = f64::from(self.rate) * 0.15;
+                        let deadband = f64::from(self.rate) * 0.025;
+                        if err.abs() > max_snap {
+                            self.read_anchor = Some((raw_read, now_ns));
+                        } else if err.abs() > deadband {
+                            let smoothed = predicted + err * 0.03;
+                            self.read_anchor = Some((smoothed, now_ns));
+                        }
+                    }
+                }
             }
         }
         if let Some(anchor) = self.read_anchor {

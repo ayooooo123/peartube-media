@@ -606,9 +606,11 @@ impl AudioSink for AndroidAudioSink {
             state.started_ns = current_monotonic_ns();
             state.read_anchor = None;
             state.write_anchor = None;
-            state.resume_read_frames = state.stream.as_ref().map_or(state.held_frames, |s| {
+            let cur_read = state.stream.as_ref().map_or(state.held_frames, |s| {
                 (s.0.frames_read() - state.base_frame) as f64
             });
+            state.resume_read_frames = cur_read;
+            state.last_read_frames = cur_read;
             state.resume_written = state.written;
             state.playing = true;
             state.stream.clone()
