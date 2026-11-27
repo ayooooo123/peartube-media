@@ -195,6 +195,22 @@ impl AndroidAudioSink {
         Ok(())
     }
 
+    /// Stops and drops the active `AAudioStream` so exclusive HDMI IEC61937
+    /// ALSA outputs (`card 0, device 0`) are released before opening a replacement.
+    fn close_stream(&self) {
+        let old = {
+            let mut state = self.clock.inner.lock();
+            let old = state.stream.take();
+            state.playing = false;
+            state.read_anchor = None;
+            state.write_anchor = None;
+            old
+        };
+        if let Some(stream) = old {
+            let _ = stream.0.request_stop();
+        }
+    }
+
     fn install_stream(&self, stream: ndk::audio::AudioStream, clock_rate: u32) {
         let old = {
             let mut state = self.clock.inner.lock();
@@ -216,6 +232,7 @@ impl AndroidAudioSink {
         format: PcmFormat,
         mode: AudioOutputMode,
     ) -> Result<(), SinkError> {
+        self.close_stream();
         let channels = layout.channel_count();
         let order = if channels > 2 { android_surround_order(layout) } else { None };
         let multichannel = order.is_some()
@@ -303,6 +320,7 @@ impl AndroidAudioSink {
     }
 
     fn open_iec_stream(&mut self, codec: Iec61937Codec, source_rate: u32) -> Result<bool, SinkError> {
+        self.close_stream();
         let (carrier_rate, carrier_ch) = codec.carrier_shape(source_rate);
         let Ok(mut b) = AudioStreamBuilder::new() else {
             return Ok(false);
@@ -640,6 +658,7 @@ impl AudioSink for AndroidAudioSink {
         // transitions; an old timestamp can never anchor the new samples.
         if self.sample_rate != 0 && !self.suspended {
             let playing = self.clock.inner.lock().playing;
+            self.close_stream();
             let reopened = if let Some(pktzr) = &self.iec {
                 let codec = pktzr.codec();
                 self.open_iec_stream(codec, self.sample_rate).unwrap_or(false)
