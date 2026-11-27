@@ -1081,7 +1081,9 @@ impl CodecSession {
             Some(m) => m,
             None => return false,
         };
-        if self.meta.mime != mime {
+        let mime_matches = self.meta.mime == mime
+            || (self.meta.mime == "video/dolby-vision" && mime == "video/hevc");
+        if !mime_matches {
             return false;
         }
         if self.meta.output_revision != current_revision {
@@ -1883,7 +1885,9 @@ fn session_can_reuse(
         Some(m) => m,
         None => return false,
     };
-    if meta.mime != mime {
+    let mime_matches = meta.mime == mime
+        || (meta.mime == "video/dolby-vision" && mime == "video/hevc");
+    if !mime_matches {
         return false;
     }
     if meta.output_revision != current_revision {
@@ -2830,36 +2834,66 @@ fn configure_and_start_codec(
         format
     };
 
-    // Prefer hardware Dolby Vision (`video/dolby-vision` + `csd-2` dvcC/dvvC) when the stream
-    // carries DV metadata, falling back cleanly to `video/hevc` HDR10 when the device lacks DV.
+    // Prefer a hardware Dolby Vision decoder whose advertised `CodecProfileLevel` matches the
+    // stream's exact HEVC DV profile (e.g. `c2.mtk.dvhe.sth.decoder` for Profile 8, `dvhe.stn`
+    // for Profile 5). Never call `from_decoder_type("video/dolby-vision")` blindly: on MediaTek
+    // devices (Google TV Streamer, etc.) the first `video/dolby-vision` component is
+    // `c2.mtk.dvav.ser.decoder` (AVC/H.264 Profile 9), which rejects HEVC packets until
+    // `UNKNOWN_ERROR`. When no matching DV decoder exists, fall straight through to hardware
+    // `video/hevc` (HDR10 base layer).
     if !force_software && base_mime == "video/hevc" {
         if let Some(dv) = &dovi_cfg {
-            if let Some(dv_codec) = MediaCodec::from_decoder_type("video/dolby-vision") {
-                check_current()?;
-                let dv_fmt = build_media_format("video/dolby-vision", Some(&dv.record));
-                if dv_codec.configure(&dv_fmt, Some(window), MediaCodecDirection::Decoder).is_ok() {
+            if let Some((dv_name, max_level)) = find_dolby_vision_decoder(dv.profile) {
+                if let Some(dv_codec) = MediaCodec::from_codec_name(&dv_name) {
                     check_current()?;
-                    if dv_codec.start().is_ok() {
-                        return Ok(CodecSession {
-                            codec: dv_codec,
-                            meta: CodecMeta {
-                                mime: "video/dolby-vision".to_string(),
-                                width: params.width.unwrap_or(0),
-                                height: params.height.unwrap_or(0),
-                                csd0,
-                                csd1,
-                                nal_length_size: nal_len_size,
-                                packets_are_annex_b: packets_annex_b,
-                                bound_surface_id: surface_id,
-                                output_revision,
-                                prefer_software: false,
-                                has_seen_output: false,
-                                csd_progress: CsdProgress::Done,
-                                current_producer: request.producer,
-                                codec_epoch,
-                                convert_p7_to_81,
-                            },
-                        });
+                    let mut dv_fmt = build_media_format("video/dolby-vision", Some(&dv.record));
+                    if let Some(android_profile) = android_dolby_vision_profile(dv.profile) {
+                        dv_fmt.set_i32("profile", android_profile);
+                    }
+                    if let Some(android_level) = android_dolby_vision_level(dv.level) {
+                        let clamped = if max_level > 0 {
+                            android_level.min(max_level)
+                        } else {
+                            android_level
+                        };
+                        dv_fmt.set_i32("level", clamped);
+                    }
+                    if dv_codec.configure(&dv_fmt, Some(window), MediaCodecDirection::Decoder).is_ok() {
+                        check_current()?;
+                        if dv_codec.start().is_ok() {
+                            video_log(&format!(
+                                "started DV decoder {dv_name} (profile={}, level={}, p7_to_81={convert_p7_to_81})",
+                                dv.profile, dv.level
+                            ));
+                            return Ok(CodecSession {
+                                codec: dv_codec,
+                                meta: CodecMeta {
+                                    mime: "video/dolby-vision".to_string(),
+                                    width: params.width.unwrap_or(0),
+                                    height: params.height.unwrap_or(0),
+                                    csd0,
+                                    csd1,
+                                    nal_length_size: nal_len_size,
+                                    packets_are_annex_b: packets_annex_b,
+                                    bound_surface_id: surface_id,
+                                    output_revision,
+                                    prefer_software: false,
+                                    has_seen_output: false,
+                                    csd_progress: CsdProgress::Done,
+                                    current_producer: request.producer,
+                                    codec_epoch,
+                                    convert_p7_to_81,
+                                },
+                            });
+                        } else {
+                            video_log(&format!(
+                                "DV decoder {dv_name} start failed; falling back to video/hevc"
+                            ));
+                        }
+                    } else {
+                        video_log(&format!(
+                            "DV decoder {dv_name} configure failed; falling back to video/hevc"
+                        ));
                     }
                 }
             }
@@ -3056,6 +3090,185 @@ fn extract_csd(mime: &str, extradata: &[u8]) -> (Vec<u8>, Vec<u8>, usize, bool) 
     }
 
     (csd0, csd1, nal_len_size, packets_annex_b)
+}
+
+fn video_log(msg: &str) {
+    super::audio::log_info(c"peartube-video", msg);
+}
+
+/// Maps a Dolby Vision profile number to Android's `MediaCodecInfo.CodecProfileLevel` constant
+/// for HEVC-based Dolby Vision streams.
+fn android_dolby_vision_profile(profile: u8) -> Option<i32> {
+    match profile {
+        4 => Some(0x10),  // DolbyVisionProfileDvheDtr (16)
+        5 => Some(0x20),  // DolbyVisionProfileDvheStn (32)
+        7 => Some(0x80),  // DolbyVisionProfileDvheDtb (128)
+        8 => Some(0x100), // DolbyVisionProfileDvheSt  (256)
+        _ => None,
+    }
+}
+
+/// Maps a Dolby Vision level (`1..=13`) to Android's `MediaCodecInfo.CodecProfileLevel` bitmask.
+fn android_dolby_vision_level(level: u8) -> Option<i32> {
+    if (1..=13).contains(&level) {
+        Some(1i32 << (level - 1))
+    } else {
+        None
+    }
+}
+
+/// Finds a non-secure hardware `video/dolby-vision` decoder advertising `profile` in its
+/// `CodecCapabilities.profileLevels`, returning `(codec_name, max_supported_level)`.
+fn find_dolby_vision_decoder(profile: u8) -> Option<(String, i32)> {
+    use jni::objects::{JObjectArray, JString, JValue};
+
+    let target_profile = android_dolby_vision_profile(profile)?;
+    let Some(vm) = super::surface::SurfaceRegistry::global().java_vm() else {
+        video_log(&format!("dv profile={profile}: no JavaVM yet; falling back to video/hevc"));
+        return None;
+    };
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => {
+            video_log(&format!("dv profile={profile}: JVM attach failed: {e}"));
+            return None;
+        }
+    };
+
+    let result = env.with_local_frame(16, |env| -> jni::errors::Result<Option<(String, i32)>> {
+        // MediaCodecList.REGULAR_CODECS = 0
+        let list = env.new_object("android/media/MediaCodecList", "(I)V", &[JValue::Int(0)])?;
+        let infos_obj = env
+            .call_method(&list, "getCodecInfos", "()[Landroid/media/MediaCodecInfo;", &[])?
+            .l()?;
+        let infos = JObjectArray::from(infos_obj);
+        let len = env.get_array_length(&infos)?;
+        let dv_mime = env.new_string("video/dolby-vision")?;
+        let secure_feat = env.new_string("secure-playback")?;
+
+        for i in 0..len {
+            let matched = env.with_local_frame(16, |env| -> jni::errors::Result<Option<(String, i32)>> {
+                let info = env.get_object_array_element(&infos, i)?;
+                if info.is_null() {
+                    return Ok(None);
+                }
+                if env.call_method(&info, "isEncoder", "()Z", &[])?.z()? {
+                    return Ok(None);
+                }
+                let name_obj = env
+                    .call_method(&info, "getName", "()Ljava/lang/String;", &[])?
+                    .l()?;
+                let name: String = env.get_string(&JString::from(name_obj))?.into();
+                let lower = name.to_ascii_lowercase();
+                if lower.contains(".secure")
+                    || lower.starts_with("c2.android.")
+                    || lower.starts_with("omx.google.")
+                {
+                    return Ok(None);
+                }
+                if env.call_method(&info, "isSoftwareOnly", "()Z", &[])?.z()? {
+                    return Ok(None);
+                }
+
+                let types_obj = env
+                    .call_method(&info, "getSupportedTypes", "()[Ljava/lang/String;", &[])?
+                    .l()?;
+                let types = JObjectArray::from(types_obj);
+                let tlen = env.get_array_length(&types)?;
+                let mut supports_dv = false;
+                for j in 0..tlen {
+                    let t_obj = env.get_object_array_element(&types, j)?;
+                    if !t_obj.is_null() {
+                        let t_str: String = env.get_string(&JString::from(t_obj))?.into();
+                        if t_str.eq_ignore_ascii_case("video/dolby-vision") {
+                            supports_dv = true;
+                            break;
+                        }
+                    }
+                }
+                if !supports_dv {
+                    return Ok(None);
+                }
+
+                let caps = env
+                    .call_method(
+                        &info,
+                        "getCapabilitiesForType",
+                        "(Ljava/lang/String;)Landroid/media/MediaCodecInfo$CodecCapabilities;",
+                        &[JValue::Object(&dv_mime)],
+                    )?
+                    .l()?;
+                if caps.is_null() {
+                    return Ok(None);
+                }
+                let req_secure = env
+                    .call_method(
+                        &caps,
+                        "isFeatureRequired",
+                        "(Ljava/lang/String;)Z",
+                        &[JValue::Object(&secure_feat)],
+                    )?
+                    .z()?;
+                if req_secure {
+                    return Ok(None);
+                }
+
+                let pls_obj = env
+                    .get_field(
+                        &caps,
+                        "profileLevels",
+                        "[Landroid/media/MediaCodecInfo$CodecProfileLevel;",
+                    )?
+                    .l()?;
+                if pls_obj.is_null() {
+                    return Ok(None);
+                }
+                let pls = JObjectArray::from(pls_obj);
+                let plen = env.get_array_length(&pls)?;
+                let mut best_level: Option<i32> = None;
+                for k in 0..plen {
+                    let pl = env.get_object_array_element(&pls, k)?;
+                    if pl.is_null() {
+                        continue;
+                    }
+                    let pl_profile = env.get_field(&pl, "profile", "I")?.i()?;
+                    if pl_profile == target_profile {
+                        let pl_level = env.get_field(&pl, "level", "I")?.i()?;
+                        best_level = Some(best_level.map_or(pl_level, |cur| cur.max(pl_level)));
+                    }
+                }
+                Ok(best_level.map(|lvl| (name, lvl)))
+            })?;
+            if matched.is_some() {
+                return Ok(matched);
+            }
+        }
+        Ok(None)
+    });
+
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+
+    match result {
+        Ok(Some((name, max_level))) => {
+            video_log(&format!(
+                "dv profile={profile} (0x{target_profile:x}) -> {name} (max_level={max_level})"
+            ));
+            Some((name, max_level))
+        }
+        Ok(None) => {
+            video_log(&format!(
+                "dv profile={profile} (0x{target_profile:x}): no matching hardware decoder; falling back to video/hevc"
+            ));
+            None
+        }
+        Err(e) => {
+            video_log(&format!("dv profile={profile}: MediaCodecList JNI error: {e}"));
+            None
+        }
+    }
 }
 
 /// Android's dav1d AV1 component (media mainline). On a Pixel 5a, a 2856x2160 AV1 film decoded

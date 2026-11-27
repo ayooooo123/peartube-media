@@ -56,12 +56,17 @@ unsafe extern "C" {
     fn __android_log_write(prio: i32, tag: *const std::ffi::c_char, text: *const std::ffi::c_char) -> i32;
 }
 
-/// Output-route decisions go to logcat under `peartube-audio`, so a device's choice can be read back.
-fn route_log(msg: &str) {
+/// Writes an info line to Android logcat under `tag`.
+pub(super) fn log_info(tag: &std::ffi::CStr, msg: &str) {
     if let Ok(text) = std::ffi::CString::new(msg) {
         // 4 = ANDROID_LOG_INFO
-        unsafe { __android_log_write(4, c"peartube-audio".as_ptr(), text.as_ptr()) };
+        unsafe { __android_log_write(4, tag.as_ptr(), text.as_ptr()) };
     }
+}
+
+/// Output-route decisions go to logcat under `peartube-audio`, so a device's choice can be read back.
+fn route_log(msg: &str) {
+    log_info(c"peartube-audio", msg);
 }
 
 /// `AudioTrack.isDirectPlaybackSupported` (API 29): whether the current route (an HDMI
@@ -167,6 +172,8 @@ impl AndroidAudioSink {
                 state.observe();
             }
             state.playing = false;
+            state.read_anchor = None;
+            state.write_anchor = None;
             state.stream.take()
         };
         self.suspended = true;
@@ -358,12 +365,21 @@ impl AndroidAudioSink {
         }
         self.iec_buf.drain(..written * frame_bytes);
         let mut state = self.clock.inner.lock();
+        let now_ns = current_monotonic_ns();
         if state.base.is_none() {
             state.base = Some(pts);
             state.base_frame = before;
-            state.started_ns = current_monotonic_ns();
+            state.started_ns = now_ns;
         }
         state.written += written as u64;
+        if state.playing
+            && state.written > state.resume_written
+            && now_ns - state.started_ns >= 100_000_000
+        {
+            let buf_frames = stream.0.buffer_size_in_frames().max(0) as f64;
+            let est = (state.written as f64 - buf_frames).max(state.held_frames);
+            state.write_anchor = Some((est, now_ns));
+        }
         Ok(self.iec_buf.is_empty())
     }
 }
@@ -473,12 +489,22 @@ impl AudioSink for AndroidAudioSink {
             Err(e) => return Err(SinkError::Fatal(format!("AAudio write: {e:?}"))),
         };
         let mut state = self.clock.inner.lock();
+        let now_ns = current_monotonic_ns();
         if written > 0 && state.base.is_none() {
             state.base = Some(pts);
             state.base_frame = before;
-            state.started_ns = current_monotonic_ns();
+            state.started_ns = now_ns;
         }
         state.written += written as u64;
+        if written > 0
+            && state.playing
+            && state.written > state.resume_written
+            && now_ns - state.started_ns >= 100_000_000
+        {
+            let buf_frames = stream.0.buffer_size_in_frames().max(0) as f64;
+            let est = (state.written as f64 - buf_frames).max(state.held_frames);
+            state.write_anchor = Some((est, now_ns));
+        }
         #[cfg(debug_assertions)]
         if super::clock::tracing() {
             if let Ok(ts) = stream.0.timestamp(ndk::audio::Clockid::Monotonic) {
@@ -578,6 +604,12 @@ impl AudioSink for AndroidAudioSink {
             let mut state = self.clock.inner.lock();
             if state.playing { return; }
             state.started_ns = current_monotonic_ns();
+            state.read_anchor = None;
+            state.write_anchor = None;
+            state.resume_read_frames = state.stream.as_ref().map_or(state.held_frames, |s| {
+                (s.0.frames_read() - state.base_frame) as f64
+            });
+            state.resume_written = state.written;
             state.playing = true;
             state.stream.clone()
         };
@@ -590,6 +622,8 @@ impl AudioSink for AndroidAudioSink {
             if !state.playing { return; }
             state.observe();
             state.playing = false;
+            state.read_anchor = None;
+            state.write_anchor = None;
             state.stream.clone()
         };
         if let Some(stream) = stream { let _ = stream.0.request_pause(); }

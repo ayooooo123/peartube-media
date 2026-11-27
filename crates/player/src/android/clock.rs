@@ -19,12 +19,30 @@ pub(super) struct AudioClockState {
     pub playing: bool,
     pub held_frames: f64,
     pub started_ns: i64,
+    pub resume_read_frames: f64,
+    pub resume_written: u64,
+    pub read_anchor: Option<(f64, i64)>,
+    pub write_anchor: Option<(f64, i64)>,
+    pub logged_fallback: bool,
 }
 
 impl AudioClockState {
     pub fn new() -> Self {
-        Self { stream: None, rate: 48000, base: None, base_frame: 0, written: 0,
-            playing: false, held_frames: 0.0, started_ns: 0 }
+        Self {
+            stream: None,
+            rate: 48000,
+            base: None,
+            base_frame: 0,
+            written: 0,
+            playing: false,
+            held_frames: 0.0,
+            started_ns: 0,
+            resume_read_frames: 0.0,
+            resume_written: 0,
+            read_anchor: None,
+            write_anchor: None,
+            logged_fallback: false,
+        }
     }
 
     /// Never extrapolate from startup/resume time. Without a fresh timestamp,
@@ -34,18 +52,84 @@ impl AudioClockState {
         if !self.playing || self.base.is_none() {
             return (self.held_frames, None);
         }
-        let timestamp = self.stream.as_ref()
-            .and_then(|stream| stream.0.timestamp(Clockid::Monotonic).ok())
+        let now_ns = current_monotonic_ns();
+        let ts_res = self
+            .stream
+            .as_ref()
+            .map(|stream| stream.0.timestamp(Clockid::Monotonic));
+        let timestamp = ts_res
+            .as_ref()
+            .and_then(|res| res.as_ref().ok())
             .map(|ts| ((ts.frame_position - self.base_frame) as f64, ts.time_nanoseconds));
         let read_frames = if timestamp.is_some_and(|(_, ns)| ns >= self.started_ns) {
             self.held_frames
         } else {
-            self.stream.as_ref().map_or(self.held_frames,
-                |stream| (stream.0.frames_read() - self.base_frame) as f64)
+            self.stream.as_ref().map_or(self.held_frames, |stream| {
+                (stream.0.frames_read() - self.base_frame) as f64
+            })
         };
-        let observed = super::position::observe(self.held_frames, self.rate, self.written,
-            self.started_ns, current_monotonic_ns(), timestamp, read_frames);
+        let observed = super::position::observe(
+            self.held_frames,
+            self.rate,
+            self.written,
+            self.started_ns,
+            now_ns,
+            timestamp,
+            read_frames,
+        );
         self.held_frames = observed.0;
+        if observed.1.is_some() {
+            return observed;
+        }
+
+        // Direct HDMI IEC61937 streams (AudioStreamLegacy on Android TV) often omit
+        // `AAudioStream_getTimestamp`. Once playback genuinely advances past the
+        // start/resume watermark, anchor to `frames_read()` (or blocking `write()`
+        // pacing if the HAL leaves `frames_read()` stuck) so video presentation can
+        // track the live audio clock instead of stalling forever on frame 0.
+        if read_frames > self.resume_read_frames {
+            let clamped = read_frames.clamp(self.held_frames, self.written as f64);
+            if self.read_anchor.is_none_or(|(prev, _)| clamped > prev) {
+                self.read_anchor = Some((clamped, now_ns));
+            }
+        }
+        if let Some(anchor) = self.read_anchor {
+            if !self.logged_fallback {
+                self.logged_fallback = true;
+                super::audio::log_info(
+                    c"peartube-audio",
+                    &format!(
+                        "clock fallback=frames_read frame={:.0} written={} ts={:?}",
+                        anchor.0,
+                        self.written,
+                        ts_res.as_ref().map(|r| r.as_ref().err())
+                    ),
+                );
+            }
+            let frames = (anchor.0 + (now_ns - anchor.1) as f64 * f64::from(self.rate) / 1e9)
+                .clamp(self.held_frames, self.written as f64);
+            self.held_frames = frames;
+            return (frames, Some(anchor));
+        }
+        if let Some(anchor) = self.write_anchor {
+            if !self.logged_fallback {
+                self.logged_fallback = true;
+                super::audio::log_info(
+                    c"peartube-audio",
+                    &format!(
+                        "clock fallback=write_pace frame={:.0} written={} read={:.0} ts={:?}",
+                        anchor.0,
+                        self.written,
+                        read_frames,
+                        ts_res.as_ref().map(|r| r.as_ref().err())
+                    ),
+                );
+            }
+            let frames = (anchor.0 + (now_ns - anchor.1) as f64 * f64::from(self.rate) / 1e9)
+                .clamp(self.held_frames, self.written as f64);
+            self.held_frames = frames;
+            return (frames, Some(anchor));
+        }
         observed
     }
 }
