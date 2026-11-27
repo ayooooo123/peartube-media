@@ -32,7 +32,7 @@ fn centers_23976_mkv_frames_started_near_vsync_edge() {
         let mkv_ms = (i as f64 * (1001.0 / 24.0)).round() as i64;
         let raw = start_raw + mkv_ms * 1_000_000;
         let adjusted = pacer.adjust(raw, Some(vsync));
-        let expected = base_vsync + i * PERIOD_23976 - (PERIOD_23976 / 2);
+        let expected = base_vsync + i * PERIOD_23976 - (PERIOD_23976 / 8);
         assert_eq!(adjusted, expected, "frame {i} should stay centered on VSYNC {i}");
         if let Some(p) = prev {
             assert_eq!(adjusted - p, PERIOD_23976, "frame {i} spacing must be exact refresh period");

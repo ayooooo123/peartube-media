@@ -90,7 +90,12 @@ impl VsyncPacer {
 
         self.last_raw_target_ns = Some(raw_target_ns);
         self.last_snapped_vsync_ns = Some(snapped);
-        snapped - (v.period_ns / 2)
+        // Place desiredPresentTime cleanly inside SurfaceFlinger's latch window for
+        // `snapped`: strictly before `snapped` (~5.2 ms at 23.976 Hz, ~2.1 ms at 60 Hz)
+        // while staying ~37.5% of a period (~15.6 ms at 23.976 Hz) away from the
+        // `snapped - 0.5 * period` early-latch boundary where SurfaceFlinger overwrites
+        // the preceding frame.
+        snapped - (v.period_ns / 8)
     }
 }
 
