@@ -5,6 +5,7 @@ use super::surface::{
     SurfaceRegistry,
 };
 use super::video::AndroidVideoSink;
+use super::vsync::DisplayVsync;
 use crate::backend::{
     AudioSink, Backend, Clock, FrameDecision, PreparedFrameId, ProducerId, SubtitleImage,
     SubtitleSink, VideoError, VideoMode, VideoOutput, VideoRequest, VideoSink,
@@ -27,6 +28,7 @@ pub struct BackendShared {
     pub active_audio: Mutex<Option<Weak<Mutex<AndroidAudioSink>>>>,
     pub active_video: Mutex<Option<Weak<Mutex<AndroidVideoSink>>>>,
     pub active_subtitles: Mutex<Option<Weak<Mutex<AndroidSubtitleSink>>>>,
+    pub display_vsync: Mutex<Option<DisplayVsync>>,
 }
 
 impl BackendRetireObserver for BackendShared {
@@ -95,6 +97,10 @@ impl BackendShared {
         self.is_suspended.load(Ordering::SeqCst)
     }
 
+    pub fn display_vsync(&self) -> Option<DisplayVsync> {
+        *self.display_vsync.lock()
+    }
+
     /// Owner/lease-bound import. No frontend path; short handle locks only.
     #[cfg(target_os = "android")]
     pub(crate) fn import_window_for_lease(
@@ -120,6 +126,7 @@ impl AndroidBackend {
             active_audio: Mutex::new(None),
             active_video: Mutex::new(None),
             active_subtitles: Mutex::new(None),
+            display_vsync: Mutex::new(None),
         });
 
         SurfaceRegistry::global()
@@ -130,6 +137,22 @@ impl AndroidBackend {
 
     pub fn shared(&self) -> &Arc<BackendShared> {
         &self.shared
+    }
+
+    /// Updates the display's hardware VSYNC anchor (`CLOCK_MONOTONIC`) and refresh period.
+    pub fn set_display_vsync(&self, hw_vsync_ns: i64, period_ns: i64) {
+        if period_ns > 0 {
+            *self.shared.display_vsync.lock() = Some(DisplayVsync {
+                hw_vsync_ns,
+                period_ns,
+            });
+        } else {
+            *self.shared.display_vsync.lock() = None;
+        }
+    }
+
+    pub fn clear_display_vsync(&self) {
+        *self.shared.display_vsync.lock() = None;
     }
 
     pub fn set_video_surface(

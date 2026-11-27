@@ -5,6 +5,7 @@
 
 use super::backend::BackendShared;
 use super::surface::{SurfaceBinding, SurfaceBindingLease, SurfaceId};
+use super::vsync::VsyncPacer;
 use crate::annexb::convert_packet_to_annex_b;
 use crate::backend::{
     Clock, FrameDecision, FrameRateMode, PictureReady, PreparedFrameId, ProducerId, SinkError, VideoControl,
@@ -1262,6 +1263,7 @@ fn run_codec_session(
     // Split codec/meta so OutputBuffer can borrow codec while meta mutates (C1).
     let CodecSession { codec, meta } = session;
     let mut held_output: Option<HeldOutput<'_>> = None;
+    let mut vsync_pacer = VsyncPacer::new();
 
     loop {
         let (req_opt, retire_req, playing, present_from, eos_requested) = {
@@ -1316,6 +1318,7 @@ fn run_codec_session(
                             meta.output_revision = req.output_revision;
                             *eos_input_queued = None;
                             *accepted_in_flight = false;
+                            vsync_pacer.reset();
                             match codec.flush() {
                                 Ok(()) => {
                                     if !meta.has_seen_output {
@@ -1493,6 +1496,7 @@ fn run_codec_session(
                 let is_eos = held.eos;
                 let now = current_monotonic_ns();
                 if !playing {
+                    vsync_pacer.reset();
                     break;
                 }
                 let Some(target) = clock.monotonic_ns_at(pts) else {
@@ -1530,8 +1534,9 @@ fn run_codec_session(
                     }
                 } else if target <= now + 60_000_000 {
                     let held_buf = held_output.take().unwrap();
+                    let present_ns = vsync_pacer.adjust(target, backend.display_vsync());
                     if let Err(e) =
-                        codec.release_output_buffer_at_time(held_buf.buffer, target)
+                        codec.release_output_buffer_at_time(held_buf.buffer, present_ns)
                     {
                         mailbox.set_async_error(
                             producer,

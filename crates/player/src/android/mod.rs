@@ -13,6 +13,8 @@ pub mod subtitle;
 pub mod surface;
 #[forbid(unsafe_code)]
 pub mod video;
+#[forbid(unsafe_code)]
+pub mod vsync;
 
 #[cfg(test)]
 #[forbid(unsafe_code)]
@@ -27,3 +29,4 @@ pub use surface::{
     TOTAL_SURFACE_CREDITS,
 };
 pub use video::AndroidVideoSink;
+pub use vsync::DisplayVsync;
