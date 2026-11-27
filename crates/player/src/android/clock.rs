@@ -15,6 +15,7 @@ pub(super) struct AudioClockState {
     pub rate: u32,
     pub base: Option<Duration>,
     pub base_frame: i64,
+    pub base_read_frame: i64,
     pub written: u64,
     pub playing: bool,
     pub held_frames: f64,
@@ -34,6 +35,7 @@ impl AudioClockState {
             rate: 48000,
             base: None,
             base_frame: 0,
+            base_read_frame: 0,
             written: 0,
             playing: false,
             held_frames: 0.0,
@@ -67,7 +69,7 @@ impl AudioClockState {
             self.held_frames
         } else {
             self.stream.as_ref().map_or(self.held_frames, |stream| {
-                (stream.0.frames_read() - self.base_frame) as f64
+                (stream.0.frames_read() - self.base_read_frame) as f64
             })
         };
         let observed = super::position::observe(

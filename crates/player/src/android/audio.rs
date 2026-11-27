@@ -4,7 +4,7 @@ use crate::channel_order::reorder_interleaved;
 use crate::backend::{AudioOutputMode, AudioSink, Clock, PcmFormat, PcmSlice, SinkError};
 use crate::clock::current_monotonic_ns;
 use crate::iec61937::{Iec61937Codec, Iec61937Packetizer};
-use ndk::audio::{AudioDirection, AudioFormat, AudioPerformanceMode, AudioStreamBuilder};
+use ndk::audio::{AudioDirection, AudioFormat, AudioPerformanceMode, AudioStreamBuilder, AudioStreamState};
 use oxideav_core::ChannelLayout;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -211,6 +211,50 @@ impl AndroidAudioSink {
         }
     }
 
+    fn flush_iec_in_place(&self) -> bool {
+        let existing = {
+            let state = self.clock.inner.lock();
+            state.stream.clone()
+        };
+        let Some(stream) = existing else {
+            return false;
+        };
+        let mut st = stream.0.state();
+        if matches!(st, AudioStreamState::Starting | AudioStreamState::Started) {
+            let _ = stream.0.request_pause();
+            st = stream.0.state();
+        }
+        if st == AudioStreamState::Pausing {
+            if let Ok(next) = stream.0.wait_for_state_change(AudioStreamState::Pausing, 80_000_000) {
+                st = next;
+            }
+        }
+        let ok = match st {
+            AudioStreamState::Open | AudioStreamState::Flushed => true,
+            AudioStreamState::Paused | AudioStreamState::Pausing | AudioStreamState::Stopped => {
+                if stream.0.request_flush().is_ok() {
+                    let _ = stream.0.wait_for_state_change(AudioStreamState::Flushing, 80_000_000);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if ok {
+            let mut state = self.clock.inner.lock();
+            let keep_stream = state.stream.take();
+            let keep_rate = state.rate;
+            *state = AudioClockState::new();
+            state.rate = keep_rate;
+            state.stream = keep_stream;
+            route_log(&format!("iec flush in-place ok (prev_state={st:?})"));
+        } else {
+            route_log(&format!("iec flush in-place fell back (state={st:?})"));
+        }
+        ok
+    }
+
     fn install_stream(&self, stream: ndk::audio::AudioStream, clock_rate: u32) {
         let old = {
             let mut state = self.clock.inner.lock();
@@ -387,6 +431,7 @@ impl AndroidAudioSink {
         if state.base.is_none() {
             state.base = Some(pts);
             state.base_frame = before;
+            state.base_read_frame = stream.0.frames_read();
             state.started_ns = now_ns;
         }
         state.written += written as u64;
@@ -511,6 +556,7 @@ impl AudioSink for AndroidAudioSink {
         if written > 0 && state.base.is_none() {
             state.base = Some(pts);
             state.base_frame = before;
+            state.base_read_frame = stream.0.frames_read();
             state.started_ns = now_ns;
         }
         state.written += written as u64;
@@ -625,7 +671,7 @@ impl AudioSink for AndroidAudioSink {
             state.read_anchor = None;
             state.write_anchor = None;
             let cur_read = state.stream.as_ref().map_or(state.held_frames, |s| {
-                (s.0.frames_read() - state.base_frame) as f64
+                (s.0.frames_read() - state.base_read_frame) as f64
             });
             state.resume_read_frames = cur_read;
             state.last_read_frames = cur_read;
@@ -658,6 +704,15 @@ impl AudioSink for AndroidAudioSink {
         // transitions; an old timestamp can never anchor the new samples.
         if self.sample_rate != 0 && !self.suspended {
             let playing = self.clock.inner.lock().playing;
+            // Keep direct HDMI IEC61937 streams open across seeks by flushing in place:
+            // closing `[hdmi_raw]` on MediaTek Android TV triggers Dolby MS12 to seize
+            // `card 0, device 0` with `[hdmi_raw_tunnel]` before the replacement starts.
+            if self.iec.is_some() && self.flush_iec_in_place() {
+                if playing {
+                    self.play();
+                }
+                return;
+            }
             self.close_stream();
             let reopened = if let Some(pktzr) = &self.iec {
                 let codec = pktzr.codec();
